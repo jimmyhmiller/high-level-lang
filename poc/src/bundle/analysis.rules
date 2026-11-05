@@ -1,0 +1,453 @@
+# Each module's import/export structure and statements, as facts for link.facts.
+rules bundle.analysis over bundle.js
+use bundle.js as js
+use bundle.link as link
+use bundle.scopes as sc
+use bundle.resolve as res
+use bundle.modules as m
+
+# An import from a CommonJS module, which turns into a property read.
+record CjsImport { importer: Int, import-var: Int, name: Text, namespace: Bool }
+
+state next-part: Int = 0
+state cjs-imports: {Int:CjsImport} = {}
+state import-vars: {Int:Int} = {}
+state part-stmt: [Node] = []
+state part-module: [Int] = []
+state entry-namespace: Bool = false
+state keep-entry-exports: Bool = false
+
+# The module the current analysis is looking at.
+context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
+
+fn root-sym(mo: m.Module, name: Text) -> Int? = sym.scope-at(m.table, mo.root).names[name]
+
+# A symbol of the runtime module, by name.
+fn helper(name: Text) -> Int = root-sym(m.modules[0], name) ?? panic "the runtime has no helper named {}", name
+
+fn dep-of(mo: m.Module, spec: Text) -> Int {
+  if res.external?(spec, m.options) { return m.external-module(spec) }
+  let r = res.resolve(spec, mo.path, m.options)
+  m.by-path[r.path] ?? panic "{}: {} was not loaded", mo.path, spec
+}
+
+fn dep-of-str(mo: m.Module, from: Node) -> Int = dep-of(mo, m.module-of-str(from))
+
+# Imported as an opaque object at run time, rather than linked by name.
+fn opaque?(t: m.Module) -> Bool = t.kind == Cjs or t.kind == External
+
+fn bound?(n: Node) -> Bool = n.lo in here.bindings
+
+# Every binding beneath `n`, by symbol. Does not enter nested functions: a top-level statement
+# declares only its own names.
+fn declared-under(part: Int, n: Node) -> Void = match n {
+  BindName(x) => {
+    let s = here.bindings[n.lo] ?? panic "{}: no symbol for binding {}", here.path, x
+    if sym.symbol-at(m.table, s).scope == here.root { assert m.db.declares(part, s) }
+  }
+  _ =>
+    if sc.hoist-name?(n.kind) {
+      declared-under(part, n.kids[0])
+    } else if not sc.opens?(n.kind) {
+      for k in n.kids { declared-under(part, k) }
+    }
+}
+
+# The module an identifier names when it is `import * as` of an ES module.
+fn namespace-of(mo: m.Module, n: Node) -> Int? = match n {
+  Ident(_) => match mo.bindings[n.lo] {
+    some(s) => first m.db.ns-import(s, ?target): some(target)
+    none => none
+  }
+  _ => none
+}
+
+# `import("x")` with a literal path: the module it names.
+fn import-call-target(mo: m.Module, n: Node) -> Int? = match n {
+  ImportCall(Str(_) as from, ...) => some(dep-of-str(mo, from))
+  _ => none
+}
+
+# `require("x")` with a literal path and a free `require`: the module it names.
+fn require-target(mo: m.Module, n: Node) -> Int? = match n {
+  CallExpr(Ident("require") as callee, Args(List(Str(_) as from))) =>
+    if callee.lo in mo.bindings then none else some(dep-of-str(mo, from))
+  _ => none
+}
+
+# What a run-time reference to a whole module needs: its wrapper, and the helpers.
+fn mention-module(part: Int, t: Int) -> Void {
+  let target = m.modules[t]
+  if target.kind != External {
+    assert m.db.imports(part-module[part], t)
+    if target.kind == Cjs {
+      assert m.db.mentions(part, target.require-sym)
+      assert m.db.mentions(part, helper("__toESM"))
+    } else {
+      assert m.db.mentions(part, target.init-sym)
+      assert m.db.mentions(part, target.ns-sym)
+      assert m.db.mentions(part, helper("__toCommonJS"))
+    }
+  }
+}
+
+fn mentions-kids(part: Int, n: Node) -> Void {
+  for k in n.kids { mentions-under(part, k) }
+}
+
+fn mentions-under(part: Int, n: Node) -> Void = match n {
+  Ident(_) => if let some(s) = here.bindings[n.lo] { assert m.db.mentions(part, s) }
+  Member(object, property) => match namespace-of(here, object) {
+    some(target) => { assert m.db.ns-member(part, target, m.name-id(property.text)) }
+    none => mentions-under(part, object)
+  }
+  ImportCall(...) => match import-call-target(here, n) {
+    some(t) => mention-module(part, t)
+    none => mentions-kids(part, n)
+  }
+  CallExpr(...) => match require-target(here, n) {
+    some(t) => mention-module(part, t)
+    none => mentions-kids(part, n)
+  }
+  _ => mentions-kids(part, n)
+}
+
+# ---------------------------------------------------------------- what can be removed
+
+const known-globals: [Text] = ["undefined", "NaN", "Infinity"]
+const known-collections: [Text] = ["Map", "Set", "WeakMap", "WeakSet"]
+
+fn annotated?(n: Node) -> Bool = n.lo in here.pure-at
+fn free-ident?(n: Node) -> Bool = n is Ident(_) and not bound?(n)
+fn known-collection?(callee: Node) -> Bool = free-ident?(callee) and callee.text in known-collections
+fn all-pure?(xs: [Node]) -> Bool = all x in xs: pure?(x)
+
+# An annotated call goes if nothing it was given has an effect.
+fn pure-call?(n: Node) -> Bool = annotated?(n) and all-pure?(n.kids[1].kids[0].kids)
+
+# `new Map()` and friends cannot run anyone's code when given nothing.
+fn pure-new?(n: Node) -> Bool = known-collection?(n.kids[0]) and len(n.kids[1].kids[0].kids) == 0
+
+# Can this be removed when nothing uses its value? Mirrors esbuild's rules: an unbound name might
+# throw, and a property read might run a getter.
+fn pure?(n: Node) -> Bool = match n {
+  Num(_) | Str(_) | True() | False() | Null() | Regex(_) | TemplateFull(_) | This() | None() | Hole() => true
+  FuncExpr(...) | GenExpr(...) | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) => true
+  Ident(x) => bound?(n) or x in known-globals
+  Paren(x) | Not(x) | Void(x) | Shorthand(x) => pure?(x)
+  TypeOf(x) => x is Ident(_) or pure?(x)
+  Or(...) | And(...) | Coalesce(...) | Cond(...) | Seq(...) | StrictEq(...) | StrictNe(...)
+    | Elem(...) | ElemLast(...) => all-pure?(n.kids)
+  ArrayLit(List(xs...)) | ObjectLit(List(xs...)) => all-pure?(xs)
+  Prop(key, v) => not (key is Computed(_)) and pure?(v)
+  Method(key, ...) => not (key is Computed(_))
+  ClassExpr(...) => pure-class?(n)
+  CallExpr(...) => pure-call?(n)
+  NewExpr(...) => pure-call?(n) or pure-new?(n)
+  NewNoArgs(callee) => annotated?(n) or known-collection?(callee)
+  # Reading a property of `Math` cannot run code, unless someone replaced Math.
+  Member(o, _) => free-ident?(o) and o.text == "Math"
+  _ => false
+}
+
+# A computed class key runs `ToPropertyKey`, so only a literal or a well-known symbol is known to
+# do nothing.
+fn pure-key?(key: Node) -> Bool = match key {
+  Computed(e) => match e {
+    Str(_) | Num(_) => true
+    Member(o, _) => free-ident?(o) and o.text == "Symbol"
+    _ => false
+  }
+  _ => true
+}
+
+fn pure-member?(member: Node) -> Bool = match member {
+  ClassEmpty() => true
+  Method(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...) | AsyncGenMethod(key, ...)
+    | Getter(key, ...) | Setter(key, ...) | Field(key, _) => pure-key?(key)
+  StaticMethod(inner) => pure-member?(inner)
+  StaticField(key, v) => pure-key?(key) and pure?(v)
+  _ => false
+}
+
+# A class with no heritage, computed keys or initialisers runs nothing. `extends` a pure expression
+# runs nothing either.
+fn pure-class?(n: Node) -> Bool {
+  let heritage = n.kids[1]
+  (heritage is None() or pure?(heritage.kids[0])) and (all x in n.kids[2].kids[0].kids: pure-member?(x))
+}
+
+fn pure-declarators?(list: Node) -> Bool =
+  all d in list.kids: d.kids[0] is BindName(_) and pure?(d.kids[1])
+
+fn pure-stmt?(s: Node) -> Bool = match s {
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | Empty() | ExportFunction(_) => true
+  VarDecl(list) | LetDecl(list) | ConstDecl(list) | ExportVar(list) => pure-declarators?(list)
+  ExportLexical(d) | ExportClass(d) => pure-stmt?(d)
+  ClassDecl(...) => pure-class?(s)
+  ExprStmt(e) => pure?(e)
+  _ => false
+}
+
+# ---------------------------------------------------------------- imports and exports
+
+fn export-local(exported: Text, local: Text) -> Void {
+  let s = root-sym(here, local) ?? panic "{}: export of {} which is not declared", here.path, local
+  assert m.db.local-export(here.id, m.name-id(exported), s)
+}
+
+fn exports-under(n: Node) -> Void = match n {
+  BindName(x) => export-local(x, x)
+  _ => if not sc.function?(n.kind) {
+    for k in n.kids { exports-under(k) }
+  }
+}
+
+fn import-var-of(mo: m.Module, target: Int) -> Int {
+  let key = mo.id * 100000 + target
+  if let some(v) = import-vars[key] { return v }
+  let v = sym.generated-symbol!(m.table, mo.root, "import_" ++ m.modules[target].base)
+  import-vars[key] = v
+  v
+}
+
+fn bind-import(target: Int, name: Text, bind: Node, namespace: Bool) -> Void {
+  let s = here.bindings[bind.lo] ?? panic "{}: no symbol for import {}", here.path, bind.text
+  if opaque?(m.modules[target]) {
+    cjs-imports[s] = CjsImport(importer: here.id, import-var: import-var-of(here, target), name: name, namespace: namespace)
+  } else if namespace {
+    assert m.db.ns-import(s, target)
+  } else {
+    assert m.db.import-of(s, target, m.name-id(name))
+  }
+}
+
+fn import-spec(target: Int, spec: Node) -> Void = match spec {
+  ImportDefault(b) => bind-import(target, "default", b, false)
+  ImportAs(name, b) => bind-import(target, m.module-name(name), b, false)
+  ImportName(b) => bind-import(target, b.text, b, false)
+  ImportNamespace(b) => bind-import(target, "*", b, true)
+  ImportDefaultAnd(b, rest) => {
+    bind-import(target, "default", b, false)
+    import-spec(target, rest)
+  }
+  ImportNamed(List(specs...)) => {
+    for s in specs { import-spec(target, s) }
+  }
+  _ => panic "{}: unexpected import form {}", here.path, js.kind-name(spec.kind)
+}
+
+# ---------------------------------------------------------------- parts
+
+# An import of a wrapped module has to run its initialiser where the import stood.
+fn needs-init(part: Int, target: Int) -> Void {
+  let t = m.modules[target]
+  if t.wrapped {
+    assert m.db.mentions(part, t.init-sym)
+    assert m.db.effect(part)
+  }
+}
+
+fn new-part(marker: Node) -> Int {
+  let part = next-part
+  next-part = part + 1
+  part-stmt += marker
+  part-module += here.id
+  assert m.db.part-of(part, here.id)
+  part
+}
+
+fn no-reexport-from-cjs(t: m.Module, what: Text) -> Void {
+  if t.kind == Cjs { panic "{}: {} the CommonJS module {} is not implemented yet", here.path, what, t.path }
+}
+
+fn export-spec-names(spec: Node) -> Text = match spec {
+  ExportAs(_, to) => m.module-name(to)
+  _ => m.module-name(spec.kids[0])
+}
+
+# One top-level statement of an ES module becomes one part.
+fn add-part(s: Node) -> Void {
+  let part = new-part(s)
+  let mid = here.id
+  match s {
+    Import(_, from) => {
+      let target = dep-of-str(here, from)
+      assert m.db.imports(mid, target)
+      needs-init(part, target)
+      if opaque?(m.modules[target]) {
+        assert m.db.declares(part, import-var-of(here, target))
+        if m.modules[target].kind == Cjs { assert m.db.mentions(part, m.modules[target].require-sym) }
+        assert m.db.effect(part)
+      }
+    }
+    ImportBare(from) => {
+      let target = dep-of-str(here, from)
+      assert m.db.imports(mid, target)
+      needs-init(part, target)
+      if opaque?(m.modules[target]) {
+        if m.modules[target].kind == Cjs { assert m.db.mentions(part, m.modules[target].require-sym) }
+        assert m.db.effect(part)
+      }
+    }
+    ExportAll(from) => {
+      let target = dep-of-str(here, from)
+      no-reexport-from-cjs(m.modules[target], "`export *` from")
+      assert m.db.imports(mid, target)
+      assert m.db.star(mid, target)
+      needs-init(part, target)
+    }
+    ExportAllAs(name, from) => {
+      let target = dep-of-str(here, from)
+      no-reexport-from-cjs(m.modules[target], "`export * as` of")
+      assert m.db.imports(mid, target)
+      assert m.db.local-export(mid, m.name-id(m.module-name(name)), m.modules[target].ns-sym)
+      needs-init(part, target)
+    }
+    ExportFrom(List(specs...), from) => {
+      let target = dep-of-str(here, from)
+      no-reexport-from-cjs(m.modules[target], "re-exporting from")
+      assert m.db.imports(mid, target)
+      needs-init(part, target)
+      for spec in specs {
+        assert m.db.reexport(mid, m.name-id(export-spec-names(spec)), target, m.name-id(m.module-name(spec.kids[0])))
+      }
+    }
+    ExportNamed(List(specs...)) => {
+      for spec in specs {
+        let local = m.module-name(spec.kids[0])
+        let s2 = root-sym(here, local) ?? panic "{}: export of {} which is not declared", here.path, local
+        assert m.db.local-export(mid, m.name-id(export-spec-names(spec)), s2)
+      }
+    }
+    _ => {
+      declared-under(part, s)
+      mentions-under(part, s)
+      match s {
+        ExportVar(...) => exports-under(s)
+        ExportLexical(d) => exports-under(d)
+        ExportFunction(d) => exports-under(d.kids[0])
+        _ => {}
+      }
+      # The runtime's statements are only ever live through a mention, and every statement of a
+      # wrapped module runs when its initialiser does.
+      if not (not here.wrapped and (here.kind == Runtime or pure-stmt?(s))) {
+        assert m.db.effect(part)
+      }
+    }
+  }
+}
+
+# Parts with no source statement: `None` is the namespace object, `Flag` the `__esm` wrapper's
+# `init_x`, which brings the whole module with it.
+fn synthetic-parts() -> Void {
+  if here.ns-sym >= 0 {
+    let part = new-part(None())
+    assert m.db.ns-part(part, here.id)
+    assert m.db.ns-symbol(here.id, here.ns-sym)
+    assert m.db.declares(part, here.ns-sym)
+    assert m.db.mentions(part, helper("__export"))
+    # A format that exposes the entry as an object keeps its namespace.
+    if entry-namespace and here.id == m.entry {
+      assert m.db.root-part(part)
+      assert m.db.mentions(part, helper("__toCommonJS"))
+    }
+  }
+  if here.wrapped {
+    let part = new-part(Flag())
+    assert m.db.declares(part, here.init-sym)
+    assert m.db.mentions(part, helper("__esm"))
+  }
+}
+
+# Facts for one module. CommonJS is one opaque part with effects, whose only symbol is its
+# `require_x`; its dependencies are whatever it `require`s.
+fn module-facts() -> Void {
+  if here.side-effects { assert m.db.module-effects(here.id) }
+  if here.kind == Cjs {
+    let part = new-part(here.tree)
+    assert m.db.effect(part)
+    assert m.db.declares(part, here.require-sym)
+    assert m.db.mentions(part, helper("__commonJS"))
+    mentions-under(part, here.tree)
+  } else {
+    synthetic-parts()
+    for s in here.tree.kids[1].kids {
+      add-part(s)
+      match s {
+        Import(_, from) =>
+          if opaque?(m.modules[dep-of-str(here, from)]) {
+            assert m.db.mentions(next-part - 1, helper("__toESM"))
+          }
+        _ => {}
+      }
+    }
+    for s in here.source {
+      if let some(name) = m.default-of(s) {
+        export-local("default", if len(name) == 0 then here.base ++ "_default" else name)
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------- linking
+
+# Which ES modules must be `__esm` wrapped: anything `require`d or `import()`ed runs on demand, and
+# so must whatever it imports.
+fn wrap(id: Int) -> Void {
+  let mo = m.modules[id]
+  if mo.kind == Esm and not mo.wrapped {
+    m.modules[id].wrapped = true
+    for d in mo.deps { wrap(d) }
+  }
+}
+
+fn on-demand-targets(mo: m.Module, n: Node) -> Void {
+  match n {
+    ImportCall(...) => if let some(t) = import-call-target(mo, n) { wrap(t) }
+    CallExpr(...) => if let some(t) = require-target(mo, n) { wrap(t) }
+    _ => {}
+  }
+  for k in n.kids { on-demand-targets(mo, k) }
+}
+
+fn link() -> Void {
+  for id in m.order {
+    let mo = m.modules[id]
+    if mo.kind != Runtime { on-demand-targets(mo, mo.tree) }
+  }
+  # A module's symbols exist before any module's facts mention them.
+  for id in m.order {
+    let mo = m.modules[id]
+    match mo.kind {
+      Cjs => { m.modules[id].require-sym = sym.generated-symbol!(m.table, m.bundle-scope, "require_" ++ mo.base) }
+      Esm => {
+        m.modules[id].ns-sym = sym.generated-symbol!(m.table, m.bundle-scope, mo.base ++ "_exports")
+        if mo.wrapped {
+          m.modules[id].init-sym = sym.generated-symbol!(m.table, m.bundle-scope, "init_" ++ mo.base)
+        }
+      }
+      _ => {}
+    }
+  }
+  assert m.db.entry(m.entry)
+  if entry-namespace or keep-entry-exports { assert m.db.keep-exports(m.entry) }
+  # Import bindings first, so a statement can tell `ns.x` from `obj.x` in any order.
+  for id in m.order {
+    let mo = m.modules[id]
+    if mo.kind == Esm {
+      with here = mo {
+        for s in mo.tree.kids[1].kids {
+          match s {
+            Import(clause, from) => import-spec(dep-of-str(mo, from), clause)
+            _ => {}
+          }
+        }
+      }
+    }
+  }
+  for id in m.order {
+    with here = m.modules[id] { module-facts() }
+  }
+  link.solve!(m.db)
+}

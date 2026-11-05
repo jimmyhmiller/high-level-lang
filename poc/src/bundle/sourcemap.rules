@@ -1,0 +1,146 @@
+# Source map v3 from the printer's marks: where each leaf token landed in the output, and which
+# module and byte it came from. A mark's source is (module+1)<<32 | offset.
+rules bundle.sourcemap
+use bundle.modules as m
+
+const base64: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const module-unit: Int = 4294967296
+
+fn vlq!(b: mut Buf, value: Int) -> Void {
+  var v = if value < 0 then (0 - value) * 2 + 1 else value * 2
+  var go = true
+  while go {
+    let digit = v % 32
+    v = v / 32
+    buf-byte!(b, base64[if v > 0 then digit + 32 else digit])
+    if v == 0 { go = false }
+  }
+}
+
+# JSON text, quoted.
+fn json-string!(b: mut Buf, s: Text) -> Void {
+  buf-add!(b, "\"")
+  for c in s {
+    if c == '"' { buf-add!(b, "\\\"") }
+    else if c == '\\' { buf-add!(b, "\\\\") }
+    else if c == '\n' { buf-add!(b, "\\n") }
+    else if c == '\r' { buf-add!(b, "\\r") }
+    else if c == '\t' { buf-add!(b, "\\t") }
+    else if c < 32 {
+      buf-add!(b, "\\u00")
+      buf-byte!(b, "0123456789abcdef"[c / 16])
+      buf-byte!(b, "0123456789abcdef"[c % 16])
+    }
+    else { buf-byte!(b, c) }
+  }
+  buf-add!(b, "\"")
+}
+
+# UTF-16 code units a UTF-8 lead byte stands for, 0 for a continuation byte.
+fn utf16-width(c: Int) -> Int =
+  if c < 128 then 1 else if c < 192 then 0 else if c < 240 then 1 else 2
+
+# Line starts of a source, for offset -> line lookups.
+fn line-starts(src: Text) -> [Int] {
+  var out: [Int] = [0]
+  for i in 0..len(src) {
+    if src[i] == '\n' { out += i + 1 }
+  }
+  out
+}
+
+fn line-at(starts: [Int], offset: Int) -> Int {
+  var lo = 0
+  var hi = len(starts) - 1
+  while lo < hi {
+    let mid = (lo + hi + 1) / 2
+    if starts[mid] <= offset { lo = mid } else { hi = mid - 1 }
+  }
+  lo
+}
+
+fn column-in(src: Text, from: Int, to: Int) -> Int {
+  var col = 0
+  for i in from..to { col += utf16-width(src[i]) }
+  col
+}
+
+# `../` for each directory of the output file, so paths resolve from the map.
+fn up-from(outfile: Text) -> Text {
+  var b = buf-new()
+  for c in outfile {
+    if c == '/' { buf-add!(b, "../") }
+  }
+  buf-text(b)
+}
+
+# The map as JSON. `marks` are in output order, and `base` is where the printed body starts in `text`.
+fn build-map(text: Text, base: Int, marks: [Mark], outfile: Text) -> Text {
+  var b = buf-new()
+  var map = buf-new()
+  var sources: [Int] = []
+  var index-of = [-1 for i in 0..len(m.modules)]
+  var starts: [[Int]] = []
+  var pos = 0
+  var gen-col = 0
+  var prev-gen-col = 0
+  var prev-src = 0
+  var prev-line = 0
+  var prev-col = 0
+  var first-on-line = true
+  for mark in marks {
+    let at = base + mark.out
+    let module = mark.src / module-unit - 1
+    let offset = mark.src % module-unit
+    if module >= 0 {
+      if index-of[module] == -1 {
+        index-of[module] = len(sources)
+        sources += module
+        starts += line-starts(m.modules[module].text)
+      }
+      # Advance the generated position to this mark.
+      while pos < at {
+        let c = text[pos]
+        if c == '\n' {
+          buf-add!(map, ";")
+          gen-col = 0
+          prev-gen-col = 0
+          first-on-line = true
+        } else {
+          gen-col += utf16-width(c)
+        }
+        pos += 1
+      }
+      let source-index = index-of[module]
+      let src = m.modules[module].text
+      let table = starts[source-index]
+      let line = line-at(table, offset)
+      let col = column-in(src, table[line], offset)
+      if not first-on-line { buf-add!(map, ",") }
+      first-on-line = false
+      vlq!(map, gen-col - prev-gen-col)
+      vlq!(map, source-index - prev-src)
+      vlq!(map, line - prev-line)
+      vlq!(map, col - prev-col)
+      prev-gen-col = gen-col
+      prev-src = source-index
+      prev-line = line
+      prev-col = col
+    }
+  }
+  buf-add!(b, "{\"version\":3,\"sources\":[")
+  let up = up-from(outfile)
+  for i in 0..len(sources) {
+    if i > 0 { buf-add!(b, ",") }
+    json-string!(b, up ++ m.modules[sources[i]].path)
+  }
+  buf-add!(b, "],\"sourcesContent\":[")
+  for i in 0..len(sources) {
+    if i > 0 { buf-add!(b, ",") }
+    json-string!(b, m.modules[sources[i]].text)
+  }
+  buf-add!(b, "],\"mappings\":")
+  json-string!(b, buf-text(map))
+  buf-add!(b, ",\"names\":[]}\n")
+  buf-text(b)
+}

@@ -1,0 +1,135 @@
+# Identifier minification, after esbuild's minify renamer. Symbols in sibling scopes can share a
+# name, so nested symbols get a "slot" by depth; top-level symbols each get their own. Slots are
+# sorted by how often their symbols are used, and the commonest gets the shortest name, drawn from
+# an alphabet ordered by character frequency.
+rules bundle.mangle over bundle.js
+use bundle.modules as m
+use bundle.emit as e
+use bundle.analysis as an
+
+state counts: [Int] = []       # uses per slot
+state slot: {Int:Int} = {}     # symbol -> slot
+state uses: {Int:Int} = {}     # symbol -> uses in live code
+state freq: [Int] = []         # per byte value
+
+fn bump(s: Int) -> Void {
+  uses[s] = (uses[s] ?? 0) + 1
+}
+
+# Count uses in live code only, attributing an import to what it resolves to.
+fn count-uses(mo: m.Module, n: Node) -> Void {
+  if n is Ident(_) | BindName(_) {
+    if let some(s) = mo.bindings[n.lo] { bump(e.target-of(s)) }
+  }
+  for k in n.kids { count-uses(mo, k) }
+}
+
+fn take-slot(s: Int, at: Int) -> Void {
+  while len(counts) <= at { counts += 0 }
+  slot[s] = at
+  counts[at] = counts[at] + (uses[s] ?? 0)
+}
+
+# Nested symbols: siblings restart from where their parent's symbols stopped.
+fn nested-slots(scope: Int, from: Int) -> Void {
+  let now = sym.scope-at(m.table, scope)
+  var next = from
+  if not now.dynamic {
+    for s in now.symbols {
+      take-slot(s, next)
+      next += 1
+    }
+  }
+  for child in now.children { nested-slots(child, next) }
+}
+
+fn scan-freq(src: Text) -> Void {
+  for c in src { freq[c] = freq[c] + 1 }
+}
+
+# Name characters, commonest first, so frequent symbols compress well.
+fn sorted-chars(candidates: Text) -> [Int] {
+  let chars = [c for c in candidates]
+  sort c in chars by freq[c] desc
+}
+
+fn minified-name(head: [Int], tail: [Int], index: Int) -> Text {
+  var b = buf-new()
+  var i = index
+  buf-byte!(b, head[i % len(head)])
+  i = i / len(head)
+  while i > 0 {
+    i = i - 1
+    buf-byte!(b, tail[i % len(tail)])
+    i = i / len(tail)
+  }
+  buf-text(b)
+}
+
+fn assign-minified() -> Void {
+  counts = []
+  slot = {}
+  uses = {}
+  freq = [0 for i in 0..256]
+  e.used = {}
+  e.stack = []
+  var toplevel: [Int] = []
+  for w in e.keywords { e.reserve(w) }
+  for id in m.order {
+    if id == 0 or e.included?(id) {
+      for f in m.modules[id].free { e.reserve(f) }
+    }
+  }
+  # Live code: uses, character frequency, and the top-level symbols in order.
+  for id in m.order {
+    if e.included?(id) {
+      let mo = m.modules[id]
+      scan-freq(mo.text)
+      for p in e.parts-of(id) {
+        if e.live?(p) {
+          count-uses(mo, an.part-stmt[p])
+          for m.db.declares(p, ?s) {
+            if not e.import-symbol?(s) { toplevel += s }
+          }
+        }
+      }
+    }
+  }
+  # Nested slots first, so top-level symbols never collide with them.
+  for id in m.order {
+    if e.included?(id) {
+      let mo = m.modules[id]
+      let root = sym.scope-at(m.table, mo.root)
+      if mo.kind == Cjs {
+        nested-slots(root.parent, 0)
+      } else {
+        for child in root.children { nested-slots(child, 0) }
+      }
+    }
+  }
+  var next = len(counts)
+  for s in toplevel {
+    take-slot(s, next)
+    next += 1
+  }
+  let head = sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$")
+  let tail = sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$0123456789")
+  # Slot numbers, by descending use; ties keep slot order.
+  let all-slots = [i for i in 0..len(counts)]
+  let order = sort i in all-slots by counts[i] desc
+  var names = ["" for i in 0..len(counts)]
+  var index = 0
+  for at in order {
+    var candidate = minified-name(head, tail, index)
+    while e.taken?(candidate) {
+      index += 1
+      candidate = minified-name(head, tail, index)
+    }
+    index += 1
+    names[at] = candidate
+  }
+  # Names for every slotted symbol; a dynamic scope's symbols keep theirs.
+  for s in 0..sym.symbol-count(m.table) {
+    if let some(at) = slot[s] { sym.set-final!(m.table, s, names[at]) }
+  }
+}

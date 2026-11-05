@@ -3,6 +3,15 @@
 # mode, and the accept/reject answer for every test262 file. Run from corpus/.
 #   usage: same.py NEW-ESB NEW-JSPARSE BASE-ESB BASE-JSPARSE
 import glob, os, subprocess, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import guard
+# No single run may take much memory or time: a runaway stops the comparison, not the machine.
+MB, SECONDS = 3000, 120
+def capped(cmd):
+    code, out, err, peak, reason = guard.run(cmd, MB, SECONDS, quiet=True)
+    if reason:
+        print("STOPPED: " + " ".join(cmd) + ": " + reason); sys.exit(2)
+    return code, out, err
 NE, NP, BE, BP = sys.argv[1:5]
 S = "out/same"; os.makedirs(S, exist_ok=True)
 APPS = "named all cjs features three zod rx datefns preact immer react d3 lib excjs nodey".split()
@@ -22,8 +31,8 @@ MODES = {
 }
 bad = 0; n = 0
 def run(bin, app, flags, out):
-    r = subprocess.run([bin, f"app/{app}.js", f"--outfile={out}"] + flags, capture_output=True, text=True, timeout=120)
-    return r.returncode, (r.stderr + r.stdout).replace(out, "OUT")
+    code, o, e = capped([bin, f"app/{app}.js", f"--outfile={out}"] + flags)
+    return code, (e + o).replace(out, "OUT")
 for app in APPS:
     if not os.path.exists(f"app/{app}.js"): continue
     for mode, flags in MODES.items():
@@ -43,8 +52,8 @@ for name in ["pass", "fail", "early"]:
     files = sorted(glob.glob(f"vendor/test262-parser-tests/{name}/*.js"))
     lst = f"{S}/{name}.list"; open(lst, "w").write("\n".join(files) + "\n")
     for mode in ["accepted", "strict", "check"]:
-        ra = subprocess.run([NP, mode, lst], capture_output=True, text=True, timeout=600).stdout
-        rb = subprocess.run([BP, mode, lst], capture_output=True, text=True, timeout=600).stdout
+        ra = capped([NP, mode, lst])[1]
+        rb = capped([BP, mode, lst])[1]
         n += 1
         if ra != rb:
             bad += 1; print(f"DIFF jsparse {mode} {name}: {ra.strip().splitlines()[-1:]} vs {rb.strip().splitlines()[-1:]}")

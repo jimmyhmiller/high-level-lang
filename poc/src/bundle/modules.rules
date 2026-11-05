@@ -1,0 +1,383 @@
+# The module graph: load files, normalise what makes modules awkward, analyse scopes.
+rules bundle.modules over bundle.js
+use bundle.js as js
+use bundle.scopes as sc
+use bundle.link as link
+use bundle.resolve as res
+use bundle.dce as dce
+use bundle.early as early
+
+# `External` is an import left for the runtime: it has no source and no statements.
+enum ModuleKind { Esm, Cjs, Runtime, External }
+
+record Module {
+  id: Int,
+  path: Text,
+  kind: ModuleKind,
+  tree: Node,
+  root: Int,
+  bindings: {Int:Int},
+  side-effects: Bool,
+  deps: [Int],
+  base: Text,
+  require-sym: Int,
+  source: [Node],
+  free: [Text],
+  text: Text,
+  ns-sym: Int,
+  init-sym: Int,
+  wrapped: Bool,
+  pure-at: {Int:Bool}
+}
+
+# `define process.env.NODE_ENV = "production"`: a dotted name and its replacement.
+record Define { key: Text, value: Node }
+
+state table: sym.Table = sym.table-new()
+state bundle-scope: Int = sym.new-scope!(table, -1, true)
+state modules: [Module] = []
+state by-path: {Text:Int} = {}
+state order: [Int] = []
+state options: res.Options = res.Options(main-fields: [], conditions: [], extensions: [], external: [], node-builtins: false)
+state db: link.Db = link.new-db()
+state names: rt.Names = names-new()
+state entry: Int = -1
+state defines: [Define] = []
+state transform: Fn(Node)->Node = keep-as-is
+
+fn keep-as-is(n: Node) -> Node = n
+
+fn name-id(s: Text) -> Int {
+  let id = intern!(names, s)
+  if s != "default" { assert db.not-default(id) }
+  id
+}
+
+# `node_modules/lodash-es/_root.js` -> `root`, as esbuild names things.
+fn base-name(path: Text) -> Text {
+  var slash = -1
+  var dot = len(path)
+  for i in 0..len(path) {
+    if path[i] == '/' { slash = i }
+  }
+  for i in slash + 1..len(path) {
+    if path[i] == '.' { dot = i }
+  }
+  var raw = path[slash + 1..dot]
+  if raw == "index" and dir-of(path) != "." { raw = base-name(dir-of(path)) }
+  var b = buf-new()
+  var started = false
+  for c in raw {
+    if name-byte?(c) {
+      if started or (c != '_' and not digit-byte?(c)) {
+        started = true
+        buf-byte!(b, c)
+      }
+    } else if started {
+      buf-byte!(b, '_')
+    }
+  }
+  let out = buf-text(b)
+  if len(out) == 0 then "module" else out
+}
+
+# A ModuleName is a PropName, or a Str naming an export.
+fn module-name(n: Node) -> Text = match n {
+  Str(raw) => unquote(raw)
+  _ => n.text
+}
+
+fn module-of-str(n: Node) -> Text = unquote(n.text)
+
+fn at-source(n: Node, from: Node) -> Node = n with { lo: from.lo, hi: from.hi }
+
+# ---------------------------------------------------------------- normalising
+
+# `export default …` becomes declarations with a real name, so everything after this treats it
+# like any other export. Synthetic names get offset -1.
+fn default-binding(base: Text) -> Node = BindName(base ++ "_default") with { lo: -1, hi: -1 }
+
+fn var-of(name: Node, init: Node) -> Node = VarDecl(List(Declarator(name, init) with { lo: name.lo, hi: init.hi }))
+
+fn normalize-stmt(s: Node, base: Text) -> Node = match s {
+  ExportDefault(e) => var-of(default-binding(base), e)
+  ExportDefaultDecl(d) => {
+    let name = d.kids[0]
+    let bound = if name is None() then default-binding(base) else name
+    match d {
+      FuncExpr(_, ps, b) => at-source(FuncDecl(bound, ps, b), d)
+      GenExpr(_, ps, b) => at-source(GenDecl(bound, ps, b), d)
+      AsyncFuncExpr(_, ps, b) => at-source(AsyncFuncDecl(bound, ps, b), d)
+      AsyncGenExpr(_, ps, b) => at-source(AsyncGenDecl(bound, ps, b), d)
+      ClassExpr(_, h, b) => at-source(ClassDecl(bound, h, b), d)
+      _ => panic "unexpected export default declaration: {}", js.kind-name(d.kind)
+    }
+  }
+  _ => s
+}
+
+fn default-of(s: Node) -> Text? = match s {
+  ExportDefault(_) => some("")
+  ExportDefaultDecl(d) => some(if d.kids[0] is None() then "" else d.kids[0].text)
+  _ => none
+}
+
+# Offsets of the tokens that `/* @__PURE__ */` or `/* #__PURE__ */` comments precede. Comments are
+# not in the tree, so this scans for them. A match inside a string only records an offset no call
+# starts at, unless one really does follow: esbuild makes the same call about annotations.
+fn pure-annotations(src: Text) -> {Int:Bool} {
+  var out: {Int:Bool} = {}
+  var i = 0
+  let n = len(src)
+  while i + 1 < n {
+    if src[i] == '/' and src[i + 1] == '*' {
+      var j = i + 2
+      var pure = false
+      while j + 1 < n and not (src[j] == '*' and src[j + 1] == '/') {
+        if at?(src, j, "@__PURE__") or at?(src, j, "#__PURE__") { pure = true }
+        j = j + 1
+      }
+      i = j + 2
+      if pure {
+        # Past space and further comments, to the token it annotates.
+        var at = i
+        var go = true
+        while go and at < n {
+          let c = src[at]
+          if c == ' ' or c == '\n' or c == '\t' or c == '\r' {
+            at = at + 1
+          } else if at?(src, at, "/*") {
+            var m = at + 2
+            while m + 1 < n and not at?(src, m, "*/") { m = m + 1 }
+            at = m + 2
+          } else {
+            go = false
+          }
+        }
+        out[at] = true
+      }
+    } else {
+      i = i + 1
+    }
+  }
+  out
+}
+
+fn declarator-of-class(c: Node) -> Node = match c {
+  ClassDecl(name, h, b) => {
+    let init = at-source(ClassExpr(None(), h, b), c)
+    Declarator(name, init) with { lo: name.lo, hi: init.hi }
+  }
+  _ => panic "expected a class declaration"
+}
+
+fn split-decl!(out: mut [Node], n: Node, exported: Bool) -> Void {
+  for d in n.kids[0].kids {
+    out += at-source(if exported then ExportVar(List(d)) else VarDecl(List(d)), d)
+  }
+}
+
+# One declarator per statement, so each can be tree-shaken on its own. A bundle's top level has no
+# TDZ worth paying for, so `let`, `const` and classes become `var`.
+fn normalized-tree(tree: Node, base: Text) -> Node {
+  var out: [Node] = []
+  for s in tree.kids[1].kids {
+    let n = normalize-stmt(s, base)
+    match n {
+      VarDecl(_) | LetDecl(_) | ConstDecl(_) => split-decl!(out, n, false)
+      ExportVar(_) => split-decl!(out, n, true)
+      ExportLexical(inner) =>
+        if inner is LetDecl(_) | ConstDecl(_) then split-decl!(out, inner, true) else { out += n }
+      Empty() => {}
+      ClassDecl(...) => { out += at-source(VarDecl(List(declarator-of-class(n))), n) }
+      ExportClass(c) => { out += at-source(ExportVar(List(declarator-of-class(c))), n) }
+      _ => { out += n }
+    }
+  }
+  Program(tree.kids[0], List(out...))
+}
+
+# ---------------------------------------------------------------- dependencies
+
+# `require("x")` strings under a node, in source order.
+fn require-calls!(n: Node, out: mut [Text]) -> Void {
+  match n {
+    CallExpr(Ident("require"), Args(List(Str(raw)))) => { out += unquote(raw) }
+    _ => {}
+  }
+  for k in n.kids { require-calls!(k, out) }
+}
+
+fn import-calls!(n: Node, out: mut [Text]) -> Void {
+  match n {
+    ImportCall(Str(raw), ...) => { out += unquote(raw) }
+    _ => {}
+  }
+  for k in n.kids { import-calls!(k, out) }
+}
+
+# ---------------------------------------------------------------- defines
+
+# A Member chain rooted at a free identifier, as dotted text: `process.env.NODE_ENV`.
+fn dotted-name(n: Node, b: {Int:Int}) -> Text? = match n {
+  Ident(x) => if n.lo in b then none else some(x)
+  Member(o, p) => match dotted-name(o, b) {
+    some(base) => some(base ++ "." ++ p.text)
+    none => none
+  }
+  _ => none
+}
+
+# Does this source mention the first name of any define? Most files do not, and they need no
+# substitution or second analysis.
+fn mentions-define?(src: Text) -> Bool = any d in defines: {
+  var end = 0
+  while end < len(d.key) and d.key[end] != '.' { end = end + 1 }
+  contains-text?(src, d.key[0..end])
+}
+
+fn define-of(key: Text) -> Node? {
+  var out: Node? = none
+  for d in defines {
+    if d.key == key { out = some(d.value) }
+  }
+  out
+}
+
+# Replace defined names. This needs the scope analysis, because a local with the same name is not
+# the define.
+fn substitute(n: Node, b: {Int:Int}) -> Node {
+  let replaced: Node? =
+    if n is Ident(_) | Member(...) {
+      match dotted-name(n, b) {
+        some(key) => define-of(key)
+        none => none
+      }
+    } else { none }
+  match replaced {
+    some(v) => v
+    none => if len(n.kids) == 0 then n else n with { kids: [substitute(k, b) for k in n.kids] }
+  }
+}
+
+# ---------------------------------------------------------------- loading
+
+# Parse and check a file. A file with import or export syntax is a module; anything else may be
+# CommonJS, whose top level is a function body.
+fn parse-file(src: Text, path: Text) -> Node {
+  let tree = js.parse-tries(src, path, js.flag-bit("await"))
+  let is-module = early.program-has-module-syntax?(tree)
+  match early.check(tree, is-module, not is-module) {
+    none => tree
+    some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
+  }
+}
+
+# Is this file in node compatibility mode: `.mjs`, or under "type": "module"?
+fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-module?(path)
+
+fn blank-module(id: Int, path: Text, kind: ModuleKind, tree: Node, root: Int) -> Module =
+  Module(id: id, path: path, kind: kind, tree: tree, root: root, bindings: {}, side-effects: true,
+         deps: [], base: base-name(path), require-sym: -1, source: [], free: [], text: "",
+         ns-sym: -1, init-sym: -1, wrapped: false, pure-at: {})
+
+# The stand-in module for an external import, one per specifier.
+fn external-module(spec: Text) -> Int {
+  let key = "external:" ++ spec
+  if let some(id) = by-path[key] { return id }
+  let id = len(modules)
+  modules += blank-module(id, spec, External, None(), bundle-scope)
+  by-path[key] = id
+  id
+}
+
+fn dep-add(m: Int, spec: Text, path: Text) -> Int {
+  let d = if res.external?(spec, options) then external-module(spec) else {
+    let r = res.resolve(spec, path, options)
+    load-file(r.path, r.side-effects)
+  }
+  modules[m].deps += d
+  d
+}
+
+# The specifier a statement imports from, or nothing.
+fn import-spec-of(s: Node) -> Text? = match s {
+  Import(_, from) | ExportAllAs(_, from) | ExportFrom(_, from) => some(module-of-str(from))
+  ImportBare(from) | ExportAll(from) => some(module-of-str(from))
+  _ => none
+}
+
+# Load a file and, first, everything it imports: `order` is post-order, so a module's dependencies
+# come before it, as they do in esbuild's output.
+fn load-file(path: Text, effects: Bool) -> Int {
+  if let some(id) = by-path[path] { return id }
+  let src0 = read-file(path)
+  let src = if ends-with(path, ".json") then "module.exports = " ++ src0 else src0
+  let tree0 = transform(parse-file(src, path))
+  let base = base-name(path)
+  let id = len(modules)
+  let esm = early.program-has-module-syntax?(tree0)
+  let tree = normalized-tree(tree0, base)
+  var bindings: {Int:Int} = {}
+  # Free names per module: this file's go to a fresh map for the moment.
+  sym.take-free!(table)
+  let first-root = sc.analyze(tree, table, bundle-scope, bindings)
+  let cjs = not esm and (sym.has-free?(table, "module") or sym.has-free?(table, "exports")
+                         or sym.has-free?(table, "require"))
+  # Defines are substituted and the branches they decide removed, then the result is analysed
+  # again, so what they kill is never seen by tree shaking.
+  let defined = mentions-define?(src)
+  let final-tree = if defined then dce.run(substitute(tree, bindings)) else tree
+  var analysed-root = first-root
+  if defined {
+    sym.drop-last-child!(table, bundle-scope)
+    clear(bindings)
+    analysed-root = sc.analyze(final-tree, table, bundle-scope, bindings)
+  }
+  # CommonJS is analysed again inside its (exports, module) wrapper. The first attempt's scope is
+  # detached, so naming never sees it.
+  var root = analysed-root
+  if cjs {
+    sym.drop-last-child!(table, bundle-scope)
+    let wrapper = sym.new-scope!(table, bundle-scope, true)
+    sym.declare!(table, wrapper, "exports")
+    sym.declare!(table, wrapper, "module")
+    clear(bindings)
+    root = sc.analyze(final-tree, table, wrapper, bindings)
+  }
+  let free-names = sym.free-names(table)
+  let real-free = [f for f in free-names if not (cjs and (f == "exports" or f == "module"))]
+  modules += blank-module(id, path, if cjs then Cjs else Esm, final-tree, root) with {
+    bindings: bindings, side-effects: effects, base: base, source: tree0.kids[1].kids,
+    free: real-free, text: src, pure-at: pure-annotations(src)
+  }
+  by-path[path] = id
+  # Imports in source order. Statements `define` removed import nothing.
+  for s in tree0.kids[1].kids {
+    if let some(spec) = import-spec-of(s) { dep-add(id, spec, path) }
+  }
+  var reqs: [Text] = []
+  for s in final-tree.kids[1].kids { require-calls!(s, reqs) }
+  for s in final-tree.kids[1].kids { import-calls!(s, reqs) }
+  for spec in reqs { dep-add(id, spec, path) }
+  order += id
+  id
+}
+
+# The runtime is an ordinary module, id 0, that nothing makes live unless a part mentions one of
+# its helpers.
+fn load-runtime(text: Text) -> Void {
+  let tree = js.parse(text, "<runtime>")
+  var bindings: {Int:Int} = {}
+  sym.take-free!(table)
+  let root = sc.analyze(tree, table, bundle-scope, bindings)
+  let free-names = sym.free-names(table)
+  modules += blank-module(0, "<runtime>", Runtime, tree, root) with {
+    bindings: bindings, side-effects: false, base: "runtime", free: free-names, text: text
+  }
+  order += 0
+}
+
+fn load-tree(entry-path: Text) -> Void {
+  entry = load-file(entry-path, true)
+}

@@ -1,0 +1,466 @@
+# From a solved graph to one program: name every symbol, rewrite identifiers to their final names,
+# wrap CommonJS modules and pick the live statements.
+rules bundle.emit over bundle.js
+use bundle.scopes as sc
+use bundle.modules as m
+use bundle.analysis as an
+
+quote stmt at 1 0 ;
+quote exp at 1 0 0 ;
+
+state void-undefined: Bool = false
+state esm-output: Bool = false
+state sourcemap: Bool = false
+state external-imports: [Text] = []
+
+# Name-collision state: every name taken at the bundle's top level or reserved, plus a stack of
+# names taken in the nested scopes around the current one.
+state used: {Text:Int} = {}
+state stack: [{Text:Int}] = []
+
+context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
+
+fn taken?(name: Text) -> Bool = name in used or (any frame in stack: name in frame)
+
+fn reserve(name: Text) -> Void {
+  used[name] = 1
+}
+
+# `name`, or `name2`, `name3`… as esbuild's number renamer does.
+fn unique-name(name: Text) -> Text {
+  if not taken?(name) { return name }
+  var tries = 2
+  var candidate = name ++ "2"
+  while taken?(candidate) {
+    tries += 1
+    candidate = name ++ int-text(tries)
+  }
+  candidate
+}
+
+const keywords: [Text] = ["arguments", "await", "break", "case", "catch", "class", "const", "continue",
+  "debugger", "default", "delete", "do", "else", "enum", "eval", "export", "extends", "false", "finally",
+  "for", "function", "if", "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
+  "package", "private", "protected", "public", "return", "static", "super", "switch", "this", "throw",
+  "true", "try", "typeof", "var", "void", "while", "with", "yield"]
+
+# Globals esbuild's full runtime refers to, which our smaller one need not. Reserving them only
+# keeps generated names the same as esbuild's.
+const esbuild-runtime-globals: [Text] = ["Math", "Object", "Array", "Error", "Proxy", "TypeError", "Reflect", "require"]
+
+fn import-symbol?(s: Int) -> Bool = m.db.import-of(s, _, _) or m.db.ns-import(s, _)
+
+# What a symbol finally means: an import means whatever it resolves to.
+fn target-of(s: Int) -> Int {
+  for m.db.import-of(s, ?d, ?n) {
+    var out = -1
+    for m.db.resolved(d, n, ?candidate) {
+      if out < 0 or not import-symbol?(candidate) { out = candidate }
+    }
+    if out < 0 {
+      panic "No matching export in {} for import {}", m.modules[d].path, name-of(m.names, n)
+    }
+    return out
+  }
+  for m.db.ns-import(s, ?target) { return m.modules[target].ns-sym }
+  s
+}
+
+fn included?(id: Int) -> Bool = m.db.included(id)
+fn live?(p: Int) -> Bool = m.db.live(p)
+fn parts-of(id: Int) -> [Int] = [p for m.db.part-of(?p, id)]
+
+# Nested names: a nested symbol must not shadow anything in scope above it. A scope code can reach
+# by name at run time keeps its names.
+fn name-nested(scope: Int) -> Void {
+  let now = sym.scope-at(m.table, scope)
+  stack += {}
+  for s in now.symbols {
+    let name = sym.symbol-at(m.table, s).name
+    let chosen = if now.dynamic then name else unique-name(name)
+    sym.set-final!(m.table, s, chosen)
+    stack[len(stack) - 1][chosen] = 1
+  }
+  for child in now.children { name-nested(child) }
+  pop(stack)
+}
+
+# An import from CommonJS is rewritten to a property read, but its own name stays taken at the top
+# level, as in esbuild.
+fn reserve-cjs-imports(s: Node, mo: m.Module) -> Void = match s {
+  BindName(x) => if let some(symbol) = mo.bindings[s.lo] {
+    if symbol in an.cjs-imports { reserve(unique-name(x)) }
+  }
+  Import(...) | ImportDefault(...) | ImportDefaultAnd(...) | ImportNamespace(...) | ImportNamed(...)
+    | ImportAs(...) | ImportName(...) | List(...) => {
+    for k in s.kids { reserve-cjs-imports(k, mo) }
+  }
+  _ => {}
+}
+
+# Assign final names, in esbuild's order: reserved words and the free names of live modules first,
+# then top-level symbols of live statements, then nested scopes.
+fn assign-names() -> Void {
+  used = {}
+  stack = []
+  for w in keywords { reserve(w) }
+  for w in esbuild-runtime-globals { reserve(w) }
+  # The runtime is part of every bundle, even when no helper of it survives.
+  for id in m.order {
+    if id == 0 or included?(id) {
+      for f in m.modules[id].free { reserve(f) }
+    }
+  }
+  for id in m.order {
+    if included?(id) {
+      for p in parts-of(id) {
+        if live?(p) {
+          reserve-cjs-imports(an.part-stmt[p], m.modules[id])
+          for m.db.declares(p, ?s) {
+            if not import-symbol?(s) {
+              let name = unique-name(sym.symbol-at(m.table, s).name)
+              reserve(name)
+              sym.set-final!(m.table, s, name)
+            }
+          }
+        }
+      }
+    }
+  }
+  for id in m.order {
+    if included?(id) {
+      let mo = m.modules[id]
+      let root = sym.scope-at(m.table, mo.root)
+      if mo.kind == Cjs {
+        # The wrapper's own (exports, module) scope, then the file's.
+        name-nested(root.parent)
+      } else {
+        for child in root.children { name-nested(child) }
+      }
+    }
+  }
+}
+
+fn final-of(s: Int) -> Text = sym.symbol-at(m.table, s).final
+
+fn helper-name(name: Text) -> Text = final-of(an.helper(name))
+
+fn void-zero() -> Node = exp`void 0`
+
+fn cjs-import-of(leaf: Node) -> an.CjsImport? = match here.bindings[leaf.lo] {
+  some(s) => an.cjs-imports[s]
+  none => none
+}
+
+fn cjs-read(ci: an.CjsImport) -> Node {
+  let base = Ident(final-of(ci.import-var))
+  if ci.namespace then base else Member(base, PropName(ci.name))
+}
+
+# The symbol an export name means in a module, preferring one that is not an import.
+fn resolved-export(module: Int, name: Int) -> Int? {
+  var out: Int? = none
+  for m.db.resolved(module, name, ?candidate) {
+    if out == none or not import-symbol?(candidate) { out = some(candidate) }
+  }
+  out
+}
+
+# `ns.name` when `ns` is `import * as` of an ES module: the export itself.
+fn namespace-read(n: Node) -> Node? = match an.namespace-of(here, n.kids[0]) {
+  none => none
+  some(target) => match resolved-export(target, intern!(m.names, n.kids[1].text)) {
+    some(s) => some(Ident(final-of(target-of(s))))
+    none => some(void-zero())
+  }
+}
+
+fn require-of(t: m.Module) -> Node {
+  let call-me = final-of(t.require-sym)
+  exp`$call_me()`
+}
+
+# `require("x")` of a wrapped ES module: `(init_x(), __toCommonJS(x_exports))`.
+fn require-esm(t: m.Module) -> Node {
+  let init = final-of(t.init-sym)
+  let to-cjs = helper-name("__toCommonJS")
+  let ns = final-of(t.ns-sym)
+  exp`($init(), $to_cjs($ns))`
+}
+
+# `import("x")`: nothing to fetch in one bundle, so a resolved promise of its namespace.
+fn import-call(t: m.Module) -> Node {
+  if t.kind == Cjs {
+    let to-esm = helper-name("__toESM")
+    let req = final-of(t.require-sym)
+    exp`Promise.resolve().then(() => $to_esm($req()))`
+  } else {
+    let init = final-of(t.init-sym)
+    let ns = final-of(t.ns-sym)
+    exp`Promise.resolve().then(() => ($init(), $ns))`
+  }
+}
+
+# Function-like kinds rebind `this`; arrows do not.
+fn rebinds-this?(n: Node) -> Bool = sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...))
+
+fn wrapper-param(name: Text) -> Int {
+  let wrapper = sym.scope-at(m.table, here.root).parent
+  sym.scope-at(m.table, wrapper).names[name] ?? panic "{}: a CommonJS wrapper has no {} symbol", here.path, name
+}
+
+fn rw-kids(n: Node, depth: Int) -> Node = n with { kids: [rw(k, depth) for k in n.kids] }
+
+# Rewrite identifiers to final names. `depth` counts `this`-rebinding functions.
+fn rw(n: Node, depth: Int) -> Node = match n {
+  Ident(x) => match cjs-import-of(n) {
+    some(ci) => cjs-read(ci)
+    none => match here.bindings[n.lo] {
+      some(s) => Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
+      # A free `undefined` is the shorter `void 0` under --minify-syntax.
+      none => if void-undefined and x == "undefined" then void-zero() else n
+    }
+  }
+  BindName(_) => match here.bindings[n.lo] {
+    some(s) => BindName(final-of(s)) with { lo: n.lo, hi: n.hi }
+    none => n
+  }
+  This() =>
+    if depth > 0 then n
+    else if here.kind == Cjs then Ident(final-of(wrapper-param("exports")))
+    else void-zero()
+  Shorthand(old) => {
+    let new = rw(old, depth)
+    if new is Ident(_) and new.text == old.text then n else Prop(PropName(old.text), new)
+  }
+  PatShort(old, default-value) => {
+    let new = rw(old, depth)
+    let init = rw(default-value, depth)
+    if new.text == old.text then PatShort(new, init) with { lo: new.lo, hi: init.hi }
+    else PatProp(PropName(old.text), BindElement(new, init) with { lo: new.lo, hi: init.hi })
+  }
+  CallExpr(...) => rw-call(n, depth)
+  Member(object, property) => match namespace-read(n) {
+    some(read) => read
+    none => {
+      let o = rw(object, depth)
+      Member(o, property) with { lo: o.lo, hi: property.hi }
+    }
+  }
+  ImportCall(...) => match an.import-call-target(here, n) {
+    some(t) => if m.modules[t].kind == External then n else import-call(m.modules[t])
+    none => rw-kids(n, depth)
+  }
+  ImportMeta() => exp`({})`.kids[0]
+  _ => if len(n.kids) == 0 then n else {
+    let inner = if rebinds-this?(n) or n is ClassBody(...) then depth + 1 else depth
+    # An empty statement in a statement list does nothing.
+    n with { kids: [rw(k, inner) for k in n.kids if not (n is List(...) and k is Empty())] }
+  }
+}
+
+# `require("x")` becomes `require_x()`; a call of a CommonJS import keeps `this` undefined by
+# reading the function first: `(0, import_x.f)(…)`.
+fn rw-call(n: Node, depth: Int) -> Node {
+  let callee = n.kids[0]
+  let args = n.kids[1]
+  if is-some(an.require-target(here, n)) {
+    let t = m.modules[an.dep-of-str(here, args.kids[0].kids[0])]
+    return match t.kind {
+      Cjs => require-of(t)
+      External => rw-kids(n, depth)
+      _ => require-esm(t)
+    }
+  }
+  let new-callee = rw(callee, depth)
+  let new-args = rw(args, depth)
+  let import-read: an.CjsImport? = if callee is Ident(_) then cjs-import-of(callee) else none
+  let wrapped = match import-read {
+    some(ci) => if ci.namespace then new-callee else exp`(0, $new_callee)`
+    none => new-callee
+  }
+  CallExpr(wrapped, new-args) with { lo: wrapped.lo, hi: new-args.hi }
+}
+
+fn init-call(t: m.Module) -> Node? {
+  if not t.wrapped { return none }
+  let init = final-of(t.init-sym)
+  some(stmt`$init();`)
+}
+
+# An external module, as an expression: `require("x")`, or in ES module output the namespace of an
+# `import * as` hoisted to the top of the file.
+fn external-object(t: m.Module) -> Node {
+  if esm-output {
+    let name = "__external_" ++ t.base
+    let line = "import * as " ++ name ++ " from \"" ++ t.path ++ "\";"
+    if not (line in external-imports) { external-imports += line }
+    Ident(name)
+  } else {
+    let path = Str(quote-text(t.path))
+    exp`require($path)`
+  }
+}
+
+# `var import_x = __toESM(require_x(), 1);` Files in node mode (.mjs, or a package with
+# "type": "module") get the second argument, so `default` is module.exports.
+fn import-cjs-stmt(t: m.Module) -> Node {
+  let v = final-of(an.import-var-of(here, t.id))
+  let to-esm = helper-name("__toESM")
+  let object = if t.kind == External then external-object(t) else require-of(t)
+  if m.node-mode?(here.path) then stmt`var $v = $to_esm($object, 1);` else stmt`var $v = $to_esm($object);`
+}
+
+# The body statements of a part, ready to print. None for a part with no code.
+fn part-output(s: Node) -> Node? = match s {
+  ImportBare(from) => {
+    let t = m.modules[an.dep-of-str(here, from)]
+    match t.kind {
+      Cjs => {
+        let call-me = final-of(t.require-sym)
+        some(stmt`$call_me();`)
+      }
+      External => {
+        let object = external-object(t)
+        some(stmt`$object;`)
+      }
+      _ => init-call(t)
+    }
+  }
+  ExportAll(from) | ExportAllAs(_, from) | ExportFrom(_, from) => init-call(m.modules[an.dep-of-str(here, from)])
+  ExportNamed(...) => none
+  Import(_, from) => {
+    let t = m.modules[an.dep-of-str(here, from)]
+    if an.opaque?(t) then some(import-cjs-stmt(t)) else init-call(t)
+  }
+  ExportVar(list) => some(rw(VarDecl(list) with { lo: s.lo, hi: s.hi }, 0))
+  ExportLexical(d) | ExportFunction(d) | ExportClass(d) => some(rw(d, 0))
+  _ => some(rw(s, 0))
+}
+
+# For a source map: each leaf's offset gains its module, as (module+1)<<32 | offset.
+fn stamp-tree(n: Node, base: Int) -> Node {
+  let stamped = n with { kids: [stamp-tree(k, base) for k in n.kids] }
+  if n.lo > 0 and n.lo < 4294967296 then stamped with { lo: n.lo + base } else stamped
+}
+
+fn stamped(n: Node) -> Node = if sourcemap then stamp-tree(n, (here.id + 1) * 4294967296) else n
+
+fn param-of(s: Int) -> Node = Param(BindName(final-of(s)), None())
+
+# `var require_x = __commonJS({ "path"(exports, module) { … } });`, leaving out parameters nothing
+# uses, as esbuild does.
+fn cjs-part() -> Node {
+  let e = wrapper-param("exports")
+  let mo = wrapper-param("module")
+  let use-module = sym.symbol-at(m.table, mo).uses > 0
+  let use-exports = use-module or sym.symbol-at(m.table, e).uses > 0
+  let body = [stamped(rw(s, 0)) for s in here.tree.kids[1].kids]
+  let name = final-of(here.require-sym)
+  let wrap = helper-name("__commonJS")
+  let path = Str(quote-text(here.path))
+  let params: [Node] =
+    if use-module then [param-of(e), param-of(mo)]
+    else if use-exports then [param-of(e)]
+    else []
+  stmt`var $name = $wrap({ $path($$params) { $$body } });`
+}
+
+fn plain-key?(s: Text) -> Bool = len(s) > 0 and name-start-byte?(s[0]) and (all c in s: name-byte?(c))
+
+fn export-getter(name-id: Int) -> Node {
+  let name = name-of(m.names, name-id)
+  let s = resolved-export(here.id, name-id) ?? panic "{}: lost export {}", here.path, name
+  let target = final-of(target-of(s))
+  let getter = exp`() => $target`
+  Prop(if plain-key?(name) then PropName(name) else Str(quote-text(name)), getter)
+}
+
+fn unique-names(rows: [Int]) -> [Int] {
+  var names: [Int] = []
+  for n in rows {
+    if not (n in names) { names += n }
+  }
+  names
+}
+
+# `var x_exports = {}; __export(x_exports, { a: () => a, … });`, names sorted.
+fn namespace-stmts!(out: mut [Node]) -> Void {
+  let ns = final-of(here.ns-sym)
+  let names = unique-names([n for m.db.resolved(here.id, ?n, _)])
+  let sorted = sort n in names by name-of(m.names, n)
+  let getters = [export-getter(n) for n in sorted]
+  let export-all = helper-name("__export")
+  out += stmt`var $ns = {};`
+  out += stmt`$export_all($ns, { $$getters });`
+}
+
+fn function-decl?(n: Node) -> Bool = n is FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...)
+
+# `var a, b; function f() {} var init_x = __esm({ "path"() { a = 1; } });` A `var` statement inside
+# an initialiser: its names hoist out and its values become assignments. Functions hoist whole.
+fn wrapped-module!(outputs: [Node], out: mut [Node]) -> Void {
+  var hoisted: [Node] = []
+  var functions: [Node] = []
+  var body: [Node] = []
+  for s in outputs {
+    if function-decl?(s) {
+      functions += s
+    } else {
+      match s {
+        VarDecl(List(ds...)) => {
+          for d in ds {
+            match d {
+              Declarator(BindName(x), init) => {
+                hoisted += Declarator(BindName(x), None())
+                if not (init is None()) { body += stmt`$x = $init;` }
+              }
+              _ => panic "{}: destructuring at the top level of a module that is required or imported dynamically is not implemented yet", here.path
+            }
+          }
+        }
+        _ => { body += s }
+      }
+    }
+  }
+  if len(hoisted) > 0 { out += VarDecl(List(hoisted...)) }
+  out ++= functions
+  let name = final-of(here.init-sym)
+  let wrap = helper-name("__esm")
+  let path = Str(quote-text(here.path))
+  out += stmt`var $name = $wrap({ $path() { $$body } });`
+}
+
+# Every live statement, in module order. Namespace objects go right after the runtime: their
+# getters are all functions, so this makes them safe to read from any module's top level.
+fn program() -> Node {
+  var out: [Node] = []
+  var namespaces: [Node] = []
+  var runtime-count = 0
+  for id in m.order {
+    if included?(id) {
+      with here = m.modules[id] {
+        if here.kind == Cjs {
+          out += cjs-part()
+        } else {
+          var outputs: [Node] = []
+          for p in parts-of(id) {
+            if live?(p) {
+              match an.part-stmt[p] {
+                None() => namespace-stmts!(namespaces)
+                Flag() => {}
+                s => if let some(o) = part-output(s) {
+                  if here.wrapped { outputs += stamped(o) } else { out += stamped(o) }
+                }
+              }
+            }
+          }
+          if here.wrapped { wrapped-module!(outputs, out) }
+        }
+      }
+      if id == 0 { runtime-count = len(out) }
+    }
+  }
+  let all-stmts = out[0..runtime-count] ++ namespaces ++ out[runtime-count..len(out)]
+  Program(None(), List(all-stmts...))
+}

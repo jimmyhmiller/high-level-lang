@@ -1,0 +1,204 @@
+# One build, from options to a file. The command line and `.bundler` specs are both just ways of
+# filling in `Options`.
+rules bundle.api over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.analysis as an
+use bundle.emit as e
+use bundle.mangle as mangle
+use bundle.resolve as res
+use bundle.fold as fold
+use bundle.minify as minify
+use bundle.final as final
+use bundle.minhost as host
+use bundle.sourcemap as map
+
+quote stmt at 1 0 ;
+quote exp at 1 0 0 ;
+
+enum Format { Iife, Esm, Cjs }
+
+record DefineText { key: Text, value: Text }
+
+record Options {
+  entry: Text,
+  outfile: Text,
+  format: Format,
+  global-name: Text,
+  minify-identifiers: Bool,
+  minify-syntax: Bool,
+  pretty: Bool,
+  timing: Bool,
+  sourcemap: Bool,
+  defines: [DefineText],
+  main-fields: [Text],
+  conditions: [Text],
+  extensions: [Text],
+  external: [Text],
+  platform-node: Bool,
+  transform: Fn(Node)->Node,
+  optimize: Fn(Node)->Node
+}
+
+fn keep-as-is(n: Node) -> Node = n
+
+# What `minify syntax` means unless a build says otherwise.
+fn default-optimize(n: Node) -> Node = host.templates(final.run(minify.run(n)))
+
+fn options-new(entry: Text, outfile: Text) -> Options =
+  Options(entry: entry, outfile: outfile, format: Iife, global-name: "",
+          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
+          defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
+          extensions: [".js", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
+          transform: keep-as-is, optimize: default-optimize)
+
+# Node's module system: builtins stay external, and packages resolve for node.
+fn platform-node!(o: mut Options) -> Void {
+  o.platform-node = true
+  o.main-fields = ["main", "module"]
+  o.conditions = ["node", "require"]
+}
+
+fn define!(o: mut Options, key: Text, value: Text) -> Void {
+  o.defines += DefineText(key: key, value: value)
+}
+
+fn clear-words() -> [Text] = []
+
+# ---------------------------------------------------------------- timing
+
+state last-ms: Int = 0
+
+fn lap(o: Options, label: Text) -> Void {
+  if o.timing {
+    let now = now-ms()
+    if last-ms > 0 { print "{:>6} ms  {}", now - last-ms, label }
+    last-ms = now
+  }
+}
+
+# ---------------------------------------------------------------- the build
+
+# A define's value is a JavaScript expression in text: `false`, `"production"`, `1`.
+fn define-value(text: Text) -> Node = js.parse(text ++ ";", "<define>").kids[1].kids[0].kids[0]
+
+fn program-plus(p: Node, s: Node) -> Node {
+  let stmts = p.kids[1].kids ++ [s]
+  Program(p.kids[0], List(stmts...))
+}
+
+# An entry that is itself wrapped only runs if something calls it.
+fn run-entry(p: Node) -> Node {
+  let mo = m.modules[m.entry]
+  if mo.kind == m.Cjs {
+    let call-me = e.final-of(mo.require-sym)
+    program-plus(p, stmt`$call_me();`)
+  } else if mo.wrapped {
+    let call-me = e.final-of(mo.init-sym)
+    program-plus(p, stmt`$call_me();`)
+  } else {
+    p
+  }
+}
+
+fn to-common-js() -> Node {
+  let to-cjs = e.helper-name("__toCommonJS")
+  let ns = e.final-of(m.modules[m.entry].ns-sym)
+  exp`$to_cjs($ns)`
+}
+
+# `export { a, b as c };` for the entry's names.
+fn esm-exports() -> Node? {
+  let names = e.unique-names([n for m.db.resolved(m.entry, ?n, _)])
+  let specs = [ExportAs(PropName(e.final-of(e.target-of(e.resolved-export(m.entry, n) ?? -1))),
+                        PropName(name-of(m.names, n)))
+               for n in names if is-some(e.resolved-export(m.entry, n))]
+  if len(specs) > 0 then some(ExportNamed(List(specs...))) else none
+}
+
+# The output text: `prefix`, the printed program, `suffix`. `base` is where the program starts, for
+# source map positions.
+record Printed { text: Text, base: Int, marks: [Mark] }
+
+fn printed(o: Options, p: Node, prefix: Text, suffix: Text) -> Printed {
+  let r = js.render-tracked(p, o.pretty, o.sourcemap)
+  Printed(text: prefix ++ r.text ++ suffix, base: len(prefix), marks: r.marks)
+}
+
+fn wrap-format(o: Options, p: Node) -> Printed = match o.format {
+  Iife =>
+    if len(o.global-name) > 0 {
+      let value = to-common-js()
+      printed(o, program-plus(p, stmt`return $value;`), "var " ++ o.global-name ++ "=(()=>{", "})();\n")
+    } else {
+      printed(o, p, "(()=>{", "})();\n")
+    }
+  Cjs => {
+    let value = to-common-js()
+    printed(o, program-plus(p, stmt`module.exports = $value;`), "", "\n")
+  }
+  Esm => match esm-exports() {
+    some(x) => printed(o, program-plus(p, x), "", "\n")
+    none => printed(o, p, "", "\n")
+  }
+}
+
+fn base-of-path(path: Text) -> Text {
+  var cut = -1
+  for i in 0..len(path) {
+    if path[i] == '/' { cut = i }
+  }
+  path[cut + 1..len(path)]
+}
+
+fn has-define?(o: Options, key: Text) -> Bool = any d in o.defines: d.key == key
+
+fn reset-all() -> Void {
+  m.reset-state!()
+  an.reset-state!()
+  e.reset-state!()
+  mangle.reset-state!()
+  res.reset-state!()
+}
+
+fn build(options: Options) -> Void {
+  var o = options
+  reset-all()
+  m.options = res.Options(main-fields: o.main-fields, conditions: o.conditions, extensions: o.extensions,
+                          external: o.external, node-builtins: o.platform-node)
+  lap(o, "startup")
+  if not has-define?(o, "process.env.NODE_ENV") {
+    define!(o, "process.env.NODE_ENV", if o.minify-syntax then "\"production\"" else "\"development\"")
+  }
+  m.defines = [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines]
+  e.void-undefined = o.minify-syntax
+  e.sourcemap = o.sourcemap
+  m.transform = o.transform
+  an.keep-entry-exports = o.format == Esm
+  e.esm-output = o.format == Esm
+  an.entry-namespace = o.format == Cjs or (o.format == Iife and len(o.global-name) > 0)
+  m.load-runtime(include-text("runtime.js"))
+  m.load-tree(o.entry)
+  lap(o, "load: resolve, parse, scopes")
+  an.link()
+  lap(o, "link: facts and Datalog")
+  if o.minify-identifiers then mangle.assign-minified() else e.assign-names()
+  lap(o, "naming")
+  let emitted = run-entry(e.program())
+  lap(o, "emit: rewrite identifiers")
+  let p = if o.minify-syntax then o.optimize(emitted) else fold.run(emitted)
+  lap(o, "minify rules")
+  let out0 = wrap-format(o, p)
+  # Hoisted external imports come first, ahead of everything the map describes.
+  var hoisted = buf-new()
+  for line in e.external-imports { buf-add!(hoisted, line) }
+  let head = buf-text(hoisted)
+  let full = head ++ out0.text
+  let base = len(head) + out0.base
+  let text = if o.sourcemap then full ++ "//# sourceMappingURL=" ++ base-of-path(o.outfile) ++ ".map\n" else full
+  lap(o, "print")
+  write-file(o.outfile, text)
+  if o.sourcemap { write-file(o.outfile ++ ".map", map.build-map(full, base, out0.marks, o.outfile)) }
+  lap(o, "write")
+  print "{} bytes -> {}", len(text), o.outfile
+}

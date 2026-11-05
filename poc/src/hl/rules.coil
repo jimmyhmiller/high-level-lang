@@ -106,7 +106,8 @@
 ;; Int Bool Text Void Never [T] T? {K:V} Fn(A,B)->R, or module.Type: a type is its own
 ;; canonical name, so equality is text equality.
 
-(defn opt? [(t (slice u8))] (-> bool) (and (> (len t) 0) (= (get t (- (len t) 1)) #\?)))
+(defn opt? [(t (slice u8))] (-> bool)
+  (and (> (len t) 0) (= (get t (- (len t) 1)) #\?) (not (rt/at? t 0 "Fn("))))
 (defn list? [(t (slice u8))] (-> bool) (and (> (len t) 0) (= (get t 0) #\[)))
 (defn map? [(t (slice u8))] (-> bool) (and (> (len t) 0) (= (get t 0) #\{)))
 (defn fn? [(t (slice u8))] (-> bool) (rt/at? t 0 "Fn("))
@@ -504,10 +505,13 @@
       (when (= (.kind d) (g/KUse)) (ensure-loaded! (mut k) (.text (kid d 0)))))
     (push! (mut (.mods k)) (mod-new name (SRules) over))
     (let [ix (- (len (.mods k)) 1)]
+      (push! (mut (.aliases (elem (mut (.mods k)) ix))) (Alias :name "rt" :module "hl.rt"))
+      (push! (mut (.aliases (elem (mut (.mods k)) ix))) (Alias :name "sym" :module "hl.symtab"))
       (for d decls
         (when (= (.kind d) (g/KUse))
           (push! (mut (.aliases (elem (mut (.mods k)) ix)))
                  (Alias :name (.text (kid d 1)) :module (.text (kid d 0))))))
+      (push! (mut (.funcs (elem (mut (.mods k)) ix))) (func-of "reset-state!" "Void"))
       ;; Type names before anything that mentions them.
       (for d decls
         (match (.kind d)
@@ -1117,6 +1121,8 @@
                        (for ~(sym t) ~(.code e) (push! (mut ~(sym o)) ~(sym t)))
                        ~(sym o))
                     (cat3 "[" (map-key (.ty e)) "]"))))
+      (and (= name "include-text") (= count 1) (= (.kind (get args 0)) (g/KStr)))
+        (Some (te `(~(sym "include-str") ~(str-literal (get args 0))) "Text"))
       :else (None [TE]))))
 
 (defn call-expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
@@ -1136,9 +1142,14 @@
                   (match (find-func (self-mod (mut k)) name)
                     (Some [f] (call-func (mut k) n (.self k) f args))
                     (None []
-                      (match (find-func (mod-at (mut k) "hl.rt") name)
-                        (Some [f] (call-func (mut k) n "hl.rt" f args))
-                        (None [] (die (mut k) callee (cat "no function named " name))))))))))))
+                      (match (find-global (self-mod (mut k)) name)
+                        (Some [x]
+                          (unless (fn? (.ty x)) (die (mut k) n (cat4 name " is a " (.ty x) ", not a function")))
+                          (fn-value-call (mut k) n `(~(primitive/code-symbol "." name) (rules-state)) (.ty x) args))
+                        (None []
+                          (match (find-func (mod-at (mut k) "hl.rt") name)
+                            (Some [f] (call-func (mut k) n "hl.rt" f args))
+                            (None [] (die (mut k) callee (cat "no function named " name))))))))))))))
       (g/KFieldE []
         (let [base (kid callee 0)
               name (.text (kid callee 1))]
@@ -1175,7 +1186,9 @@
     (for i (range 0 (len args))
       (let [x (expect (mut k) (get args i) (expr (mut k) (get args i) (get ps i)) (get ps i))]
         (push! (mut out) (.code x))))
-    (te `(~f ~@out) (fn-ret ty))))
+    ;; A call's head must be a name.
+    (let [t (fresh (mut k) "f")]
+      (te `(let [~(sym t) ~f] (~(sym t) ~@out)) (fn-ret ty)))))
 
 ;;; `db.rel(a, b)` as a question: is there such a row? `_` matches anything.
 (defn relation-test [(k (mut Comp)) (n g/Node) (db TE) (rel (slice u8)) (args (ArrayList g/Node))] (-> TE)
@@ -1887,6 +1900,11 @@
     (g/KIndex [] (check-assignable! (mut k) (kid target 0)))
     (_ 0)))
 
+(defn let-like? [(s g/Node)] (-> bool)
+  (or (= (.kind s) (g/KLet)) (= (.kind s) (g/KVar))))
+
+;;; A block, kept as flat as it can be: Coil's expander pays for depth, so a run of `let`s
+;;; shares one binding vector rather than each nesting the rest of the block.
 (defn block-from [(k (mut Comp)) (stmts (ArrayList g/Node)) (i i64) (want (slice u8))] (-> TE)
   (let [(mut forms) (primitive/code-list-new)
         (mut ty) "Void"
@@ -1896,35 +1914,34 @@
     (while go
       (let [s (get stmts j)
             at-end (= j (- n 1))]
-        (match (.kind s)
-          (g/KLet []
-            (let [declared (if (none? (kid s 1)) "" (resolve-type (mut k) (.self k) (kid s 1)))
-                  v (expect (mut k) (kid s 2) (expr (mut k) (kid s 2) declared) declared)
-                  local (bind-local! (mut k) (.text (kid s 0)) (.ty v) false)
-                  rest (block-from (mut k) stmts (+ j 1) want)]
-              (push! (mut forms) `(let [~(sym local) ~(.code v)] ~(.code rest)))
-              (set! ty (.ty rest))
-              (set! go false)))
-          (g/KVar []
-            (let [declared (if (none? (kid s 1)) "" (resolve-type (mut k) (.self k) (kid s 1)))
-                  v (expect (mut k) (kid s 2) (expr (mut k) (kid s 2) declared) declared)
-                  fresh-value (match (.kind (kid s 2))
-                                (g/KName [] false)
-                                (g/KFieldE [] false)
-                                (g/KIndex [] false)
-                                (_ true))
-                  init (if fresh-value (.code v) (list-copy (mut k) v))
-                  local (bind-local! (mut k) (.text (kid s 0)) (.ty v) true)
-                  rest (block-from (mut k) stmts (+ j 1) want)]
-              (push! (mut forms) `(let [(mut ~(sym local)) ~init] ~(.code rest)))
-              (set! ty (.ty rest))
-              (set! go false)))
-          (_
+        (if (let-like? s)
+            (let [(mut binds) (primitive/code-list-new)]
+              (while (and (< j n) (let-like? (get stmts j)))
+                (let [b (get stmts j)
+                      is-var (= (.kind b) (g/KVar))
+                      declared (if (none? (kid b 1)) "" (resolve-type (mut k) (.self k) (kid b 1)))
+                      v (expect (mut k) (kid b 2) (expr (mut k) (kid b 2) declared) declared)
+                      fresh-value (match (.kind (kid b 2))
+                                    (g/KName [] false)
+                                    (g/KFieldE [] false)
+                                    (g/KIndex [] false)
+                                    (_ true))
+                      init (if (or (not is-var) fresh-value) (.code v) (list-copy (mut k) v))
+                      local (bind-local! (mut k) (.text (kid b 0)) (.ty v) is-var)]
+                  (if is-var
+                      (push! (mut binds) `(mut ~(sym local)))
+                      (push! (mut binds) (sym local)))
+                  (push! (mut binds) init))
+                (set! j (+ j 1)))
+              (let [rest (block-from (mut k) stmts j want)]
+                (push! (mut forms) `(let [~@binds] ~(.code rest)))
+                (set! ty (.ty rest))
+                (set! go false)))
             (let [e (stmt (mut k) s (if at-end want "Void"))]
               (push! (mut forms) (.code e))
               (when at-end (set! ty (.ty e)))
               (set! j (+ j 1))
-              (when (>= j n) (set! go false)))))))
+              (when (>= j n) (set! go false))))))
     (when (>= i n) (push! (mut forms) `0))
     (te `(do ~@forms) ty)))
 

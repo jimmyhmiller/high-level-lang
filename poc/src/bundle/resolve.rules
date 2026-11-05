@@ -1,0 +1,244 @@
+# Node-style module resolution: a search over the filesystem, whose knobs come from the build.
+rules bundle.resolve
+use bundle.package as pkg
+
+record Options {
+  main-fields: [Text],
+  conditions: [Text],
+  extensions: [Text],
+  external: [Text],
+  node-builtins: Bool
+}
+
+record Resolved { path: Text, side-effects: Bool }
+
+# Everything the filesystem answered, so each question is asked once.
+state files: {Text:Bool} = {}
+state docs: {Text:pkg.Node} = {}
+state resolved: {Text:Text} = {}
+state effects: {Text:Bool} = {}
+state type-module: {Text:Bool} = {}
+
+fn file?(path: Text) -> Bool {
+  if let some(known) = files[path] { return known }
+  let there = readable-file?(path)
+  files[path] = there
+  there
+}
+
+fn doc-of(path: Text) -> pkg.Node {
+  if let some(d) = docs[path] { return d }
+  let d = pkg.parse(read-file(path), path)
+  docs[path] = d
+  d
+}
+
+# Remove `.` and `..` segments.
+fn normalize(path: Text) -> Text {
+  var parts: [Text] = []
+  var start = 0
+  for i in 0..len(path) + 1 {
+    if i == len(path) or path[i] == '/' {
+      let seg = path[start..i]
+      if len(seg) == 0 or seg == "." {
+      } else if seg == ".." and len(parts) > 0 and last(parts) != ".." {
+        pop(parts)
+      } else {
+        parts += seg
+      }
+      start = i + 1
+    }
+  }
+  var b = buf-new()
+  if len(path) > 0 and path[0] == '/' { buf-add!(b, "/") }
+  for i in 0..len(parts) {
+    if i > 0 { buf-add!(b, "/") }
+    buf-add!(b, parts[i])
+  }
+  buf-text(b)
+}
+
+fn member(object: pkg.Node, key: Text) -> pkg.Node? {
+  var out: pkg.Node? = none
+  match object {
+    pkg.Object(List(ms...)) => {
+      for m in ms {
+        if unquote(m.kids[0].text) == key { out = some(m.kids[1]) }
+      }
+    }
+    _ => {}
+  }
+  out
+}
+
+fn text-member(object: pkg.Node, key: Text) -> Text? = match member(object, key) {
+  some(pkg.Str(raw)) => some(unquote(raw))
+  _ => none
+}
+
+# A package `exports` value: a path, or conditions tried in the file's order.
+fn exports-target(v: pkg.Node, o: Options) -> Text? = match v {
+  pkg.Str(raw) => some(unquote(raw))
+  pkg.Object(List(ms...)) => first m in ms: condition-target(m, o)
+  _ => none
+}
+
+fn condition-target(m: pkg.Node, o: Options) -> Text? {
+  let key = unquote(m.kids[0].text)
+  if key == "default" or key in o.conditions then exports-target(m.kids[1], o) else none
+}
+
+fn package-exports(doc: pkg.Node, subpath: Text, o: Options) -> Text? = match member(doc, "exports") {
+  none => none
+  some(e) => match e {
+    pkg.Object(List(first-member, ...)) =>
+      if unquote(first-member.kids[0].text)[0] == '.' {
+        match member(e, subpath) {
+          some(v) => exports-target(v, o)
+          none => none
+        }
+      } else if subpath == "." then exports-target(e, o) else none
+    _ => if subpath == "." then exports-target(e, o) else none
+  }
+}
+
+fn try-file(base: Text, o: Options) -> Text? {
+  if file?(base) { return some(base) }
+  first ext in o.extensions: if file?(base ++ ext) then some(base ++ ext) else none
+}
+
+# A directory: its package.json entry, then its index.
+fn try-dir(dir: Text, o: Options) -> Text? {
+  let pj = dir ++ "/package.json"
+  let from-main: Text? =
+    if file?(pj) {
+      let doc = doc-of(pj)
+      first field-name in o.main-fields: match text-member(doc, field-name) {
+        some(target) => try-path(normalize(dir ++ "/" ++ target), o)
+        none => none
+      }
+    } else { none }
+  from-main ?? try-file(dir ++ "/index", o)
+}
+
+fn try-path(base: Text, o: Options) -> Text? = try-file(base, o) ?? try-dir(base, o)
+
+fn top-of-tree?(dir: Text) -> Bool = dir == "." or len(dir) == 0 or dir == "/"
+
+# The package.json governing a directory: the nearest one at or above it.
+fn package-json-for(start: Text) -> Text? {
+  var dir = start
+  while true {
+    let pj = if dir == "." then "package.json" else dir ++ "/package.json"
+    if file?(pj) { return some(pj) }
+    if top-of-tree?(dir) { return none }
+    dir = dir-of(dir)
+  }
+  none
+}
+
+# Is the package.json governing a file `"type": "module"`?
+fn package-type-module?(path: Text) -> Bool {
+  let dir = dir-of(path)
+  if let some(known) = type-module[dir] { return known }
+  let answer = match package-json-for(dir) {
+    none => false
+    some(pj) => match text-member(doc-of(pj), "type") {
+      some(t) => t == "module"
+      none => false
+    }
+  }
+  type-module[dir] = answer
+  answer
+}
+
+# `"sideEffects": false` in the package.json governing a file.
+fn side-effects-of(path: Text) -> Bool {
+  let dir = dir-of(path)
+  if let some(known) = effects[dir] { return known }
+  let answer = match package-json-for(dir) {
+    none => true
+    some(pj) => match member(doc-of(pj), "sideEffects") {
+      some(v) => not (v is pkg.False())
+      none => true
+    }
+  }
+  effects[dir] = answer
+  answer
+}
+
+# Where a package's name ends: `@scope/name` has two parts.
+fn split-package(spec: Text) -> Int {
+  let need = if spec[0] == '@' then 2 else 1
+  var slashes = 0
+  var out = len(spec)
+  for i in 0..len(spec) {
+    if spec[i] == '/' and out == len(spec) {
+      slashes += 1
+      if slashes == need { out = i }
+    }
+  }
+  out
+}
+
+fn resolve-bare(spec: Text, from-dir: Text, o: Options) -> Text? {
+  let cut = split-package(spec)
+  let name = spec[0..cut]
+  let sub = if cut < len(spec) then "." ++ spec[cut..len(spec)] else "."
+  var dir = from-dir
+  while true {
+    let pdir = if dir == "." then "node_modules/" ++ name else dir ++ "/node_modules/" ++ name
+    let pj = pdir ++ "/package.json"
+    if file?(pj) {
+      match package-exports(doc-of(pj), sub, o) {
+        some(target) => return some(normalize(pdir ++ "/" ++ target))
+        none => {
+          let found = if sub == "." then try-dir(pdir, o) else try-path(normalize(pdir ++ "/" ++ sub), o)
+          if let some(p) = found { return some(p) }
+        }
+      }
+    }
+    if top-of-tree?(dir) { return none }
+    dir = dir-of(dir)
+  }
+  none
+}
+
+const node-builtin-names: [Text] = ["assert", "async_hooks", "buffer", "child_process", "cluster",
+  "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs",
+  "fs/promises", "http", "http2", "https", "inspector", "module", "net", "os", "path", "perf_hooks",
+  "process", "punycode", "querystring", "readline", "repl", "stream", "stream/promises",
+  "string_decoder", "timers", "tls", "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib"]
+
+fn node-builtin?(spec: Text) -> Bool = starts-with(spec, "node:") or spec in node-builtin-names
+
+# Is this import left for the runtime to resolve?
+fn external?(spec: Text, o: Options) -> Bool =
+  (o.node-builtins and node-builtin?(spec)) or spec in o.external
+
+fn relative?(spec: Text) -> Bool =
+  starts-with(spec, "./") or starts-with(spec, "../") or spec == "." or spec == ".." or starts-with(spec, "/")
+
+fn resolve-uncached(spec: Text, importer: Text, from-dir: Text, o: Options) -> Text {
+  let target =
+    if relative?(spec) {
+      try-path(normalize(if starts-with(spec, "/") then spec else from-dir ++ "/" ++ spec), o)
+    } else {
+      resolve-bare(spec, from-dir, o)
+    }
+  target ?? panic "{}: could not resolve {}", importer, spec
+}
+
+fn resolve(spec: Text, importer: Text, o: Options) -> Resolved {
+  let from-dir = dir-of(importer)
+  let key = from-dir ++ "\n" ++ spec
+  let path = match resolved[key] {
+    some(p) => p
+    none => {
+      let p = resolve-uncached(spec, importer, from-dir, o)
+      resolved[key] = p
+      p
+    }
+  }
+  Resolved(path: path, side-effects: side-effects-of(path))
+}
