@@ -1,6 +1,7 @@
 # What the minifier's rules ask about nodes and text.
 rules bundle.minhost over bundle.js
 use bundle.js as js
+use bundle.literal as lit
 
 fn opaque(n: Node) -> Bool = js.opaque-spine?(n)
 fn present(n: Node) -> Bool = not (n is None())
@@ -182,25 +183,32 @@ fn num-short(n: Node) -> Node = Num(best-number(n.text)) with { lo: n.lo, hi: n.
 
 # ---------------------------------------------------------------- strings
 
+# String content as text and escapes. Most strings have no escape to look at.
+fn pieces(s: Text) -> [lit.Node] {
+  if all c in s: c != '\\' { return [lit.Plain(s)] }
+  match lit.parse(s, "<string>") {
+    lit.Content(List(ps...)) => ps
+    _ => panic "string content parses to content"
+  }
+}
+
+# The character an escape names, for one that stands for itself.
+fn escaped(p: lit.Node) -> Int = p.text[1]
+
 # Content rewritten for double quotes: a `\'` loses its slash, a bare `"` gains one.
 fn to-double-quoted(raw: Text) -> Text {
   let content = unquote(raw)
-  let single = raw[0] == '\''
+  if raw[0] != '\'' { return content }
   var b = buf-new()
-  var i = 0
-  while i < len(content) {
-    let c = content[i]
-    if c == '\\' and i + 1 < len(content) {
-      if single and content[i + 1] == '\'' {
-        buf-byte!(b, '\'')
-      } else {
-        buf-byte!(b, c)
-        buf-byte!(b, content[i + 1])
+  for p in pieces(content) {
+    match p {
+      lit.Plain(t) => {
+        for c in t {
+          if c == '"' { buf-byte!(b, '\\') }
+          buf-byte!(b, c)
+        }
       }
-      i = i + 2
-    } else {
-      if single and c == '"' { buf-add!(b, "\\\"") } else { buf-byte!(b, c) }
-      i = i + 1
+      _ => if escaped(p) == '\'' { buf-byte!(b, '\'') } else { buf-add!(b, p.text) }
     }
   }
   buf-text(b)
@@ -209,27 +217,21 @@ fn to-double-quoted(raw: Text) -> Text {
 # Two string tokens as one.
 fn concat(a: Text, b: Text) -> Node = Str("\"" ++ to-double-quoted(a) ++ to-double-quoted(b) ++ "\"")
 
+fn quote-byte?(c: Int) -> Bool = c == '"' or c == '\''
+
 # The same string in the given quote, with its escapes adjusted.
 fn requote(raw: Text, quote: Int) -> Text {
-  let content = unquote(raw)
   var b = buf-new()
-  var i = 0
   buf-byte!(b, quote)
-  while i < len(content) {
-    let c = content[i]
-    if c == '\\' and i + 1 < len(content) {
-      let e = content[i + 1]
-      if (e == '"' or e == '\'') and e != quote {
-        buf-byte!(b, e)
-      } else {
-        buf-byte!(b, c)
-        buf-byte!(b, e)
+  for p in pieces(unquote(raw)) {
+    match p {
+      lit.Plain(t) => {
+        for c in t {
+          if c == quote { buf-byte!(b, '\\') }
+          buf-byte!(b, c)
+        }
       }
-      i = i + 2
-    } else {
-      if c == quote { buf-byte!(b, '\\') }
-      buf-byte!(b, c)
-      i = i + 1
+      _ => if quote-byte?(escaped(p)) and escaped(p) != quote { buf-byte!(b, escaped(p)) } else { buf-add!(b, p.text) }
     }
   }
   buf-byte!(b, quote)
@@ -270,18 +272,15 @@ fn interpolation-at?(s: Text, i: Int) -> Bool = s[i] == '$' and i + 1 < len(s) a
 
 # A string with raw newlines is shorter as a template: `\n` is two bytes, a line break one.
 fn template-gain(raw: Text) -> Int {
-  let content = unquote(raw)
   var gain = 0
-  var i = 0
-  while i < len(content) {
-    let c = content[i]
-    if c == '\\' and i + 1 < len(content) {
-      let e = content[i + 1]
-      if e == 'n' or e == '"' or e == '\'' { gain += 1 }
-      i = i + 2
-    } else {
-      if c == '`' or interpolation-at?(content, i) { gain = gain - 1 }
-      i = i + 1
+  for p in pieces(unquote(raw)) {
+    match p {
+      lit.Plain(t) => {
+        for i in 0..len(t) {
+          if t[i] == '`' or interpolation-at?(t, i) { gain = gain - 1 }
+        }
+      }
+      _ => if escaped(p) == 'n' or quote-byte?(escaped(p)) { gain += 1 }
     }
   }
   gain
@@ -289,27 +288,20 @@ fn template-gain(raw: Text) -> Int {
 
 # A string's content as a template token.
 fn as-template(raw: Text) -> Text {
-  let content = unquote(raw)
   var b = buf-new()
-  var i = 0
   buf-byte!(b, '`')
-  while i < len(content) {
-    let c = content[i]
-    if c == '\\' and i + 1 < len(content) {
-      let e = content[i + 1]
-      if e == 'n' {
-        buf-byte!(b, '\n')
-      } else if e == '"' or e == '\'' {
-        buf-byte!(b, e)
-      } else {
-        buf-byte!(b, c)
-        buf-byte!(b, e)
+  for p in pieces(unquote(raw)) {
+    match p {
+      lit.Plain(t) => {
+        for i in 0..len(t) {
+          if t[i] == '`' or interpolation-at?(t, i) { buf-byte!(b, '\\') }
+          buf-byte!(b, t[i])
+        }
       }
-      i = i + 2
-    } else {
-      if c == '`' or interpolation-at?(content, i) { buf-byte!(b, '\\') }
-      buf-byte!(b, c)
-      i = i + 1
+      _ =>
+        if escaped(p) == 'n' { buf-byte!(b, '\n') }
+        else if quote-byte?(escaped(p)) { buf-byte!(b, escaped(p)) }
+        else { buf-add!(b, p.text) }
     }
   }
   buf-byte!(b, '`')
