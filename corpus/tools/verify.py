@@ -269,6 +269,27 @@ for entry, flags in [("app/tsc/src/main.tsx", ["--platform=node"]), ("app/tsc/sr
     ra, rb = sh(["node", a], 30), sh(["node", b], 30)
     check(code == 0 and ra[0] == 0 and ra[1] and ra[1] == rb[1], f"{entry} {' '.join(flags)}: same output as esbuild's")
 
+print("== more options against esbuild")
+for entry, flags in [("app/opts/drop.js", ["--drop:console"]), ("app/opts/drop.js", ["--drop:debugger"]),
+                     ("app/opts/drop.js", ["--minify", "--drop:console", "--drop:debugger"]),
+                     ("app/opts/drop.js", ["--pure:makeThing", "--pure:lib.factory"]),
+                     ("app/opts/drop.js", ["--packages=external", "--platform=node"]),
+                     ("app/opts/charset.js", []), ("app/opts/charset.js", ["--charset=utf8"]), ("app/opts/charset.js", ["--minify"]),
+                     ("app/named.js", ["--main-fields=main,module"]), ("app/named.js", ["--conditions=node"])]:
+    a, b = f"{SCRATCH}/op.o.cjs", f"{SCRATCH}/op.e.cjs"
+    code, _ = sh([ESB, entry, f"--outfile={a}"] + flags)
+    sh([E, entry, "--bundle", f"--outfile={b}", "--log-level=error"] + flags)
+    ra, rb = sh(["node", a], 30), sh(["node", b], 30)
+    check(code == 0 and ra[0] == rb[0] and ra[1] == rb[1], f"{entry} {' '.join(flags)}: same output as esbuild's")
+for flags in [["--drop:console"], ["--drop:debugger"]]:
+    sh([ESB, "app/opts/drop.js", f"--outfile={SCRATCH}/op.o.cjs"] + flags)
+    text = open(f"{SCRATCH}/op.o.cjs").read()
+    gone = "drop me" not in text if flags == ["--drop:console"] else "debugger" not in text
+    check(gone, f"{flags[0]}: gone from the output")
+sh([ESB, "app/opts/charset.js", f"--outfile={SCRATCH}/op.o.cjs"])
+lines = [l for l in open(f"{SCRATCH}/op.o.cjs", encoding="utf-8").read().split("\n") if any(ord(c) > 127 for c in l)]
+check(len(lines) == 1 and "/[" in lines[0], f"ASCII output: only the regular expressions keep their bytes ({len(lines)} line)")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)

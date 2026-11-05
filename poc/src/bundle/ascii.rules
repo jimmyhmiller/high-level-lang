@@ -1,0 +1,112 @@
+# `--charset=ascii`, esbuild's default: output that means the same whatever encoding it is read in.
+# Strings and identifiers spell anything past ASCII as an escape; a tagged template's raw text and a
+# regular expression keep theirs, since an escape there would change what they mean.
+rules bundle.ascii over bundle.js
+use bundle.js as js
+
+const hex-digits: Text = "0123456789ABCDEF"
+
+state braces: Bool = true
+
+fn plain?(t: Text) -> Bool = all c in t: c < 128
+
+# `width` hex digits of `v`, at least: written straight into the output, since a long string can
+# need thousands.
+fn hex!(b: mut Buf, v: Int, width: Int) -> Void {
+  var digits = 1
+  var top = 16
+  while top <= v {
+    digits += 1
+    top = top * 16
+  }
+  if digits < width { digits = width }
+  var place = 1
+  for i in 1..digits { place = place * 16 }
+  while place > 0 {
+    buf-byte!(b, hex-digits[(v / place) % 16])
+    place = place / 16
+  }
+}
+
+# One code point past ASCII. Strings may use `\xE9`; identifiers may not.
+fn escape!(b: mut Buf, cp: Int, in-string: Bool) -> Void {
+  if in-string and cp < 256 {
+    buf-add!(b, "\\x")
+    hex!(b, cp, 2)
+  } else if cp < 65536 {
+    buf-add!(b, "\\u")
+    hex!(b, cp, 4)
+  } else if braces {
+    buf-add!(b, "\\u{")
+    hex!(b, cp, 1)
+    buf-add!(b, "}")
+  } else {
+    let v = cp - 65536
+    buf-add!(b, "\\u")
+    hex!(b, 55296 + v / 1024, 4)
+    buf-add!(b, "\\u")
+    hex!(b, 56320 + v % 1024, 4)
+  }
+}
+
+fn escaped(t: Text, in-string: Bool) -> Text {
+  var b = buf-new()
+  var i = 0
+  while i < len(t) {
+    let c = t[i]
+    if c < 128 {
+      buf-byte!(b, c)
+      i += 1
+    } else {
+      # UTF-8, by hand: this runs on every string with anything past ASCII in it.
+      let size = if c >= 240 then 4 else if c >= 224 then 3 else 2
+      var cp = if size == 4 then c - 240 else if size == 3 then c - 224 else c - 192
+      for k in 1..size { cp = cp * 64 + (t[i + k] - 128) }
+      escape!(b, cp, in-string)
+      i += size
+    }
+  }
+  buf-text(b)
+}
+
+# The node in ASCII, or nothing when it already was: most of a program is, and need not be rebuilt.
+fn ascii-opt(n: Node) -> Node? = match n {
+  Str(t) | TemplateFull(t) | TemplateHead(t) | TemplateMiddle(t) | TemplateTail(t) =>
+    if plain?(t) then none else some(n with { text: escaped(t, true) })
+  Ident(t) | BindName(t) | PropName(t) | PrivateName(t) | LabelName(t) =>
+    if plain?(t) then none else some(n with { text: escaped(t, false) })
+  Regex(_) => none
+  # Kept JSX names its tags and attributes in its own syntax, where an escape is not allowed.
+  JsxElement(tag, attrs, rest) => rebuilt-from(n, 1)
+  JsxClose(children, tag) => match ascii-opt(children) {
+    some(c) => some(n with { kids: [c, tag] })
+    none => none
+  }
+  JsxAttr(name, value) => rebuilt-from(n, 1)
+  JsxText(_) | JsxStr(_) | JsxTagText(_) | JsxName(_) => none
+  Tagged(tag, t) => match ascii-opt(tag) {
+    some(x) => some(n with { kids: [x, t] })
+    none => none
+  }
+  _ => rebuilt-from(n, 0)
+}
+
+# Kids from `from` on in ASCII, the ones before as they are. Nothing is built until one changes.
+fn rebuilt-from(n: Node, from: Int) -> Node? {
+  for i in from..len(n.kids) {
+    if let some(x) = ascii-opt(n.kids[i]) {
+      var kids: [Node] = []
+      for j in 0..i { kids += n.kids[j] }
+      kids += x
+      for j in i + 1..len(n.kids) { kids += ascii-opt(n.kids[j]) ?? n.kids[j] }
+      return some(n with { kids: kids })
+    }
+  }
+  none
+}
+
+# The program in ASCII. Before ES2015 there is no `\u{…}`, so a pair of escapes stands for one.
+fn run(program: Node, target: Int) -> Node {
+  braces = target >= 2015
+  ascii-opt(program) ?? program
+}

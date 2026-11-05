@@ -86,21 +86,22 @@ normalises the original and our output to the same bytes, or that acorn gives th
 Invalid code: 714 of 729 test262 `fail/` and 662 of 668 `early/` are rejected. What remains
 is regex pattern validation, some Annex B cases, and tests newer JavaScript made valid.
 
-**Bundles against esbuild, minified.** All produce the same program output as esbuild's.
+**Bundles against esbuild, minified.** All produce the same program output as esbuild's. Output is
+ASCII, as esbuild's is by default (`--charset=utf8` turns that off).
 
 | App | Ours (bytes) | esbuild | Difference |
 |---|---|---|---|
-| lodash-es, tree-shaken | 34,641 | 35,207 | -1.6% |
-| all of lodash-es | 91,647 | 92,958 | -1.4% |
-| lodash (CommonJS) | 74,093 | 74,092 | 0.0% |
-| three | 263,047 | 258,124 | +1.9% |
-| zod | 387,473 | 454,182 | -14.7% (+0.7% against `--charset=utf8`, 384,756 bytes) |
+| lodash-es, tree-shaken | 35,145 | 35,207 | -0.2% |
+| all of lodash-es | 92,180 | 92,958 | -0.8% |
+| lodash (CommonJS) | 74,500 | 74,092 | +0.6% |
+| three | 263,253 | 258,124 | +2.0% |
+| zod | 456,947 | 454,182 | +0.6% |
 | rxjs | 18,199 | 17,510 | +3.9% |
 | date-fns | 23,240 | 22,915 | +1.4% |
-| preact | 11,047 | 11,045 | 0.0% |
+| preact | 11,047 | 11,045 | +0.0% |
 | immer | 9,562 | 9,431 | +1.4% |
-| react + react-dom/server | 217,450 | 216,850 | +0.3% |
-| d3 | 47,246 | 46,294 | +2.1% |
+| react + react-dom/server | 218,736 | 216,850 | +0.9% |
+| d3 | 47,251 | 46,294 | +2.1% |
 | features test app (small) | 2,679 | 2,520 | +6.3% |
 | re-exports test app (small) | 1,400 | 1,357 | +3.2% |
 
@@ -141,7 +142,8 @@ imports, `import x = …`, `export =`, `./x.js` meaning `./x.ts`, and `tsconfig.
 footer, tree shaking off, iife/esm/cjs and spec-defined output formats, `--target=es2015` and later (`??`, `?.`, logical
 assignment, `**`, numeric separators, optional catch binding, object spread and rest, async
 functions, async generators and `for await`, class fields, private members and static blocks, each
-checked by acorn at that version), several entries with `--outdir`, code splitting with
+checked by acorn at that version), `--drop:console`, `--drop:debugger`, `--pure:`, `--packages=external`, `--charset`,
+`--main-fields`, `--conditions`, `--resolve-extensions`, `--public-path`, several entries with `--outdir`, code splitting with
 shared chunks and `import()` (`--splitting`, `--entry-names`, `--chunk-names`, `--outbase`), global
 names, `--external`, `--platform=node`, identifier and syntax minification, source maps, and resolve,
 load, transform and optimize hooks.
