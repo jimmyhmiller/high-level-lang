@@ -57,13 +57,17 @@
     (set! (mut (.symbols (.table gr))) s symbol)))
 
 (defn import-symbol? [(gr (mut g/Graph)) (s i64)] (-> bool)
-  (> (len (rt/rel-bucket (mut (.import-of (.db gr))) 0 s)) 0))
+  (or (> (len (rt/rel-bucket (mut (.import-of (.db gr))) 0 s)) 0)
+      (> (len (rt/rel-bucket (mut (.ns-import (.db gr))) 0 s)) 0)))
 
 ;;; What a symbol finally means: an import means whatever it resolves to.
 (defn target-of [(gr (mut g/Graph)) (s i64)] (-> i64)
-  (let [rows (rt/rel-bucket (mut (.import-of (.db gr))) 0 s)]
+  (let [rows (rt/rel-bucket (mut (.import-of (.db gr))) 0 s)
+        ns-rows (rt/rel-bucket (mut (.ns-import (.db gr))) 0 s)]
     (if (= (len rows) 0)
-        s
+        (if (> (len ns-rows) 0)
+            (.ns-sym (g/module-at (mut gr) (rt/rel-at (mut (.ns-import (.db gr))) (get ns-rows 0) 1)))
+            s)
         (let [row (get rows 0)
               d (rt/rel-at (mut (.import-of (.db gr))) row 1)
               n (rt/rel-at (mut (.import-of (.db gr))) row 2)
@@ -175,6 +179,69 @@
     (None [] (None [g/CjsImport]))))
 
 ;;; Function-like kinds rebind `this`; arrows do not.
+;;; `ns.name` when `ns` is `import * as` of an ES module: the export itself.
+(defn namespace-read [(gr (mut g/Graph)) (m g/Module) (n js/Node)] (-> (Option js/Node))
+  (match (g/namespace-of (mut gr) m (get (.kids n) 0))
+    (None [] (None [js/Node]))
+    (Some [target]
+      (let [name (.text (get (.kids n) 1))]
+        (match (resolved-export (mut gr) target (rt/intern! (mut (.names gr)) name))
+          (Some [s] (Some (ident (final-of (mut gr) (target-of (mut gr) s)))))
+          (None [] (Some (void-zero))))))))
+
+;;; The symbol an export name means in a module, preferring one that is not an import.
+(defn resolved-export [(gr (mut g/Graph)) (module i64) (name i64)] (-> (Option i64))
+  (let [(mut out) (None [i64])]
+    (for r (rt/rel-bucket (mut (.resolved (.db gr))) 0 module)
+      (when (= (rt/rel-at (mut (.resolved (.db gr))) r 1) name)
+        (let [candidate (rt/rel-at (mut (.resolved (.db gr))) r 2)]
+          (match out
+            (None [] (set! out (Some candidate)))
+            (Some [_]
+              (unless (import-symbol? (mut gr) candidate) (set! out (Some candidate))))))))
+    out))
+
+(defn require-of [(gr (mut g/Graph)) (t g/Module)] (-> js/Node)
+  (let [(mut none) (js/new-kids)]
+    (push! (mut none) (js/mk (js/KList) (js/new-kids) 0 0))
+    (js/node2 (js/KCallExpr)
+              (ident (final-of (mut gr) (.require-sym t)))
+              (js/mk (js/KArgs) none 0 0))))
+
+;;; `require("x")` of a wrapped ES module: `(init_x(), __toCommonJS(x_exports))`.
+(defn require-esm-text [(gr (mut g/Graph)) (t g/Module)] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) "(")
+    (push-str! (mut b) (final-of (mut gr) (.init-sym t)))
+    (push-str! (mut b) "(),")
+    (push-str! (mut b) (final-of (mut gr) (g/helper! (mut gr) "__toCommonJS")))
+    (push-str! (mut b) "(")
+    (push-str! (mut b) (final-of (mut gr) (.ns-sym t)))
+    (push-str! (mut b) "));")
+    (finish! (mut b))))
+
+(defn expression-of [(text (slice u8))] (-> js/Node)
+  (get (.kids (first-stmt text)) 0))
+
+;;; `import("x")`: nothing to fetch in one bundle, so a resolved promise of its namespace.
+(defn import-call [(gr (mut g/Graph)) (t g/Module)] (-> js/Node)
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) "Promise.resolve().then(()=>")
+    (if (= (.kind t) (g/Cjs))
+        (do
+          (push-str! (mut b) (final-of (mut gr) (g/helper! (mut gr) "__toESM")))
+          (push-str! (mut b) "(")
+          (push-str! (mut b) (final-of (mut gr) (.require-sym t)))
+          (push-str! (mut b) "())"))
+        (do
+          (push-str! (mut b) "(")
+          (push-str! (mut b) (final-of (mut gr) (.init-sym t)))
+          (push-str! (mut b) "(),")
+          (push-str! (mut b) (final-of (mut gr) (.ns-sym t)))
+          (push-str! (mut b) ")")))
+    (push-str! (mut b) ");")
+    (expression-of (finish! (mut b)))))
+
 (defn rebinds-this? [(k js/Kind)] (-> bool)
   (and (sc/function? k)
        (not (or (= k (js/KArrow)) (= k (js/KAsyncArrow))))))
@@ -222,6 +289,19 @@
                       (js/leaf (js/KPropName) (.text old) 0 0)
                       (js/node2 (js/KBindElement) new init)))))
     (js/KCallExpr [] (rw-call (mut gr) m n depth))
+    (js/KMember []
+      (match (namespace-read (mut gr) m n)
+        (Some [read] read)
+        (None []
+          (js/node2 (js/KMember) (rw (mut gr) m (get (.kids n) 0) depth) (get (.kids n) 1)))))
+    (js/KImportCall []
+      (match (g/import-call-target (mut gr) m n)
+        (Some [t] (import-call (mut gr) (g/module-at (mut gr) t)))
+        (None [] (rw-kids (mut gr) m n depth))))
+    (js/KImportMeta []
+      (let [(mut kids) (js/new-kids)]
+        (push! (mut kids) (js/mk (js/KList) (js/new-kids) 0 0))
+        (js/mk (js/KObjectLit) kids 0 0)))
     (_
       (if (= (len (.kids n)) 0)
           n
@@ -236,6 +316,11 @@
                 (push! (mut kids) (rw (mut gr) m k inner))))
             (js/mk (.kind n) kids (.lo n) (.hi n)))))))
 
+(defn rw-kids [(gr (mut g/Graph)) (m g/Module) (n js/Node) (depth i64)] (-> js/Node)
+  (let [(mut kids) (js/new-kids)]
+    (for k (.kids n) (push! (mut kids) (rw (mut gr) m k depth)))
+    (js/mk (.kind n) kids (.lo n) (.hi n))))
+
 (defn final-of-exports [(gr (mut g/Graph)) (m g/Module)] (-> (slice u8))
   (let [wrapper (.parent (get (.scopes (.table gr)) (.root m)))]
     (match (get (.names (get (.scopes (.table gr)) wrapper)) "exports")
@@ -248,18 +333,11 @@
   (let [callee (get (.kids n) 0)
         args (get (.kids n) 1)
         arg-list (.kids (get (.kids args) 0))]
-    (if (and (= (.kind callee) (js/KIdent))
-             (= (.text callee) "require")
-             (= (.kind m) (g/Cjs))
-             (= (len arg-list) 1)
-             (= (.kind (get arg-list 0)) (js/KStr))
-             (match (get (.bindings m) (.lo callee)) (Some [_] false) (None [] true)))
-        (let [t (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get arg-list 0)))))
-              (mut none) (js/new-kids)]
-          (push! (mut none) (js/mk (js/KList) (js/new-kids) 0 0))
-          (js/node2 (js/KCallExpr)
-                    (ident (final-of (mut gr) (.require-sym t)))
-                    (js/mk (js/KArgs) none 0 0)))
+    (if (match (g/require-target (mut gr) m n) (Some [_] true) (None [] false))
+        (let [t (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get arg-list 0)))))]
+          (if (= (.kind t) (g/Cjs))
+              (require-of (mut gr) t)
+              (expression-of (require-esm-text (mut gr) t))))
         (let [new-callee (rw (mut gr) m callee depth)
               new-args (rw (mut gr) m args depth)
               wrapped
@@ -279,15 +357,20 @@
 ;;; The body statements of a part, ready to print. None for a part with no code.
 (defn part-output [(gr (mut g/Graph)) (m g/Module) (s js/Node)] (-> (Option js/Node))
   (match (.kind s)
-    (js/KImportBare [] (None [js/Node]))
-    (js/KExportAll [] (None [js/Node]))
-    (js/KExportFrom [] (None [js/Node]))
+    (js/KImportBare []
+      (let [t (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 0)))))]
+        (if (= (.kind t) (g/Cjs))
+            (Some (first-stmt (rt/join (final-of (mut gr) (.require-sym t)) "();")))
+            (init-call (mut gr) t))))
+    (js/KExportAll [] (init-call (mut gr) (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 0)))))))
+    (js/KExportAllAs [] (init-call (mut gr) (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 1)))))))
+    (js/KExportFrom [] (init-call (mut gr) (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 1)))))))
     (js/KExportNamed [] (None [js/Node]))
     (js/KImport []
       (let [t (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 1)))))]
         (if (= (.kind t) (g/Cjs))
             (Some (import-cjs-stmt (mut gr) m t))
-            (None [js/Node]))))
+            (init-call (mut gr) t))))
     (js/KExportVar []
       (let [(mut kids) (js/new-kids)]
         (push! (mut kids) (get (.kids s) 0))
@@ -296,6 +379,11 @@
     (js/KExportFunction [] (Some (rw (mut gr) m (get (.kids s) 0) 0)))
     (js/KExportClass [] (Some (rw (mut gr) m (get (.kids s) 0) 0)))
     (_ (Some (rw (mut gr) m s 0)))))
+
+(defn init-call [(gr (mut g/Graph)) (t g/Module)] (-> (Option js/Node))
+  (if (.wrapped t)
+      (Some (first-stmt (rt/join (final-of (mut gr) (.init-sym t)) "();")))
+      (None [js/Node])))
 
 (defn first-stmt [(text (slice u8))] (-> js/Node)
   (get (.kids (get (.kids (js/parse text "<generated>")) 1)) 0))
@@ -357,6 +445,102 @@
     (push-str! (mut t) "){}});")
     (fill-body (first-stmt (finish! (mut t))) body)))
 
+;;; `var x_exports = {}; __export(x_exports, { a: () => a, … });`, names sorted.
+(defn namespace-stmts! [(gr (mut g/Graph)) (m g/Module) (out (mut (ArrayList js/Node)))] (-> void)
+  (let [ns (final-of (mut gr) (.ns-sym m))
+        (mut names) (ArrayList::new [i64] (malloc-allocator))
+        (mut b) (str/StrBuf::new (malloc-allocator))]
+    (for r (rt/rel-bucket (mut (.resolved (.db gr))) 0 (.id m))
+      (let [n (rt/rel-at (mut (.resolved (.db gr))) r 1) (mut seen) false]
+        (for x names (when (= x n) (set! seen true)))
+        (unless seen (push! (mut names) n))))
+    ;; Insertion sort: a module exports few names.
+    (for i (range 1 (len names))
+      (let [(mut j) i]
+        (while (and (> j 0)
+                    (< (str/cmp (rt/name-of (mut (.names gr)) (get names j))
+                                (rt/name-of (mut (.names gr)) (get names (- j 1)))) 0))
+          (let [x (get names j)]
+            (set! (mut names) j (get names (- j 1)))
+            (set! (mut names) (- j 1) x))
+          (set! j (- j 1)))))
+    (push! (mut out) (first-stmt (rt/join (rt/join "var " ns) "={};")))
+    (push-str! (mut b) (final-of (mut gr) (g/helper! (mut gr) "__export")))
+    (push-str! (mut b) "(")
+    (push-str! (mut b) ns)
+    (push-str! (mut b) ",{")
+    (for i (range 0 (len names))
+      (let [n (get names i)
+            name (rt/name-of (mut (.names gr)) n)]
+        (match (resolved-export (mut gr) (.id m) n)
+          (Some [s]
+            (when (> i 0) (push-str! (mut b) ","))
+            (if (plain-key? name)
+                (push-str! (mut b) name)
+                (do (push-str! (mut b) "\"") (push-str! (mut b) name) (push-str! (mut b) "\"")))
+            (push-str! (mut b) ":()=>")
+            (push-str! (mut b) (final-of (mut gr) (target-of (mut gr) s))))
+          (None [] (panic "{}: lost export {}" (.path m) name)))))
+    (push-str! (mut b) "});")
+    (push! (mut out) (first-stmt (finish! (mut b))))))
+
+(defn plain-key? [(s (slice u8))] (-> bool)
+  (let [(mut ok) (and (> (len s) 0) (rt/name-start? (get s 0)))]
+    (for c s (unless (rt/name-char? c) (set! ok false)))
+    ok))
+
+(defn function-decl? [(k js/Kind)] (-> bool)
+  (or (= k (js/KFuncDecl)) (= k (js/KGenDecl)) (= k (js/KAsyncFuncDecl)) (= k (js/KAsyncGenDecl))))
+
+;;; A `var` statement inside an initialiser: its names hoist out and its values become
+;;; assignments. Functions hoist whole.
+(defn wrapped-stmt! [(s js/Node) (path (slice u8))
+                     (hoisted (mut (ArrayList (slice u8))))
+                     (functions (mut (ArrayList js/Node)))
+                     (body (mut (ArrayList js/Node)))] (-> void)
+  (cond
+    (function-decl? (.kind s)) (push! (mut functions) s)
+    (= (.kind s) (js/KVarDecl))
+      (for d (.kids (get (.kids s) 0))
+        (let [target (get (.kids d) 0) init (get (.kids d) 1)]
+          (unless (= (.kind target) (js/KBindName))
+            (panic "{}: destructuring at the top level of a module that is required or imported dynamically is not implemented yet" path))
+          (push! (mut hoisted) (.text target))
+          (unless (= (.kind init) (js/KNone))
+            (let [(mut kids) (js/new-kids)
+                  (mut assign) (js/new-kids)]
+              (push! (mut assign) (ident (.text target)))
+              (push! (mut assign) (js/leaf (js/KAssignOp) "=" 0 0))
+              (push! (mut assign) init)
+              (push! (mut kids) (js/mk (js/KAssignment) assign 0 0))
+              (push! (mut body) (js/mk (js/KExprStmt) kids 0 0))))))
+    :else (push! (mut body) s)))
+
+;;; `var a, b; function f() {} var init_x = __esm({ "path"() { a = 1; } });`
+(defn wrapped-module! [(gr (mut g/Graph)) (m g/Module) (outputs (ArrayList js/Node)) (out (mut (ArrayList js/Node)))] (-> void)
+  (let [(mut hoisted) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut functions) (js/new-kids)
+        (mut body) (js/new-kids)
+        (mut t) (str/StrBuf::new (malloc-allocator))]
+    (for s outputs (wrapped-stmt! s (.path m) (mut hoisted) (mut functions) (mut body)))
+    (when (> (len hoisted) 0)
+      (let [(mut v) (str/StrBuf::new (malloc-allocator))]
+        (push-str! (mut v) "var ")
+        (for i (range 0 (len hoisted))
+          (when (> i 0) (push-str! (mut v) ","))
+          (push-str! (mut v) (get hoisted i)))
+        (push-str! (mut v) ";")
+        (push! (mut out) (first-stmt (finish! (mut v))))))
+    (for f functions (push! (mut out) f))
+    (push-str! (mut t) "var ")
+    (push-str! (mut t) (final-of (mut gr) (.init-sym m)))
+    (push-str! (mut t) "=")
+    (push-str! (mut t) (final-of (mut gr) (g/helper! (mut gr) "__esm")))
+    (push-str! (mut t) "({\"")
+    (push-str! (mut t) (.path m))
+    (push-str! (mut t) "\"(){}});")
+    (push! (mut out) (fill-body (first-stmt (finish! (mut t))) body))))
+
 ;;; Every live statement, in module order.
 (defn program [(gr (mut g/Graph))] (-> js/Node)
   (let [(mut out) (js/new-kids)]
@@ -365,11 +549,22 @@
         (let [m (g/module-at (mut gr) id)]
           (if (= (.kind m) (g/Cjs))
               (push! (mut out) (cjs-part (mut gr) m))
-              (for p (parts-of (mut gr) id)
-                (when (live? (mut gr) p)
-                  (match (part-output (mut gr) m (get (.part-stmt gr) p))
-                    (Some [s] (push! (mut out) s))
-                    (None [] 0))))))))
+              (let [(mut outputs) (js/new-kids)]
+                (for p (parts-of (mut gr) id)
+                  (when (live? (mut gr) p)
+                    (let [s (get (.part-stmt gr) p)]
+                      (match (.kind s)
+                        (js/KNone [] (namespace-stmts! (mut gr) m (mut out)))
+                        (js/KFlag [] 0)
+                        (_
+                          (match (part-output (mut gr) m s)
+                            (Some [o]
+                              (if (.wrapped m)
+                                  (push! (mut outputs) o)
+                                  (push! (mut out) o)))
+                            (None [] 0)))))))
+                (when (.wrapped m)
+                  (wrapped-module! (mut gr) m outputs (mut out))))))))
     (let [(mut top) (js/new-kids)]
       (push! (mut top) (js/none-node))
       (push! (mut top) (js/mk (js/KList) out 0 0))
