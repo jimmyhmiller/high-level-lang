@@ -1,0 +1,217 @@
+;;; One build, from options to a file. The command line and `.bundler` specs are both
+;;; just ways of filling in `Options`.
+(module bundle.api)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.str" :as str)
+(import "coil.thread" :use [Thread ThreadConfig])
+(import "coil.time" :use [monotonic-now-ms])
+(import "coil.var" :use [var-static])
+(import "bundle.js" :as js)
+(import "bundle.graph" :as g)
+(import "bundle.emit" :as e)
+(import "bundle.mangle" :as mangle)
+(import "bundle.resolve" :as res)
+(import "bundle.fold" :as fold)
+(import "bundle.minify" :as minify)
+(import "bundle.final" :as final)
+(import "hl.rt" :as rt)
+
+(defsum Format (Iife) (Esm) (Cjs))
+(derive Eq Format)
+
+(defstruct DefineText [(key (slice u8)) (value (slice u8))])
+
+(defstruct Options
+  [(entry (slice u8))
+   (outfile (slice u8))
+   (format Format)
+   (global-name (slice u8))
+   (minify-identifiers bool)
+   (minify-syntax bool)
+   (pretty bool)
+   (timing bool)
+   (defines (ArrayList DefineText))
+   (main-fields (ArrayList (slice u8)))
+   (conditions (ArrayList (slice u8)))
+   (extensions (ArrayList (slice u8)))
+   ;; A pass over one syntax tree: input pointer, output pointer.
+   (transform (Option (fnptr (cc/C) [(ptr js/Node) (ptr js/Node)] void)))
+   (optimize (Option (fnptr (cc/C) [(ptr js/Node) (ptr js/Node)] void)))])
+
+(defn words [(a (slice u8)) (b (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (push! (mut out) a)
+    (push! (mut out) b)
+    out))
+
+(defn options-new [(entry (slice u8)) (outfile (slice u8))] (-> Options)
+  (let [(mut exts) (words ".js" ".mjs")]
+    (push! (mut exts) ".cjs")
+    (push! (mut exts) ".json")
+    (Options :entry entry :outfile outfile :format (Iife) :global-name ""
+             :minify-identifiers false :minify-syntax false :pretty false :timing false
+             :defines (ArrayList::new [DefineText] (malloc-allocator))
+             :main-fields (words "module" "main")
+             :conditions (words "import" "browser")
+             :extensions exts
+             :transform (None [(fnptr (cc/C) [(ptr js/Node) (ptr js/Node)] void)])
+             :optimize (None [(fnptr (cc/C) [(ptr js/Node) (ptr js/Node)] void)]))))
+
+(defn define! [(o (mut Options)) (key (slice u8)) (value (slice u8))] (-> void)
+  (push! (mut (.defines o)) (DefineText :key key :value value)))
+
+(defn clear-words [] (-> (ArrayList (slice u8)))
+  (ArrayList::new [(slice u8)] (malloc-allocator)))
+
+;; ---------------------------------------------------------------- timing
+
+(def LAST-MS (var-static i64 0))
+
+(defn lap! [(o (mut Options)) (label (slice u8))] (-> void)
+  (when (.timing o)
+    (match (monotonic-now-ms)
+      (Ok [now]
+        (when (> (get LAST-MS) 0) (println "{:>6} ms  {}" (- now (get LAST-MS)) label))
+        (set LAST-MS now))
+      (Err [_] 0))))
+
+;; ---------------------------------------------------------------- the build
+
+;;; A define's value is a JavaScript expression in text: `false`, `"production"`, `1`.
+(defn define-value [(text (slice u8))] (-> js/Node)
+  (e/expression-of (rt/join text ";")))
+
+(defn has-define? [(o (mut Options)) (key (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for d (.defines o) (when (= (.key d) key) (set! hit true)))
+    hit))
+
+(defn push-stmt! [(p js/Node) (s js/Node)] (-> js/Node)
+  (let [(mut stmts) (js/sublist (.kids (get (.kids p) 1)) 0 (len (.kids (get (.kids p) 1))))
+        (mut top) (js/new-kids)]
+    (push! (mut stmts) s)
+    (push! (mut top) (get (.kids p) 0))
+    (push! (mut top) (js/mk (js/KList) stmts 0 0))
+    (js/mk (js/KProgram) top 0 0)))
+
+;;; An entry that is itself wrapped only runs if something calls it.
+(defn run-entry [(gr (mut g/Graph)) (p js/Node)] (-> js/Node)
+  (let [m (g/module-at (mut gr) (.entry gr))]
+    (cond
+      (= (.kind m) (g/Cjs))
+        (push-stmt! p (e/first-stmt (rt/join (e/final-of (mut gr) (.require-sym m)) "();")))
+      (.wrapped m)
+        (push-stmt! p (e/first-stmt (rt/join (e/final-of (mut gr) (.init-sym m)) "();")))
+      :else p)))
+
+(defn to-common-js [(gr (mut g/Graph))] (-> (slice u8))
+  (let [m (g/module-at (mut gr) (.entry gr))
+        (mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) (e/final-of (mut gr) (g/helper! (mut gr) "__toCommonJS")))
+    (push-str! (mut b) "(")
+    (push-str! (mut b) (e/final-of (mut gr) (.ns-sym m)))
+    (push-str! (mut b) ")")
+    (finish! (mut b))))
+
+;;; `export { a, b as c };` for the entry's names.
+(defn esm-exports [(gr (mut g/Graph))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))
+        (mut seen) (ArrayList::new [i64] (malloc-allocator))
+        (mut any) false]
+    (push-str! (mut b) "export {")
+    (for r (rt/rel-bucket (mut (.resolved (.db gr))) 0 (.entry gr))
+      (let [n (rt/rel-at (mut (.resolved (.db gr))) r 1) (mut dup) false]
+        (for x seen (when (= x n) (set! dup true)))
+        (unless dup
+          (push! (mut seen) n)
+          (match (e/resolved-export (mut gr) (.entry gr) n)
+            (Some [s]
+              (when any (push-str! (mut b) ","))
+              (set! any true)
+              (push-str! (mut b) (e/final-of (mut gr) (e/target-of (mut gr) s)))
+              (push-str! (mut b) " as ")
+              (push-str! (mut b) (rt/name-of (mut (.names gr)) n)))
+            (None [] 0)))))
+    (push-str! (mut b) "};")
+    (if any (finish! (mut b)) "")))
+
+(defn wrap-format [(o (mut Options)) (gr (mut g/Graph)) (p js/Node)] (-> (slice u8))
+  (match (.format o)
+    (Iife []
+      (if (> (len (.global-name o)) 0)
+          (let [(mut b) (str/StrBuf::new (malloc-allocator))
+                body (js/render (push-stmt! p (e/first-stmt (rt/join (rt/join "return " (to-common-js (mut gr))) ";")))
+                                (.pretty o))]
+            (push-str! (mut b) "var ")
+            (push-str! (mut b) (.global-name o))
+            (push-str! (mut b) "=(()=>{")
+            (push-str! (mut b) body)
+            (push-str! (mut b) "})();\n")
+            (finish! (mut b)))
+          (rt/join (rt/join "(()=>{" (js/render p (.pretty o))) "})();\n")))
+    (Cjs []
+      (let [text (rt/join (rt/join "module.exports=" (to-common-js (mut gr))) ";")
+            body (js/render (push-stmt! p (e/first-stmt text)) (.pretty o))]
+        (rt/join body "\n")))
+    (Esm []
+      (let [exports (esm-exports (mut gr))
+            body (js/render (if (> (len exports) 0) (push-stmt! p (e/first-stmt exports)) p) (.pretty o))]
+        (rt/join body "\n")))))
+
+(defn build [(options Options)] (-> void)
+  (let [(mut o) options
+        r (res/Options :main-fields (.main-fields o) :conditions (.conditions o)
+                       :extensions (.extensions o) :cache (res/cache-new))
+        (mut gr) (g/graph-new r)]
+    (lap! (mut o) "startup")
+    (unless (has-define? (mut o) "process.env.NODE_ENV")
+      (define! (mut o) "process.env.NODE_ENV"
+               (if (.minify-syntax o) "\"production\"" "\"development\"")))
+    (for d (.defines o)
+      (push! (mut (.defines gr)) (g/Define :key (.key d) :value (define-value (.value d)))))
+    (set! (.void-undefined gr) (.minify-syntax o))
+    (set! (.transform gr) (.transform o))
+    (set! (.keep-entry-exports gr) (= (.format o) (Esm)))
+    (set! (.entry-namespace gr)
+          (or (= (.format o) (Cjs))
+              (and (= (.format o) (Iife)) (> (len (.global-name o)) 0))))
+    (g/load-runtime! (mut gr) (include-str "runtime.js"))
+    (g/load-tree! (mut gr) (.entry o))
+    (lap! (mut o) "load: resolve, parse, scopes")
+    (g/link! (mut gr))
+    (lap! (mut o) "link: facts and Datalog")
+    (if (.minify-identifiers o) (mangle/assign-minified! (mut gr)) (e/assign-names! (mut gr)))
+    (lap! (mut o) "naming")
+    (let [emitted (run-entry (mut gr) (e/program (mut gr)))
+          p (do
+              (lap! (mut o) "emit: rewrite identifiers")
+              (if (.minify-syntax o)
+                  (match (.optimize o)
+                    (Some [f]
+                      (let [(mut input) emitted (mut out) emitted]
+                        (f (cast (ptr js/Node) (mut input)) (cast (ptr js/Node) (mut out)))
+                        out))
+                    (None [] (final/run (minify/run emitted))))
+                  (fold/run emitted)))
+          text (do (lap! (mut o) "minify rules") (wrap-format (mut o) (mut gr) p))]
+      (lap! (mut o) "print")
+      (rt/write-output (.outfile o) text)
+      (lap! (mut o) "write")
+      (println "{} bytes -> {}" (len text) (.outfile o)))))
+
+;; ---------------------------------------------------------------- big stack
+
+;;; Trees can be as deep as a merged statement list is long, so builds run on a thread
+;;; with room for that.
+(defn run-on-big-stack [(body (fnptr (cc/C) [(ptr i8)] (ptr i8)))] (-> void)
+  (let [(mut t) (Thread :handle (cast (ptr i8) 0))]
+    (when (!= (Thread::spawn-configured (cast (ptr Thread) (mut t))
+                                        body
+                                        (cast (ptr i8) 0)
+                                        (ThreadConfig :stack-size 1073741824 :guard-size 0))
+              (: 0 i32))
+      (panic "could not start the build thread"))
+    (join (cast (ptr Thread) (mut t)))
+    0))
