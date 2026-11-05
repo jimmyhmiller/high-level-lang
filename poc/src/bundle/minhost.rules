@@ -1,0 +1,255 @@
+# What the minifier's rules ask about nodes and text.
+rules bundle.minhost over bundle.js
+use bundle.js as js
+
+fn opaque(n: Node) -> Bool = js.opaque-spine?(n)
+fn present(n: Node) -> Bool = not (n is None())
+
+# A string expression statement might be a directive, which must stay one.
+fn directive(n: Node) -> Bool = n is Str(_)
+
+# Declarations a block scopes to itself.
+fn not-lexical(n: Node) -> Bool = match n {
+  LetDecl(...) | ConstDecl(...) | ClassDecl(...)
+    | FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) => false
+  _ => true
+}
+
+fn all-plain(xs: [Node]) -> Bool = all x in xs: not-lexical(x)
+
+# Would this statement grab a following `else` if it lost its braces?
+fn trailing-if?(n: Node) -> Bool = match n {
+  If(_, _, e) => e is None() or trailing-if?(e)
+  For(_, _, _, b) | ForOf(_, _, _, b) => trailing-if?(b)
+  ForIn(_, _, b) => trailing-if?(b)
+  While(_, b) | With(_, b) | Labeled(_, b) => trailing-if?(b)
+  _ => false
+}
+
+fn no-dangling(n: Node) -> Bool = not trailing-if?(n)
+
+# Does control never fall out of this statement?
+fn jumps(n: Node) -> Bool = n is Return(_) | Throw(_) | Break(_) | Continue(_)
+
+# Removing dead code must keep what hoists out of it. Nested functions have their own scope.
+fn no-hoist(n: Node) -> Bool = match n {
+  VarDecl(...) | VarInit(...) | VarLeft(...) | VarLeftInit(...)
+    | FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) => false
+  FuncExpr(...) | Arrow(...) | Method(...) => true
+  _ => all k in n.kids: no-hoist(k)
+}
+
+fn name-text?(s: Text) -> Bool =
+  len(s) > 0 and name-start-byte?(s[0]) and (all c in s: name-byte?(c))
+
+fn plain-key(raw: Text) -> Bool = name-text?(unquote(raw))
+fn dot(o: Node, raw: Text) -> Node = Member(o, PropName(unquote(raw)))
+fn plain-prop(raw: Text, v: Node) -> Node = Prop(PropName(unquote(raw)), v)
+
+# ---------------------------------------------------------------- numbers
+
+fn digit-value(c: Int) -> Int =
+  if digit-byte?(c) then c - '0'
+  else if c >= 'a' and c <= 'f' then c - 'a' + 10
+  else if c >= 'A' and c <= 'F' then c - 'A' + 10
+  else -1
+
+fn hex-value(s: Text) -> Int? {
+  if not (len(s) > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X') and len(s) < 16) {
+    return none
+  }
+  var v = 0
+  for i in 2..len(s) {
+    let d = digit-value(s[i])
+    if d < 0 { return none }
+    v = v * 16 + d
+  }
+  some(v)
+}
+
+# An integer's shortest decimal spelling: 1000 as 1e3.
+fn int-spelling(v: Int) -> Text {
+  let text = int-text(v)
+  var zeros = 0
+  var i = len(text) - 1
+  while i > 0 and text[i] == '0' {
+    zeros += 1
+    i = i - 1
+  }
+  if zeros >= 3 then text[0..len(text) - zeros] ++ "e" ++ int-text(zeros) else text
+}
+
+# `0.5` as `.5`, `1.50` as `1.5`, `2.0` as `2`, `1e+21` as `1e21`.
+fn float-spelling(s: Text) -> Text {
+  var mantissa = s
+  var exponent = ""
+  for i in 0..len(s) {
+    if len(exponent) == 0 and (s[i] == 'e' or s[i] == 'E') {
+      mantissa = s[0..i]
+      let rest = s[i + 1..len(s)]
+      exponent = if len(rest) > 0 and rest[0] == '+' then rest[1..len(rest)] else rest
+    }
+  }
+  var point = -1
+  for i in 0..len(mantissa) {
+    if mantissa[i] == '.' { point = i }
+  }
+  if point >= 0 {
+    var end = len(mantissa)
+    while mantissa[end - 1] == '0' { end = end - 1 }
+    if mantissa[end - 1] == '.' { end = end - 1 }
+    mantissa = mantissa[0..end]
+    if len(mantissa) > 1 and mantissa[0] == '0' and mantissa[1] == '.' {
+      mantissa = mantissa[1..len(mantissa)]
+    }
+  }
+  if len(exponent) > 0 then mantissa ++ "e" ++ exponent else mantissa
+}
+
+fn number-byte?(c: Int) -> Bool =
+  digit-byte?(c) or c == '.' or c == 'e' or c == 'E' or c == '+' or c == '-'
+
+# A leading zero with more digits is legacy octal.
+fn plain-number?(s: Text) -> Bool =
+  len(s) > 0 and (all c in s: number-byte?(c))
+    and not (len(s) > 1 and s[0] == '0' and digit-byte?(s[1]))
+
+fn best-number(s: Text) -> Text = match parse-int-opt(s) {
+  some(v) => int-spelling(v)
+  none => match hex-value(s) {
+    some(v) => {
+      let d = int-spelling(v)
+      if len(d) < len(s) then d else s
+    }
+    none => if plain-number?(s) then float-spelling(s) else s
+  }
+}
+
+fn num-shorter(n: Node) -> Bool = len(best-number(n.text)) < len(n.text)
+fn num-short(n: Node) -> Node = Num(best-number(n.text)) with { lo: n.lo, hi: n.hi }
+
+# ---------------------------------------------------------------- strings
+
+# The same string in the given quote, with its escapes adjusted.
+fn requote(raw: Text, quote: Int) -> Text {
+  let content = unquote(raw)
+  var b = buf-new()
+  var i = 0
+  buf-byte!(b, quote)
+  while i < len(content) {
+    let c = content[i]
+    if c == '\\' and i + 1 < len(content) {
+      let e = content[i + 1]
+      if (e == '"' or e == '\'') and e != quote {
+        buf-byte!(b, e)
+      } else {
+        buf-byte!(b, c)
+        buf-byte!(b, e)
+      }
+      i = i + 2
+    } else {
+      if c == quote { buf-byte!(b, '\\') }
+      buf-byte!(b, c)
+      i = i + 1
+    }
+  }
+  buf-byte!(b, quote)
+  buf-text(b)
+}
+
+# Double quotes, unless single quotes are shorter.
+fn best-string(raw: Text) -> Text {
+  let d = requote(raw, '"')
+  let s = requote(raw, '\'')
+  if len(s) < len(d) then s else d
+}
+
+fn str-better(n: Node) -> Bool = best-string(n.text) != n.text
+fn str-best(n: Node) -> Node = Str(best-string(n.text)) with { lo: n.lo, hi: n.hi }
+
+# Same string contents? Without an escape on either side the spelling is the value. With one,
+# neither question is answered, so nothing folds.
+fn escape-free?(s: Text) -> Bool = all c in s: c != '\\'
+
+fn same-text(a: Text, b: Text) -> Bool =
+  escape-free?(a) and escape-free?(b) and unquote(a) == unquote(b)
+fn different-text(a: Text, b: Text) -> Bool =
+  escape-free?(a) and escape-free?(b) and unquote(a) != unquote(b)
+
+# Two reads of the same plain variable: safe to merge, reading one has no effect.
+fn same-ref(a: Node, b: Node) -> Bool = match a {
+  Ident(x) => match b {
+    Ident(y) => x == y
+    _ => false
+  }
+  _ => false
+}
+
+# ---------------------------------------------------------------- template literals
+
+fn interpolation-at?(s: Text, i: Int) -> Bool = s[i] == '$' and i + 1 < len(s) and s[i + 1] == '{'
+
+# A string with raw newlines is shorter as a template: `\n` is two bytes, a line break one.
+fn template-gain(raw: Text) -> Int {
+  let content = unquote(raw)
+  var gain = 0
+  var i = 0
+  while i < len(content) {
+    let c = content[i]
+    if c == '\\' and i + 1 < len(content) {
+      let e = content[i + 1]
+      if e == 'n' or e == '"' or e == '\'' { gain += 1 }
+      i = i + 2
+    } else {
+      if c == '`' or interpolation-at?(content, i) { gain = gain - 1 }
+      i = i + 1
+    }
+  }
+  gain
+}
+
+# A string's content as a template token.
+fn as-template(raw: Text) -> Text {
+  let content = unquote(raw)
+  var b = buf-new()
+  var i = 0
+  buf-byte!(b, '`')
+  while i < len(content) {
+    let c = content[i]
+    if c == '\\' and i + 1 < len(content) {
+      let e = content[i + 1]
+      if e == 'n' {
+        buf-byte!(b, '\n')
+      } else if e == '"' or e == '\'' {
+        buf-byte!(b, e)
+      } else {
+        buf-byte!(b, c)
+        buf-byte!(b, e)
+      }
+      i = i + 2
+    } else {
+      if c == '`' or interpolation-at?(content, i) { buf-byte!(b, '\\') }
+      buf-byte!(b, c)
+      i = i + 1
+    }
+  }
+  buf-byte!(b, '`')
+  buf-text(b)
+}
+
+# A key or a directive cannot be a template, so this walk knows positions.
+fn key-first?(n: Node) -> Bool =
+  n is Prop(...) | Method(...) | GenMethod(...) | AsyncMethod(...) | AsyncGenMethod(...)
+     | Getter(...) | Setter(...) | Field(...) | StaticField(...) | PatProp(...)
+
+fn templates(n: Node) -> Node = match n {
+  Str(raw) =>
+    if template-gain(raw) > 0
+    then TemplateFull(as-template(raw)) with { lo: n.lo, hi: n.hi }
+    else n
+  ExprStmt(Str(_)) => n
+  _ => if len(n.kids) == 0 then n else {
+    let skip = key-first?(n)
+    n with { kids: [if skip and i == 0 then n.kids[i] else templates(n.kids[i]) for i in 0..len(n.kids)] }
+  }
+}

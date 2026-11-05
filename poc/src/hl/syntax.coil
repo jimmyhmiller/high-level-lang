@@ -431,7 +431,15 @@
     (OStar [] true) (OPlus [] true) (OOpt [] true) (OSepStar [] true) (OSepPlus [] true)
     (OKeep [] (captures? g (mut c) (get (.kids e) 0)))
     (OWith [] (captures? g (mut c) (get (.kids e) 0)))
+    (OChoice [] (no-captures-inside! g (mut c) e) false)
+    (OSeq [] (no-captures-inside! g (mut c) e) false)
     (_ false)))
+
+;;; A bare group is matched but yields nothing, so a capture inside it would vanish.
+(defn no-captures-inside! [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> void)
+  (for k (.kids e)
+    (when (captures? g (mut c) k)
+      (dsl/die (mut c) (.tok k) "this capture is inside a bare group and would be lost; give the group a rule"))))
 
 (defn seq-items [(e PE)] (-> (ArrayList PE))
   (if (= (.op e) (OSeq))
@@ -1359,6 +1367,8 @@
        (import "coil.alloc" :use [malloc-allocator box!])
        (import "coil.arraylist" :use [ArrayList])
        (import "hl.rt" :as rt)
+       (import "coil.primitive" :as primitive)
+       (import "hl.quote" :as hq)
 
        ~@flag-consts
 
@@ -1396,6 +1406,22 @@
            (mk k kids (.lo a) (.hi b))))
        (defn box-node [(n Node)] (-> i64)
          (cast i64 (box! (rt/tree-allocator) Node n)))
+
+       ;; Templates: source text in this grammar, read at compile time. `hl.quote` turns
+       ;; the tree into code that builds it, for whichever grammar it came from.
+       (defn quote-tree [(n Node)] (-> hq/QNode)
+         (let [(mut kids) (ArrayList::new [hq/QNode] (malloc-allocator))]
+           (for (ref k) (.kids n) (push! (mut kids) (quote-tree k)))
+           (hq/QNode :kind (kind-name (.kind n)) :text (.text n) :kids kids)))
+       ;;; ALIAS is how the caller imported this grammar, PATH the children to descend
+       ;;; to reach the form wanted, HOLES ((NAME VALUE SORT) …).
+       (defn quote-template [(alias Code) (src Code) (path Code) (holes Code)] (-> Code)
+         (match (parse-result (primitive/code-str src) "<template>" 0)
+           (Err [e] (primitive/error (rt/join "this template does not parse: " (primitive/code-str src))))
+           (Ok [tree]
+             (let [(mut at) tree]
+               (for step path (set! at (get (.kids at) (primitive/code-int step))))
+               (hq/expansion (quote-tree at) (primitive/code-str alias) holes)))))
 
        ;;; Most tokens have no space before them, and the grammar says which bytes could
        ;;; begin some: anything else needs no look at all.
@@ -1456,6 +1482,25 @@
          (match (parse-result src path 0)
            (Ok [n] n)
            (Err [e] (rt/parse-failed e))))
+
+       ;;; Parse, trying again under other flags if that fails. Errors are the first try's.
+       (defn parse-tries [(src (slice u8)) (path (slice u8)) (flags i64)] (-> Node)
+         (match (parse-result src path 0)
+           (Ok [t] t)
+           (Err [first]
+             (match (parse-result src path flags)
+               (Ok [t] t)
+               (Err [_] (rt/parse-failed first))))))
+
+       ;;; Parse under flags, or nothing, for tools that report failures themselves.
+       (defn parse-opt [(src (slice u8)) (path (slice u8)) (flags i64)] (-> (Option Node))
+         (match (parse-result src path flags)
+           (Ok [t] (Some t))
+           (Err [e] (set! (.last (rt/last-parse-error)) e) (None [Node]))))
+
+       ;;; A flag's bit, by name.
+       (defn flag-bit [(name (slice u8))] (-> i64)
+         (cond ~@(flag-arms g) :else (panic "no flag named {}" name)))
 
        (defn kind-level [(k Kind)] (-> i64)
          (match k ~@level-arms (_ ~(no-level))))
@@ -1526,6 +1571,13 @@
            (KNone [] 0)
            (KFlag [] 0)))
 
+       ;;; Printed text and where each leaf landed, for source maps.
+       (defn render-tracked [(n Node) (pretty bool) (tracking bool)] (-> rt/Rendered)
+         (let [(mut w) (rt/w-new pretty)]
+           (set! (.tracking w) tracking)
+           (print-at n 0 (mut w))
+           (rt/Rendered :text (rt/w-finish w) :marks (.marks w))))
+
        ;;; Print into a writer the caller set up, for one that tracks leaf positions.
        (defn render-into [(n Node) (w (mut rt/W))] (-> void)
          (print-at n 0 (mut w)))
@@ -1538,7 +1590,32 @@
 
 ;; ---------------------------------------------------------------- entry
 
-(defn read-grammar [(source (slice u8)) (path (slice u8))] (-> (slice u8))
+(defn flag-arms [(g Grammar)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for f (.flags g)
+      (push! (mut out) `(= name ~f))
+      (push! (mut out) (flag-sym f)))
+    `(~@out)))
+
+(defstruct Loaded [(grammar Grammar) (cursor dsl/Cur)])
+
+;;; One node a grammar declares: what another language checks itself against.
+(defstruct KindEntry [(name (slice u8)) (arity i64) (leaf bool)])
+
+;;; Every node of a grammar, for languages that read one without generating it.
+(defn grammar-table [(source (slice u8)) (path (slice u8))] (-> (ArrayList KindEntry))
+  (let [(mut l) (load-grammar source path)
+        (mut out) (ArrayList::new [KindEntry] (malloc-allocator))]
+    (for k (.kinds (.grammar l))
+      (push! (mut out)
+             (KindEntry :name (.name k) :arity (.arity k)
+                        :leaf (match (.print k) (PLeaf [] true) (_ false)))))
+    (push! (mut out) (KindEntry :name "List" :arity -1 :leaf false))
+    (push! (mut out) (KindEntry :name "None" :arity 0 :leaf false))
+    (push! (mut out) (KindEntry :name "Flag" :arity 0 :leaf false))
+    out))
+
+(defn load-grammar [(source (slice u8)) (path (slice u8))] (-> Loaded)
   (let [(mut c) (dsl/grammar-cursor source path "-> ,* ,+ = | ; * + ? ! & ~ ( ) . @ -")
         (mut g) (Grammar
                   :start "" :space "" :word ""
@@ -1553,7 +1630,6 @@
                   :memo-count 0 :next-aux 0
                   :aux (empty-strs)
                   :path path)
-        (mut levels) (ArrayList::new [Named] (malloc-allocator))
         (mut go) true]
     (dsl/expect! (mut c) "syntax")
     (while go
@@ -1594,6 +1670,13 @@
     (while (not (dsl/eof? (mut c)))
       (push! (mut (.decls g)) (read-decl (mut c))))
     (analyse! (mut g) (mut c))
+    (Loaded :grammar g :cursor c)))
+
+(defn read-grammar [(source (slice u8)) (path (slice u8))] (-> (slice u8))
+  (let [l (load-grammar source path)
+        (mut g) (.grammar l)
+        (mut c) (.cursor l)
+        (mut levels) (ArrayList::new [Named] (malloc-allocator))]
     (add-lit! (mut g) ",")
     (assign-levels! (mut g) (mut c) (mut levels))
     ;; Code generation order: bodies first, so literals and reps are all known.

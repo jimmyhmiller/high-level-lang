@@ -1,0 +1,2073 @@
+;;; `.rules`: the language for everything between a grammar and a Datalog program.
+;;;
+;;;   rules bundle.graph over bundle.js   # the file's module, and the grammar it works on
+;;;   use bundle.link as link             # another module of any language
+;;;   quote stmt at 1 0 ;                 # stmt`…` is the template's first statement
+;;;
+;;;   record Module { path: Text, deps: [Int] }
+;;;   enum Sort { Esm, Cjs }
+;;;   state modules: [Module] = []        # lives as long as the build
+;;;   context strict: Bool = false        # rebound for a dynamic extent by `with`
+;;;
+;;;   fn pure?(n: Node) -> Bool = match n {
+;;;     Num(_) | Str(_) => true
+;;;     Paren(x) | Not(x) => pure?(x)
+;;;     ArrayLit(List(xs...)) => all x in xs: pure?(x)
+;;;     _ => false
+;;;   }
+;;;   fn wrap(name: Text, body: [Node]) -> Node = stmt`var $name = $helper(() => { $$body });`
+;;;   for db.declares(p, ?s) { names[s] = final(s) }     # a query over a relation
+;;;
+;;; Node patterns and constructors are checked against the grammar, and everything is
+;;; type-checked here, across modules, so mistakes are located in the guest file. There is
+;;; no runtime: this compiles to the Coil a person would have written.
+(module hl.rules)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.slice" :use [subslice])
+(import "coil.str" :as str)
+(import "coil.meta" :as meta)
+(import "hl.rt" :as rt)
+(import "hl.dsl" :as dsl)
+(import "hl.syntax" :as syntax)
+(import "hl.grammars.rules" :as g)
+(import "hl.grammars.facts" :as gf)
+
+(reader-provider "hl.rules" read-rules)
+
+;; ---------------------------------------------------------------- what modules offer
+
+(defstruct Param [(name (slice u8)) (ty (slice u8)) (by-ref bool)])
+(defstruct Func [(name (slice u8)) (coil (slice u8)) (params (ArrayList Param)) (ret (slice u8))])
+(defstruct FieldDef [(name (slice u8)) (ty (slice u8))])
+(defstruct RecDef [(name (slice u8)) (fields (ArrayList FieldDef))])
+(defstruct EnumDef [(name (slice u8)) (variants (ArrayList (slice u8)))])
+(defstruct Global [(name (slice u8)) (ty (slice u8)) (assignable bool)])
+(defstruct RelDef [(name (slice u8)) (arity i64)])
+(defstruct QuoteDef [(name (slice u8)) (path (ArrayList i64))])
+(defstruct Alias [(name (slice u8)) (module (slice u8))])
+
+(defsum Sort (SRules) (SForeign) (SGrammar) (SFacts) (SRewrite) (SScopes))
+(derive Eq Sort)
+
+(defstruct Mod
+  [(name (slice u8))
+   (sort Sort)
+   (funcs (ArrayList Func))
+   (recs (ArrayList RecDef))
+   (enums (ArrayList EnumDef))
+   (globals (ArrayList Global))
+   (types (ArrayList (slice u8)))
+   (kinds (ArrayList syntax/KindEntry))
+   (rels (ArrayList RelDef))
+   (quotes (ArrayList QuoteDef))
+   (aliases (ArrayList Alias))
+   (over (slice u8))])
+
+(defstruct Local [(name (slice u8)) (ty (slice u8)) (sym (slice u8)) (mutable bool)])
+
+(defstruct Comp
+  [(mods (ArrayList Mod))
+   (self (slice u8))
+   (table (ArrayList Alias))     ; module name -> file, from the manifest
+   (base (slice u8))             ; the manifest's directory
+   (depends (ArrayList (slice u8)))
+   (src (slice u8))
+   (path (slice u8))
+   (locals (ArrayList Local))
+   (counter i64)
+   (in-with i64)
+   (returned bool)
+   (ret (slice u8))])
+
+;;; A compiled expression.
+(defstruct TE [(code Code) (ty (slice u8))])
+
+(defn te [(code Code) (ty (slice u8))] (-> TE) (TE :code code :ty ty))
+(defn kid [(n g/Node) (i i64)] (-> g/Node) (get (.kids n) i))
+(defn list-kids [(n g/Node)] (-> (ArrayList g/Node)) (.kids n))
+(defn none? [(n g/Node)] (-> bool) (= (.kind n) (g/KNone)))
+(defn text-list [] (-> (ArrayList (slice u8))) (ArrayList::new [(slice u8)] (malloc-allocator)))
+(defn sym [(s (slice u8))] (-> Code) (primitive/code-symbol s))
+(defn cat [(a (slice u8)) (b (slice u8))] (-> (slice u8)) (rt/join a b))
+(defn cat3 [(a (slice u8)) (b (slice u8)) (c (slice u8))] (-> (slice u8)) (rt/join (rt/join a b) c))
+(defn cat4 [(a (slice u8)) (b (slice u8)) (c (slice u8)) (d (slice u8))] (-> (slice u8)) (rt/join (cat3 a b c) d))
+
+(defn die [(k (mut Comp)) (n g/Node) (msg (slice u8))] (-> never)
+  (let [at (rt/line-col (.src k) (.lo n))]
+    (dsl/fail-at (.path k) (.line at) (.col at) msg)))
+
+(defn fresh [(k (mut Comp)) (base (slice u8))] (-> (slice u8))
+  (set! (.counter k) (+ (.counter k) 1))
+  (cat3 base "-" (rt/num-text (.counter k))))
+
+;; ---------------------------------------------------------------- types, as text
+;; Int Bool Text Void Never [T] T? {K:V} Fn(A,B)->R, or module.Type: a type is its own
+;; canonical name, so equality is text equality.
+
+(defn opt? [(t (slice u8))] (-> bool) (and (> (len t) 0) (= (get t (- (len t) 1)) #\?)))
+(defn list? [(t (slice u8))] (-> bool) (and (> (len t) 0) (= (get t 0) #\[)))
+(defn map? [(t (slice u8))] (-> bool) (and (> (len t) 0) (= (get t 0) #\{)))
+(defn fn? [(t (slice u8))] (-> bool) (rt/at? t 0 "Fn("))
+(defn opt-of [(t (slice u8))] (-> (slice u8)) (subslice t 0 (- (len t) 1)))
+(defn elem-of [(t (slice u8))] (-> (slice u8)) (subslice t 1 (- (len t) 1)))
+
+;;; Position of a top-level `c` in a type, past `from`.
+(defn top-level-at [(t (slice u8)) (from i64) (c u8)] (-> i64)
+  (let [(mut depth) 0 (mut out) -1 (mut i) from]
+    (while (and (< out 0) (< i (len t)))
+      (let [x (get t i)]
+        (cond
+          (and (= x c) (= depth 0)) (set! out i)
+          (or (= x #\[) (= x #\{) (= x #\()) (set! depth (+ depth 1))
+          (or (= x #\]) (= x #\}) (= x #\))) (set! depth (- depth 1))
+          :else 0))
+      (set! i (+ i 1)))
+    out))
+
+(defn map-key [(t (slice u8))] (-> (slice u8))
+  (subslice t 1 (top-level-at t 1 #\:)))
+(defn map-val [(t (slice u8))] (-> (slice u8))
+  (subslice t (+ (top-level-at t 1 #\:) 1) (- (len t) 1)))
+
+(defn fn-params [(t (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (text-list)
+        close (top-level-at t 3 #\))
+        (mut from) 3
+        (mut go) (> close 3)]
+    (while go
+      (let [next (top-level-at t from #\,)]
+        (if (and (>= next 0) (< next close))
+            (do (push! (mut out) (subslice t from next)) (set! from (+ next 1)))
+            (do (push! (mut out) (subslice t from close)) (set! go false)))))
+    out))
+(defn fn-ret [(t (slice u8))] (-> (slice u8))
+  (subslice t (+ (top-level-at t 3 #\)) 3) (len t)))
+
+(defn builtin-type? [(t (slice u8))] (-> bool)
+  (or (= t "Int") (= t "Bool") (= t "Text") (= t "Void") (= t "Never")))
+
+;;; The dot before a named type's own name.
+(defn last-dot [(t (slice u8))] (-> i64)
+  (let [(mut cut) -1]
+    (for i (range 0 (len t)) (when (= (get t i) #\.) (set! cut i)))
+    cut))
+(defn type-module [(t (slice u8))] (-> (slice u8)) (subslice t 0 (last-dot t)))
+(defn type-name [(t (slice u8))] (-> (slice u8)) (subslice t (+ (last-dot t) 1) (len t)))
+
+(defn alias-of [(module (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (for c module (push! (mut (.bytes b)) (if (= c #\.) #\- c)))
+    (finish! (mut b))))
+
+(defn qualified [(k (mut Comp)) (module (slice u8)) (name (slice u8))] (-> (slice u8))
+  (if (= module (.self k)) name (cat3 (alias-of module) "/" name)))
+
+(defn coil-type [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (cond
+    (= t "Int") `i64
+    (= t "Bool") `bool
+    (= t "Text") `(slice u8)
+    (or (= t "Void") (= t "Never")) `void
+    (opt? t) `(Option ~(coil-type (mut k) (opt-of t)))
+    (list? t) `(ArrayList ~(coil-type (mut k) (elem-of t)))
+    (map? t) `(HashMap ~(coil-type (mut k) (map-key t)) ~(coil-type (mut k) (map-val t)))
+    (fn? t)
+      (let [(mut ps) (primitive/code-list-new)]
+        (for p (fn-params t) (push! (mut ps) (coil-type (mut k) p)))
+        `(fnptr (cc/C) [~@ps] ~(coil-type (mut k) (fn-ret t))))
+    :else (sym (qualified (mut k) (type-module t) (type-name t)))))
+
+;; ---------------------------------------------------------------- finding things
+
+(defn mod-index [(k (mut Comp)) (name (slice u8))] (-> i64)
+  (let [(mut out) -1]
+    (for i (range 0 (len (.mods k)))
+      (when (= (.name (get (.mods k) i)) name) (set! out i)))
+    out))
+
+(defn mod-at [(k (mut Comp)) (name (slice u8))] (-> Mod)
+  (let [i (mod-index (mut k) name)]
+    (when (< i 0) (panic "rules: module {} was not loaded" name))
+    (get (.mods k) i)))
+
+(defn self-mod [(k (mut Comp))] (-> Mod) (mod-at (mut k) (.self k)))
+
+(defn alias-target [(m Mod) (name (slice u8))] (-> (Option (slice u8)))
+  (let [(mut out) (None [(slice u8)])]
+    (for a (.aliases m) (when (= (.name a) name) (set! out (Some (.module a)))))
+    out))
+
+(defn find-func [(m Mod) (name (slice u8))] (-> (Option Func))
+  (let [(mut out) (None [Func])]
+    (for f (.funcs m) (when (= (.name f) name) (set! out (Some f))))
+    out))
+(defn find-rec [(m Mod) (name (slice u8))] (-> (Option RecDef))
+  (let [(mut out) (None [RecDef])]
+    (for r (.recs m) (when (= (.name r) name) (set! out (Some r))))
+    out))
+(defn find-enum-of [(m Mod) (variant (slice u8))] (-> (Option EnumDef))
+  (let [(mut out) (None [EnumDef])]
+    (for e (.enums m)
+      (for v (.variants e) (when (= v variant) (set! out (Some e)))))
+    out))
+(defn find-global [(m Mod) (name (slice u8))] (-> (Option Global))
+  (let [(mut out) (None [Global])]
+    (for x (.globals m) (when (= (.name x) name) (set! out (Some x))))
+    out))
+(defn find-kind [(m Mod) (name (slice u8))] (-> (Option syntax/KindEntry))
+  (let [(mut out) (None [syntax/KindEntry])]
+    (for x (.kinds m) (when (= (.name x) name) (set! out (Some x))))
+    out))
+(defn find-rel [(m Mod) (name (slice u8))] (-> (Option RelDef))
+  (let [(mut out) (None [RelDef])]
+    (for x (.rels m) (when (= (.name x) name) (set! out (Some x))))
+    out))
+(defn find-enum-named [(m Mod) (name (slice u8))] (-> (Option EnumDef))
+  (let [(mut out) (None [EnumDef])]
+    (for e (.enums m) (when (= (.name e) name) (set! out (Some e))))
+    out))
+
+(defn has-type? [(m Mod) (name (slice u8))] (-> bool)
+  (or (match (find-rec m name) (Some [_] true) (None [] false))
+      (match (find-enum-named m name) (Some [_] true) (None [] false))
+      (let [(mut hit) false]
+        (for t (.types m) (when (= t name) (set! hit true)))
+        hit)))
+
+;;; A type written in module `m`'s file.
+(defn resolve-type [(k (mut Comp)) (m (slice u8)) (n g/Node)] (-> (slice u8))
+  (let [mo (mod-at (mut k) m)]
+    (match (.kind n)
+      (g/KUpper []
+        (let [name (.text n)]
+          (cond
+            (builtin-type? name) name
+            (has-type? mo name) (cat3 m "." name)
+            (and (> (len (.over mo)) 0) (has-type? (mod-at (mut k) (.over mo)) name))
+              (cat3 (.over mo) "." name)
+            (has-type? (mod-at (mut k) "hl.rt") name) (cat "hl.rt." name)
+            :else (die (mut k) n (cat "no type named " name)))))
+      (g/KTQual []
+        (match (alias-target mo (.text (kid n 0)))
+          (None [] (die (mut k) n (cat "no module imported as " (.text (kid n 0)))))
+          (Some [target]
+            (let [name (.text (kid n 1))]
+              (unless (has-type? (mod-at (mut k) target) name)
+                (die (mut k) n (cat4 target " has no type named " name "")))
+              (cat3 target "." name)))))
+      (g/KTOpt [] (cat (resolve-type (mut k) m (kid n 0)) "?"))
+      (g/KTList [] (cat3 "[" (resolve-type (mut k) m (kid n 0)) "]"))
+      (g/KTMap [] (cat4 "{" (resolve-type (mut k) m (kid n 0))
+                        ":" (cat (resolve-type (mut k) m (kid n 1)) "}")))
+      (g/KTFn []
+        (let [(mut b) (str/StrBuf::new (malloc-allocator)) (mut first) true]
+          (push-str! (mut b) "Fn(")
+          (for p (list-kids (kid n 0))
+            (unless first (push-str! (mut b) ","))
+            (set! first false)
+            (push-str! (mut b) (resolve-type (mut k) m p)))
+          (push-str! (mut b) ")->")
+          (push-str! (mut b) (resolve-type (mut k) m (kid n 1)))
+          (finish! (mut b))))
+      (g/KTMut [] (resolve-type (mut k) m (kid n 0)))
+      (_ (die (mut k) n "expected a type")))))
+
+;; ---------------------------------------------------------------- reading signatures
+
+(defn mod-new [(name (slice u8)) (sort Sort) (over (slice u8))] (-> Mod)
+  (Mod :name name :sort sort
+       :funcs (ArrayList::new [Func] (malloc-allocator))
+       :recs (ArrayList::new [RecDef] (malloc-allocator))
+       :enums (ArrayList::new [EnumDef] (malloc-allocator))
+       :globals (ArrayList::new [Global] (malloc-allocator))
+       :types (text-list)
+       :kinds (ArrayList::new [syntax/KindEntry] (malloc-allocator))
+       :rels (ArrayList::new [RelDef] (malloc-allocator))
+       :quotes (ArrayList::new [QuoteDef] (malloc-allocator))
+       :aliases (ArrayList::new [Alias] (malloc-allocator))
+       :over over))
+
+(defn func-of [(name (slice u8)) (ret (slice u8))] (-> Func)
+  (Func :name name :coil name :params (ArrayList::new [Param] (malloc-allocator)) :ret ret))
+
+(defn param [(f (mut Func)) (name (slice u8)) (ty (slice u8)) (by-ref bool)] (-> void)
+  (push! (mut (.params f)) (Param :name name :ty ty :by-ref by-ref)))
+
+(defn parse-file [(k (mut Comp)) (src (slice u8)) (path (slice u8))] (-> g/Node)
+  (match (g/parse-result src path 0)
+    (Ok [t] t)
+    (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
+
+;;; `"bundle.js" = "src/bundle/js.syntax"` lines under [modules].
+(defn read-manifest! [(k (mut Comp)) (manifest (slice u8))] (-> void)
+  (set! (.base k) (rt/dir-of manifest))
+  (let [text (rt/read-all manifest)
+        (mut start) 0
+        (mut in-modules) false]
+    (for i (range 0 (+ (len text) 1))
+      (when (or (= i (len text)) (= (get text i) #\newline))
+        (let [line (subslice text start i)]
+          (set! start (+ i 1))
+          (cond
+            (rt/at? line 0 "[") (set! in-modules (= line "[modules]"))
+            (and in-modules (rt/at? line 0 "\""))
+              (let [(mut quotes) (ArrayList::new [i64] (malloc-allocator))]
+                (for j (range 0 (len line))
+                  (when (= (get line j) #\") (push! (mut quotes) j)))
+                (when (= (len quotes) 4)
+                  (push! (mut (.table k))
+                         (Alias :name (subslice line (+ (get quotes 0) 1) (get quotes 1))
+                                :module (subslice line (+ (get quotes 2) 1) (get quotes 3))))))
+            :else 0))))))
+
+(defn file-of [(k (mut Comp)) (module (slice u8))] (-> (Option (slice u8)))
+  (let [(mut out) (None [(slice u8)])]
+    (for a (.table k)
+      (when (= (.name a) module)
+        (set! out (Some (cat3 (.base k) "/" (.module a))))))
+    out))
+
+(defn grammar-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
+  (let [(mut m) (mod-new module (SGrammar) "")
+        node (cat module ".Node")]
+    (set! (.kinds m) (syntax/grammar-table (rt/read-all path) path))
+    (push! (mut (.types m)) "Node")
+    (push! (mut (.types m)) "Kind")
+    (let [(mut f) (func-of "parse" node)]
+      (param (mut f) "src" "Text" false) (param (mut f) "path" "Text" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "parse-tries" node)]
+      (param (mut f) "src" "Text" false) (param (mut f) "path" "Text" false) (param (mut f) "flags" "Int" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "parse-opt" (cat node "?"))]
+      (param (mut f) "src" "Text" false) (param (mut f) "path" "Text" false) (param (mut f) "flags" "Int" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "flag-bit" "Int")]
+      (param (mut f) "name" "Text" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "render" "Text")]
+      (param (mut f) "n" node false) (param (mut f) "pretty" "Bool" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "render-tracked" "hl.rt.Rendered")]
+      (param (mut f) "n" node false) (param (mut f) "pretty" "Bool" false) (param (mut f) "tracking" "Bool" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "opaque-spine?" "Bool")]
+      (param (mut f) "n" node false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "kind-name" "Text")]
+      (param (mut f) "k" (cat module ".Kind") false)
+      (push! (mut (.funcs m)) f))
+    m))
+
+(defn facts-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
+  (let [(mut m) (mod-new module (SFacts) "")
+        src (rt/read-all path)
+        db (cat module ".Db")
+        tree (match (gf/parse-result src path 0)
+               (Ok [t] t)
+               (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e)))))]
+    (push! (mut (.types m)) "Db")
+    (for item (.kids (get (.kids tree) 0))
+      (when (= (.kind item) (gf/KRelation))
+        (push! (mut (.rels m))
+               (RelDef :name (.text (get (.kids item) 0))
+                       :arity (len (.kids (get (.kids item) 1)))))))
+    (push! (mut (.funcs m)) (func-of "new-db" db))
+    (let [(mut f) (func-of "solve!" "Int")]
+      (param (mut f) "db" db true)
+      (push! (mut (.funcs m)) f))
+    m))
+
+(defn rewrite-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
+  (let [(mut m) (mod-new module (SRewrite) "")
+        src (rt/read-all path)
+        ;; The file's own header names its grammar.
+        start (let [(mut i) 0]
+                (while (and (< i (len src)) (not (rt/at? src i "rewrite "))) (set! i (+ i 1)))
+                (+ i 8))
+        (mut end) start]
+    (while (and (< end (len src)) (!= (get src end) #\newline)) (set! end (+ end 1)))
+    (let [grammar (subslice src start end)
+          node (cat grammar ".Node")
+          (mut f) (func-of "run" node)]
+      (ensure-loaded! (mut k) grammar)
+      (param (mut f) "n" node false)
+      (push! (mut (.funcs m)) f))
+    m))
+
+(defn scopes-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
+  (let [(mut m) (mod-new module (SScopes) "")
+        src (rt/read-all path)
+        start (let [(mut i) 0]
+                (while (and (< i (len src)) (not (rt/at? src i "scopes "))) (set! i (+ i 1)))
+                (+ i 7))
+        (mut end) start]
+    (while (and (< end (len src)) (!= (get src end) #\newline)) (set! end (+ end 1)))
+    (let [grammar (subslice src start end)
+          node (cat grammar ".Node")
+          kind (cat grammar ".Kind")]
+      (ensure-loaded! (mut k) grammar)
+      (let [(mut f) (func-of "analyze" "Int")]
+        (param (mut f) "tree" node false)
+        (param (mut f) "table" "hl.symtab.Table" true)
+        (param (mut f) "parent" "Int" false)
+        (param (mut f) "bindings" "{Int:Int}" true)
+        (push! (mut (.funcs m)) f))
+      (for name ["opens?" "function?" "var?" "hoist-name?" "lexical?" "block?" "param?" "ref?" "bind?"]
+        (let [(mut f) (func-of name "Bool")]
+          (param (mut f) "k" kind false)
+          (push! (mut (.funcs m)) f))))
+    m))
+
+(defn ensure-loaded! [(k (mut Comp)) (module (slice u8))] (-> void)
+  (when (< (mod-index (mut k) module) 0)
+    (match (file-of (mut k) module)
+      (None []
+        (dsl/fail-at (.path k) 1 1 (cat3 "no file for the module " module "; list it under [modules]")))
+      (Some [path]
+        (push! (mut (.depends k)) path)
+        (cond
+          (rt/ends-with path ".rules") (load-rules-file! (mut k) path (rt/read-all path) false)
+          (rt/ends-with path ".syntax")
+            (push! (mut (.mods k)) (grammar-mod (mut k) module path))
+          (rt/ends-with path ".facts")
+            (push! (mut (.mods k)) (facts-mod (mut k) module path))
+          (rt/ends-with path ".rewrite")
+            (let [m (rewrite-mod (mut k) module path)] (push! (mut (.mods k)) m))
+          (rt/ends-with path ".scopes")
+            (let [m (scopes-mod (mut k) module path)] (push! (mut (.mods k)) m))
+          :else (dsl/fail-at (.path k) 1 1 (cat "cannot read the signatures of " path)))))))
+
+(defn add-foreign! [(k (mut Comp)) (decl g/Node) (owner (slice u8))] (-> void)
+  (let [module (.text (kid decl 0))
+        alias (.text (kid decl 1))
+        items (list-kids (kid decl 2))]
+    (when (< (mod-index (mut k) module) 0)
+      (push! (mut (.mods k)) (mod-new module (SForeign) "")))
+    (let [ix (mod-index (mut k) module)]
+      ;; Names first, so items can mention each other in any order.
+      (for item items
+        (match (.kind item)
+          (g/KFType []
+            (unless (has-type? (get (.mods k) ix) (.text (kid item 0)))
+              (push! (mut (.types (elem (mut (.mods k)) ix))) (.text (kid item 0)))))
+          (g/KFRecord []
+            (unless (has-type? (get (.mods k) ix) (.text (kid item 0)))
+              (push! (mut (.recs (elem (mut (.mods k)) ix)))
+                     (RecDef :name (.text (kid item 0))
+                             :fields (ArrayList::new [FieldDef] (malloc-allocator))))))
+          (_ 0)))
+      (for item items
+        (match (.kind item)
+          (g/KFRecord []
+            (let [rec-name (.text (kid item 0))
+                  (mut rec-at) -1]
+              (for i (range 0 (len (.recs (get (.mods k) ix))))
+                (when (= (.name (get (.recs (get (.mods k) ix)) i)) rec-name) (set! rec-at i)))
+              (when (= (len (.fields (get (.recs (get (.mods k) ix)) rec-at))) 0)
+                (for f (list-kids (kid item 1))
+                  (let [ty (resolve-type (mut k) module (kid f 1))]
+                    (push! (mut (.fields (elem (mut (.recs (elem (mut (.mods k)) ix))) rec-at)))
+                           (FieldDef :name (.text (kid f 0)) :ty ty)))))))
+          (g/KFFn []
+            (let [name (.text (kid item 0))
+                  coil-name (if (none? (kid item 1)) name (.text (kid item 1)))
+                  (mut f) (Func :name name :coil coil-name
+                                :params (ArrayList::new [Param] (malloc-allocator))
+                                :ret (if (none? (kid item 3)) "Void" (resolve-type (mut k) module (kid item 3))))]
+              (for p (list-kids (kid item 2))
+                (push! (mut (.params f))
+                       (Param :name (.text (kid p 0))
+                              :ty (resolve-type (mut k) module (kid p 1))
+                              :by-ref (= (.kind (kid p 1)) (g/KTMut)))))
+              (match (find-func (get (.mods k) ix) name)
+                (None [] (push! (mut (.funcs (elem (mut (.mods k)) ix))) f))
+                (Some [_] 0))))
+          (_ 0))))
+    (let [(mut at) (mod-index (mut k) owner)]
+      (push! (mut (.aliases (elem (mut (.mods k)) at))) (Alias :name alias :module module)))))
+
+;;; Read a file's declarations. The body is compiled only for the module being read.
+(defn load-rules-file! [(k (mut Comp)) (path (slice u8)) (src (slice u8)) (is-self bool)] (-> g/Node)
+  (let [saved-src (.src k)
+        saved-path (.path k)
+        tree (parse-file (mut k) src path)
+        name (.text (kid tree 0))
+        over (if (none? (kid tree 1)) "" (.text (kid tree 1)))
+        decls (list-kids (kid tree 2))]
+    (set! (.src k) src)
+    (set! (.path k) path)
+    (when (> (len over) 0) (ensure-loaded! (mut k) over))
+    (for d decls
+      (when (= (.kind d) (g/KUse)) (ensure-loaded! (mut k) (.text (kid d 0)))))
+    (push! (mut (.mods k)) (mod-new name (SRules) over))
+    (let [ix (- (len (.mods k)) 1)]
+      (for d decls
+        (when (= (.kind d) (g/KUse))
+          (push! (mut (.aliases (elem (mut (.mods k)) ix)))
+                 (Alias :name (.text (kid d 1)) :module (.text (kid d 0))))))
+      ;; Type names before anything that mentions them.
+      (for d decls
+        (match (.kind d)
+          (g/KRecord []
+            (push! (mut (.recs (elem (mut (.mods k)) ix)))
+                   (RecDef :name (.text (kid d 0))
+                           :fields (ArrayList::new [FieldDef] (malloc-allocator)))))
+          (g/KEnum []
+            (let [(mut vs) (text-list)]
+              (for v (list-kids (kid d 1)) (push! (mut vs) (.text v)))
+              (push! (mut (.enums (elem (mut (.mods k)) ix)))
+                     (EnumDef :name (.text (kid d 0)) :variants vs))))
+          (g/KQuoteDecl []
+            (let [(mut path-out) (ArrayList::new [i64] (malloc-allocator))]
+              (for step (list-kids (kid d 1)) (push! (mut path-out) (rt/parse-int (.text step))))
+              (push! (mut (.quotes (elem (mut (.mods k)) ix)))
+                     (QuoteDef :name (.text (kid d 0)) :path path-out))))
+          (_ 0)))
+      (for d decls
+        (when (= (.kind d) (g/KForeign)) (add-foreign! (mut k) d name)))
+      ;; add-foreign! may have added modules after this one, but never before it.
+      (let [ix2 (mod-index (mut k) name)
+            (mut rec-index) 0]
+        (for d decls
+          (match (.kind d)
+            (g/KRecord []
+              (for f (list-kids (kid d 1))
+                (let [ty (resolve-type (mut k) name (kid f 1))]
+                  (push! (mut (.fields (elem (mut (.recs (elem (mut (.mods k)) ix2))) rec-index)))
+                         (FieldDef :name (.text (kid f 0)) :ty ty))))
+              (set! rec-index (+ rec-index 1)))
+            (g/KState [] (add-global! (mut k) ix2 name d true))
+            (g/KContext [] (add-global! (mut k) ix2 name d true))
+            (g/KConst [] (add-global! (mut k) ix2 name d false))
+            (g/KFn []
+              (let [(mut f) (Func :name (.text (kid d 0)) :coil (.text (kid d 0))
+                                  :params (ArrayList::new [Param] (malloc-allocator))
+                                  :ret (if (none? (kid d 2)) "Void" (resolve-type (mut k) name (kid d 2))))]
+                (for p (list-kids (kid d 1))
+                  (push! (mut (.params f))
+                         (Param :name (.text (kid p 0))
+                                :ty (resolve-type (mut k) name (kid p 1))
+                                :by-ref (= (.kind (kid p 1)) (g/KTMut)))))
+                (push! (mut (.funcs (elem (mut (.mods k)) ix2))) f)))
+            (_ 0)))))
+    (set! (.src k) saved-src)
+    (set! (.path k) saved-path)
+    tree))
+
+(defn add-global! [(k (mut Comp)) (ix i64) (module (slice u8)) (d g/Node) (assignable bool)] (-> void)
+  (let [ty (resolve-type (mut k) module (kid d 1))]
+    (push! (mut (.globals (elem (mut (.mods k)) ix)))
+           (Global :name (.text (kid d 0)) :ty ty :assignable assignable))))
+
+;; ---------------------------------------------------------------- locals
+
+(defn bind-local! [(k (mut Comp)) (name (slice u8)) (ty (slice u8)) (mutable bool)] (-> (slice u8))
+  (let [s (fresh (mut k) (cat "v-" name))]
+    (push! (mut (.locals k)) (Local :name name :ty ty :sym s :mutable mutable))
+    s))
+
+(defn find-local [(k (mut Comp)) (name (slice u8))] (-> (Option Local))
+  (let [(mut out) (None [Local])]
+    (for l (.locals k) (when (= (.name l) name) (set! out (Some l))))
+    out))
+
+(defn locals-mark [(k (mut Comp))] (-> i64) (len (.locals k)))
+(defn locals-reset! [(k (mut Comp)) (mark i64)] (-> void)
+  (while (> (len (.locals k)) mark) (pop! (mut (.locals k))))
+  0)
+
+;; ---------------------------------------------------------------- literals
+
+(defn unescape [(raw (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator)) (mut i) 0]
+    (while (< i (len raw))
+      (let [c (get raw i)]
+        (if (and (= c #\\) (< (+ i 1) (len raw)))
+            (let [e (get raw (+ i 1))]
+              (cond
+                (= e #\n) (push! (mut (.bytes b)) #\newline)
+                (= e #\t) (push! (mut (.bytes b)) #\tab)
+                (= e #\r) (push! (mut (.bytes b)) #\return)
+                (= e #\0) (push! (mut (.bytes b)) (: 0 u8))
+                :else (push! (mut (.bytes b)) e))
+              (set! i (+ i 2)))
+            (do (push! (mut (.bytes b)) c) (set! i (+ i 1))))))
+    (finish! (mut b))))
+
+(defn str-literal [(n g/Node)] (-> (slice u8))
+  (unescape (subslice (.text n) 1 (- (len (.text n)) 1))))
+
+(defn char-value [(n g/Node)] (-> i64)
+  (let [s (unescape (subslice (.text n) 1 (- (len (.text n)) 1)))]
+    (cast i64 (get s 0))))
+
+;; ---------------------------------------------------------------- checks
+
+(defn expect [(k (mut Comp)) (n g/Node) (e TE) (want (slice u8))] (-> TE)
+  (when (and (> (len want) 0) (!= want "Void") (!= (.ty e) want) (!= (.ty e) "Never"))
+    (die (mut k) n (cat4 "expected " want ", found " (.ty e))))
+  e)
+
+(defn unify [(k (mut Comp)) (n g/Node) (a (slice u8)) (b (slice u8))] (-> (slice u8))
+  (cond
+    (= a b) a
+    (= a "Never") b
+    (= b "Never") a
+    (or (= a "Void") (= b "Void")) "Void"
+    :else (die (mut k) n (cat4 "these branches disagree: " a " and " b))))
+
+;;; A form whose type must come from elsewhere: `none`, `[]` and `{}`.
+(defn needs-want? [(n g/Node)] (-> bool)
+  (match (.kind n)
+    (g/KNoneE [] true)
+    (g/KListLit [] (= (len (list-kids (kid n 0))) 0))
+    (g/KBlock [] (= (len (list-kids (kid n 0))) 0))
+    (_ false)))
+
+(defn new-list [(k (mut Comp)) (elem (slice u8))] (-> Code)
+  `(ArrayList::new [~(coil-type (mut k) elem)] (rt/tree-allocator)))
+
+(defn new-map [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (if (= (map-key t) "Text")
+      `(HashMap::new [~(coil-type (mut k) (map-key t)) ~(coil-type (mut k) (map-val t))]
+                     (malloc-allocator) (str/keyops))
+      `(HashMap::new-scalar [~(coil-type (mut k) (map-key t)) ~(coil-type (mut k) (map-val t))]
+                            (malloc-allocator))))
+
+;; ---------------------------------------------------------------- patterns
+
+(defsum Step
+  (STest [(code Code)])
+  (SBind [(sym (slice u8)) (code Code)])
+  (SSome [(sym (slice u8)) (code Code)]))
+
+(defn wrap-steps [(steps (ArrayList Step)) (i i64) (inner Code)] (-> Code)
+  (if (>= i (len steps))
+      inner
+      (let [rest (wrap-steps steps (+ i 1) inner)]
+        (match (get steps i)
+          (STest [c] `(when ~c ~rest))
+          (SBind [s c] `(let [~(sym s) ~c] ~rest))
+          (SSome [s c] `(match ~c (Some [~(sym s)] ~rest) (_ 0)))))))
+
+;;; The grammar a Node type belongs to.
+(defn grammar-of-type [(k (mut Comp)) (n g/Node) (ty (slice u8))] (-> Mod)
+  (unless (and (not (builtin-type? ty)) (> (last-dot ty) 0) (= (type-name ty) "Node"))
+    (die (mut k) n (cat "a node pattern needs a node, but this is " ty)))
+  (mod-at (mut k) (type-module ty)))
+
+(defn kind-code [(gr Mod) (name (slice u8))] (-> Code)
+  (primitive/code-symbol (alias-of (.name gr)) "/K" name))
+
+;;; The children of a node pattern.
+(defn pat-kids! [(k (mut Comp)) (p g/Node) (args (ArrayList g/Node)) (subject Code) (ty (slice u8))
+                 (arity i64) (steps (mut (ArrayList Step)))] (-> void)
+  (let [(mut rest-at) -1
+        n (len args)]
+    (for i (range 0 n)
+      (let [a (get args i)]
+        (when (or (= (.kind a) (g/KPAny)) (= (.kind a) (g/KRest)))
+          (when (>= rest-at 0) (die (mut k) a "a pattern has at most one rest"))
+          (set! rest-at i))))
+    (let [fixed (if (>= rest-at 0) (- n 1) n)]
+      (cond
+        (and (>= arity 0) (< rest-at 0) (!= fixed arity))
+          (die (mut k) p (cat4 "this node has " (rt/num-text arity) " children, this pattern has " (rt/num-text fixed)))
+        (and (>= arity 0) (> fixed arity))
+          (die (mut k) p (cat4 "this node has " (rt/num-text arity) " children, this pattern has " (rt/num-text fixed)))
+        (and (< arity 0) (< rest-at 0))
+          (push! (mut steps) (STest `(= (len (.kids ~subject)) ~fixed)))
+        (and (< arity 0) (>= rest-at 0) (> fixed 0))
+          (push! (mut steps) (STest `(>= (len (.kids ~subject)) ~fixed)))
+        :else 0))
+    (for i (range 0 n)
+      (let [a (get args i)]
+        (cond
+          (= (.kind a) (g/KPAny)) 0
+          (= (.kind a) (g/KRest))
+            (let [name (subslice (.text a) 0 (- (len (.text a)) 3))
+                  after (- n (+ i 1))
+                  s (bind-local! (mut k) name (cat3 "[" ty "]") false)
+                  whole (and (= i 0) (= after 0))]
+              (push! (mut steps)
+                     (SBind s (if whole
+                                  `(.kids ~subject)
+                                  `(~(primitive/code-symbol (alias-of (type-module ty)) "/sublist")
+                                    (.kids ~subject) ~i (- (len (.kids ~subject)) ~after))))))
+          :else
+            (let [index (if (or (< rest-at 0) (< i rest-at))
+                            `~i
+                            `(- (len (.kids ~subject)) ~(- n i)))]
+              (if (and (= (.kind a) (g/KName)) (= (.text a) "_"))
+                  0
+                  (if (= (.kind a) (g/KName))
+                      (let [s (bind-local! (mut k) (.text a) ty false)]
+                        (push! (mut steps) (SBind s `(get (.kids ~subject) ~index))))
+                      (let [t (fresh (mut k) "s")]
+                        (push! (mut steps) (SBind t `(get (.kids ~subject) ~index)))
+                        (pat! (mut k) a (sym t) ty (mut steps) ""))))))))))
+
+;;; A node pattern. `known` is the kind a dispatch has already established.
+(defn pat-node! [(k (mut Comp)) (p g/Node) (name (slice u8)) (args (ArrayList g/Node)) (subject Code)
+                 (ty (slice u8)) (steps (mut (ArrayList Step))) (known (slice u8))] (-> void)
+  (let [gr (grammar-of-type (mut k) p ty)]
+    (match (find-kind gr name)
+      (None [] (die (mut k) p (cat4 "the grammar " (.name gr) " has no node named " name)))
+      (Some [entry]
+        (when (!= known name)
+          (push! (mut steps) (STest `(= (.kind ~subject) (~(kind-code gr name))))))
+        (if (.leaf entry)
+            (do
+              (unless (= (len args) 1)
+                (die (mut k) p (cat name " is a token: its pattern has one argument, its text")))
+              (let [a (get args 0)]
+                (match (.kind a)
+                  (g/KStr []
+                    (push! (mut steps) (STest `(rt/leaf-is? (.text ~subject) ~(str-literal a)))))
+                  (g/KName []
+                    (unless (= (.text a) "_")
+                      (let [s (bind-local! (mut k) (.text a) "Text" false)]
+                        (push! (mut steps) (SBind s `(.text ~subject))))))
+                  (g/KPAny [] 0)
+                  (_ (die (mut k) a "a token's pattern is a name, _ or a string")))))
+            (pat-kids! (mut k) p args subject ty (.arity entry) (mut steps)))))))
+
+;;; `p` against `subject`, adding tests and bindings. Locals stay bound for the caller.
+(defn pat! [(k (mut Comp)) (p g/Node) (subject Code) (ty (slice u8)) (steps (mut (ArrayList Step))) (known (slice u8))] (-> void)
+  (match (.kind p)
+    (g/KName []
+      (unless (= (.text p) "_")
+        (let [s (bind-local! (mut k) (.text p) ty false)]
+          (push! (mut steps) (SBind s subject)))))
+    (g/KPAs []
+      (pat! (mut k) (kid p 0) subject ty (mut steps) known)
+      (let [s (bind-local! (mut k) (.text (kid p 1)) ty false)]
+        (push! (mut steps) (SBind s subject))))
+    (g/KPOr []
+      (let [(mut tests) (primitive/code-list-new)]
+        (for alt (list-kids (kid p 1))
+          (push! (mut tests) (pat-test (mut k) alt subject ty)))
+        (push! (mut steps)
+               (STest `(or ~(pat-test (mut k) (kid p 0) subject ty) ~@tests)))))
+    (g/KPNode []
+      (pat-node! (mut k) p (.text (kid p 0)) (list-kids (kid p 1)) subject ty (mut steps) known))
+    (g/KPNodeQ []
+      (pat-node! (mut k) p (.text (kid p 1)) (list-kids (kid p 2)) subject ty (mut steps) known))
+    (g/KPSome []
+      (unless (opt? ty) (die (mut k) p (cat "some(…) needs an option, but this is " ty)))
+      (let [t (fresh (mut k) "s")]
+        (push! (mut steps) (SSome t subject))
+        (pat! (mut k) (kid p 0) (sym t) (opt-of ty) (mut steps) "")))
+    (g/KPNone []
+      (unless (opt? ty) (die (mut k) p (cat "none needs an option, but this is " ty)))
+      (push! (mut steps) (STest `(match ~subject (None [] true) (_ false)))))
+    (g/KPTrue [] (push! (mut steps) (STest subject)))
+    (g/KPFalse [] (push! (mut steps) (STest `(not ~subject))))
+    (g/KInt [] (push! (mut steps) (STest `(= ~subject ~(rt/parse-int (.text p))))))
+    (g/KChar [] (push! (mut steps) (STest `(= ~subject ~(char-value p)))))
+    (g/KStr [] (push! (mut steps) (STest `(= ~subject ~(str-literal p)))))
+    (g/KUpper []
+      (let [m (mod-at (mut k) (type-module ty))]
+        (match (find-enum-named m (type-name ty))
+          (None [] (die (mut k) p (cat4 (.text p) " is not a value of " ty ", which is no enum")))
+          (Some [_]
+            (push! (mut steps)
+                   (STest `(= ~subject (~(sym (qualified (mut k) (type-module ty) (.text p)))))))))))
+    (g/KPEnumQ []
+      (push! (mut steps)
+             (STest `(= ~subject (~(sym (qualified (mut k) (type-module ty) (.text (kid p 1)))))))))
+    (_ (die (mut k) p "this cannot be a pattern"))))
+
+;;; Does `subject` match? The pattern's names are bound only inside this test.
+(defn pat-test [(k (mut Comp)) (p g/Node) (subject Code) (ty (slice u8))] (-> Code)
+  (let [mark (locals-mark (mut k))
+        (mut steps) (ArrayList::new [Step] (malloc-allocator))
+        label (primitive/code-symbol ":" (fresh (mut k) "t"))]
+    (pat! (mut k) p subject ty (mut steps) "")
+    (locals-reset! (mut k) mark)
+    `(block ~label ~(wrap-steps steps 0 `(return-from ~label true)) false)))
+
+;; ---------------------------------------------------------------- match
+
+;;; One alternative of one arm: or-patterns at the top become several.
+(defstruct Alt [(pat g/Node) (as-name g/Node) (guard g/Node) (body g/Node)])
+
+(defn alts-of [(arms (ArrayList g/Node))] (-> (ArrayList Alt))
+  (let [(mut out) (ArrayList::new [Alt] (malloc-allocator))]
+    (for arm arms
+      (let [p0 (kid arm 0)
+            as-name (if (= (.kind p0) (g/KPAs)) (kid p0 1) (kid arm 1))
+            p (if (= (.kind p0) (g/KPAs)) (kid p0 0) p0)
+            has-as (= (.kind p0) (g/KPAs))]
+        (if (= (.kind p) (g/KPOr))
+            (do
+              (push! (mut out) (Alt :pat (kid p 0) :as-name (if has-as as-name (g/none-node)) :guard (kid arm 1) :body (kid arm 2)))
+              (for q (list-kids (kid p 1))
+                (push! (mut out) (Alt :pat q :as-name (if has-as as-name (g/none-node)) :guard (kid arm 1) :body (kid arm 2)))))
+            (push! (mut out) (Alt :pat p :as-name (if has-as as-name (g/none-node)) :guard (kid arm 1) :body (kid arm 2))))))
+    out))
+
+;;; A node pattern's kind, or "" for one that matches anything.
+(defn alt-head [(a Alt)] (-> (slice u8))
+  (match (.kind (.pat a))
+    (g/KPNode [] (.text (kid (.pat a) 0)))
+    (g/KPNodeQ [] (.text (kid (.pat a) 1)))
+    (_ "")))
+
+(defn alt-code [(k (mut Comp)) (a Alt) (subject Code) (ty (slice u8)) (want (slice u8)) (label Code) (known (slice u8))] (-> TE)
+  (let [mark (locals-mark (mut k))
+        (mut steps) (ArrayList::new [Step] (malloc-allocator))]
+    (pat! (mut k) (.pat a) subject ty (mut steps) known)
+    (unless (none? (.as-name a))
+      (let [s (bind-local! (mut k) (.text (.as-name a)) ty false)]
+        (push! (mut steps) (SBind s subject))))
+    (unless (none? (.guard a))
+      (let [g-te (expect (mut k) (.guard a) (expr (mut k) (.guard a) "Bool") "Bool")]
+        (push! (mut steps) (STest (.code g-te)))))
+    (let [body (stmt (mut k) (.body a) want)
+          inner (cond
+                  (= (.ty body) "Never") (.code body)
+                  (or (= (.ty body) "Void") (= want "Void"))
+                    `(do ~(.code body) (return-from ~label 0))
+                  :else `(return-from ~label ~(.code body)))
+          out (wrap-steps steps 0 inner)]
+      (locals-reset! (mut k) mark)
+      (te out (.ty body)))))
+
+(defn no-case [(k (mut Comp)) (n g/Node)] (-> Code)
+  (let [at (rt/line-col (.src k) (.lo n))]
+    `(panic "{}:{}: no case of this match applies" ~(.path k) ~(.line at))))
+
+;;; The type a match or if yields, when nothing says: its first arm with a type of its own.
+(defn arms-want [(k (mut Comp)) (alts (ArrayList Alt)) (subject Code) (ty (slice u8))] (-> (slice u8))
+  (let [(mut out) ""
+        label (primitive/code-symbol ":none")]
+    (for a alts
+      (when (and (= (len out) 0) (not (needs-want? (.body a))))
+        (let [t (.ty (alt-code (mut k) a subject ty "" label ""))]
+          (unless (= t "Never") (set! out t)))))
+    out))
+
+(defn match-code [(k (mut Comp)) (n g/Node) (subject-node g/Node) (arms (ArrayList g/Node)) (want0 (slice u8))] (-> TE)
+  (let [subject (expr (mut k) subject-node "")
+        ty (.ty subject)
+        s (fresh (mut k) "m")
+        ss (sym s)
+        alts (alts-of arms)
+        label (primitive/code-symbol ":" (fresh (mut k) "m"))
+        want (if (> (len want0) 0) want0 (arms-want (mut k) alts ss ty))
+        (mut result) "Never"
+        node-subject (and (not (builtin-type? ty)) (> (last-dot ty) 0) (= (type-name ty) "Node"))
+        (mut dispatch) false]
+    (when node-subject
+      (for a alts (when (> (len (alt-head a)) 0) (set! dispatch true))))
+    (let [body
+            (if dispatch
+                (let [gr (grammar-of-type (mut k) n ty)
+                      (mut heads) (text-list)
+                      (mut arms-out) (primitive/code-list-new)
+                      (mut wild) (primitive/code-list-new)]
+                  (for a alts
+                    (let [h (alt-head a) (mut seen) (= (len h) 0)]
+                      (for x heads (when (= x h) (set! seen true)))
+                      (unless seen (push! (mut heads) h))))
+                  (for h heads
+                    (let [(mut forms) (primitive/code-list-new)]
+                      (for a alts
+                        (when (or (= (alt-head a) h) (= (len (alt-head a)) 0))
+                          (let [c (alt-code (mut k) a ss ty want label h)]
+                            (set! result (unify (mut k) n result (.ty c)))
+                            (push! (mut forms) (.code c)))))
+                      (unless (match (find-kind gr h) (Some [_] true) (None [] false))
+                        (die (mut k) n (cat4 "the grammar " (.name gr) " has no node named " h)))
+                      (push! (mut arms-out) `(~(kind-code gr h) [] ~@forms 0))))
+                  (for a alts
+                    (when (= (len (alt-head a)) 0)
+                      (let [c (alt-code (mut k) a ss ty want label "")]
+                        (set! result (unify (mut k) n result (.ty c)))
+                        (push! (mut wild) (.code c)))))
+                  `(match (.kind ~ss) ~@arms-out (_ ~@wild 0)))
+                (let [(mut forms) (primitive/code-list-new)]
+                  (for a alts
+                    (let [c (alt-code (mut k) a ss ty want label "")]
+                      (set! result (unify (mut k) n result (.ty c)))
+                      (push! (mut forms) (.code c))))
+                  `(do ~@forms)))]
+      (te `(let [~ss ~(.code subject)]
+             (block ~label ~body ~(no-case (mut k) n)))
+          result))))
+
+;; ---------------------------------------------------------------- loops
+
+(defstruct HeadInfo
+  [(wrap-kind i64)          ; 0 list, 1 map keys, 2 text, 3 range, 4 query
+   (var (slice u8))
+   (seq Code)
+   (hi Code)
+   (lets Code)
+   (row (slice u8))
+   (tests Code)
+   (binds Code)])
+
+(defn empty-code [] (-> Code) `())
+
+(defn head-open! [(k (mut Comp)) (h g/Node)] (-> HeadInfo)
+  (match (.kind h)
+    (g/KRangeHead []
+      (let [lo (expect (mut k) (kid h 1) (expr (mut k) (kid h 1) "Int") "Int")
+            hi (expect (mut k) (kid h 2) (expr (mut k) (kid h 2) "Int") "Int")
+            v (bind-local! (mut k) (.text (kid h 0)) "Int" false)]
+        (HeadInfo :wrap-kind 3 :var v :seq (.code lo) :hi (.code hi) :lets (empty-code) :row ""
+                  :tests (empty-code) :binds (empty-code))))
+    (g/KInHead []
+      (let [e (expr (mut k) (kid h 1) "")
+            t (.ty e)
+            kind (cond (list? t) 0 (map? t) 1 (= t "Text") 2
+                       :else (die (mut k) h (cat "cannot loop over " t)))
+            v (bind-local! (mut k) (.text (kid h 0))
+                           (cond (list? t) (elem-of t) (map? t) (map-key t) :else "Int")
+                           false)]
+        (HeadInfo :wrap-kind kind :var v :seq (.code e) :hi `0 :lets (empty-code) :row ""
+                  :tests (empty-code) :binds (empty-code))))
+    (g/KQueryHead [] (query-open! (mut k) (kid h 0)))
+    (_ (die (mut k) h "expected a loop head"))))
+
+;;; `db.rel(a, ?x, _)`: rows matching the known columns, binding the `?` ones.
+(defn query-open! [(k (mut Comp)) (call g/Node)] (-> HeadInfo)
+  (unless (and (= (.kind call) (g/KCall)) (= (.kind (kid call 0)) (g/KFieldE)))
+    (die (mut k) call "a query is db.relation(columns)"))
+  (let [rel-name (.text (kid (kid call 0) 1))
+        db (place (mut k) (kid (kid call 0) 0))
+        rel-code `(mut (~(primitive/code-symbol "." rel-name) ~(.code db)))
+        args (list-kids (kid call 1))
+        (mut lets) (primitive/code-list-new)
+        (mut tests) (primitive/code-list-new)
+        (mut binds) (primitive/code-list-new)
+        row (fresh (mut k) "row")
+        rowsym (sym row)
+        (mut key-col) -1
+        (mut key-sym) ""]
+    (rel-check (mut k) call (.ty db) rel-name (len args))
+    (for i (range 0 (len args))
+      (let [a (get args i)]
+        (cond
+          (= (.kind a) (g/KQvar)) 0
+          (and (= (.kind a) (g/KName)) (= (.text a) "_")) 0
+          :else
+            (let [v (expect (mut k) a (expr (mut k) a "Int") "Int")
+                  t (fresh (mut k) "key")]
+              (push! (mut lets) (sym t))
+              (push! (mut lets) (.code v))
+              (if (< key-col 0)
+                  (do (set! key-col i) (set! key-sym t))
+                  (push! (mut tests) `(= (rt/rel-at ~rel-code ~rowsym ~i) ~(sym t))))))))
+    (for i (range 0 (len args))
+      (let [a (get args i)]
+        (when (= (.kind a) (g/KQvar))
+          (let [v (bind-local! (mut k) (subslice (.text a) 1 (len (.text a))) "Int" false)]
+            (push! (mut binds) (sym v))
+            (push! (mut binds) `(rt/rel-at ~rel-code ~rowsym ~i))))))
+    (HeadInfo :wrap-kind 4 :var ""
+              :seq (if (>= key-col 0)
+                       `(rt/rel-bucket ~rel-code ~key-col ~(sym key-sym))
+                       `(range 0 (.count (~(primitive/code-symbol "." rel-name) ~(.code db)))))
+              :hi `0 :lets `(~@lets) :row row :tests `(~@tests) :binds `(~@binds))))
+
+(defn rel-check [(k (mut Comp)) (n g/Node) (db-ty (slice u8)) (rel (slice u8)) (count i64)] (-> void)
+  (unless (and (> (last-dot db-ty) 0) (= (type-name db-ty) "Db"))
+    (die (mut k) n (cat "a relation is read from a fact database, but this is " db-ty)))
+  (match (find-rel (mod-at (mut k) (type-module db-ty)) rel)
+    (None [] (die (mut k) n (cat4 (type-module db-ty) " has no relation named " rel "")))
+    (Some [r]
+      (unless (= (.arity r) count)
+        (die (mut k) n (cat4 rel " has " (rt/num-text (.arity r)) " columns"))))))
+
+(defn head-wrap [(k (mut Comp)) (h HeadInfo) (inner Code)] (-> Code)
+  (let [v (if (> (len (.var h)) 0) (sym (.var h)) `_)]
+    (cond
+      (= (.wrap-kind h) 0) `(for (ref ~v) ~(.seq h) ~inner)
+      (= (.wrap-kind h) 1) `(for ~v ~(.seq h) ~inner)
+      (= (.wrap-kind h) 2)
+        (let [t (fresh (mut k) "c")]
+          `(for ~(sym t) ~(.seq h) (let [~v (cast i64 ~(sym t))] ~inner)))
+      (= (.wrap-kind h) 3) `(for ~v (range ~(.seq h) ~(.hi h)) ~inner)
+      :else
+        `(let [~@(.lets h)]
+           (for ~(sym (.row h)) ~(.seq h)
+             (when (and ~@(.tests h) true)
+               (let [~@(.binds h)] ~inner)))))))
+
+;; ---------------------------------------------------------------- places
+
+;;; An expression as an addressable path, for `(mut …)`.
+(defn place [(k (mut Comp)) (e g/Node)] (-> TE)
+  (match (.kind e)
+    (g/KName []
+      (match (find-local (mut k) (.text e))
+        (Some [l] (te (sym (.sym l)) (.ty l)))
+        (None []
+          (let [m (self-mod (mut k))]
+            (match (find-global m (.text e))
+              (Some [x] (te `(~(primitive/code-symbol "." (.name x)) (rules-state)) (.ty x)))
+              (None [] (die (mut k) e (cat "nothing named " (.text e)))))))))
+    (g/KGroup [] (place (mut k) (kid e 0)))
+    (g/KFieldE []
+      (let [base (kid e 0)
+            field (.text (kid e 1))]
+        (match (module-prefix (mut k) base)
+          (Some [module]
+            (match (find-global (mod-at (mut k) module) field)
+              (Some [x]
+                (te `(~(primitive/code-symbol "." field) (~(sym (qualified (mut k) module "rules-state"))))
+                    (.ty x)))
+              (None [] (die (mut k) e (cat4 module " has no state named " field "")))))
+          (None []
+            (let [b (place (mut k) base)]
+              (te `(~(primitive/code-symbol "." field) ~(.code b))
+                  (field-type (mut k) e (.ty b) field)))))))
+    (g/KIndex []
+      (let [b (place (mut k) (kid e 0))]
+        (unless (list? (.ty b)) (die (mut k) e (cat "only a list's element is a place, not one of " (.ty b))))
+        (let [i (expect (mut k) (kid e 1) (expr (mut k) (kid e 1) "Int") "Int")]
+          (te `(elem (mut ~(.code b)) ~(.code i)) (elem-of (.ty b))))))
+    (_ (die (mut k) e "this cannot be assigned or passed by reference"))))
+
+;;; `base` names an imported module, rather than a value.
+(defn module-prefix [(k (mut Comp)) (base g/Node)] (-> (Option (slice u8)))
+  (if (and (= (.kind base) (g/KName))
+           (match (find-local (mut k) (.text base)) (Some [_] false) (None [] true)))
+      (alias-target (self-mod (mut k)) (.text base))
+      (None [(slice u8)])))
+
+(defn field-type [(k (mut Comp)) (n g/Node) (ty (slice u8)) (field (slice u8))] (-> (slice u8))
+  (cond
+    (builtin-type? ty) (die (mut k) n (cat4 ty " has no field named " field ""))
+    (or (list? ty) (map? ty) (opt? ty) (fn? ty)) (die (mut k) n (cat4 ty " has no field named " field ""))
+    (= (type-name ty) "Node")
+      (cond
+        (= field "text") "Text"
+        (= field "lo") "Int"
+        (= field "hi") "Int"
+        (= field "gen") "Int"
+        (= field "kids") (cat3 "[" ty "]")
+        (= field "kind") (cat (type-module ty) ".Kind")
+        :else (die (mut k) n (cat "a node has text, lo, hi, kids and kind, not " field)))
+    :else
+      (match (find-rec (mod-at (mut k) (type-module ty)) (type-name ty))
+        (None [] (die (mut k) n (cat4 ty " has no field named " field "")))
+        (Some [r]
+          (let [(mut out) ""]
+            (for f (.fields r) (when (= (.name f) field) (set! out (.ty f))))
+            (when (= (len out) 0) (die (mut k) n (cat4 ty " has no field named " field "")))
+            out)))))
+
+;; ---------------------------------------------------------------- calls
+
+(defn args-code [(k (mut Comp)) (n g/Node) (f Func) (args (ArrayList g/Node))] (-> Code)
+  (unless (= (len args) (len (.params f)))
+    (die (mut k) n (cat4 (.name f) " takes " (rt/num-text (len (.params f)))
+                         (cat " arguments, this has " (rt/num-text (len args))))))
+  (let [(mut out) (primitive/code-list-new)]
+    (for i (range 0 (len args))
+      (let [p (get (.params f) i)
+            a (get args i)]
+        (if (.by-ref p)
+            (let [x (place (mut k) a)]
+              (unless (= (.ty x) (.ty p))
+                (die (mut k) a (cat4 "expected " (.ty p) ", found " (.ty x))))
+              (push! (mut out) `(mut ~(.code x))))
+            (let [x (expect (mut k) a (expr (mut k) a (.ty p)) (.ty p))]
+              (push! (mut out) (.code x))))))
+    `(~@out)))
+
+(defn call-func [(k (mut Comp)) (n g/Node) (module (slice u8)) (f Func) (args (ArrayList g/Node))] (-> TE)
+  (let [cs (args-code (mut k) n f args)]
+    (te `(~(sym (qualified (mut k) module (.coil f))) ~@cs) (.ret f))))
+
+;;; Calls the language itself understands, for any element type.
+(defn builtin-call [(k (mut Comp)) (n g/Node) (name (slice u8)) (args (ArrayList g/Node))] (-> (Option TE))
+  (let [count (len args)]
+    (cond
+      (and (= name "len") (= count 1))
+        (Some (te `(len ~(.code (expr (mut k) (get args 0) ""))) "Int"))
+      (and (= name "is-some") (= count 1))
+        (Some (te `(match ~(.code (expr (mut k) (get args 0) "")) (Some [_] true) (None [] false)) "Bool"))
+      (and (= name "is-none") (= count 1))
+        (Some (te `(match ~(.code (expr (mut k) (get args 0) "")) (Some [_] false) (None [] true)) "Bool"))
+      (and (= name "pop") (= count 1))
+        (let [p (place (mut k) (get args 0))]
+          (Some (te `(pop! (mut ~(.code p))) "Void")))
+      (and (= name "clear") (= count 1))
+        (let [p (place (mut k) (get args 0))]
+          (Some (te `(clear! (mut ~(.code p))) "Void")))
+      (and (= name "last") (= count 1))
+        (let [e (expr (mut k) (get args 0) "")
+              t (fresh (mut k) "l")]
+          (unless (list? (.ty e)) (die (mut k) n "last needs a list"))
+          (Some (te `(let [~(sym t) ~(.code e)] (get ~(sym t) (- (len ~(sym t)) 1))) (elem-of (.ty e)))))
+      (and (= name "keys") (= count 1))
+        (let [e (expr (mut k) (get args 0) "")
+              t (fresh (mut k) "k")
+              o (fresh (mut k) "out")]
+          (unless (map? (.ty e)) (die (mut k) n "keys needs a map"))
+          (Some (te `(let [(mut ~(sym o)) ~(new-list (mut k) (map-key (.ty e)))]
+                       (for ~(sym t) ~(.code e) (push! (mut ~(sym o)) ~(sym t)))
+                       ~(sym o))
+                    (cat3 "[" (map-key (.ty e)) "]"))))
+      :else (None [TE]))))
+
+(defn call-expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+  (let [callee (kid n 0)
+        args (list-kids (kid n 1))]
+    (match (.kind callee)
+      (g/KName []
+        (let [name (.text callee)]
+          (match (find-local (mut k) name)
+            (Some [l]
+              (unless (fn? (.ty l)) (die (mut k) n (cat4 name " is a " (.ty l) ", not a function")))
+              (fn-value-call (mut k) n (sym (.sym l)) (.ty l) args))
+            (None []
+              (match (builtin-call (mut k) n name args)
+                (Some [b] b)
+                (None []
+                  (match (find-func (self-mod (mut k)) name)
+                    (Some [f] (call-func (mut k) n (.self k) f args))
+                    (None []
+                      (match (find-func (mod-at (mut k) "hl.rt") name)
+                        (Some [f] (call-func (mut k) n "hl.rt" f args))
+                        (None [] (die (mut k) callee (cat "no function named " name))))))))))))
+      (g/KFieldE []
+        (let [base (kid callee 0)
+              name (.text (kid callee 1))]
+          (match (module-prefix (mut k) base)
+            (Some [module]
+              (match (find-func (mod-at (mut k) module) name)
+                (Some [f] (call-func (mut k) n module f args))
+                (None [] (die (mut k) callee (cat4 module " has no function named " name "")))))
+            (None []
+              (let [b (if (is-place? base) (place (mut k) base) (expr (mut k) base ""))]
+                (if (and (> (last-dot (.ty b)) 0) (= (type-name (.ty b)) "Db") (not (builtin-type? (.ty b))))
+                    (relation-test (mut k) n b name args)
+                    (let [ft (field-type (mut k) callee (.ty b) name)]
+                      (unless (fn? ft) (die (mut k) n (cat name " is not a function")))
+                      (fn-value-call (mut k) n
+                                     `(~(primitive/code-symbol "." name) ~(.code b)) ft args))))))))
+      (g/KMember []
+        (ctor-qualified (mut k) n callee args want))
+      (_ (die (mut k) n "this cannot be called")))))
+
+(defn is-place? [(e g/Node)] (-> bool)
+  (match (.kind e)
+    (g/KName [] true)
+    (g/KFieldE [] (is-place? (kid e 0)))
+    (g/KIndex [] (is-place? (kid e 0)))
+    (g/KGroup [] (is-place? (kid e 0)))
+    (_ false)))
+
+(defn fn-value-call [(k (mut Comp)) (n g/Node) (f Code) (ty (slice u8)) (args (ArrayList g/Node))] (-> TE)
+  (let [ps (fn-params ty)
+        (mut out) (primitive/code-list-new)]
+    (unless (= (len ps) (len args))
+      (die (mut k) n (cat "wrong number of arguments for a function of type " ty)))
+    (for i (range 0 (len args))
+      (let [x (expect (mut k) (get args i) (expr (mut k) (get args i) (get ps i)) (get ps i))]
+        (push! (mut out) (.code x))))
+    (te `(~f ~@out) (fn-ret ty))))
+
+;;; `db.rel(a, b)` as a question: is there such a row? `_` matches anything.
+(defn relation-test [(k (mut Comp)) (n g/Node) (db TE) (rel (slice u8)) (args (ArrayList g/Node))] (-> TE)
+  (rel-check (mut k) n (.ty db) rel (len args))
+  (let [module (type-module (.ty db))
+        (mut wild) false
+        (mut cs) (primitive/code-list-new)]
+    (for a args
+      (when (and (= (.kind a) (g/KName)) (= (.text a) "_")) (set! wild true)))
+    (if wild
+        (let [mark (locals-mark (mut k))
+              label (primitive/code-symbol ":" (fresh (mut k) "q"))
+              h (query-open! (mut k) n)
+              code (head-wrap (mut k) h `(return-from ~label true))]
+          (locals-reset! (mut k) mark)
+          (te `(block ~label ~code false) "Bool"))
+        (do
+          (for a args
+            (let [x (expect (mut k) a (expr (mut k) a "Int") "Int")]
+              (push! (mut cs) (.code x))))
+          (te `(~(sym (qualified (mut k) module (cat3 "has-" rel "?"))) (mut ~(.code db)) ~@cs) "Bool")))))
+
+;; ---------------------------------------------------------------- constructors
+
+(defn build-record [(k (mut Comp)) (n g/Node) (module (slice u8)) (r RecDef) (args (ArrayList g/Node))] (-> TE)
+  (let [(mut inits) (primitive/code-list-new)]
+    (for a args
+      (unless (= (.kind a) (g/KNamed))
+        (die (mut k) a (cat3 "the fields of " (.name r) " are given by name"))))
+    (for f (.fields r)
+      (let [(mut found) false]
+        (for a args
+          (when (= (.text (kid a 0)) (.name f))
+            (set! found true)
+            (push! (mut inits) (primitive/code-symbol ":" (.name f)))
+            (push! (mut inits) (.code (expect (mut k) (kid a 1) (expr (mut k) (kid a 1) (.ty f)) (.ty f))))))
+        (unless found
+          (die (mut k) n (cat4 (.name r) " needs its field " (.name f) "")))))
+    (for a args
+      (let [(mut known) false]
+        (for f (.fields r) (when (= (.name f) (.text (kid a 0))) (set! known true)))
+        (unless known
+          (die (mut k) a (cat4 (.name r) " has no field named " (.text (kid a 0)) "")))))
+    (te `(~(sym (qualified (mut k) module (.name r))) ~@inits) (cat3 module "." (.name r)))))
+
+(defn build-node [(k (mut Comp)) (n g/Node) (gr Mod) (entry syntax/KindEntry) (args (ArrayList g/Node))] (-> TE)
+  (let [alias (alias-of (.name gr))
+        ty (cat (.name gr) ".Node")
+        kind (kind-code gr (.name entry))]
+    (cond
+      (.leaf entry)
+        (do
+          (unless (= (len args) 1)
+            (die (mut k) n (cat (.name entry) " is a token: it holds one text")))
+          (let [t (expect (mut k) (get args 0) (expr (mut k) (get args 0) "Text") "Text")]
+            (te `(~(primitive/code-symbol alias "/leaf") (~kind) ~(.code t) 0 0) ty)))
+      (= (.name entry) "None") (te `(~(primitive/code-symbol alias "/none-node")) ty)
+      :else
+        (let [(mut pushes) (primitive/code-list-new)
+              (mut count) 0
+              (mut spread) false
+              kids (fresh (mut k) "kids")]
+          (for a args
+            (if (= (.kind a) (g/KRest))
+                (let [name (subslice (.text a) 0 (- (len (.text a)) 3))]
+                  (match (find-local (mut k) name)
+                    (None [] (die (mut k) a (cat "nothing named " name)))
+                    (Some [l]
+                      (unless (= (.ty l) (cat3 "[" ty "]"))
+                        (die (mut k) a (cat4 "only a list of nodes can be spread here, not " (.ty l) "" "")))
+                      (set! spread true)
+                      (let [each (fresh (mut k) "each")]
+                        (push! (mut pushes)
+                               `(for (ref ~(sym each)) ~(sym (.sym l)) (push! (mut ~(sym kids)) ~(sym each))))))))
+                (let [x (expect (mut k) a (expr (mut k) a ty) ty)]
+                  (set! count (+ count 1))
+                  (push! (mut pushes) `(push! (mut ~(sym kids)) ~(.code x))))))
+          (when (and (>= (.arity entry) 0) (not spread) (!= count (.arity entry)))
+            (die (mut k) n (cat4 (.name entry) " has " (rt/num-text (.arity entry))
+                                 (cat " children, this gives it " (rt/num-text count)))))
+          (te `(let [(mut ~(sym kids)) (~(primitive/code-symbol alias "/new-kids"))]
+                 ~@pushes
+                 (~(primitive/code-symbol alias "/mk") (~kind) ~(sym kids) 0 0))
+              ty)))))
+
+(defn ctor [(k (mut Comp)) (n g/Node) (name (slice u8)) (args (ArrayList g/Node))] (-> TE)
+  (let [m (self-mod (mut k))]
+    (match (find-rec m name)
+      (Some [r] (build-record (mut k) n (.self k) r args))
+      (None []
+        (match (find-rec (mod-at (mut k) "hl.rt") name)
+          (Some [r] (build-record (mut k) n "hl.rt" r args))
+          (None []
+            (when (= (len (.over m)) 0)
+              (die (mut k) n (cat3 "no record named " name ", and this file names no grammar")))
+            (let [gr (mod-at (mut k) (.over m))]
+              (match (find-kind gr name)
+                (Some [entry] (build-node (mut k) n gr entry args))
+                (None [] (die (mut k) n (cat4 "nothing named " name " here, nor in the grammar " (.name gr))))))))))))
+
+(defn ctor-qualified [(k (mut Comp)) (n g/Node) (callee g/Node) (args (ArrayList g/Node)) (want (slice u8))] (-> TE)
+  (let [base (kid callee 0)
+        name (.text (kid callee 1))]
+    (match (module-prefix (mut k) base)
+      (None [] (die (mut k) callee "expected module.Name"))
+      (Some [module]
+        (let [m (mod-at (mut k) module)]
+          (match (find-rec m name)
+            (Some [r] (build-record (mut k) n module r args))
+            (None []
+              (match (find-kind m name)
+                (Some [entry] (build-node (mut k) n m entry args))
+                (None [] (die (mut k) callee (cat4 module " has nothing named " name "")))))))))))
+
+;; ---------------------------------------------------------------- templates
+
+(defn hole-name? [(c u8)] (-> bool)
+  (or (rt/name-char? c)))
+
+(defn template [(k (mut Comp)) (n g/Node)] (-> TE)
+  (let [raw (.text n)
+        (mut tick) 0]
+    (while (!= (get raw tick) #\`) (set! tick (+ tick 1)))
+    (let [tag (subslice raw 0 tick)
+          src (subslice raw (+ tick 1) (- (len raw) 1))
+          m (self-mod (mut k))
+          (mut path-code) (primitive/code-list-new)
+          (mut known) false
+          (mut holes) (primitive/code-list-new)
+          (mut seen) (text-list)
+          (mut i) 0]
+      (when (= (len (.over m)) 0) (die (mut k) n "a template needs `over GRAMMAR` in the header"))
+      (for q (.quotes m)
+        (when (= (.name q) tag)
+          (set! known true)
+          (for s (.path q) (push! (mut path-code) `~s))))
+      (unless known (die (mut k) n (cat3 "no template form named " tag "; declare it with `quote`")))
+      ;; Each `$name` is a variable in scope, with `_` standing for `-`: JavaScript
+      ;; names have no hyphen.
+      (while (< i (len src))
+        (if (= (get src i) #\$)
+            (let [splice (and (< (+ i 1) (len src)) (= (get src (+ i 1)) #\$))
+                  from (if splice (+ i 2) (+ i 1))
+                  (mut j) from]
+              (while (and (< j (len src)) (hole-name? (get src j))) (set! j (+ j 1)))
+              (when (> j from)
+                (let [name (subslice src from j)
+                      (mut dashed) (str/StrBuf::new (malloc-allocator))
+                      (mut dup) false]
+                  (for c name (push! (mut (.bytes dashed)) (if (= c #\_) #\- c)))
+                  (for s seen (when (= s name) (set! dup true)))
+                  (unless dup
+                    (push! (mut seen) name)
+                    (let [var-name (finish! (mut dashed))]
+                      (match (find-local (mut k) var-name)
+                        (None [] (die (mut k) n (cat "this template's hole has no variable named " var-name)))
+                        (Some [l]
+                          (let [sort (cond
+                                       (= (.ty l) "Text") "text"
+                                       (= (.ty l) (cat (.over m) ".Node")) "node"
+                                       (= (.ty l) (cat3 "[" (.over m) ".Node]")) "list"
+                                       :else (die (mut k) n (cat4 "a hole holds text, a node or a list of nodes, but " var-name " is " (.ty l))))]
+                            (push! (mut holes) `(~name ~(sym (.sym l)) ~sort))))))))
+                (set! i j))
+              (when (<= j from) (set! i (+ i 1))))
+            (set! i (+ i 1))))
+      (te `(~(primitive/code-symbol (alias-of (.over m)) "/quote-template")
+            ~(alias-of (.over m)) ~(unescape-template src) (~@path-code) (~@holes))
+          (cat (.over m) ".Node")))))
+
+(defn unescape-template [(src (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator)) (mut i) 0]
+    (while (< i (len src))
+      (if (and (= (get src i) #\\) (< (+ i 1) (len src)) (= (get src (+ i 1)) #\`))
+          (do (push! (mut (.bytes b)) #\`) (set! i (+ i 2)))
+          (do (push! (mut (.bytes b)) (get src i)) (set! i (+ i 1)))))
+    (finish! (mut b))))
+
+;; ---------------------------------------------------------------- expressions
+
+(defn concat-operands! [(n g/Node) (out (mut (ArrayList g/Node)))] (-> void)
+  (if (= (.kind n) (g/KConcat))
+      (do (concat-operands! (kid n 0) (mut out)) (concat-operands! (kid n 1) (mut out)))
+      (push! (mut out) n)))
+
+(defn binary-int [(k (mut Comp)) (n g/Node) (op Code)] (-> TE)
+  (let [a (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Int") "Int")
+        b (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")]
+    (te `(~op ~(.code a) ~(.code b)) "Int")))
+
+(defn compare [(k (mut Comp)) (n g/Node) (op Code)] (-> TE)
+  (let [a (expr (mut k) (kid n 0) "")
+        b (expr (mut k) (kid n 1) (.ty a))]
+    (unless (= (.ty a) (.ty b))
+      (die (mut k) n (cat4 "cannot compare " (.ty a) " with " (.ty b))))
+    (if (= (.ty a) "Text")
+        (te `(~op (str/cmp ~(.code a) ~(.code b)) 0) "Bool")
+        (do
+          (unless (= (.ty a) "Int") (die (mut k) n (cat "cannot order " (.ty a))))
+          (te `(~op ~(.code a) ~(.code b)) "Bool")))))
+
+(defn equality [(k (mut Comp)) (n g/Node) (negate bool)] (-> TE)
+  (let [left (kid n 0) right (kid n 1)]
+    (if (= (.kind right) (g/KNoneE))
+        (let [a (expr (mut k) left "")]
+          (te (if negate
+                  `(match ~(.code a) (Some [_] true) (None [] false))
+                  `(match ~(.code a) (Some [_] false) (None [] true)))
+              "Bool"))
+        (let [a (expr (mut k) left "")
+              b (expr (mut k) right (.ty a))]
+          (unless (= (.ty a) (.ty b))
+            (die (mut k) n (cat4 "cannot compare " (.ty a) " with " (.ty b))))
+          (when (or (list? (.ty a)) (map? (.ty a)) (opt? (.ty a)))
+            (die (mut k) n (cat "cannot compare values of " (.ty a))))
+          (te (if negate `(!= ~(.code a) ~(.code b)) `(= ~(.code a) ~(.code b))) "Bool")))))
+
+(defn in-test [(k (mut Comp)) (n g/Node)] (-> TE)
+  (let [right (expr (mut k) (kid n 1) "")
+        t (.ty right)]
+    (cond
+      (list? t)
+        (let [a (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) (elem-of t)) (elem-of t))
+              x (fresh (mut k) "x") e (fresh (mut k) "e")
+              label (primitive/code-symbol ":" (fresh (mut k) "in"))]
+          (te `(let [~(sym x) ~(.code a)]
+                 (block ~label
+                   (for ~(sym e) ~(.code right)
+                     (when (= ~(sym e) ~(sym x)) (return-from ~label true)))
+                   false))
+              "Bool"))
+      (map? t)
+        (let [a (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) (map-key t)) (map-key t))]
+          (te `(match (get ~(.code right) ~(.code a)) (Some [_] true) (None [] false)) "Bool"))
+      (= t "Text")
+        (let [a (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Text") "Text")]
+          (te `(rt/contains-text? ~(.code right) ~(.code a)) "Bool"))
+      :else (die (mut k) n (cat "cannot look inside " t)))))
+
+(defn if-code [(k (mut Comp)) (n g/Node) (want0 (slice u8))] (-> TE)
+  (let [c (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Bool") "Bool")
+        then-node (kid n 1)
+        else-node (kid n 2)]
+    (if (none? else-node)
+        (te `(when ~(.code c) ~(.code (stmt (mut k) then-node "Void"))) "Void")
+        (let [want (cond
+                     (> (len want0) 0) want0
+                     (needs-want? then-node)
+                       (.ty (stmt (mut k) else-node ""))
+                     :else "")
+              a (stmt (mut k) then-node want)
+              b (stmt (mut k) else-node (if (and (= (len want) 0) (!= (.ty a) "Never")) (.ty a) want))
+              ty (unify (mut k) n (.ty a) (.ty b))]
+          (te (if (= ty "Void")
+                  `(if ~(.code c) (do ~(.code a) 0) (do ~(.code b) 0))
+                  `(if ~(.code c) ~(.code a) ~(.code b)))
+              ty)))))
+
+(defn if-let-code [(k (mut Comp)) (n g/Node) (want0 (slice u8))] (-> TE)
+  (let [pattern (kid n 0)
+        subject (expr (mut k) (kid n 1) "")
+        s (fresh (mut k) "m")
+        label (primitive/code-symbol ":" (fresh (mut k) "if"))
+        mark (locals-mark (mut k))
+        (mut steps) (ArrayList::new [Step] (malloc-allocator))]
+    (pat! (mut k) pattern (sym s) (.ty subject) (mut steps) "")
+    (let [else-node (kid n 3)
+          want (if (> (len want0) 0)
+                   want0
+                   (if (none? else-node) "Void" ""))
+          body (expr (mut k) (kid n 2) want)
+          ty0 (.ty body)
+          inner (cond
+                  (= ty0 "Never") (.code body)
+                  (or (= ty0 "Void") (= want "Void")) `(do ~(.code body) (return-from ~label 0))
+                  :else `(return-from ~label ~(.code body)))
+          wrapped (wrap-steps steps 0 inner)]
+      (locals-reset! (mut k) mark)
+      (if (none? else-node)
+          (te `(let [~(sym s) ~(.code subject)] (block ~label ~wrapped 0)) "Void")
+          (let [b (stmt (mut k) else-node (if (> (len want) 0) want (if (= ty0 "Never") "" ty0)))
+                ty (unify (mut k) n ty0 (.ty b))]
+            (te `(let [~(sym s) ~(.code subject)]
+                   (block ~label ~wrapped ~(if (= ty "Void") `(do ~(.code b) 0) (.code b))))
+                ty))))))
+
+(defn loop-all [(k (mut Comp)) (n g/Node) (negate-empty bool)] (-> TE)
+  (let [mark (locals-mark (mut k))
+        h (head-open! (mut k) (kid n 0))
+        c (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Bool") "Bool")
+        label (primitive/code-symbol ":" (fresh (mut k) "q"))
+        inner (if negate-empty
+                  `(when ~(.code c) (return-from ~label true))
+                  `(unless ~(.code c) (return-from ~label false)))
+        code (head-wrap (mut k) h inner)]
+    (locals-reset! (mut k) mark)
+    (te `(block ~label ~code ~(if negate-empty `false `true)) "Bool")))
+
+(defn expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+  (match (.kind n)
+    (g/KInt [] (te `~(rt/parse-int (.text n)) "Int"))
+    (g/KStr [] (te `~(str-literal n) "Text"))
+    (g/KChar [] (te `~(char-value n) "Int"))
+    (g/KTrue [] (te `true "Bool"))
+    (g/KFalse [] (te `false "Bool"))
+    (g/KNoneE []
+      (unless (opt? want) (die (mut k) n "this `none` needs a known type"))
+      (te `(None [~(coil-type (mut k) (opt-of want))]) want))
+    (g/KSomeE []
+      (let [inner (expr (mut k) (kid n 0) (if (opt? want) (opt-of want) ""))]
+        (te `(Some ~(.code inner)) (cat (.ty inner) "?"))))
+    (g/KGroup [] (expr (mut k) (kid n 0) want))
+    (g/KName []
+      (match (find-local (mut k) (.text n))
+        (Some [l] (te (sym (.sym l)) (.ty l)))
+        (None []
+          (let [m (self-mod (mut k))]
+            (match (find-global m (.text n))
+              (Some [x] (te `(~(primitive/code-symbol "." (.name x)) (rules-state)) (.ty x)))
+              (None []
+                (match (find-func m (.text n))
+                  (Some [f] (te `(fnptr-of ~(sym (.coil f))) (func-type f)))
+                  (None [] (die (mut k) n (cat "nothing named " (.text n)))))))))))
+    (g/KQvar [] (die (mut k) n "a `?name` only binds in a loop's query"))
+    (g/KUpper [] (enum-value (mut k) n (.text n) want))
+    (g/KMember []
+      (let [base (kid n 0) name (.text (kid n 1))]
+        (match (module-prefix (mut k) base)
+          (None [] (die (mut k) n "expected module.Name"))
+          (Some [module]
+            (match (find-enum-of (mod-at (mut k) module) name)
+              (None [] (die (mut k) n (cat4 module " has no value named " name "")))
+              (Some [e]
+                (te `(~(sym (qualified (mut k) module name))) (cat3 module "." (.name e)))))))))
+    (g/KFieldE []
+      (let [base (kid n 0) field (.text (kid n 1))]
+        (match (module-prefix (mut k) base)
+          (Some [module]
+            (let [mo (mod-at (mut k) module)]
+              (match (find-global mo field)
+                (Some [_] (place (mut k) n))
+                (None []
+                  (match (find-func mo field)
+                    (Some [f] (te `(fnptr-of ~(sym (qualified (mut k) module (.coil f)))) (func-type f)))
+                    (None [] (die (mut k) n (cat4 module " has nothing named " field ""))))))))
+          (None []
+            (let [b (expr (mut k) base "")]
+              (te `(~(primitive/code-symbol "." field) ~(.code b))
+                  (field-type (mut k) n (.ty b) field)))))))
+    (g/KCall [] (call-expr (mut k) n want))
+    (g/KCtor [] (ctor (mut k) n (.text (kid n 0)) (list-kids (kid n 1))))
+    (g/KIndex []
+      (let [b (expr (mut k) (kid n 0) "")
+            t (.ty b)]
+        (cond
+          (list? t)
+            (let [i (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")]
+              (te `(get ~(.code b) ~(.code i)) (elem-of t)))
+          (map? t)
+            (let [i (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) (map-key t)) (map-key t))]
+              (te `(get ~(.code b) ~(.code i)) (cat (map-val t) "?")))
+          (= t "Text")
+            (let [i (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")]
+              (te `(cast i64 (get ~(.code b) ~(.code i))) "Int"))
+          :else (die (mut k) n (cat "cannot index " t)))))
+    (g/KSlice []
+      (let [b (expr (mut k) (kid n 0) "")
+            lo (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")
+            hi (expect (mut k) (kid n 2) (expr (mut k) (kid n 2) "Int") "Int")]
+        (cond
+          (= (.ty b) "Text") (te `(subslice ~(.code b) ~(.code lo) ~(.code hi)) "Text")
+          (list? (.ty b))
+            (let [o (fresh (mut k) "out") s (fresh (mut k) "src") i (fresh (mut k) "i")]
+              (te `(let [~(sym s) ~(.code b) (mut ~(sym o)) ~(new-list (mut k) (elem-of (.ty b)))]
+                     (for ~(sym i) (range ~(.code lo) ~(.code hi))
+                       (push! (mut ~(sym o)) (get ~(sym s) ~(sym i))))
+                     ~(sym o))
+                  (.ty b)))
+          :else (die (mut k) n (cat "cannot slice " (.ty b))))))
+    (g/KListLit []
+      (let [args (list-kids (kid n 0))
+            elem (cond
+                   (list? want) (elem-of want)
+                   (> (len args) 0) (.ty (first-elem-type (mut k) (get args 0)))
+                   :else (die (mut k) n "this `[]` needs a known type"))
+            o (fresh (mut k) "out")
+            (mut pushes) (primitive/code-list-new)]
+        (for a args
+          (if (= (.kind a) (g/KRest))
+              (let [name (subslice (.text a) 0 (- (len (.text a)) 3))
+                    each (fresh (mut k) "each")]
+                (match (find-local (mut k) name)
+                  (None [] (die (mut k) a (cat "nothing named " name)))
+                  (Some [l]
+                    (push! (mut pushes)
+                           `(for (ref ~(sym each)) ~(sym (.sym l)) (push! (mut ~(sym o)) ~(sym each)))))))
+              (let [x (expect (mut k) a (expr (mut k) a elem) elem)]
+                (push! (mut pushes) `(push! (mut ~(sym o)) ~(.code x))))))
+        (te `(let [(mut ~(sym o)) ~(new-list (mut k) elem)] ~@pushes ~(sym o))
+            (cat3 "[" elem "]"))))
+    (g/KComp []
+      (let [mark (locals-mark (mut k))
+            value (kid n 0)
+            heads (list-kids (kid n 1))
+            filter (kid n 2)
+            (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+        (for h heads (push! (mut opened) (head-open! (mut k) h)))
+        (let [v (expr (mut k) value (if (list? want) (elem-of want) ""))
+              o (fresh (mut k) "out")
+              push-code `(push! (mut ~(sym o)) ~(.code v))
+              guarded (if (none? filter)
+                          push-code
+                          `(when ~(.code (expect (mut k) filter (expr (mut k) filter "Bool") "Bool")) ~push-code))
+              (mut body) guarded
+              (mut i) (- (len opened) 1)]
+          (while (>= i 0)
+            (set! body (head-wrap (mut k) (get opened i) body))
+            (set! i (- i 1)))
+          (locals-reset! (mut k) mark)
+          (te `(let [(mut ~(sym o)) ~(new-list (mut k) (.ty v))] ~body ~(sym o))
+              (cat3 "[" (.ty v) "]")))))
+    (g/KAll [] (loop-all (mut k) n false))
+    (g/KAny [] (loop-all (mut k) n true))
+    (g/KCount []
+      (let [mark (locals-mark (mut k))
+            h (head-open! (mut k) (kid n 0))
+            c (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Bool") "Bool")
+            total (fresh (mut k) "n")
+            code (head-wrap (mut k) h `(when ~(.code c) (set! ~(sym total) (+ ~(sym total) 1))))]
+        (locals-reset! (mut k) mark)
+        (te `(let [(mut ~(sym total)) 0] ~code ~(sym total)) "Int")))
+    (g/KFirst []
+      (let [mark (locals-mark (mut k))
+            h (head-open! (mut k) (kid n 0))
+            v (expr (mut k) (kid n 1) want)
+            label (primitive/code-symbol ":" (fresh (mut k) "q"))
+            x (fresh (mut k) "x")]
+        (unless (opt? (.ty v)) (die (mut k) n (cat "`first` takes the first some(…), but this is " (.ty v))))
+        (let [code (head-wrap (mut k) h
+                              `(match ~(.code v)
+                                 (Some [~(sym x)] (return-from ~label (Some ~(sym x))))
+                                 (None [] 0)))]
+          (locals-reset! (mut k) mark)
+          (te `(block ~label ~code (None [~(coil-type (mut k) (opt-of (.ty v)))])) (.ty v)))))
+    (g/KSort []
+      (let [mark (locals-mark (mut k))
+            items (expr (mut k) (kid n 1) "")
+            _ (unless (list? (.ty items)) (die (mut k) n "sort needs a list"))
+            v (bind-local! (mut k) (.text (kid n 0)) (elem-of (.ty items)) false)
+            key (expr (mut k) (kid n 2) "")
+            all (fresh (mut k) "items")
+            keys (fresh (mut k) "keys")
+            o (fresh (mut k) "out")
+            i (fresh (mut k) "i")
+            desc (if (none? (kid n 3)) `false `true)
+            order (if (= (.ty key) "Text")
+                      `(rt/sort-order-text ~(sym keys) ~desc)
+                      `(rt/sort-order-int ~(sym keys) ~desc))]
+        (unless (or (= (.ty key) "Int") (= (.ty key) "Text"))
+          (die (mut k) n (cat "sort keys are Int or Text, not " (.ty key))))
+        (locals-reset! (mut k) mark)
+        (te `(let [~(sym all) ~(.code items)
+                   (mut ~(sym keys)) ~(new-list (mut k) (.ty key))
+                   (mut ~(sym o)) ~(new-list (mut k) (elem-of (.ty items)))]
+               (for (ref ~(sym v)) ~(sym all) (push! (mut ~(sym keys)) ~(.code key)))
+               (for ~(sym i) ~order (push! (mut ~(sym o)) (get ~(sym all) ~(sym i))))
+               ~(sym o))
+            (.ty items))))
+    (g/KIf [] (if-code (mut k) n want))
+    (g/KIfLet [] (if-let-code (mut k) n want))
+    (g/KMatch [] (match-code (mut k) n (kid n 0) (list-kids (kid n 1)) want))
+    (g/KBlock []
+      (let [stmts (list-kids (kid n 0))]
+        (if (and (= (len stmts) 0) (map? want))
+            (te (new-map (mut k) want) want)
+            (let [mark (locals-mark (mut k))
+                  r (block-from (mut k) stmts 0 want)]
+              (locals-reset! (mut k) mark)
+              r))))
+    (g/KTmpl [] (template (mut k) n))
+    (g/KNot []
+      (let [x (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Bool") "Bool")]
+        (te `(not ~(.code x)) "Bool")))
+    (g/KNeg []
+      (let [x (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Int") "Int")]
+        (te `(- 0 ~(.code x)) "Int")))
+    (g/KOr []
+      (let [a (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Bool") "Bool")
+            b (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Bool") "Bool")]
+        (te `(or ~(.code a) ~(.code b)) "Bool")))
+    (g/KAnd []
+      (let [a (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Bool") "Bool")
+            b (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Bool") "Bool")]
+        (te `(and ~(.code a) ~(.code b)) "Bool")))
+    (g/KEq [] (equality (mut k) n false))
+    (g/KNe [] (equality (mut k) n true))
+    (g/KLt [] (compare (mut k) n `<))
+    (g/KLe [] (compare (mut k) n `<=))
+    (g/KGt [] (compare (mut k) n `>))
+    (g/KGe [] (compare (mut k) n `>=))
+    (g/KIn [] (in-test (mut k) n))
+    (g/KAdd [] (binary-int (mut k) n `+))
+    (g/KSub [] (binary-int (mut k) n `-))
+    (g/KMul [] (binary-int (mut k) n `*))
+    (g/KDiv [] (binary-int (mut k) n `/))
+    (g/KMod [] (binary-int (mut k) n `%))
+    (g/KConcat []
+      (let [first-ty (.ty (expr (mut k) (kid n 0) want))]
+        (if (list? first-ty)
+            (let [a (expr (mut k) (kid n 0) want)
+                  b (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) first-ty) first-ty)
+                  o (fresh (mut k) "out") e (fresh (mut k) "e")]
+              (te `(let [(mut ~(sym o)) ~(new-list (mut k) (elem-of first-ty))]
+                     (for (ref ~(sym e)) ~(.code a) (push! (mut ~(sym o)) ~(sym e)))
+                     (for (ref ~(sym e)) ~(.code b) (push! (mut ~(sym o)) ~(sym e)))
+                     ~(sym o))
+                  first-ty))
+            (let [(mut parts) (ArrayList::new [g/Node] (malloc-allocator))
+                  b (fresh (mut k) "b")
+                  (mut pushes) (primitive/code-list-new)]
+              (concat-operands! n (mut parts))
+              (for p parts
+                (let [x (expect (mut k) p (expr (mut k) p "Text") "Text")]
+                  (push! (mut pushes) `(push-str! (mut ~(sym b)) ~(.code x)))))
+              (te `(let [(mut ~(sym b)) (str/StrBuf::new (malloc-allocator))]
+                     ~@pushes
+                     (finish! (mut ~(sym b))))
+                  "Text")))))
+    (g/KDefault []
+      (let [a (expr (mut k) (kid n 0) (if (> (len want) 0) (if (opt? want) want (cat want "?")) ""))]
+        (unless (opt? (.ty a)) (die (mut k) n (cat "`??` needs an option on its left, but this is " (.ty a))))
+        (let [x (fresh (mut k) "x")
+              b (expr (mut k) (kid n 1) (if (> (len want) 0) want (opt-of (.ty a))))]
+          (cond
+            (= (.ty b) (.ty a))
+              (te `(match ~(.code a) (Some [~(sym x)] (Some ~(sym x))) (None [] ~(.code b))) (.ty a))
+            (or (= (.ty b) (opt-of (.ty a))) (= (.ty b) "Never"))
+              (te `(match ~(.code a) (Some [~(sym x)] ~(sym x)) (None [] ~(.code b))) (opt-of (.ty a)))
+            :else (die (mut k) n (cat4 "`??` has " (.ty a) " and " (.ty b)))))))
+    (g/KIsE []
+      (let [s (expr (mut k) (kid n 0) "")
+            t (fresh (mut k) "m")]
+        (te `(let [~(sym t) ~(.code s)] ~(pat-test (mut k) (kid n 1) (sym t) (.ty s))) "Bool")))
+    (g/KWithE []
+      (let [base (expr (mut k) (kid n 0) want)
+            t (fresh (mut k) "w")
+            (mut sets) (primitive/code-list-new)]
+        (for f (list-kids (kid n 1))
+          (let [name (.text (kid f 0))
+                ft (field-type (mut k) f (.ty base) name)
+                v (expect (mut k) (kid f 1) (expr (mut k) (kid f 1) ft) ft)]
+            (push! (mut sets) `(set! (~(primitive/code-symbol "." name) ~(sym t)) ~(.code v)))))
+        (te `(let [(mut ~(sym t)) ~(.code base)] ~@sets ~(sym t)) (.ty base))))
+    (g/KPanic []
+      (let [(mut args) (primitive/code-list-new)]
+        (for a (list-kids (kid n 1)) (push! (mut args) (.code (expr (mut k) a ""))))
+        (te `(panic ~(str-literal (kid n 0)) ~@args) "Never")))
+    (g/KReturn []
+      (when (> (.in-with k) 0)
+        (die (mut k) n "cannot return from inside `with`: its context would not be restored"))
+      (set! (.returned k) true)
+      (if (none? (kid n 0))
+          (te `(return-from :fn 0) "Never")
+          (let [v (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) (.ret k)) (.ret k))]
+            (te `(return-from :fn ~(.code v)) "Never"))))
+    (_ (die (mut k) n (cat "this is not an expression: " (g/kind-name (.kind n)))))))
+
+(defn first-elem-type [(k (mut Comp)) (a g/Node)] (-> TE) (expr (mut k) a ""))
+
+(defn func-type [(f Func)] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator)) (mut first) true]
+    (push-str! (mut b) "Fn(")
+    (for p (.params f)
+      (unless first (push-str! (mut b) ","))
+      (set! first false)
+      (push-str! (mut b) (.ty p)))
+    (push-str! (mut b) ")->")
+    (push-str! (mut b) (.ret f))
+    (finish! (mut b))))
+
+;;; A bare capitalised name: a value of the enum that's wanted, or of this module's.
+(defn enum-value [(k (mut Comp)) (n g/Node) (name (slice u8)) (want (slice u8))] (-> TE)
+  (let [from-want
+          (if (and (> (len want) 0) (not (builtin-type? want)) (> (last-dot want) 0)
+                   (not (list? want)) (not (map? want)) (not (opt? want)) (not (fn? want)))
+              (match (find-enum-named (mod-at (mut k) (type-module want)) (type-name want))
+                (Some [e]
+                  (let [(mut hit) false]
+                    (for v (.variants e) (when (= v name) (set! hit true)))
+                    hit))
+                (None [] false))
+              false)]
+    (if from-want
+        (te `(~(sym (qualified (mut k) (type-module want) name))) want)
+        (match (find-enum-of (self-mod (mut k)) name)
+          (Some [e] (te `(~(sym name)) (cat3 (.self k) "." (.name e))))
+          (None [] (die (mut k) n (cat "nothing named " name)))))))
+
+;; ---------------------------------------------------------------- statements
+
+(defn list-copy [(k (mut Comp)) (e TE)] (-> Code)
+  (if (list? (.ty e))
+      (let [o (fresh (mut k) "out") x (fresh (mut k) "x")]
+        `(let [(mut ~(sym o)) ~(new-list (mut k) (elem-of (.ty e)))]
+           (for (ref ~(sym x)) ~(.code e) (push! (mut ~(sym o)) ~(sym x)))
+           ~(sym o)))
+      (.code e)))
+
+(defn stmt [(k (mut Comp)) (s g/Node) (want (slice u8))] (-> TE)
+  (match (.kind s)
+    (g/KFor []
+      (let [mark (locals-mark (mut k))
+            h (head-open! (mut k) (kid s 0))
+            body (expr (mut k) (kid s 1) "Void")
+            code (head-wrap (mut k) h (.code body))]
+        (locals-reset! (mut k) mark)
+        (te code "Void")))
+    (g/KWhile []
+      (let [c (expect (mut k) (kid s 0) (expr (mut k) (kid s 0) "Bool") "Bool")
+            body (expr (mut k) (kid s 1) "Void")]
+        (te `(while ~(.code c) ~(.code body)) "Void")))
+    (g/KAssert []
+      (let [call-node (kid s 0)]
+        (unless (and (= (.kind call-node) (g/KCall)) (= (.kind (kid call-node 0)) (g/KFieldE)))
+          (die (mut k) s "assert takes db.relation(columns)"))
+        (let [db (place (mut k) (kid (kid call-node 0) 0))
+              rel (.text (kid (kid call-node 0) 1))
+              args (list-kids (kid call-node 1))
+              (mut cs) (primitive/code-list-new)]
+          (rel-check (mut k) s (.ty db) rel (len args))
+          (for a args
+            (push! (mut cs) (.code (expect (mut k) a (expr (mut k) a "Int") "Int"))))
+          (te `(~(sym (qualified (mut k) (type-module (.ty db)) (cat3 "add-" rel "!"))) (mut ~(.code db)) ~@cs)
+              "Void"))))
+    (g/KWithCtx []
+      (let [inits (list-kids (kid s 0))
+            (mut saves) (primitive/code-list-new)
+            (mut sets) (primitive/code-list-new)
+            (mut restores) (primitive/code-list-new)
+            m (self-mod (mut k))]
+        (for init inits
+          (let [name (.text (kid init 0))]
+            (match (find-global m name)
+              (None [] (die (mut k) init (cat "no context named " name)))
+              (Some [x]
+                (let [saved (fresh (mut k) "saved")
+                      field `(~(primitive/code-symbol "." name) (rules-state))
+                      v (expect (mut k) (kid init 1) (expr (mut k) (kid init 1) (.ty x)) (.ty x))]
+                  (push! (mut saves) (sym saved))
+                  (push! (mut saves) field)
+                  (push! (mut sets) `(set! ~field ~(.code v)))
+                  (push! (mut restores) `(set! ~field ~(sym saved))))))))
+        (set! (.in-with k) (+ (.in-with k) 1))
+        (let [body (expr (mut k) (kid s 1) "Void")]
+          (set! (.in-with k) (- (.in-with k) 1))
+          (te `(let [~@saves] ~@sets ~(.code body) ~@restores 0) "Void"))))
+    (g/KPrint []
+      (let [(mut args) (primitive/code-list-new)]
+        (for a (list-kids (kid s 1)) (push! (mut args) (.code (expr (mut k) a ""))))
+        (te `(println ~(str-literal (kid s 0)) ~@args) "Void")))
+    (g/KAssign []
+      (let [target (kid s 0)]
+        (if (and (= (.kind target) (g/KIndex))
+                 (let [b (place (mut k) (kid target 0))] (or (list? (.ty b)) (map? (.ty b)))))
+            (let [b (place (mut k) (kid target 0))]
+              (if (map? (.ty b))
+                  (let [i (expect (mut k) (kid target 1) (expr (mut k) (kid target 1) (map-key (.ty b))) (map-key (.ty b)))
+                        v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) (map-val (.ty b))) (map-val (.ty b)))]
+                    (te `(set! (mut ~(.code b)) ~(.code i) ~(.code v)) "Void"))
+                  (let [i (expect (mut k) (kid target 1) (expr (mut k) (kid target 1) "Int") "Int")
+                        v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) (elem-of (.ty b))) (elem-of (.ty b)))]
+                    (te `(set! (mut ~(.code b)) ~(.code i) ~(.code v)) "Void"))))
+            (let [p (place (mut k) target)
+                  v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) (.ty p)) (.ty p))]
+              (check-assignable! (mut k) target)
+              (te `(set! ~(.code p) ~(.code v)) "Void")))))
+    (g/KAppend []
+      (let [p (place (mut k) (kid s 0))
+            t (.ty p)]
+        (check-assignable! (mut k) (kid s 0))
+        (cond
+          (list? t)
+            (let [v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) (elem-of t)) (elem-of t))]
+              (te `(push! (mut ~(.code p)) ~(.code v)) "Void"))
+          (= t "Int")
+            (let [v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) "Int") "Int")]
+              (te `(set! ~(.code p) (+ ~(.code p) ~(.code v))) "Void"))
+          :else (die (mut k) s (cat "cannot add to " t)))))
+    (g/KExtend []
+      (let [p (place (mut k) (kid s 0))
+            t (.ty p)]
+        (check-assignable! (mut k) (kid s 0))
+        (unless (list? t) (die (mut k) s (cat "++= extends a list, not " t)))
+        (let [v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) t) t)
+              e (fresh (mut k) "e")]
+          (te `(for (ref ~(sym e)) ~(.code v) (push! (mut ~(.code p)) ~(sym e))) "Void"))))
+    (_ (expr (mut k) s want))))
+
+;;; A plain local is assignable only when declared with `var`.
+(defn check-assignable! [(k (mut Comp)) (target g/Node)] (-> void)
+  (match (.kind target)
+    (g/KName []
+      (match (find-local (mut k) (.text target))
+        (Some [l]
+          (unless (.mutable l)
+            (die (mut k) target (cat3 "cannot change " (.text target) ": declare it with `var`"))))
+        (None [] 0)))
+    (g/KFieldE [] (check-assignable! (mut k) (kid target 0)))
+    (g/KIndex [] (check-assignable! (mut k) (kid target 0)))
+    (_ 0)))
+
+(defn block-from [(k (mut Comp)) (stmts (ArrayList g/Node)) (i i64) (want (slice u8))] (-> TE)
+  (let [(mut forms) (primitive/code-list-new)
+        (mut ty) "Void"
+        (mut j) i
+        n (len stmts)
+        (mut go) (< j n)]
+    (while go
+      (let [s (get stmts j)
+            at-end (= j (- n 1))]
+        (match (.kind s)
+          (g/KLet []
+            (let [declared (if (none? (kid s 1)) "" (resolve-type (mut k) (.self k) (kid s 1)))
+                  v (expect (mut k) (kid s 2) (expr (mut k) (kid s 2) declared) declared)
+                  local (bind-local! (mut k) (.text (kid s 0)) (.ty v) false)
+                  rest (block-from (mut k) stmts (+ j 1) want)]
+              (push! (mut forms) `(let [~(sym local) ~(.code v)] ~(.code rest)))
+              (set! ty (.ty rest))
+              (set! go false)))
+          (g/KVar []
+            (let [declared (if (none? (kid s 1)) "" (resolve-type (mut k) (.self k) (kid s 1)))
+                  v (expect (mut k) (kid s 2) (expr (mut k) (kid s 2) declared) declared)
+                  fresh-value (match (.kind (kid s 2))
+                                (g/KName [] false)
+                                (g/KFieldE [] false)
+                                (g/KIndex [] false)
+                                (_ true))
+                  init (if fresh-value (.code v) (list-copy (mut k) v))
+                  local (bind-local! (mut k) (.text (kid s 0)) (.ty v) true)
+                  rest (block-from (mut k) stmts (+ j 1) want)]
+              (push! (mut forms) `(let [(mut ~(sym local)) ~init] ~(.code rest)))
+              (set! ty (.ty rest))
+              (set! go false)))
+          (_
+            (let [e (stmt (mut k) s (if at-end want "Void"))]
+              (push! (mut forms) (.code e))
+              (when at-end (set! ty (.ty e)))
+              (set! j (+ j 1))
+              (when (>= j n) (set! go false)))))))
+    (when (>= i n) (push! (mut forms) `0))
+    (te `(do ~@forms) ty)))
+
+;; ---------------------------------------------------------------- declarations
+
+(defn reserved-name? [(s (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for w ["len" "get" "set" "elem" "for" "let" "if" "do" "block" "match" "when" "unless" "while"
+            "not" "and" "or" "range" "cond" "push!" "pop!" "clear!" "reserve!" "set!" "cast" "load"
+            "store!" "slice" "panic" "print" "println" "join" "call" "rules-state" "rules-init!"
+            "mut" "ref" "fn" "defn" "const" "def" "import" "module" "export" "impl" "defstruct" "defsum"]
+      (when (= w s) (set! hit true)))
+    hit))
+
+(defn compile-fn [(k (mut Comp)) (d g/Node)] (-> Code)
+  (let [name (.text (kid d 0))
+        f (match (find-func (self-mod (mut k)) name)
+            (Some [x] x)
+            (None [] (die (mut k) d "this function was not collected")))
+        (mut params) (primitive/code-list-new)
+        body-node (kid d 3)]
+    (when (reserved-name? name)
+      (die (mut k) (kid d 0) (cat3 "the name " name " is reserved")))
+    (clear! (mut (.locals k)))
+    (set! (.returned k) false)
+    (set! (.ret k) (.ret f))
+    (for p (.params f)
+      (let [local (bind-local! (mut k) (.name p) (.ty p) (.by-ref p))]
+        (push! (mut params)
+               (if (.by-ref p)
+                   `(~(sym local) (mut ~(coil-type (mut k) (.ty p))))
+                   `(~(sym local) ~(coil-type (mut k) (.ty p)))))))
+    (let [body (expect (mut k) body-node (expr (mut k) body-node (.ret f)) (.ret f))
+          code (if (.returned k) `(block :fn ~(.code body)) (.code body))]
+      (when (and (!= (.ret f) "Void") (= (.ty body) "Void"))
+        (die (mut k) body-node (cat "this function must answer " (.ret f))))
+      `(defn ~(sym name) [~@params] (-> ~(coil-type (mut k) (.ret f))) ~code))))
+
+(defn compile-record [(k (mut Comp)) (r RecDef)] (-> Code)
+  (let [(mut fields) (primitive/code-list-new)]
+    (for f (.fields r)
+      (push! (mut fields) `(~(sym (.name f)) ~(coil-type (mut k) (.ty f)))))
+    `(defstruct ~(sym (.name r)) [~@fields])))
+
+(defn compile-enum [(e EnumDef)] (-> Code)
+  (let [(mut variants) (primitive/code-list-new)]
+    (for v (.variants e) (push! (mut variants) `(~(sym v))))
+    `(do (defsum ~(sym (.name e)) ~@variants)
+         (derive Eq ~(sym (.name e))))))
+
+;;; Text, one form to a line, is what the generated module is.
+(defn emit! [(out (mut str/StrBuf)) (form Code)] (-> void)
+  (push-str! (mut out) (dsl/render form))
+  (push-str! (mut out) "\n"))
+
+(defn prelude-text [] (-> (slice u8)) (include-str "rules_prelude.rules"))
+
+(defn compile-module [(context Code)] (-> (slice u8))
+  (let [src (dsl/source-of context)
+        path (dsl/path-of context)
+        (mut k) (Comp :mods (ArrayList::new [Mod] (malloc-allocator))
+                      :self ""
+                      :table (ArrayList::new [Alias] (malloc-allocator))
+                      :base ""
+                      :depends (text-list)
+                      :src src
+                      :path path
+                      :locals (ArrayList::new [Local] (malloc-allocator))
+                      :counter 0
+                      :in-with 0
+                      :returned false
+                      :ret "Void")
+        manifest (meta/read-context-manifest context)]
+    (read-manifest! (mut k) manifest)
+    (load-prelude! (mut k))
+    (let [tree (load-rules-file! (mut k) path src true)
+          name (.text (kid tree 0))
+          decls (list-kids (kid tree 2))
+          (mut out) (str/StrBuf::new (malloc-allocator))]
+      (set! (.self k) name)
+      (set! (.src k) src)
+      (set! (.path k) path)
+      ;; Every file sees the prelude's foreign modules by their aliases.
+      (emit! (mut out)
+             `(do
+                (import "coil.primitive" :as primitive)
+                (import "coil.alloc" :use [malloc-allocator])
+                (import "coil.arraylist" :use [ArrayList])
+                (import "coil.hashmap" :use [HashMap])
+                (import "coil.slice" :use [subslice])
+                (import "coil.str" :as str)
+                (import "coil.cc" :as cc)
+                (import "coil.control" :use [return-from])))
+      (for m (.mods k)
+        (unless (or (= (.name m) name) (= (.name m) "hl.prelude") (= (.name m) "hl.rt"))
+          (emit! (mut out) `(import ~(.name m) :as ~(sym (alias-of (.name m)))))))
+      (emit! (mut out) `(import "hl.rt" :as rt))
+      (emit! (mut out) `(import "hl.rt" :as hl-rt))
+      (let [(mut deps) (primitive/code-list-new)]
+        (for d (.depends k) (push! (mut deps) `~d))
+        (when (> (len (.depends k)) 0)
+          (emit! (mut out) `(depends-on ~@deps))))
+      (let [self (self-mod (mut k))
+            (mut state-fields) (primitive/code-list-new)
+            (mut state-inits) (primitive/code-list-new)]
+        (for e (.enums self) (emit! (mut out) (compile-enum e)))
+        (for r (.recs self) (emit! (mut out) (compile-record (mut k) r)))
+        (for d decls
+          (when (or (= (.kind d) (g/KState)) (= (.kind d) (g/KContext)) (= (.kind d) (g/KConst)))
+            (let [g-name (.text (kid d 0))
+                  x (match (find-global self g-name)
+                      (Some [v] v)
+                      (None [] (die (mut k) d "this was not collected")))
+                  v (expect (mut k) (kid d 2) (expr (mut k) (kid d 2) (.ty x)) (.ty x))]
+              (push! (mut state-fields) `(~(sym g-name) ~(coil-type (mut k) (.ty x))))
+              (push! (mut state-inits) `(set! (~(primitive/code-symbol "." g-name) s) ~(.code v))))))
+        (emit! (mut out)
+               `(defstruct RulesState [(rules-ready bool) ~@state-fields]))
+        (emit! (mut out)
+               `(defn rules-init! [(s (ptr RulesState))] (-> void)
+                  (set! (.rules-ready s) true)
+                  ~@state-inits
+                  0))
+        (emit! (mut out)
+               `(defn rules-state [] (-> (ptr RulesState))
+                  (let [s (primitive/alloc-static RulesState)]
+                    (unless (.rules-ready s) (rules-init! s))
+                    s)))
+        (emit! (mut out)
+               `(defn reset-state! [] (-> void)
+                  (rules-init! (rules-state)))))
+      (for d decls
+        (when (= (.kind d) (g/KFn))
+          (emit! (mut out) (compile-fn (mut k) d))))
+      (finish! (mut out)))))
+
+(defn load-prelude! [(k (mut Comp))] (-> void)
+  (let [text (prelude-text)
+        (mut tree) (parse-file (mut k) text "rules_prelude.rules")]
+    (push! (mut (.mods k)) (mod-new "hl.prelude" (SRules) ""))
+    (set! (.src k) text)
+    (for d (list-kids (kid tree 2))
+      (when (= (.kind d) (g/KForeign)) (add-foreign! (mut k) d "hl.prelude")))))
+
+(defn read-rules [(context Code)] (-> Code)
+  (primitive/code-read (compile-module context) `(reader-config)))

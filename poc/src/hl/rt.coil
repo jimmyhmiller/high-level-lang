@@ -12,6 +12,11 @@
 (import "coil.str" :as str)
 (import "coil.fs" :as fs)
 (import "coil.primitive" :as primitive)
+(import "coil.unicode" :as u)
+(import "coil.time" :use [monotonic-now-ms])
+(import "coil.thread" :use [Thread ThreadConfig])
+(import "coil.cc" :as cc)
+(import "coil.args" :as args)
 
 ;;; Syntax trees live until the process exits, so they come from one growing arena:
 ;;; allocating a node's children is then a pointer bump.
@@ -279,6 +284,16 @@
 
 (defstruct Pos [(line i64) (col i64)])
 
+;;; Where a tool that handles failure itself finds the last one.
+(defstruct LastParse [(last ParseError)])
+(defn last-parse-error [] (-> (ptr LastParse)) (primitive/alloc-static LastParse))
+(defn last-parse-path [] (-> (slice u8)) (.path (.last (last-parse-error))))
+(defn last-parse-line [] (-> i64) (.line (.last (last-parse-error))))
+(defn last-parse-col [] (-> i64) (.col (.last (last-parse-error))))
+(defn last-parse-want [] (-> (slice u8)) (.want (.last (last-parse-error))))
+(defn last-parse-found [] (-> (slice u8)) (.found (.last (last-parse-error))))
+(defn fail-last-parse [] (-> never) (parse-failed (.last (last-parse-error))))
+
 (defn parse-error [(p (mut P))] (-> ParseError)
   (let [at (line-col (.src p) (.far p))
         n (len (.src p))
@@ -295,6 +310,7 @@
 ;;; `pending` holds a `;` that a following `}` makes unnecessary.
 ;;; `marks`, when `tracking`, records where each leaf token landed, for source maps.
 (defstruct Mark [(out i64) (src i64)])
+(defstruct Rendered [(text (slice u8)) (marks (ArrayList Mark))])
 (defstruct W [(buf (ArrayList u8)) (pretty bool) (pending bool) (keep i64) (after-int bool)
               (tracking bool) (marks (ArrayList Mark)) (next-src i64)])
 
@@ -683,3 +699,116 @@
   (match (parse-num s)
     (Some [v] v)
     (None [] (panic "expected a number, got {}" s))))
+;; ---------------------------------------------------------------- what `.rules` calls
+
+;;; A leaf's text is this, or is this in quotes.
+(defn leaf-is? [(text (slice u8)) (want (slice u8))] (-> bool)
+  (or (= text want)
+      (and (= (len text) (+ (len want) 2))
+           (or (= (get text 0) #\") (= (get text 0) #\'))
+           (= (subslice text 1 (- (len text) 1)) want))))
+
+(defn starts-with [(s (slice u8)) (prefix (slice u8))] (-> bool) (at? s 0 prefix))
+
+(defn ends-with [(s (slice u8)) (suffix (slice u8))] (-> bool)
+  (and (>= (len s) (len suffix))
+       (= (subslice s (- (len s) (len suffix)) (len s)) suffix)))
+
+;;; Indices of `keys` in sorted order, equal keys keeping their order.
+(defn sort-order-int [(keys (ArrayList i64)) (desc bool)] (-> (ArrayList i64))
+  (let [n (len keys)
+        (mut a) (ArrayList::new [i64] (malloc-allocator))
+        (mut b) (ArrayList::new [i64] (malloc-allocator))
+        (mut width) 1]
+    (for i (range 0 n) (push! (mut a) i) (push! (mut b) i))
+    (while (< width n)
+      (let [(mut lo) 0]
+        (while (< lo n)
+          (let [mid (if (< (+ lo width) n) (+ lo width) n)
+                hi (if (< (+ lo (* 2 width)) n) (+ lo (* 2 width)) n)
+                (mut i) lo (mut j) mid (mut at) lo]
+            (while (< at hi)
+              (if (and (< i mid)
+                       (or (>= j hi)
+                           (let [x (get keys (get a i)) y (get keys (get a j))]
+                             (if desc (>= x y) (<= x y)))))
+                  (do (set! (mut b) at (get a i)) (set! i (+ i 1)))
+                  (do (set! (mut b) at (get a j)) (set! j (+ j 1))))
+              (set! at (+ at 1))))
+          (set! lo (+ lo (* 2 width)))))
+      (for i (range 0 n) (set! (mut a) i (get b i)))
+      (set! width (* width 2)))
+    a))
+
+;;; The same over text, by bytes: a module sorts few names.
+(defn sort-order-text [(keys (ArrayList (slice u8))) (desc bool)] (-> (ArrayList i64))
+  (let [(mut order) (ArrayList::new [i64] (malloc-allocator))]
+    (for i (range 0 (len keys)) (push! (mut order) i))
+    (for i (range 1 (len keys))
+      (let [(mut j) i]
+        (while (and (> j 0)
+                    (let [c (str/cmp (get keys (get order j)) (get keys (get order (- j 1))))]
+                      (if desc (> c 0) (< c 0))))
+          (let [x (get order j)]
+            (set! (mut order) j (get order (- j 1)))
+            (set! (mut order) (- j 1) x))
+          (set! j (- j 1)))))
+    order))
+
+;;; A growing piece of text.
+(defn buf-new [] (-> str/StrBuf) (str/StrBuf::new (malloc-allocator)))
+(defn buf-add! [(b (mut str/StrBuf)) (s (slice u8))] (-> void) (push-str! (mut b) s))
+(defn buf-byte! [(b (mut str/StrBuf)) (c i64)] (-> void) (push! (mut (.bytes b)) (cast u8 c)))
+(defn buf-text [(b (mut str/StrBuf))] (-> (slice u8)) (finish! (mut b)))
+
+;;; A one-element text from a byte.
+(defn text-of-byte [(c i64)] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push! (mut (.bytes b)) (cast u8 c))
+    (finish! (mut b))))
+
+(defn line-of [(src (slice u8)) (at i64)] (-> i64) (.line (line-col src at)))
+(defn col-of [(src (slice u8)) (at i64)] (-> i64) (.col (line-col src at)))
+
+(defn file-exists? [(path (slice u8))] (-> bool)
+  (match (fs/exists? (malloc-allocator) path)
+    (Ok [e] e)
+    (Err [_] false)))
+
+;;; Exists and can be read: a directory exists, but is not a file.
+(defn readable-file? [(path (slice u8))] (-> bool)
+  (and (file-exists? path)
+       (match (fs/read-file (malloc-allocator) path)
+         (Ok [_] true)
+         (Err [_] false))))
+
+;;; Unicode's general category of a code point, as its two-letter abbreviation.
+(defn unicode-category [(cp i64)] (-> (slice u8))
+  (u/general-category-abbrev (u/general-category (str/Rune :value (cast u32 cp)))))
+
+(defn now-ms [] (-> i64)
+  (match (monotonic-now-ms)
+    (Ok [now] now)
+    (Err [_] 0)))
+
+;;; Trees can be as deep as a merged statement list is long, so builds run on a thread
+;;; with room for that.
+(defn run-on-big-stack [(body (fnptr (cc/C) [(ptr i8)] (ptr i8)))] (-> void)
+  (let [(mut t) (Thread :handle (cast (ptr i8) 0))]
+    (when (!= (Thread::spawn-configured (cast (ptr Thread) (mut t))
+                                        body
+                                        (cast (ptr i8) 0)
+                                        (ThreadConfig :stack-size 1073741824 :guard-size 0))
+              (: 0 i32))
+      (panic "could not start the build thread"))
+    (join-thread! (mut t))
+    0))
+(defn join-thread! [(t (mut Thread))] (-> void) (join (cast (ptr Thread) (mut t))) 0)
+
+;;; Command-line arguments, for a program written in `.rules`.
+(defn arg-count [] (-> i64) (args/count))
+(defn arg-at [(i i64)] (-> (slice u8)) (args/nth i))
+
+(defn digit-i64? [(c i64)] (-> bool) (and (>= c 48) (<= c 57)))
+(defn name-start-i64? [(c i64)] (-> bool) (and (>= c 0) (< c 256) (name-start? (cast u8 c))))
+(defn name-char-i64? [(c i64)] (-> bool) (and (>= c 0) (< c 256) (name-char? (cast u8 c))))
