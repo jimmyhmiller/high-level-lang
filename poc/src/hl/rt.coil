@@ -503,14 +503,26 @@
    (next (ArrayList i64))
    (index (ArrayList (HashMap i64 (ArrayList i64))))
    (indexed (ArrayList i64))
-   (queue (ArrayList i64))])
+   ;; By two columns at once, for `(col1 * arity + col2)`.
+   (pair-index (ArrayList (HashMap i64 (ArrayList i64))))
+   (pair-indexed (ArrayList i64))
+   (queue (ArrayList i64))
+   ;; The rows the last round added, for evaluating only what they make possible.
+   (seen i64)
+   (delta-from i64)
+   (delta-to i64)])
 
 (defn rel-new [(arity i64)] (-> Rel)
   (let [(mut index) (ArrayList::new [(HashMap i64 (ArrayList i64))] (malloc-allocator))
-        (mut indexed) (ArrayList::new [i64] (malloc-allocator))]
+        (mut indexed) (ArrayList::new [i64] (malloc-allocator))
+        (mut pair-index) (ArrayList::new [(HashMap i64 (ArrayList i64))] (malloc-allocator))
+        (mut pair-indexed) (ArrayList::new [i64] (malloc-allocator))]
     (for _ (range 0 arity)
       (push! (mut index) (HashMap::new-scalar [i64 (ArrayList i64)] (malloc-allocator)))
       (push! (mut indexed) 0))
+    (for _ (range 0 (* arity arity))
+      (push! (mut pair-index) (HashMap::new-scalar [i64 (ArrayList i64)] (malloc-allocator)))
+      (push! (mut pair-indexed) 0))
     (Rel :arity arity
          :data (ArrayList::new [i64] (malloc-allocator))
          :count 0
@@ -518,7 +530,12 @@
          :next (ArrayList::new [i64] (malloc-allocator))
          :index index
          :indexed indexed
-         :queue (ArrayList::new [i64] (malloc-allocator)))))
+         :pair-index pair-index
+         :pair-indexed pair-indexed
+         :queue (ArrayList::new [i64] (malloc-allocator))
+         :seen 0
+         :delta-from 0
+         :delta-to 0)))
 
 (defn rel-at [(r (mut Rel)) (row i64) (col i64)] (-> i64)
   (get (.data r) (+ (* row (.arity r)) col)))
@@ -563,6 +580,22 @@
           (set! (mut (elem (mut (.index r)) col)) key b))))))
 
 ;;; True when the row is new.
+;;; One key for two columns. Different pairs may share it, and a scan tests each column anyway.
+(defn pair-key [(x i64) (y i64)] (-> i64)
+  (primitive/imul (^ (primitive/imul (^ -3750763034362895579 x) 1099511628211) y) 1099511628211))
+
+(defn pair-index-add! [(r (mut Rel)) (slot i64) (c1 i64) (c2 i64) (row i64)] (-> void)
+  (let [key (pair-key (rel-at (mut r) row c1) (rel-at (mut r) row c2))]
+    (match (get (get (.pair-index r) slot) key)
+      (Some [bucket]
+        (let [(mut b) bucket]
+          (push! (mut b) row)
+          (set! (mut (elem (mut (.pair-index r)) slot)) key b)))
+      (None []
+        (let [(mut b) (ArrayList::new [i64] (malloc-allocator))]
+          (push! (mut b) row)
+          (set! (mut (elem (mut (.pair-index r)) slot)) key b))))))
+
 (defn rel-add! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
   (if (rel-has? (mut r) a b c d)
       false
@@ -578,6 +611,10 @@
         (for col (range 0 n)
           (when (!= (get (.indexed r) col) 0)
             (index-add! (mut r) col row)))
+        (for c1 (range 0 n)
+          (for c2 (range 0 n)
+            (when (!= (get (.pair-indexed r) (+ (* c1 n) c2)) 0)
+              (pair-index-add! (mut r) (+ (* c1 n) c2) c1 c2 row))))
         true)))
 
 (defn rel-queue! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> void)
@@ -608,6 +645,25 @@
   (match (get (get (.index r) col) key)
     (Some [b] b)
     (None [] (ArrayList::new [i64] (malloc-allocator)))))
+
+;;; The rows whose two columns equal these keys, and perhaps a few others. Stable until the next flush.
+(defn rel-bucket2 [(r (mut Rel)) (c1 i64) (c2 i64) (k1 i64) (k2 i64)] (-> (ArrayList i64))
+  (let [slot (+ (* c1 (.arity r)) c2)]
+    (when (= (get (.pair-indexed r) slot) 0)
+      (set! (mut (.pair-indexed r)) slot 1)
+      (for row (range 0 (.count r)) (pair-index-add! (mut r) slot c1 c2 row)))
+    (match (get (get (.pair-index r) slot) (pair-key k1 k2))
+      (Some [b] b)
+      (None [] (ArrayList::new [i64] (malloc-allocator))))))
+
+;;; Start a round: what arrived since the last start is now the delta. True when there is any.
+(defn rel-advance! [(r (mut Rel))] (-> bool)
+  (set! (.delta-from r) (.seen r))
+  (set! (.delta-to r) (.count r))
+  (set! (.seen r) (.count r))
+  (< (.delta-from r) (.delta-to r)))
+
+(defn rel-delta? [(r (mut Rel))] (-> bool) (< (.delta-from r) (.delta-to r)))
 
 ;;; Strings to the dense ids relations hold.
 (defstruct Names [(ids (HashMap (slice u8) i64)) (strs (ArrayList (slice u8)))])
@@ -817,6 +873,12 @@
     (join-thread! (mut t))
     0))
 (defn join-thread! [(t (mut Thread))] (-> void) (join (cast (ptr Thread) (mut t))) 0)
+
+;;; What a program answered, carried from the thread it ran on to `main`.
+(defstruct Answer [(value i64)])
+(defn answered [] (-> (ptr Answer)) (primitive/alloc-static Answer))
+(defn answer! [(v i64)] (-> void) (set! (.value (answered)) v) 0)
+(defn answer [] (-> i64) (.value (answered)))
 
 ;;; Command-line arguments, for a program written in `.rules`.
 (defn args-init! [(argc i32) (argv (ptr (ptr i8)))] (-> void) (args/init! argc argv) 0)

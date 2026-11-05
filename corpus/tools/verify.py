@@ -140,6 +140,39 @@ for flags in [[], ["--minify"]]:
 code, text = sh([ESB, f"{JSX}/mismatch.jsx", f"--outfile={SCRATCH}/jsx.bad.js"])
 check(code != 0 and "does not match" in text, "a closing tag that does not match is an error")
 
+print("== TypeScript against esbuild")
+for entry in ["main", "eq", "rx", "zod3", "zod4", "immer"]:
+    for flags in [[], ["--minify"]]:
+        a, b = f"{SCRATCH}/ts.o.cjs", f"{SCRATCH}/ts.e.cjs"
+        code, text = sh([ESB, f"app/ts/{entry}.ts", f"--outfile={a}"] + flags)
+        sh([E, f"app/ts/{entry}.ts", "--bundle", "--log-level=error", f"--outfile={b}"] + flags)
+        ra, rb = sh(["node", a], 30), sh(["node", b], 30)
+        size = f"{os.path.getsize(a)} vs {os.path.getsize(b)} bytes" if "--minify" in flags else f"{len(ra[1])} bytes of output"
+        check(code == 0 and ra[0] == 0 and ra[1] and ra[1] == rb[1], f"{' '.join([entry] + flags)}: same output as esbuild's; {size}")
+all_ts = subprocess.run("find node_modules -name '*.ts' -o -name '*.tsx' -o -name '*.mts' -o -name '*.cts'", shell=True, capture_output=True, text=True).stdout.split()
+source = [f for f in all_ts if not re.search(r"\.d\.[mc]?ts$", f)]
+declarations = [f for f in all_ts if re.search(r"\.d\.[mc]?ts$", f)]
+for name, files in [("sources", source), ("declarations", declarations)]:
+    listfile = f"{SCRATCH}/ts-{name}.list"; open(listfile, "w").write("\n".join(files) + "\n")
+    code, out = sh([PARSE, "check", listfile], 300)
+    tail = out.strip().split("\n")[-1]
+    # Esbuild rejects these too. Three say `export const x: T;`, and four are `export =       function
+    # f(): T;`, a find-and-replace on `export default` in the package's own build.
+    rejected = set() if name == "sources" else {f"node_modules/{f}" for f in [
+        "acorn/dist/acorn.d.ts", "acorn/dist/acorn.d.mts", "preact/src/index.d.ts",
+        "@jridgewell/trace-mapping/types/by-source.d.cts", "@jridgewell/trace-mapping/types/resolve.d.cts",
+        "@jridgewell/trace-mapping/types/strip-filename.d.cts", "@jridgewell/trace-mapping/types/sort.d.cts"]}
+    failed = set(re.findall(r"^FAIL (\S+?):\d+:\d+", out, re.M))
+    check("parsed" in tail and failed == rejected, f"every TypeScript file in node_modules, {name}: {tail}, {len(rejected)} expected")
+
+print("== side effects against esbuild")
+for a in "globs via-named via-star via-local via-ns via-whole via-none".split():
+    ours, theirs = f"{SCRATCH}/fx.o.cjs", f"{SCRATCH}/fx.e.cjs"
+    sh([ESB, f"app/fx/{a}.js", f"--outfile={ours}"])
+    sh([E, f"app/fx/{a}.js", "--bundle", "--log-level=error", f"--outfile={theirs}"])
+    x, y = sh(["node", ours], 15)[1], sh(["node", theirs], 15)[1]
+    check(x and x == y, f"{a}: runs the same module effects")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)

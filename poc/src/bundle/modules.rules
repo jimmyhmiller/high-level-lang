@@ -9,6 +9,7 @@ use bundle.early as early
 use bundle.comments as cm
 use bundle.minhost as host
 use bundle.jsx as jsx
+use bundle.ts as ts
 
 # `External` is an import left for the runtime: it has no source and no statements.
 enum ModuleKind { Esm, Cjs, Runtime, External }
@@ -172,9 +173,20 @@ fn annotated-token(parts: [cm.Node], from: Int, end: Int) -> Int {
   at
 }
 
+fn mentions-name?(n: Node, name: Text) -> Bool = match n {
+  Ident(x) => x == name
+  _ => any k in n.kids: mentions-name?(k, name)
+}
+
+# A class has a binding of its own name inside it, which is there before the `var` around it is
+# assigned: `static x = new A()` needs that. A second, inner name is only worth it if something
+# in the class says the name.
 fn declarator-of-class(c: Node) -> Node = match c {
   ClassDecl(name, h, b) => {
-    let init = at-source(ClassExpr(None(), h, b), c)
+    let inner = if mentions-name?(h, name.text) or mentions-name?(b, name.text)
+                then BindName(name.text) with { lo: c.lo, hi: c.lo }
+                else None()
+    let init = at-source(ClassExpr(inner, h, b), c)
     Declarator(name, init) with { lo: name.lo, hi: init.hi }
   }
   _ => panic "expected a class declaration"
@@ -274,10 +286,12 @@ fn substitute(n: Node, b: {Int:Int}) -> Node {
 # Parse and check a file. A file with import or export syntax is a module; anything else may be
 # CommonJS, whose top level is a function body.
 fn parse-file(src: Text, path: Text) -> Node {
-  let syntax = if loader-of(path) == "jsx" then js.flag-bit("jsx") else 0
+  let loader = loader-of(path)
+  let syntax = (if loader == "jsx" or loader == "tsx" then js.flag-bit("jsx") else 0)
+             + (if loader == "ts" or loader == "tsx" then js.flag-bit("ts") else 0)
   let tree = js.parse-tries(src, path, syntax, js.flag-bit("await"))
   let is-module = early.program-has-module-syntax?(tree)
-  match early.check(tree, is-module, not is-module) {
+  match early.check(tree, is-module, not is-module, loader == "ts" or loader == "tsx") {
     none => tree
     some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
   }
@@ -347,12 +361,20 @@ fn loader-of(path: Text) -> Text {
   for l in loaders {
     if ends-with(path, l.key) { return l.value }
   }
-  if ends-with(path, ".json") then "json" else if ends-with(path, ".jsx") then "jsx" else "js"
+  default-loader(path)
 }
+
+fn default-loader(path: Text) -> Text =
+  if ends-with(path, ".json") then "json"
+  else if ends-with(path, ".jsx") then "jsx"
+  else if ends-with(path, ".tsx") then "tsx"
+  else if ends-with(path, ".ts") or ends-with(path, ".mts") or ends-with(path, ".cts") then "ts"
+  else "js"
+
 
 # A file's text as a module, by what its loader says it is.
 fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
-  "js" | "jsx" => text
+  "js" | "jsx" | "ts" | "tsx" => text
   "json" => "module.exports = " ++ text
   "text" => "export default " ++ host.js-string(text) ++ ";"
   "base64" => "export default \"" ++ host.base64(text) ++ "\";"
@@ -377,9 +399,14 @@ fn load-file(path: Text, effects: Bool) -> Int {
   if let some(id) = by-path[path] { return id }
   let src = as-module(source-of(path), path)
   let parsed = parse-file(src, path)
-  let lowered = if loader-of(path) == "jsx" then jsx.lower(parsed, src, path, jsx-options)
+  let loader = loader-of(path)
+  let lowered = if loader == "jsx" or loader == "tsx" then jsx.lower(parsed, src, path, jsx-options)
                 else jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
-  let tree0 = transform(lowered.tree)
+  let typed = if loader == "ts" or loader == "tsx" then ts.lower(lowered.tree, src, jsx.kept-names(src, path, jsx-options))
+              else ts.Lowered(tree: lowered.tree, pure-calls: {})
+  var pure-calls = lowered.pure-calls
+  for k in keys(typed.pure-calls) { pure-calls[k] = typed.pure-calls[k] ?? k }
+  let tree0 = transform(typed.tree)
   let base = base-name(path)
   let id = len(modules)
   let esm = early.program-has-module-syntax?(tree0)
@@ -419,7 +446,7 @@ fn load-file(path: Text, effects: Bool) -> Int {
   let real-free = [f for f in free-names if not (cjs and (f == "exports" or f == "module"))]
   modules += blank-module(id, path, if cjs then Cjs else Esm, final-tree, root) with {
     bindings: bindings, side-effects: effects, base: base, source: tree0.kids[1].kids,
-    free: real-free, text: src, pure-at: pure-annotations(src), pure-calls: lowered.pure-calls
+    free: real-free, text: src, pure-at: pure-annotations(src), pure-calls: pure-calls
   }
   by-path[path] = id
   # Imports in source order. Statements `define` removed import nothing.

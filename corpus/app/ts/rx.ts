@@ -1,0 +1,11 @@
+import { of, from, map, filter, reduce, Subject, BehaviorSubject, merge, concat, take, toArray, firstValueFrom } from "../../node_modules/rxjs/src/index";
+const out: unknown[] = [];
+of(1, 2, 3).pipe(map((x) => x * 2), filter((x) => x > 2), reduce((a, b) => a + b, 0)).subscribe((v) => out.push(v));
+const s = new Subject<number>();
+s.subscribe((v) => out.push(["subject", v]));
+s.next(1);
+new BehaviorSubject(5).pipe(take(1)).subscribe((v) => out.push(v));
+concat(of(1), from([2, 3])).pipe(toArray()).subscribe((v) => out.push(v));
+merge(of("a"), of("b")).subscribe((v) => out.push(v));
+console.log(JSON.stringify(out));
+firstValueFrom(of(9)).then(console.log);

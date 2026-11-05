@@ -1,0 +1,706 @@
+# TypeScript's run-time parts become JavaScript, before anything else looks at the program. The
+# grammar has already thrown the types away, so what is left here is what has a meaning when it
+# runs: enums, namespaces, parameter properties, `import x = …`, `export =`, and imports that turn
+# out to have named only types.
+rules bundle.ts over bundle.js
+use bundle.js as js
+use bundle.scopes as sc
+use bundle.early as early
+use bundle.minhost as host
+
+quote stmt at 1 0 ;
+quote exp at 1 0 0 ;
+
+record Lowered { tree: Node, pure-calls: {Int:Int} }
+
+state src: Text = ""
+state next-offset: Int = -1000
+state pure: {Int:Int} = {}
+state aliases: {Int:Bool} = {}
+state namespace-exports: {Text:[Text]} = {}
+context namespace-path: Text = ""
+
+# Scope analysis finds a name's symbol by offset. Real offsets are not negative.
+fn fresh-offset() -> Int {
+  next-offset = next-offset - 1
+  next-offset
+}
+
+fn ident(name: Text) -> Node {
+  let at = fresh-offset()
+  Ident(name) with { lo: at, hi: at }
+}
+
+fn bind(name: Text) -> Node {
+  let at = fresh-offset()
+  BindName(name) with { lo: at, hi: at }
+}
+
+# A name no code in this file can mean, for the parameter of an enum's or namespace's function.
+fn fresh-name(base: Text) -> Text {
+  var n = 2
+  var name = base ++ int-text(n)
+  while contains-text?(src, name) {
+    n += 1
+    name = base ++ int-text(n)
+  }
+  name
+}
+
+fn string-node(text: Text) -> Node = Str(host.js-string(text))
+
+# ---------------------------------------------------------------- 32-bit arithmetic
+
+const two-32: Int = 4294967296
+const two-31: Int = 2147483648
+
+fn to-u32(v: Int) -> Int = ((v % two-32) + two-32) % two-32
+fn to-i32(v: Int) -> Int {
+  let u = to-u32(v)
+  if u >= two-31 then u - two-32 else u
+}
+
+fn power-of-two(k: Int) -> Int {
+  var out = 1
+  for i in 0..k { out = out * 2 }
+  out
+}
+
+# `kind` is 0 for and, 1 for or, 2 for xor.
+fn bits(a: Int, b: Int, kind: Int) -> Int {
+  var x = to-u32(a)
+  var y = to-u32(b)
+  var out = 0
+  var place = 1
+  for i in 0..32 {
+    let p = x % 2
+    let q = y % 2
+    let hit = if kind == 0 then p == 1 and q == 1
+              else if kind == 1 then p == 1 or q == 1
+              else p != q
+    if hit { out = out + place }
+    place = place * 2
+    x = x / 2
+    y = y / 2
+  }
+  to-i32(out)
+}
+
+fn shift-left(a: Int, b: Int) -> Int = to-i32(to-i32(a) * power-of-two(to-u32(b) % 32))
+fn shift-right(a: Int, b: Int) -> Int {
+  let v = to-i32(a)
+  let d = power-of-two(to-u32(b) % 32)
+  if v >= 0 then v / d else (v - d + 1) / d
+}
+fn shift-right-unsigned(a: Int, b: Int) -> Int = to-u32(a) / power-of-two(to-u32(b) % 32)
+
+# ---------------------------------------------------------------- enums
+
+# A member's value, when it can be known here: the next member counts on from a number.
+record Value { is-text: Bool, num: Int, node: Node }
+
+fn number-value(v: Int) -> Value = Value(is-text: false, num: v, node: None())
+fn text-value(n: Node) -> Value = Value(is-text: true, num: 0, node: n)
+
+fn digits-value(s: Text, base: Int) -> Int? {
+  if len(s) == 0 { return none }
+  var v = 0
+  for c in s {
+    if c != '_' {
+      let d = if digit-byte?(c) then c - '0'
+              else if c >= 'a' and c <= 'f' then c - 'a' + 10
+              else if c >= 'A' and c <= 'F' then c - 'A' + 10
+              else 99
+      if d >= base { return none }
+      v = v * base + d
+      if v > 9007199254740992 { return none }
+    }
+  }
+  some(v)
+}
+
+fn number-literal(t: Text) -> Int? {
+  if len(t) > 2 and t[0] == '0' {
+    let rest = t[2..len(t)]
+    match t[1] {
+      'x' | 'X' => return digits-value(rest, 16)
+      'b' | 'B' => return digits-value(rest, 2)
+      'o' | 'O' => return digits-value(rest, 8)
+      _ => {}
+    }
+  }
+  digits-value(t, 10)
+}
+
+fn int-of(v: Value?) -> Int? = match v {
+  some(x) => if x.is-text then none else some(x.num)
+  none => none
+}
+
+fn fold-unary(e: Node, known: {Text:Value}, self: Text, kind: Int) -> Value? {
+  if let some(v) = int-of(evaluated(e, known, self)) {
+    return some(number-value(if kind == 0 then 0 - v else if kind == 1 then v else -1 - to-i32(v)))
+  }
+  none
+}
+
+# `kind` numbers the operators, in the order `fold-binary`'s callers use them.
+fn fold-binary(a: Node, b: Node, known: {Text:Value}, self: Text, kind: Int) -> Value? {
+  let x = int-of(evaluated(a, known, self))
+  let y = int-of(evaluated(b, known, self))
+  if let some(p) = x {
+    if let some(q) = y {
+      let result: Int? = match kind {
+        _ if kind == 0 => some(p + q)
+        _ if kind == 1 => some(p - q)
+        _ if kind == 2 => some(p * q)
+        _ if kind == 3 => if q != 0 and p % q == 0 then some(p / q) else none
+        _ if kind == 4 => if q != 0 then some(p % q) else none
+        _ if kind == 5 => some(shift-left(p, q))
+        _ if kind == 6 => some(shift-right(p, q))
+        _ if kind == 7 => some(shift-right-unsigned(p, q))
+        _ if kind == 8 => some(bits(p, q, 0))
+        _ if kind == 9 => some(bits(p, q, 1))
+        _ => some(bits(p, q, 2))
+      }
+      if let some(r) = result {
+        if r > -9007199254740992 and r < 9007199254740992 { return some(number-value(r)) }
+      }
+    }
+  }
+  none
+}
+
+fn evaluated(e: Node, known: {Text:Value}, self: Text) -> Value? = match e {
+  Num(t) => match number-literal(t) {
+    some(v) => some(number-value(v))
+    none => none
+  }
+  Str(_) | TemplateFull(_) => some(text-value(e))
+  Paren(x) => evaluated(x, known, self)
+  Neg(x) => fold-unary(x, known, self, 0)
+  Pos(x) => fold-unary(x, known, self, 1)
+  BitNot(x) => fold-unary(x, known, self, 2)
+  Add(a, b) => match evaluated(a, known, self) {
+    some(x) => match evaluated(b, known, self) {
+      some(y) => if x.is-text and y.is-text and x.node is Str(_) and y.node is Str(_)
+                 then some(text-value(host.concat(x.node.text, y.node.text)))
+                 else fold-binary(a, b, known, self, 0)
+      none => none
+    }
+    none => none
+  }
+  Sub(a, b) => fold-binary(a, b, known, self, 1)
+  Mul(a, b) => fold-binary(a, b, known, self, 2)
+  Div(a, b) => fold-binary(a, b, known, self, 3)
+  Mod(a, b) => fold-binary(a, b, known, self, 4)
+  Shl(a, b) => fold-binary(a, b, known, self, 5)
+  Shr(a, b) => fold-binary(a, b, known, self, 6)
+  Ushr(a, b) => fold-binary(a, b, known, self, 7)
+  BitAnd(a, b) => fold-binary(a, b, known, self, 8)
+  BitOr(a, b) => fold-binary(a, b, known, self, 9)
+  BitXor(a, b) => fold-binary(a, b, known, self, 10)
+  Ident(x) => known[x]
+  Member(Ident(s), p) => if s == self then known[p.text] else none
+  _ => none
+}
+
+fn number-node(v: Int) -> Node = if v < 0 then Neg(Num(int-text(0 - v))) else Num(int-text(v))
+
+fn member-key(k: Node) -> Text = match k {
+  Str(raw) => unquote(raw)
+  _ => k.text
+}
+
+# Inside an initializer, an earlier member's bare name means that member.
+fn with-members(e: Node, names: [Text], param: Text) -> Node = match e {
+  Ident(x) => if x in names then Member(ident(param), PropName(x)) else e
+  _ => if len(e.kids) == 0 then e else e with { kids: [with-members(k, names, param) for k in e.kids] }
+}
+
+# The function that fills an enum in, called on what `outer` evaluates to.
+fn enum-call(n: Node, outer: Node) -> Node = match n {
+  TsEnum(name, List(members...)) => {
+    let param = fresh-name(name.text)
+    let p = bind(param)
+    let a = ident(param)
+    var known: {Text:Value} = {}
+    var names: [Text] = []
+    var next: Int? = some(0)
+    var constant = true
+    var body: [Node] = []
+    for m in members {
+      let k = member-key(m.kids[0])
+      let key = string-node(k)
+      let init = m.kids[1]
+      let value: Value? = if init is None() then none else evaluated(lowered(init), known, name.text)
+      if init is None() {
+        match next {
+          some(v) => {
+            let number = number-node(v)
+            body += stmt`$a[$a[$key] = $number] = $key;`
+            known[k] = number-value(v)
+            next = some(v + 1)
+          }
+          none => panic "enum member {} needs an initializer: the one before it is not a number known here", k
+        }
+      } else {
+        match value {
+          some(v) => {
+            if v.is-text {
+              let text = v.node
+              body += stmt`$a[$key] = $text;`
+              next = none
+            } else {
+              let number = number-node(v.num)
+              body += stmt`$a[$a[$key] = $number] = $key;`
+              next = some(v.num + 1)
+            }
+            known[k] = v
+          }
+          none => {
+            constant = false
+            let computed = with-members(lowered(init), names, param)
+            body += stmt`$a[$a[$key] = $computed] = $key;`
+            next = none
+          }
+        }
+      }
+      names += k
+    }
+    body += stmt`return $a;`
+    let call = exp`(($p) => { $$body })($outer)`
+    let at = fresh-offset()
+    if constant { pure[at] = at }
+    call with { lo: at, hi: at }
+  }
+  _ => panic "expected an enum"
+}
+
+fn enum-name(n: Node) -> Text = n.kids[0].text
+
+# `var E = ((E2) => { … })(E || {});`
+fn enum-declarator(n: Node) -> Node {
+  let name = n.kids[0]
+  let again = ident(name.text)
+  let empty = ObjectLit(List())
+  let call = enum-call(n, Or(again, empty))
+  Declarator(name, call) with { lo: n.lo, hi: n.hi }
+}
+
+# ---------------------------------------------------------------- namespaces
+
+# Which names an inner scope takes for itself, so the namespace's do not reach in.
+fn shadowed-by(n: Node) -> [Text] {
+  var names: [Text] = []
+  var ignored: [Text] = []
+  if sc.function?(n.kind) {
+    for k in n.kids {
+      match k {
+        Params(_) | BindName(_) => early.binds!(k, names)
+        FuncBody(List(ss...)) => for s in ss {
+          early.var-names!(s, names)
+          early.lexical-of!(s, true, names, ignored)
+        }
+        _ => {}
+      }
+    }
+    return names
+  }
+  match n {
+    Block(List(ss...)) | TryBlock(List(ss...)) => for s in ss { early.lexical-of!(s, false, names, names) }
+    Switch(_, List(cases...)) => for c in cases {
+      for s in c.kids[len(c.kids) - 1].kids { early.lexical-of!(s, false, names, names) }
+    }
+    For(LetInit(_) | ConstInit(_), ...) => early.binds!(n.kids[0], names)
+    ForIn(LetLeft(_) | ConstLeft(_), ...) | ForOf(LetLeft(_) | ConstLeft(_), ...) => early.binds!(n.kids[0], names)
+    Catch(CatchHead(_), ...) => early.binds!(n.kids[0], names)
+    _ => {}
+  }
+  names
+}
+
+# References to a namespace's exported variables read and write its object, wherever they are.
+fn through-namespace(n: Node, names: [Text], param: Text) -> Node {
+  if len(names) == 0 { return n }
+  match n {
+    Ident(x) => return if x in names then Member(ident(param), PropName(x)) with { lo: n.lo, hi: n.hi } else n
+    Shorthand(Ident(x)) =>
+      if x in names { return Prop(PropName(x), Member(ident(param), PropName(x))) with { lo: n.lo, hi: n.hi } }
+    _ => {}
+  }
+  if len(n.kids) == 0 { return n }
+  let hidden = shadowed-by(n)
+  let inner = if len(hidden) == 0 then names else [x for x in names if not (x in hidden)]
+  n with { kids: [through-namespace(k, inner, param) for k in n.kids] }
+}
+
+fn exported-names-of!(ds: [Node], out: mut [Text]) -> Void {
+  for d in ds {
+    match d {
+      Declarator(BindName(x), _) => { out += x }
+      _ => panic "destructuring in `export` inside a namespace is not implemented yet"
+    }
+  }
+}
+
+fn exported-variables!(stmts: [Node], out: mut [Text]) -> Void {
+  for s in stmts {
+    match s {
+      ExportVar(List(ds...)) => exported-names-of!(ds, out)
+      ExportLexical(d) => exported-names-of!(d.kids[0].kids, out)
+      _ => {}
+    }
+  }
+}
+
+fn assign-out!(out: mut [Node], param: Text, name: Text, value: Node) -> Void {
+  let ns = ident(param)
+  out += stmt`$ns.$name = $value;`
+}
+
+# One statement of a namespace's body, with its `export` turned into an assignment.
+fn namespace-statement!(s: Node, param: Text, out: mut [Node]) -> Void = match s {
+  ExportVar(List(ds...)) => export-declarators!(ds, param, out)
+  ExportLexical(d) => export-declarators!(d.kids[0].kids, param, out)
+  ExportFunction(f) => {
+    out ++= lowered-statements([f])
+    assign-out!(out, param, f.kids[0].text, ident(f.kids[0].text))
+  }
+  ExportClass(c) => {
+    out ++= lowered-statements([c])
+    assign-out!(out, param, c.kids[0].text, ident(c.kids[0].text))
+  }
+  TsExportEnum(e) => {
+    let name = enum-name(e)
+    let holder = bind(name)
+    let ns1 = ident(param)
+    let ns2 = ident(param)
+    let local = ident(name)
+    let outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
+    let call = enum-call(e, outer)
+    pure-off(call)
+    out += stmt`let $holder;`
+    out += ExprStmt(call)
+  }
+  TsExportNamespace(TsNamespace(name, body)) => nested-namespace!(name.text, body, param, out)
+  TsExportImport(TsImportAlias(name, target)) => assign-out!(out, param, name.text, target)
+  TsExportImport(TsImportRequire(name, from)) => {
+    let req = ident("require")
+    let required = exp`$req($from)`
+    assign-out!(out, param, name.text, required)
+  }
+  ExportNamed(List(specs...)) => for spec in specs {
+    match spec {
+      ExportName(x) => assign-out!(out, param, x.text, ident(x.text))
+      ExportAs(x, y) => assign-out!(out, param, y.text, ident(x.text))
+      _ => {}
+    }
+  }
+  _ => { out ++= lowered-statements([s]) }
+}
+
+fn pure-off(n: Node) -> Void {
+  if let some(hi) = pure[n.lo] {
+    if hi == n.hi { pure[n.lo] = n.hi + 1 }
+  }
+}
+
+fn export-declarators!(ds: [Node], param: Text, out: mut [Node]) -> Void {
+  for d in ds {
+    match d {
+      Declarator(BindName(x), None()) => {}
+      Declarator(BindName(x), init) => assign-out!(out, param, x, lowered(init))
+      _ => panic "destructuring in `export` inside a namespace is not implemented yet"
+    }
+  }
+}
+
+# The function a namespace's body becomes, or nothing if the body held only types.
+fn namespace-call(name: Text, body: Node, outer: Node) -> Node? {
+  let param = fresh-name(name)
+  let path = namespace-path ++ "." ++ name
+  var stmts: [Node] = []
+  with namespace-path = path {
+    match body {
+      TsNamespaceNested(inner, rest) => nested-namespace!(inner.text, rest, param, stmts)
+      TsNamespaceBlock(List(ss...)) => {
+        var exported = namespace-exports[path] ?? []
+        exported-variables!(ss, exported)
+        namespace-exports[path] = exported
+        for s in ss { namespace-statement!(s, param, stmts) }
+        stmts = [through-namespace(s, exported, param) for s in stmts]
+      }
+      _ => panic "unexpected namespace body"
+    }
+  }
+  if len(stmts) == 0 { return none }
+  let p = bind(param)
+  some(exp`(($p) => { $$stmts })($outer)`)
+}
+
+# `let M; ((M2) => { … })(M = N2.M || (N2.M = {}));`
+fn nested-namespace!(name: Text, body: Node, param: Text, out: mut [Node]) -> Void {
+  let ns1 = ident(param)
+  let ns2 = ident(param)
+  let local = ident(name)
+  let outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
+  if let some(call) = namespace-call(name, body, outer) {
+    let holder = bind(name)
+    out += stmt`let $holder;`
+    out += ExprStmt(call)
+  }
+}
+
+# `var N; ((N2) => { … })(N || (N = {}));`, without the `var` if something already declares N.
+fn namespace-statements!(n: Node, exported: Bool, declared: mut [Text], out: mut [Node]) -> Void = match n {
+  TsNamespace(name, body) => {
+    let again1 = ident(name.text)
+    let again2 = ident(name.text)
+    let outer = exp`$again1 || ($again2 = {})`
+    if let some(call) = namespace-call(name.text, body, outer) {
+      if not (name.text in declared) {
+        declared += name.text
+        let holder = Declarator(name, None()) with { lo: n.lo, hi: n.hi }
+        out += if exported then ExportVar(List(holder)) else VarDecl(List(holder))
+      }
+      out += ExprStmt(call)
+    }
+  }
+  _ => panic "expected a namespace"
+}
+
+# ---------------------------------------------------------------- classes
+
+fn param-of(p: Node) -> Node = match p {
+  TsParamProp(target, init) => Param(lowered(target), lowered(init)) with { lo: p.lo, hi: p.hi }
+  _ => lowered(p)
+}
+
+# Directives stay first, and in a derived class `this` is only there after `super()`.
+fn assignments-at(stmts: [Node]) -> Int {
+  var at = 0
+  var directive = true
+  for i in 0..len(stmts) {
+    if directive and stmts[i] is ExprStmt(Str(_)) {
+      at = i + 1
+    } else {
+      directive = false
+    }
+  }
+  for i in 0..len(stmts) {
+    if stmts[i] is ExprStmt(CallExpr(Super(), _)) { return i + 1 }
+  }
+  at
+}
+
+fn constructor-with-properties(m: Node, props: [Node]) -> Node = match m {
+  Method(key, Params(List(ps...)), FuncBody(List(ss...))) => {
+    var assigns: [Node] = []
+    for p in props {
+      let name = p.kids[0].text
+      let value = ident(name)
+      assigns += stmt`this.$name = $value;`
+    }
+    let body = lowered-statements(ss)
+    let at = assignments-at(body)
+    var out: [Node] = []
+    for i in 0..at { out += body[i] }
+    out ++= assigns
+    for i in at..len(body) { out += body[i] }
+    let params = [param-of(p) for p in ps]
+    m with { kids: [key, Params(List(params...)) with { lo: m.kids[1].lo, hi: m.kids[1].hi },
+                    FuncBody(List(out...)) with { lo: m.kids[2].lo, hi: m.kids[2].hi }] }
+  }
+  _ => panic "expected a constructor"
+}
+
+fn constructor?(m: Node) -> Bool = m is Method(PropName("constructor"), _, _)
+
+fn parameter-properties(m: Node) -> [Node] = match m {
+  Method(_, Params(List(ps...)), _) => [p for p in ps if p is TsParamProp(...)]
+  _ => []
+}
+
+# A parameter property is a field, declared ahead of the others, set by the constructor.
+fn class-body(n: Node) -> Node = match n {
+  ClassBody(List(members...)) => {
+    var props: [Node] = []
+    for m in members {
+      if constructor?(m) { props ++= parameter-properties(m) }
+    }
+    if len(props) == 0 { return n with { kids: [lowered(n.kids[0])] } }
+    var out: [Node] = []
+    for m in members {
+      if constructor?(m) { out += constructor-with-properties(m, props) }
+    }
+    for p in props {
+      let key = PropName(p.kids[0].text) with { lo: p.kids[0].lo, hi: p.kids[0].hi }
+      out += Field(key, None()) with { lo: p.lo, hi: p.hi }
+    }
+    for m in members {
+      if not constructor?(m) and not (m is TsErased()) { out += lowered(m) }
+    }
+    n with { kids: [List(out...) with { lo: n.kids[0].lo, hi: n.kids[0].hi }] }
+  }
+  _ => panic "expected a class body"
+}
+
+# ---------------------------------------------------------------- the walk
+
+# Names the statements in one list declare by way of a function or a class, which a namespace or
+# an enum of the same name extends rather than declares again.
+fn declared-names(stmts: [Node]) -> [Text] {
+  var out: [Text] = []
+  for s in stmts {
+    match s {
+      FuncDecl(name, ...) | GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...)
+        | ClassDecl(name, ...) => { out += name.text }
+      ExportFunction(d) | ExportClass(d) => { out += d.kids[0].text }
+      _ => {}
+    }
+  }
+  out
+}
+
+fn lowered-statements(xs: [Node]) -> [Node] {
+  var out: [Node] = []
+  var declared = declared-names(xs)
+  for x in xs {
+    match x {
+      TsErased() => {}
+      TsEnum(...) => { out += VarDecl(List(enum-declarator(x))) with { lo: x.lo, hi: x.hi } }
+      TsExportEnum(e) => { out += ExportVar(List(enum-declarator(e))) with { lo: x.lo, hi: x.hi } }
+      TsNamespace(...) => namespace-statements!(x, false, declared, out)
+      TsExportNamespace(n) => namespace-statements!(n, true, declared, out)
+      TsImportRequire(name, from) | TsExportImport(TsImportRequire(name, from)) => {
+        let req = ident("require")
+    let required = exp`$req($from)`
+        let d = List(Declarator(name, required) with { lo: x.lo, hi: x.hi })
+        out += if x is TsExportImport(_) then ExportLexical(ConstDecl(d)) else ConstDecl(d)
+      }
+      TsImportAlias(name, target) => {
+        aliases[name.lo] = true
+        out += ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi })) with { lo: x.lo, hi: x.hi }
+      }
+      TsExportImport(TsImportAlias(name, target)) => {
+        out += ExportLexical(ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi }))) with { lo: x.lo, hi: x.hi }
+      }
+      TsExportAssign(e) => {
+        let value = lowered(e)
+        let holder = ident("module")
+        out += stmt`$holder.exports = $value;`
+      }
+      Import(ImportNamed(List(specs...)), _) | ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) => {
+        # `import {type A} from "x"` and its like are gone once their specifiers are.
+        let left = [s for s in specs if not (s is TsErased())]
+        if len(left) > 0 or len(specs) == 0 { out += lowered(x) }
+      }
+      _ => { out += lowered(x) }
+    }
+  }
+  out
+}
+
+fn lowered(n: Node) -> Node = match n {
+  List(xs...) => n with { kids: lowered-statements(xs) }
+  ClassBody(...) => class-body(n)
+  TsParamProp(...) => panic "a parameter property is only allowed in a constructor"
+  _ => if len(n.kids) == 0 then n else n with { kids: [lowered(k) for k in n.kids] }
+}
+
+# ---------------------------------------------------------------- imports that named only types
+
+# Is this symbol's name mentioned as a value? `export { A }` counts: a value, as far as one file
+# can tell.
+fn used-symbols!(n: Node, b: {Int:Int}, used: mut {Int:Bool}, exported: mut {Text:Bool}) -> Void {
+  match n {
+    Ident(_) => if let some(s) = b[n.lo] { used[s] = true }
+    ExportNamed(List(specs...)) => for spec in specs {
+      if spec is ExportName(_) | ExportAs(...) { exported[spec.kids[0].text] = true }
+    }
+    _ => {}
+  }
+  for k in n.kids { used-symbols!(k, b, used, exported) }
+}
+
+fn keep-binding?(bound: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool}, keep: [Text]) -> Bool {
+  if bound.text in keep or bound.text in exported { return true }
+  match b[bound.lo] {
+    some(s) => s in used
+    none => true
+  }
+}
+
+fn pruned-clause(c: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool}, keep: [Text]) -> Node? = match c {
+  ImportDefault(x) | ImportNamespace(x) => if keep-binding?(x, b, used, exported, keep) then some(c) else none
+  ImportNamed(List(specs...)) => {
+    let left = [s for s in specs if keep-binding?(s.kids[len(s.kids) - 1], b, used, exported, keep)]
+    if len(left) == 0 then none else some(c with { kids: [List(left...) with { lo: c.kids[0].lo, hi: c.kids[0].hi }] })
+  }
+  ImportDefaultAnd(x, rest) => {
+    let first = keep-binding?(x, b, used, exported, keep)
+    match pruned-clause(rest, b, used, exported, keep) {
+      some(r) => some(if first then c with { kids: [x, r] } else r)
+      none => if first then some(ImportDefault(x) with { lo: c.lo, hi: c.hi }) else none
+    }
+  }
+  _ => some(c)
+}
+
+fn alias-unused?(s: Node, b: {Int:Int}, used: {Int:Bool}) -> Bool = match s {
+  ConstDecl(List(Declarator(name, _))) => name.lo in aliases and not (b[name.lo] is some(_) and (b[name.lo] ?? -1) in used)
+  _ => false
+}
+
+# Drop aliases nothing uses, at any depth: what they point at may be a type.
+fn without-aliases(n: Node, b: {Int:Int}, used: {Int:Bool}) -> Node = match n {
+  List(xs...) => {
+    let left = [without-aliases(x, b, used) for x in xs if not alias-unused?(x, b, used)]
+    n with { kids: left }
+  }
+  _ => if len(n.kids) == 0 then n else n with { kids: [without-aliases(k, b, used) for k in n.kids] }
+}
+
+fn pruned(tree: Node, keep: [Text]) -> Node {
+  var table = sym.table-new()
+  let scope = sym.new-scope!(table, -1, true)
+  var bindings: {Int:Int} = {}
+  sc.analyze(tree, table, scope, bindings)
+  var used: {Int:Bool} = {}
+  var exported: {Text:Bool} = {}
+  used-symbols!(tree, bindings, used, exported)
+  var out: [Node] = []
+  let plain = without-aliases(tree.kids[1], bindings, used)
+  let declared = early.module-names(tree.kids[1].kids)
+  for s in plain.kids {
+    match s {
+      Import(clause, from) => match pruned-clause(clause, bindings, used, exported, keep) {
+        some(c) => { out += s with { kids: [c, from] } }
+        none => {}
+      }
+      # What is exported but not declared was a type.
+      ExportNamed(List(specs...)) => {
+        let left = [x for x in specs if x.kids[0].text in declared]
+        if len(left) > 0 or len(specs) == 0 {
+          out += s with { kids: [List(left...) with { lo: s.kids[0].lo, hi: s.kids[0].hi }] }
+        }
+      }
+      _ => { out += s }
+    }
+  }
+  Program(tree.kids[0], List(out...))
+}
+
+# ---------------------------------------------------------------- the whole file
+
+fn lower(tree: Node, source: Text, keep: [Text]) -> Lowered {
+  src = source
+  next-offset = -1000
+  pure = {}
+  aliases = {}
+  namespace-exports = {}
+  let stmts = lowered-statements(tree.kids[1].kids)
+  let whole = Program(tree.kids[0], List(stmts...))
+  Lowered(tree: pruned(whole, keep), pure-calls: pure)
+}

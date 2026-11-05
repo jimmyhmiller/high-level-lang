@@ -16,7 +16,7 @@ record Resolved { path: Text, side-effects: Bool }
 state files: {Text:Bool} = {}
 state docs: {Text:pkg.Node} = {}
 state resolved: {Text:Text} = {}
-state effects: {Text:Bool} = {}
+state effects: {Text:[Text]} = {}
 state type-module: {Text:Bool} = {}
 
 fn file?(path: Text) -> Bool {
@@ -104,7 +104,22 @@ fn package-exports(doc: pkg.Node, subpath: Text, o: Options) -> Text? = match me
 
 fn try-file(base: Text, o: Options) -> Text? {
   if file?(base) { return some(base) }
-  first ext in o.extensions: if file?(base ++ ext) then some(base ++ ext) else none
+  let found = first ext in o.extensions: if file?(base ++ ext) then some(base ++ ext) else none
+  found ?? typescript-instead(base)
+}
+
+# TypeScript writes `./x.js` and means `./x.ts`: what it will be called once compiled.
+fn typescript-instead(base: Text) -> Text? {
+  if ends-with(base, ".js") { return same-stem(base, 3, [".ts", ".tsx"]) }
+  if ends-with(base, ".jsx") { return same-stem(base, 4, [".ts", ".tsx"]) }
+  if ends-with(base, ".mjs") { return same-stem(base, 4, [".mts"]) }
+  if ends-with(base, ".cjs") { return same-stem(base, 4, [".cts"]) }
+  none
+}
+
+fn same-stem(base: Text, cut: Int, exts: [Text]) -> Text? {
+  let stem = base[0..len(base) - cut]
+  first ext in exts: if file?(stem ++ ext) then some(stem ++ ext) else none
 }
 
 # A directory: its package.json entry, then its index.
@@ -152,19 +167,67 @@ fn package-type-module?(path: Text) -> Bool {
   answer
 }
 
-# `"sideEffects": false` in the package.json governing a file.
-fn side-effects-of(path: Text) -> Bool {
-  let dir = dir-of(path)
+# `"sideEffects"` in the package.json governing a file: `false`, or the files that have them. No
+# list at all is every file, written as the empty pattern.
+fn effect-patterns(dir: Text) -> [Text] {
   if let some(known) = effects[dir] { return known }
-  let answer = match package-json-for(dir) {
-    none => true
+  let answer: [Text] = match package-json-for(dir) {
+    none => [""]
     some(pj) => match member(doc-of(pj), "sideEffects") {
-      some(v) => not (v is pkg.False())
-      none => true
+      some(pkg.False()) => []
+      some(pkg.Array(List(items...))) => {
+        let root = dir-of(pj)
+        var out: [Text] = []
+        for item in items {
+          if item is pkg.Str(_) {
+            # A pattern with no slash may be anywhere in the package.
+            let pattern = unquote(item.text)
+            let anywhere = all c in pattern: c != '/'
+            out += normalize(root ++ (if anywhere then "/**/" else "/") ++ pattern)
+          }
+        }
+        out
+      }
+      _ => [""]
     }
   }
   effects[dir] = answer
   answer
+}
+
+fn side-effects-of(path: Text) -> Bool =
+  any p in effect-patterns(dir-of(path)): len(p) == 0 or glob-match?(p, 0, path, 0)
+
+# `*` is within one path segment, `?` is one byte, and `**` as a whole segment is any number of them.
+fn glob-match?(p: Text, i: Int, s: Text, j: Int) -> Bool {
+  if i == len(p) { return j == len(s) }
+  match p[i] {
+    '?' => return j < len(s) and glob-match?(p, i + 1, s, j + 1)
+    '*' => {
+      var after = i
+      while after < len(p) and p[after] == '*' { after += 1 }
+      let whole-segment = after - i > 1 and (i == 0 or p[i - 1] == '/')
+                          and (after == len(p) or p[after] == '/')
+      if whole-segment {
+        let rest = if after < len(p) then after + 1 else after
+        var k = j
+        while true {
+          if glob-match?(p, rest, s, k) { return true }
+          while k < len(s) and s[k] != '/' { k += 1 }
+          if k >= len(s) { return false }
+          k += 1
+        }
+      }
+      var k = j
+      while true {
+        if glob-match?(p, after, s, k) { return true }
+        if k >= len(s) or s[k] == '/' { return false }
+        k += 1
+      }
+    }
+    c => return j < len(s) and s[j] == c and glob-match?(p, i + 1, s, j + 1)
+  }
+  false
 }
 
 # Where a package's name ends: `@scope/name` has two parts.
