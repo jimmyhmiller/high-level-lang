@@ -1,0 +1,100 @@
+;;; Symbol and scope tables. The `.scopes` language generates the walker that fills
+;;; them; these tables know nothing about any grammar.
+(module hl.symtab)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.str" :as str)
+
+(defstruct Symbol
+  [(name (slice u8))
+   (scope i64)
+   (uses i64)
+   (final (slice u8))
+   (pinned bool)])
+
+(defstruct Scope
+  [(parent i64)
+   (is-function bool)
+   (names (HashMap (slice u8) i64))
+   (symbols (ArrayList i64))
+   (children (ArrayList i64))
+   (dynamic bool)])
+
+(defstruct Table
+  [(scopes (ArrayList Scope))
+   (symbols (ArrayList Symbol))
+   (free (HashMap (slice u8) i64))])
+
+(defn table-new [] (-> Table)
+  (Table :scopes (ArrayList::new [Scope] (malloc-allocator))
+         :symbols (ArrayList::new [Symbol] (malloc-allocator))
+         :free (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+
+(defn new-scope! [(t (mut Table)) (parent i64) (is-function bool)] (-> i64)
+  (let [id (len (.scopes t))]
+    (push! (mut (.scopes t))
+           (Scope :parent parent :is-function is-function
+                  :names (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+                  :symbols (ArrayList::new [i64] (malloc-allocator))
+                  :children (ArrayList::new [i64] (malloc-allocator))
+                  :dynamic false))
+    (when (>= parent 0)
+      (push! (mut (.children (elem (mut (.scopes t)) parent))) id))
+    id))
+
+;;; Declare `name` in `scope`, or answer the symbol it already has there.
+(defn declare! [(t (mut Table)) (scope i64) (name (slice u8))] (-> i64)
+  (match (get (.names (get (.scopes t) scope)) name)
+    (Some [s] s)
+    (None []
+      (let [id (len (.symbols t))]
+        (push! (mut (.symbols t))
+               (Symbol :name name :scope scope :uses 0 :final name :pinned false))
+        (set! (mut (.names (elem (mut (.scopes t)) scope))) name id)
+        (push! (mut (.symbols (elem (mut (.scopes t)) scope))) id)
+        id))))
+
+;;; A symbol with no name in any scope's map: only the program refers to it.
+(defn generated-symbol! [(t (mut Table)) (scope i64) (name (slice u8))] (-> i64)
+  (let [id (len (.symbols t))]
+    (push! (mut (.symbols t))
+           (Symbol :name name :scope scope :uses 0 :final name :pinned false))
+    (push! (mut (.symbols (elem (mut (.scopes t)) scope))) id)
+    id))
+
+(defn resolve [(t (mut Table)) (scope i64) (name (slice u8))] (-> (Option i64))
+  (let [(mut at) scope (mut out) (None [i64])]
+    (while (>= at 0)
+      (let [sc (get (.scopes t) at)]
+        (match (get (.names sc) name)
+          (Some [s] (set! out (Some s)) (set! at -1))
+          (None [] (set! at (.parent sc))))))
+    out))
+
+(defn add-use! [(t (mut Table)) (s i64)] (-> void)
+  (let [(mut sym) (get (.symbols t) s)]
+    (set! (.uses sym) (+ (.uses sym) 1))
+    (set! (mut (.symbols t)) s sym)))
+
+(defn add-free! [(t (mut Table)) (name (slice u8))] (-> void)
+  (match (get (.free t) name)
+    (Some [n] (set! (mut (.free t)) name (+ n 1)))
+    (None [] (set! (mut (.free t)) name 1))))
+
+;;; A scope code can see by name at run time (direct eval, `with`) keeps its names,
+;;; and so does every scope around it.
+(defn mark-dynamic! [(t (mut Table)) (scope i64)] (-> void)
+  (let [(mut at) scope]
+    (while (>= at 0)
+      (let [(mut sc) (get (.scopes t) at)]
+        (set! (.dynamic sc) true)
+        (set! (mut (.scopes t)) at sc)
+        (set! at (.parent sc))))))
+
+;;; The nearest enclosing function scope.
+(defn function-scope [(t (mut Table)) (scope i64)] (-> i64)
+  (let [(mut at) scope]
+    (while (not (.is-function (get (.scopes t) at)))
+      (set! at (.parent (get (.scopes t) at))))
+    at))

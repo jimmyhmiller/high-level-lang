@@ -1,0 +1,634 @@
+;;; The module graph: load files, normalise default exports, analyse scopes, and turn
+;;; each module's import/export structure and statements into facts for link.facts.
+(module bundle.graph)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.slice" :use [subslice])
+(import "coil.str" :as str)
+(import "bundle.js" :as js)
+(import "bundle.scopes" :as sc)
+(import "bundle.link" :as facts)
+(import "bundle.resolve" :as res)
+(import "hl.symtab" :as sym)
+(import "hl.rt" :as rt)
+
+(defsum ModuleKind (Esm) (Cjs) (Runtime))
+(derive Eq ModuleKind)
+
+(defstruct Module
+  [(id i64)
+   (path (slice u8))
+   (kind ModuleKind)
+   (tree js/Node)
+   (root i64)
+   (bindings (HashMap i64 i64))
+   (side-effects bool)
+   (deps (ArrayList i64))
+   (base (slice u8))
+   (first-part i64)
+   (part-count i64)
+   (default-sym i64)
+   (require-sym i64)
+   (source (ArrayList js/Node))
+   (free (ArrayList (slice u8)))])
+
+;;; A symbol an import from a CommonJS module turned into a property read.
+(defstruct CjsImport [(importer i64) (import-var i64) (name (slice u8)) (namespace bool)])
+
+(defstruct Graph
+  [(table sym/Table)
+   (bundle-scope i64)
+   (modules (ArrayList Module))
+   (by-path (HashMap (slice u8) i64))
+   (order (ArrayList i64))
+   (options res/Options)
+   (db facts/Db)
+   (names rt/Names)
+   (next-part i64)
+   (cjs-imports (HashMap i64 CjsImport))
+   (import-vars (HashMap i64 i64))
+   (part-stmt (ArrayList js/Node))
+   (part-module (ArrayList i64))
+   (helpers (HashMap (slice u8) i64))])
+
+(defn name-id! [(g (mut Graph)) (s (slice u8))] (-> i64)
+  (let [id (rt/intern! (mut (.names g)) s)]
+    (when (!= s "default") (facts/add-not-default! (mut (.db g)) id) 0)
+    id))
+
+;;; `node_modules/lodash-es/_root.js` -> `root`, as esbuild names things.
+(defn base-name [(path (slice u8))] (-> (slice u8))
+  (let [(mut slash) -1 (mut dot) (len path)]
+    (for i (range 0 (len path)) (when (= (get path i) #\/) (set! slash i)))
+    (for i (range (+ slash 1) (len path)) (when (= (get path i) #\.) (set! dot i)))
+    (let [(mut raw) (subslice path (+ slash 1) dot)
+          (mut b) (str/StrBuf::new (malloc-allocator))
+          (mut started) false]
+      (when (= raw "index")
+        (let [parent (rt/dir-of path)]
+          (when (!= parent ".") (set! raw (base-name parent)))))
+      (for c raw
+        (if (rt/name-char? c)
+            (when (or started (and (!= c #\_) (not (rt/digit? c))))
+              (set! started true)
+              (push! (mut (.bytes b)) c))
+            (when started (push! (mut (.bytes b)) #\_))))
+      (let [out (finish! (mut b))]
+        (if (= (len out) 0) "module" out)))))
+
+(defn strip-quotes [(s (slice u8))] (-> (slice u8)) (subslice s 1 (- (len s) 1)))
+
+;;; A ModuleName is a PropName, or a Str naming an export.
+(defn module-name [(n js/Node)] (-> (slice u8))
+  (if (= (.kind n) (js/KStr)) (strip-quotes (.text n)) (.text n)))
+
+(defn list1 [(a js/Node)] (-> js/Node)
+  (let [(mut kids) (js/new-kids)]
+    (push! (mut kids) a)
+    (js/mk (js/KList) kids 0 0)))
+
+(defn node1 [(k js/Kind) (a js/Node)] (-> js/Node)
+  (let [(mut kids) (js/new-kids)]
+    (push! (mut kids) a)
+    (js/mk k kids 0 0)))
+
+;;; `export default …` becomes declarations with a real name, so everything after
+;;; this treats it like any other export. Synthetic names get offset -1.
+(defn default-binding [(base (slice u8))] (-> js/Node)
+  (js/leaf (js/KBindName) (rt/join base "_default") -1 -1))
+
+(defn var-of [(name js/Node) (init js/Node)] (-> js/Node)
+  (node1 (js/KVarDecl) (list1 (js/node2 (js/KDeclarator) name init))))
+
+(defn function-decl-kind [(k js/Kind)] (-> (Option js/Kind))
+  (match k
+    (js/KFuncExpr [] (Some (js/KFuncDecl)))
+    (js/KGenExpr [] (Some (js/KGenDecl)))
+    (js/KAsyncFuncExpr [] (Some (js/KAsyncFuncDecl)))
+    (js/KAsyncGenExpr [] (Some (js/KAsyncGenDecl)))
+    (js/KClassExpr [] (Some (js/KClassDecl)))
+    (_ (None [js/Kind]))))
+
+;;; Answers the statement that replaces this one, and notes which binding is default.
+(defn normalize-stmt [(s js/Node) (base (slice u8))] (-> js/Node)
+  (match (.kind s)
+    (js/KExportDefault []
+      (var-of (default-binding base) (get (.kids s) 0)))
+    (js/KExportDefaultDecl []
+      (let [d (get (.kids s) 0)
+            name (get (.kids d) 0)
+            bound (if (= (.kind name) (js/KNone)) (default-binding base) name)
+            (mut kids) (js/new-kids)]
+        (push! (mut kids) bound)
+        (for i (range 1 (len (.kids d))) (push! (mut kids) (get (.kids d) i)))
+        (match (function-decl-kind (.kind d))
+          (Some [k] (js/mk k kids (.lo d) (.hi d)))
+          (None [] (panic "unexpected export default declaration: {:?}" (.kind d))))))
+    (_ s)))
+
+(defn default-of [(s js/Node)] (-> (Option (slice u8)))
+  (match (.kind s)
+    (js/KExportDefault [] (Some ""))
+    (js/KExportDefaultDecl []
+      (let [name (get (.kids (get (.kids s) 0)) 0)]
+        (Some (if (= (.kind name) (js/KNone)) "" (.text name)))))
+    (_ (None [(slice u8)]))))
+
+(defn has-esm-syntax? [(tree js/Node)] (-> bool)
+  (let [(mut hit) false]
+    (for s (.kids (get (.kids tree) 1))
+      (match (.kind s)
+        (js/KImport [] (set! hit true))
+        (js/KImportBare [] (set! hit true))
+        (js/KExportAll [] (set! hit true))
+        (js/KExportAllAs [] (set! hit true))
+        (js/KExportFrom [] (set! hit true))
+        (js/KExportNamed [] (set! hit true))
+        (js/KExportDefault [] (set! hit true))
+        (js/KExportDefaultDecl [] (set! hit true))
+        (js/KExportVar [] (set! hit true))
+        (js/KExportLexical [] (set! hit true))
+        (js/KExportFunction [] (set! hit true))
+        (js/KExportClass [] (set! hit true))
+        (_ 0)))
+    hit))
+
+(defn split-decl! [(out (mut (ArrayList js/Node))) (n js/Node) (k js/Kind)] (-> void)
+  (for d (.kids (get (.kids n) 0))
+    (let [(mut kids) (js/new-kids)]
+      (push! (mut kids) (list1 d))
+      (push! (mut out) (js/mk k kids (.lo d) (.hi d))))))
+
+(defn normalized-tree [(tree js/Node) (base (slice u8))] (-> js/Node)
+  (let [(mut out) (js/new-kids)]
+    (for s (.kids (get (.kids tree) 1))
+      (let [n (normalize-stmt s base)]
+        ;; One declarator per statement, so each can be tree-shaken on its own.
+        (match (.kind n)
+          (js/KVarDecl [] (split-decl! (mut out) n (js/KVarDecl)))
+          ;; A bundle's top level has no TDZ worth paying for, so these become `var`.
+          (js/KLetDecl [] (split-decl! (mut out) n (js/KVarDecl)))
+          (js/KConstDecl [] (split-decl! (mut out) n (js/KVarDecl)))
+          (js/KExportVar [] (split-decl! (mut out) n (js/KExportVar)))
+          (js/KExportLexical []
+            (let [inner (get (.kids n) 0)]
+              (if (or (= (.kind inner) (js/KLetDecl)) (= (.kind inner) (js/KConstDecl)))
+                  (split-decl! (mut out) inner (js/KExportVar))
+                  (push! (mut out) n))))
+          (js/KEmpty [] 0)
+          (_ (push! (mut out) n)))))
+    (let [(mut kids) (js/new-kids)]
+      (push! (mut kids) (get (.kids tree) 0))
+      (push! (mut kids) (js/mk (js/KList) out 0 0))
+      (js/mk (js/KProgram) kids 0 0))))
+
+;;; `require("x")` strings under a node, in source order.
+(defn require-calls! [(n js/Node) (out (mut (ArrayList (slice u8))))] (-> void)
+  (when (and (= (.kind n) (js/KCallExpr))
+             (= (.kind (get (.kids n) 0)) (js/KIdent))
+             (= (.text (get (.kids n) 0)) "require"))
+    (let [args (.kids (get (.kids (get (.kids n) 1)) 0))]
+      (when (and (= (len args) 1) (= (.kind (get args 0)) (js/KStr)))
+        (push! (mut out) (strip-quotes (.text (get args 0)))))))
+  (for k (.kids n) (require-calls! k (mut out))))
+
+(defn free-name? [(t (mut sym/Table)) (name (slice u8))] (-> bool)
+  (match (get (.free t) name) (Some [_] true) (None [] false)))
+
+(defn merge-free! [(into (mut sym/Table)) (from (mut sym/Table))] (-> void)
+  (for name (keys-of (.free from))
+    (sym/add-free! (mut into) name)))
+
+(defn keys-of [(m (HashMap (slice u8) i64))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (for k m (push! (mut out) k))
+    out))
+
+;;; In a wrapped CommonJS module `exports` and `module` are the wrapper's parameters.
+(defn real-free [(names (ArrayList (slice u8))) (cjs bool)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (for n names
+      (unless (and cjs (or (= n "exports") (= n "module")))
+        (push! (mut out) n)))
+    out))
+
+(defn parse-file [(src (slice u8)) (path (slice u8))] (-> js/Node)
+  (match (js/parse-result src path 0)
+    (Ok [t] t)
+    (Err [first]
+      (match (js/parse-result src path js/FLAG-await)
+        (Ok [t] t)
+        (Err [_] (rt/parse-failed first))))))
+
+;;; Is this file in node compatibility mode: `.mjs`, or under "type": "module"?
+(defn node-mode? [(path (slice u8))] (-> bool)
+  (or (ends-with? path ".mjs") (res/package-type-module? path)))
+
+(defn ends-with? [(s (slice u8)) (suffix (slice u8))] (-> bool)
+  (and (>= (len s) (len suffix))
+       (= (subslice s (- (len s) (len suffix)) (len s)) suffix)))
+
+(defn dep-add! [(g (mut Graph)) (m i64) (spec (slice u8)) (path (slice u8))] (-> i64)
+  (let [r (res/resolve spec path (.options g))
+        d (load! (mut g) (.path r) (.side-effects r))]
+    (let [(mut mo) (get (.modules g) m)]
+      (push! (mut (.deps mo)) d)
+      (set! (mut (.modules g)) m mo))
+    d))
+
+;;; Load a file and, first, everything it imports: `order` is post-order, so a
+;;; module's dependencies come before it, as they do in esbuild's output.
+(defn load! [(g (mut Graph)) (path (slice u8)) (effects bool)] (-> i64)
+  (match (get (.by-path g) path)
+    (Some [id] id)
+    (None []
+      (let [src0 (rt/read-all path)
+            src (if (ends-with? path ".json") (rt/join "module.exports = " src0) src0)
+            tree0 (parse-file src path)
+            base (base-name path)
+            id (len (.modules g))
+            esm (has-esm-syntax? tree0)
+            tree (normalized-tree tree0 base)
+            ;; First pass on a scratch table, only to see which names are free.
+            (mut scratch) (sym/table-new)
+            (mut scratch-b) (HashMap::new-scalar [i64 i64] (malloc-allocator))
+            scratch-root (sc/analyze tree (mut scratch) -1 (mut scratch-b))
+            cjs (and (not esm)
+                     (or (free-name? (mut scratch) "module")
+                         (free-name? (mut scratch) "exports")
+                         (free-name? (mut scratch) "require")))
+            (mut bindings) (HashMap::new-scalar [i64 i64] (malloc-allocator))
+            parent (if cjs
+                       (let [w (sym/new-scope! (mut (.table g)) (.bundle-scope g) true)]
+                         (sym/declare! (mut (.table g)) w "exports")
+                         (sym/declare! (mut (.table g)) w "module")
+                         w)
+                       (.bundle-scope g))
+            root (do scratch-root (sc/analyze tree (mut (.table g)) parent (mut bindings)))]
+        (push! (mut (.modules g))
+               (Module :id id :path path :kind (if cjs (Cjs) (Esm)) :tree tree :root root
+                       :bindings bindings :side-effects effects
+                       :deps (ArrayList::new [i64] (malloc-allocator))
+                       :base base :first-part 0 :part-count 0 :default-sym -1 :require-sym -1
+                       :source (.kids (get (.kids tree0) 1))
+                       :free (real-free (keys-of (.free scratch)) cjs)))
+        (set! (mut (.by-path g)) path id)
+        ;; Imports in source order.
+        (for s (.kids (get (.kids tree0) 1))
+          (match (.kind s)
+            (js/KImport [] (dep-add! (mut g) id (strip-quotes (.text (get (.kids s) 1))) path) 0)
+            (js/KImportBare [] (dep-add! (mut g) id (strip-quotes (.text (get (.kids s) 0))) path) 0)
+            (js/KExportAll [] (dep-add! (mut g) id (strip-quotes (.text (get (.kids s) 0))) path) 0)
+            (js/KExportAllAs [] (dep-add! (mut g) id (strip-quotes (.text (get (.kids s) 1))) path) 0)
+            (js/KExportFrom [] (dep-add! (mut g) id (strip-quotes (.text (get (.kids s) 1))) path) 0)
+            (_ 0)))
+        (let [(mut reqs) (ArrayList::new [(slice u8)] (malloc-allocator))]
+          (for s (.kids (get (.kids tree0) 1)) (require-calls! s (mut reqs)))
+          (for spec reqs (dep-add! (mut g) id spec path) 0))
+        (push! (mut (.order g)) id)
+        id))))
+
+;; ---------------------------------------------------------------- facts
+
+(defn root-sym [(g (mut Graph)) (m Module) (name (slice u8))] (-> (Option i64))
+  (get (.names (get (.scopes (.table g)) (.root m))) name))
+
+(defn dep-of [(g (mut Graph)) (m Module) (spec (slice u8))] (-> i64)
+  (let [r (res/resolve spec (.path m) (.options g))]
+    (match (get (.by-path g) (.path r))
+      (Some [id] id)
+      (None [] (panic "{}: {} was not loaded" (.path m) spec)))))
+
+(defn module-at [(g (mut Graph)) (id i64)] (-> Module) (get (.modules g) id))
+
+;;; Every binding beneath `n`, by symbol. Does not enter nested functions: a top-level
+;;; statement declares only its own names.
+(defn declared-under! [(g (mut Graph)) (m Module) (part i64) (n js/Node)] (-> void)
+  (if (= (.kind n) (js/KBindName))
+      (match (get (.bindings m) (.lo n))
+        (Some [s]
+          (when (= (.scope (get (.symbols (.table g)) s)) (.root m))
+            (facts/add-declares! (mut (.db g)) part s)
+            0))
+        (None [] (panic "{}: no symbol for binding {}" (.path m) (.text n))))
+      (if (sc/hoist-name? (.kind n))
+          (declared-under! (mut g) m part (get (.kids n) 0))
+          (unless (sc/opens? (.kind n))
+            (for k (.kids n) (declared-under! (mut g) m part k))))))
+
+(defn mentions-under! [(g (mut Graph)) (m Module) (part i64) (n js/Node)] (-> void)
+  (if (= (.kind n) (js/KIdent))
+      (match (get (.bindings m) (.lo n))
+        (Some [s] (facts/add-mentions! (mut (.db g)) part s) 0)
+        (None [] 0))
+      (for k (.kids n) (mentions-under! (mut g) m part k))))
+
+;;; Can this be removed when nothing uses its value? Mirrors esbuild's rules: an
+;;; unbound name might throw, and a property read might run a getter.
+(defn pure-expr? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
+  (match (.kind n)
+    (js/KNum [] true) (js/KStr [] true) (js/KTrue [] true) (js/KFalse [] true) (js/KNull [] true)
+    (js/KRegex [] true) (js/KTemplateFull [] true) (js/KThis [] true)
+    (js/KNone [] true)
+    (js/KFuncExpr [] true) (js/KGenExpr [] true) (js/KAsyncFuncExpr [] true)
+    (js/KAsyncGenExpr [] true) (js/KArrow [] true) (js/KAsyncArrow [] true)
+    (js/KIdent []
+      (match (get (.bindings m) (.lo n))
+        (Some [_] true)
+        (None [] (known-global? (.text n)))))
+    (js/KParen [] (pure-expr? (mut g) m (get (.kids n) 0)))
+    (js/KNot [] (pure-expr? (mut g) m (get (.kids n) 0)))
+    (js/KVoid [] (pure-expr? (mut g) m (get (.kids n) 0)))
+    (js/KTypeOf []
+      (let [k (get (.kids n) 0)]
+        (or (= (.kind k) (js/KIdent)) (pure-expr? (mut g) m k))))
+    (js/KOr [] (all-pure? (mut g) m n))
+    (js/KAnd [] (all-pure? (mut g) m n))
+    (js/KCoalesce [] (all-pure? (mut g) m n))
+    (js/KCond [] (all-pure? (mut g) m n))
+    (js/KSeq [] (all-pure? (mut g) m n))
+    (js/KStrictEq [] (all-pure? (mut g) m n))
+    (js/KStrictNe [] (all-pure? (mut g) m n))
+    (js/KArrayLit [] (all-pure-list? (mut g) m (get (.kids n) 0)))
+    (js/KHole [] true)
+    (js/KElem [] (all-pure? (mut g) m n))
+    (js/KElemLast [] (all-pure? (mut g) m n))
+    (js/KObjectLit [] (all-pure-list? (mut g) m (get (.kids n) 0)))
+    (js/KProp []
+      (and (!= (.kind (get (.kids n) 0)) (js/KComputed))
+           (pure-expr? (mut g) m (get (.kids n) 1))))
+    (js/KShorthand [] (pure-expr? (mut g) m (get (.kids n) 0)))
+    (js/KMethod [] (!= (.kind (get (.kids n) 0)) (js/KComputed)))
+    (js/KClassExpr [] (pure-class? (mut g) m n))
+    (_ false)))
+
+(defn all-pure? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
+  (let [(mut ok) true]
+    (for k (.kids n) (unless (pure-expr? (mut g) m k) (set! ok false)))
+    ok))
+
+(defn all-pure-list? [(g (mut Graph)) (m Module) (list js/Node)] (-> bool)
+  (let [(mut ok) true]
+    (for k (.kids list) (unless (pure-expr? (mut g) m k) (set! ok false)))
+    ok))
+
+;;; A class with no heritage, computed keys or initialisers runs nothing.
+(defn pure-class? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
+  (let [heritage (get (.kids n) 1)
+        body (get (.kids (get (.kids n) 2)) 0)
+        (mut ok) (= (.kind heritage) (js/KNone))]
+    (for member (.kids body)
+      (match (.kind member)
+        (js/KMethod [] (when (= (.kind (get (.kids member) 0)) (js/KComputed)) (set! ok false)))
+        (js/KClassEmpty [] 0)
+        (js/KGetter [] (when (= (.kind (get (.kids member) 0)) (js/KComputed)) (set! ok false)))
+        (js/KSetter [] (when (= (.kind (get (.kids member) 0)) (js/KComputed)) (set! ok false)))
+        (js/KField []
+          (when (or (= (.kind (get (.kids member) 0)) (js/KComputed))) (set! ok false)))
+        (_ (set! ok false))))
+    ok))
+
+;;; Globals esbuild treats as safe to read.
+(defn known-global? [(name (slice u8))] (-> bool)
+  (or (= name "undefined") (= name "NaN") (= name "Infinity")))
+
+(defn pure-declarators? [(g (mut Graph)) (m Module) (list js/Node)] (-> bool)
+  (let [(mut ok) true]
+    (for d (.kids list)
+      (let [target (get (.kids d) 0) init (get (.kids d) 1)]
+        (unless (and (= (.kind target) (js/KBindName)) (pure-expr? (mut g) m init))
+          (set! ok false))))
+    ok))
+
+(defn pure-stmt? [(g (mut Graph)) (m Module) (s js/Node)] (-> bool)
+  (match (.kind s)
+    (js/KFuncDecl [] true) (js/KGenDecl [] true) (js/KAsyncFuncDecl [] true) (js/KAsyncGenDecl [] true)
+    (js/KEmpty [] true)
+    (js/KVarDecl [] (pure-declarators? (mut g) m (get (.kids s) 0)))
+    (js/KLetDecl [] (pure-declarators? (mut g) m (get (.kids s) 0)))
+    (js/KConstDecl [] (pure-declarators? (mut g) m (get (.kids s) 0)))
+    (js/KExportVar [] (pure-declarators? (mut g) m (get (.kids s) 0)))
+    (js/KExportLexical [] (pure-stmt? (mut g) m (get (.kids s) 0)))
+    (js/KExportFunction [] true)
+    (js/KExportClass [] (pure-stmt? (mut g) m (get (.kids s) 0)))
+    (js/KClassDecl [] (pure-class? (mut g) m s))
+    (js/KExprStmt [] (pure-expr? (mut g) m (get (.kids s) 0)))
+    (_ false)))
+
+(defn export-local! [(g (mut Graph)) (m Module) (exported (slice u8)) (local (slice u8))] (-> void)
+  (match (root-sym (mut g) m local)
+    (Some [s]
+      (facts/add-local-export! (mut (.db g)) (.id m) (name-id! (mut g) exported) s)
+      0)
+    (None [] (panic "{}: export of {} which is not declared" (.path m) local))))
+
+(defn exports-under! [(g (mut Graph)) (m Module) (n js/Node)] (-> void)
+  (if (= (.kind n) (js/KBindName))
+      (export-local! (mut g) m (.text n) (.text n))
+      (unless (sc/function? (.kind n))
+        (for k (.kids n) (exports-under! (mut g) m k)))))
+
+(defn import-spec! [(g (mut Graph)) (m Module) (target i64) (spec js/Node)] (-> void)
+  (match (.kind spec)
+    (js/KImportDefault [] (bind-import! (mut g) m target "default" (get (.kids spec) 0) false))
+    (js/KImportAs []
+      (bind-import! (mut g) m target (module-name (get (.kids spec) 0)) (get (.kids spec) 1) false))
+    (js/KImportName []
+      (bind-import! (mut g) m target (.text (get (.kids spec) 0)) (get (.kids spec) 0) false))
+    (js/KImportNamespace [] (bind-import! (mut g) m target "*" (get (.kids spec) 0) true))
+    (js/KImportDefaultAnd []
+      (bind-import! (mut g) m target "default" (get (.kids spec) 0) false)
+      (import-spec! (mut g) m target (get (.kids spec) 1)))
+    (js/KImportNamed []
+      (for s (.kids (get (.kids spec) 0)) (import-spec! (mut g) m target s)))
+    (_ (panic "{}: unexpected import form {:?}" (.path m) (.kind spec)))))
+
+(defn import-var-of! [(g (mut Graph)) (m Module) (target i64)] (-> i64)
+  (let [key (+ (* (.id m) 100000) target)]
+    (match (get (.import-vars g) key)
+      (Some [v] v)
+      (None []
+        (let [t (module-at (mut g) target)
+              v (sym/generated-symbol! (mut (.table g)) (.root m) (rt/join "import_" (.base t)))]
+          (set! (mut (.import-vars g)) key v)
+          v)))))
+
+(defn bind-import! [(g (mut Graph)) (m Module) (target i64) (name (slice u8)) (bind js/Node) (namespace bool)] (-> void)
+  (match (get (.bindings m) (.lo bind))
+    (None [] (panic "{}: no symbol for import {}" (.path m) (.text bind)))
+    (Some [s]
+      (let [t (module-at (mut g) target)]
+        (if (= (.kind t) (Cjs))
+            (set! (mut (.cjs-imports g)) s
+                  (CjsImport :importer (.id m) :import-var (import-var-of! (mut g) m target)
+                             :name name :namespace namespace))
+            (if namespace
+                (panic "{}: `import * as` of an ES module is not implemented yet" (.path m))
+                (do
+                  (facts/add-import-of! (mut (.db g)) s target (name-id! (mut g) name))
+                  0)))))))
+
+;;; One top-level statement of an ES module becomes one part.
+(defn add-part! [(g (mut Graph)) (m Module) (s js/Node)] (-> void)
+  (let [part (.next-part g)
+        mid (.id m)]
+    (set! (.next-part g) (+ part 1))
+    (push! (mut (.part-stmt g)) s)
+    (push! (mut (.part-module g)) mid)
+    (facts/add-part-of! (mut (.db g)) part mid)
+    (match (.kind s)
+      (js/KImport []
+        (let [target (dep-of (mut g) m (strip-quotes (.text (get (.kids s) 1))))]
+          (facts/add-imports! (mut (.db g)) mid target)
+          (import-spec! (mut g) m target (get (.kids s) 0))
+          (when (= (.kind (module-at (mut g) target)) (Cjs))
+            (let [v (import-var-of! (mut g) m target)]
+              (facts/add-declares! (mut (.db g)) part v)
+              (facts/add-mentions! (mut (.db g)) part (.require-sym (module-at (mut g) target)))
+              (facts/add-effect! (mut (.db g)) part)
+              0))))
+      (js/KImportBare []
+        (facts/add-imports! (mut (.db g)) mid (dep-of (mut g) m (strip-quotes (.text (get (.kids s) 0)))))
+        0)
+      (js/KExportAll []
+        (let [target (dep-of (mut g) m (strip-quotes (.text (get (.kids s) 0))))]
+          (facts/add-imports! (mut (.db g)) mid target)
+          (facts/add-star! (mut (.db g)) mid target)
+          0))
+      (js/KExportAllAs []
+        (panic "{}: `export * as` is not implemented yet" (.path m)))
+      (js/KExportFrom []
+        (let [target (dep-of (mut g) m (strip-quotes (.text (get (.kids s) 1))))]
+          (facts/add-imports! (mut (.db g)) mid target)
+          (for spec (.kids (get (.kids s) 0))
+            (let [from (module-name (get (.kids spec) 0))
+                  to (if (= (.kind spec) (js/KExportAs)) (module-name (get (.kids spec) 1)) from)]
+              (facts/add-reexport! (mut (.db g)) mid (name-id! (mut g) to) target (name-id! (mut g) from))
+              0))))
+      (js/KExportNamed []
+        (for spec (.kids (get (.kids s) 0))
+          (let [local (module-name (get (.kids spec) 0))
+                to (if (= (.kind spec) (js/KExportAs)) (module-name (get (.kids spec) 1)) local)]
+            (export-named! (mut g) m to local))))
+      (_
+        (declared-under! (mut g) m part s)
+        (mentions-under! (mut g) m part s)
+        (match (.kind s)
+          (js/KExportVar [] (exports-under! (mut g) m s))
+          (js/KExportLexical [] (exports-under! (mut g) m (get (.kids s) 0)))
+          (js/KExportFunction [] (exports-under! (mut g) m (get (.kids (get (.kids s) 0)) 0)))
+          (js/KExportClass [] (exports-under! (mut g) m (get (.kids (get (.kids s) 0)) 0)))
+          (_ 0))
+        ;; The runtime's statements are only ever live through a mention.
+        (unless (or (= (.kind m) (Runtime)) (pure-stmt? (mut g) m s))
+          (facts/add-effect! (mut (.db g)) part)
+          0)))))
+
+;;; `export {a as b}`: of a local, or of something this module itself imported.
+(defn export-named! [(g (mut Graph)) (m Module) (to (slice u8)) (local (slice u8))] (-> void)
+  (match (root-sym (mut g) m local)
+    (None [] (panic "{}: export of {} which is not declared" (.path m) local))
+    (Some [s]
+      (facts/add-local-export! (mut (.db g)) (.id m) (name-id! (mut g) to) s)
+      0)))
+
+;;; Set the symbol `default` means in this module, from the source statement.
+;;; Facts for one module. CommonJS is one opaque part with effects, whose only
+;;; symbol is its `require_x`; its dependencies are whatever it `require`s.
+(defn module-facts! [(g (mut Graph)) (m Module)] (-> void)
+  (when (.side-effects m)
+    (facts/add-module-effects! (mut (.db g)) (.id m))
+    0)
+  (match (.kind m)
+    (Cjs []
+      (let [part (.next-part g) mid (.id m)]
+        (set! (.next-part g) (+ part 1))
+        (push! (mut (.part-stmt g)) (.tree m))
+        (push! (mut (.part-module g)) mid)
+        (facts/add-part-of! (mut (.db g)) part mid)
+        (facts/add-effect! (mut (.db g)) part)
+        (facts/add-declares! (mut (.db g)) part (.require-sym m))
+        (facts/add-mentions! (mut (.db g)) part (helper! (mut g) "__commonJS"))
+        (mentions-under! (mut g) m part (.tree m))
+        (for d (.deps m)
+          (facts/add-imports! (mut (.db g)) mid d)
+          (let [t (module-at (mut g) d)]
+            (unless (= (.kind t) (Cjs))
+              (panic "{}: require() of the ES module {} is not implemented yet" (.path m) (.path t)))
+            (facts/add-mentions! (mut (.db g)) part (.require-sym t))
+            0))))
+    (_
+      (for s (.kids (get (.kids (.tree m)) 1))
+        (add-part! (mut g) m s)
+        (when (= (.kind s) (js/KImport))
+          (when (= (.kind (module-at (mut g) (dep-of (mut g) m (strip-quotes (.text (get (.kids s) 1)))))) (Cjs))
+            (let [part (- (.next-part g) 1)]
+              (facts/add-mentions! (mut (.db g)) part (helper! (mut g) "__toESM"))
+              0))))
+      (default-export! (mut g) m (.source m)))))
+
+;;; A symbol of the runtime module, by name.
+(defn helper! [(g (mut Graph)) (name (slice u8))] (-> i64)
+  (match (root-sym (mut g) (module-at (mut g) 0) name)
+    (Some [s] s)
+    (None [] (panic "the runtime has no helper named {}" name))))
+
+(defn graph-new [(o res/Options)] (-> Graph)
+  (let [(mut table) (sym/table-new)
+        scope (sym/new-scope! (mut table) -1 true)]
+    (Graph :table table :bundle-scope scope
+           :modules (ArrayList::new [Module] (malloc-allocator))
+           :by-path (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+           :order (ArrayList::new [i64] (malloc-allocator))
+           :options o
+           :db (facts/new-db)
+           :names (rt/names-new)
+           :next-part 0
+           :cjs-imports (HashMap::new-scalar [i64 CjsImport] (malloc-allocator))
+           :import-vars (HashMap::new-scalar [i64 i64] (malloc-allocator))
+           :part-stmt (js/new-kids)
+           :part-module (ArrayList::new [i64] (malloc-allocator))
+           :helpers (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))))
+
+;;; The runtime is an ordinary module, id 0, that nothing makes live unless a part
+;;; mentions one of its helpers.
+(defn load-runtime! [(g (mut Graph)) (text (slice u8))] (-> void)
+  (let [tree (js/parse text "<runtime>")
+        (mut bindings) (HashMap::new-scalar [i64 i64] (malloc-allocator))
+        (mut scratch) (sym/table-new)
+        (mut scratch-b) (HashMap::new-scalar [i64 i64] (malloc-allocator))
+        scratch-root (sc/analyze tree (mut scratch) -1 (mut scratch-b))
+        root (do scratch-root (sc/analyze tree (mut (.table g)) (.bundle-scope g) (mut bindings)))]
+    (push! (mut (.modules g))
+           (Module :id 0 :path "<runtime>" :kind (Runtime) :tree tree :root root
+                   :bindings bindings :side-effects false
+                   :deps (ArrayList::new [i64] (malloc-allocator))
+                   :base "runtime" :first-part 0 :part-count 0 :default-sym -1 :require-sym -1
+                   :source (js/new-kids)
+                   :free (keys-of (.free scratch))))
+    (push! (mut (.order g)) 0)))
+
+;;; Load everything from `entry` and solve the link facts.
+(defn build! [(g (mut Graph)) (entry (slice u8))] (-> void)
+  (let [e (load! (mut g) entry true)]
+    (for id (.order g)
+      (let [m (module-at (mut g) id)]
+        (when (= (.kind m) (Cjs))
+          (let [(mut mo) m
+                s (sym/generated-symbol! (mut (.table g)) (.bundle-scope g) (rt/join "require_" (.base m)))]
+            (set! (.require-sym mo) s)
+            (set! (mut (.modules g)) id mo)))))
+    (facts/add-entry! (mut (.db g)) e)
+    (for id (.order g)
+      (module-facts! (mut g) (module-at (mut g) id)))
+    (facts/solve! (mut (.db g)))
+    0))
+
+(defn default-export! [(g (mut Graph)) (m Module) (tree0-stmts (ArrayList js/Node))] (-> void)
+  (for s tree0-stmts
+    (match (default-of s)
+      (Some [name]
+        (let [local (if (= (len name) 0) (rt/join (.base m) "_default") name)]
+          (export-local! (mut g) m "default" local)))
+      (None [] 0))))

@@ -406,52 +406,139 @@
 
 ;; ---------------------------------------------------------------- relations
 
-;;; A binary relation over interned ids. A unary relation stores 0 in `b`.
-(defstruct Row [(a i64) (b i64)])
+;;; A relation of up to four columns of ids, with its rows stored flat. Row
+;;; membership hashes into a chain, and each column gets an index on first use.
+;;; Rules queue new rows and flush after a scan, so nothing grows under a loop.
+(defstruct Rel
+  [(arity i64)
+   (data (ArrayList i64))
+   (count i64)
+   (heads (HashMap i64 i64))
+   (next (ArrayList i64))
+   (index (ArrayList (HashMap i64 (ArrayList i64))))
+   (indexed (ArrayList i64))
+   (queue (ArrayList i64))])
 
-(defstruct Rel [(rows (ArrayList Row)) (seen (HashMap i64 bool))])
+(defn rel-new [(arity i64)] (-> Rel)
+  (let [(mut index) (ArrayList::new [(HashMap i64 (ArrayList i64))] (malloc-allocator))
+        (mut indexed) (ArrayList::new [i64] (malloc-allocator))]
+    (for _ (range 0 arity)
+      (push! (mut index) (HashMap::new-scalar [i64 (ArrayList i64)] (malloc-allocator)))
+      (push! (mut indexed) 0))
+    (Rel :arity arity
+         :data (ArrayList::new [i64] (malloc-allocator))
+         :count 0
+         :heads (HashMap::new-scalar [i64 i64] (malloc-allocator))
+         :next (ArrayList::new [i64] (malloc-allocator))
+         :index index
+         :indexed indexed
+         :queue (ArrayList::new [i64] (malloc-allocator)))))
 
-(defn rel-new [] (-> Rel)
-  (Rel
-    :rows (ArrayList::new [Row] (malloc-allocator))
-    :seen (HashMap::new-scalar [i64 bool] (malloc-allocator))))
+(defn rel-at [(r (mut Rel)) (row i64) (col i64)] (-> i64)
+  (get (.data r) (+ (* row (.arity r)) col)))
 
-(const MAX-ID 2147483648)
+(defn row-hash [(a i64) (b i64) (c i64) (d i64)] (-> i64)
+  (let [(mut h) a]
+    (set! h (+ (* (% h 1000003) 1000003) b))
+    (set! h (+ (* (% h 1000003) 1000003) c))
+    (set! h (+ (* (% h 1000003) 1000003) d))
+    h))
 
-(defn row-key [(a i64) (b i64)] (-> i64)
-  (when (or (< a 0) (>= a MAX-ID) (< b 0) (>= b MAX-ID))
-    (panic "relation id out of range: {} {}" a b))
-  (+ (* a MAX-ID) b))
+(defn row-equal? [(r (mut Rel)) (row i64) (a i64) (b i64) (c i64) (d i64)] (-> bool)
+  (let [n (.arity r)]
+    (and (= (rel-at (mut r) row 0) a)
+         (or (< n 2) (= (rel-at (mut r) row 1) b))
+         (or (< n 3) (= (rel-at (mut r) row 2) c))
+         (or (< n 4) (= (rel-at (mut r) row 3) d)))))
+
+;;; Unused columns are passed as 0.
+(defn rel-has? [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
+  (match (get (.heads r) (row-hash a b c d))
+    (None [] false)
+    (Some [first]
+      (let [(mut at) first (mut hit) false]
+        (while (and (>= at 0) (not hit))
+          (if (row-equal? (mut r) at a b c d)
+              (set! hit true)
+              (set! at (get (.next r) at))))
+        hit))))
+
+(defn index-add! [(r (mut Rel)) (col i64) (row i64)] (-> void)
+  (let [key (rel-at (mut r) row col)]
+    (match (get (get (.index r) col) key)
+      (Some [bucket]
+        (let [(mut b) bucket]
+          (push! (mut b) row)
+          (set! (mut (elem (mut (.index r)) col)) key b)))
+      (None []
+        (let [(mut b) (ArrayList::new [i64] (malloc-allocator))]
+          (push! (mut b) row)
+          (set! (mut (elem (mut (.index r)) col)) key b))))))
 
 ;;; True when the row is new.
-(defn rel-add! [(r (mut Rel)) (a i64) (b i64)] (-> bool)
-  (let [key (row-key a b)]
-    (match (get (.seen r) key)
-      (Some [_] false)
-      (None []
-            (set! (mut (.seen r)) key true)
-            (push! (mut (.rows r)) (Row :a a :b b))
-            true))))
+(defn rel-add! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
+  (if (rel-has? (mut r) a b c d)
+      false
+      (let [row (.count r) h (row-hash a b c d) n (.arity r)]
+        (push! (mut (.data r)) a)
+        (when (>= n 2) (push! (mut (.data r)) b))
+        (when (>= n 3) (push! (mut (.data r)) c))
+        (when (>= n 4) (push! (mut (.data r)) d))
+        (push! (mut (.next r))
+               (match (get (.heads r) h) (Some [old] old) (None [] -1)))
+        (set! (mut (.heads r)) h row)
+        (set! (.count r) (+ row 1))
+        (for col (range 0 n)
+          (when (!= (get (.indexed r) col) 0)
+            (index-add! (mut r) col row)))
+        true)))
 
-(defn rel-has? [(r Rel) (a i64) (b i64)] (-> bool)
-  (match (get (.seen r) (row-key a b)) (Some [_] true) (None [] false)))
+(defn rel-queue! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> void)
+  (push! (mut (.queue r)) a)
+  (push! (mut (.queue r)) b)
+  (push! (mut (.queue r)) c)
+  (push! (mut (.queue r)) d))
+
+;;; Move queued rows in. True when any was new.
+(defn rel-flush! [(r (mut Rel))] (-> bool)
+  (let [(mut changed) false
+        n (/ (len (.queue r)) 4)]
+    (for i (range 0 n)
+      (when (rel-add! (mut r)
+                      (get (.queue r) (* i 4))
+                      (get (.queue r) (+ (* i 4) 1))
+                      (get (.queue r) (+ (* i 4) 2))
+                      (get (.queue r) (+ (* i 4) 3)))
+        (set! changed true)))
+    (clear! (mut (.queue r)))
+    changed))
+
+;;; The rows whose column equals `key`. Stable until the next flush.
+(defn rel-bucket [(r (mut Rel)) (col i64) (key i64)] (-> (ArrayList i64))
+  (when (= (get (.indexed r) col) 0)
+    (set! (mut (.indexed r)) col 1)
+    (for row (range 0 (.count r)) (index-add! (mut r) col row)))
+  (match (get (get (.index r) col) key)
+    (Some [b] b)
+    (None [] (ArrayList::new [i64] (malloc-allocator)))))
 
 ;;; Strings to the dense ids relations hold.
-(defstruct Names [(ids (HashMap (slice u8) i64)) (count i64)])
+(defstruct Names [(ids (HashMap (slice u8) i64)) (strs (ArrayList (slice u8)))])
 
 (defn names-new [] (-> Names)
-  (Names
-    :ids (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
-    :count 0))
+  (Names :ids (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+         :strs (ArrayList::new [(slice u8)] (malloc-allocator))))
 
 (defn intern! [(ns (mut Names)) (s (slice u8))] (-> i64)
   (match (get (.ids ns) s)
     (Some [id] id)
     (None []
-          (let [id (.count ns)]
-            (set! (mut (.ids ns)) s id)
-            (set! (.count ns) (+ id 1))
-            id))))
+      (let [id (len (.strs ns))]
+        (set! (mut (.ids ns)) s id)
+        (push! (mut (.strs ns)) s)
+        id))))
+
+(defn name-of [(ns (mut Names)) (id i64)] (-> (slice u8)) (get (.strs ns) id))
 
 ;; ---------------------------------------------------------------- files
 

@@ -1,14 +1,20 @@
 ;;; `.facts`: the analysis language. Datalog over relations of interned ids,
-;;; compiled to nested loops run to a fixpoint. There is no engine at runtime.
+;;; compiled to nested loops with hash indexes, run to a fixpoint. There is no engine
+;;; at runtime.
 ;;;
 ;;;   facts
 ;;;   relation refs(from, to)
 ;;;   relation live(name)
 ;;;   live(Y) :- live(X), refs(X, Y) ;
+;;;   visible(M, N, S) :- star(M, D), exported(D, N, S), !local(M, N) ;
 ;;;
-;;; The PoC's limits: arity 1 or 2, no negation, no constants, and naive
-;;; evaluation with full scans. Each is a reader error or a choice inside this file,
-;;; so a real implementation (indexes, semi-naive) changes no .facts source.
+;;; Negation is stratified: a negated relation is finished before any rule that reads
+;;; it runs, and negation through a cycle is an error. A body atom scans through an
+;;; index on its first bound column. Evaluation is naive, so every round re-runs every
+;;; rule in the stratum.
+;;;
+;;; Generated API: `Db`, `new-db`, `add-REL!`, `has-REL?`, `solve!`, and each relation
+;;; as a field of `Db`, read with `rt/rel-at`.
 (module hl.facts)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
@@ -18,58 +24,64 @@
 
 (reader-provider "hl.facts" read-facts)
 
-(defstruct Relation [(name (slice u8)) (arity i64)])
-(defstruct Atom [(rel (slice u8)) (args (ArrayList rt/Tok)) (tok rt/Tok)])
+(defstruct Relation [(name (slice u8)) (arity i64) (stratum i64)])
+(defstruct Atom [(rel (slice u8)) (args (ArrayList rt/Tok)) (negated bool) (tok rt/Tok)])
 (defstruct Clause [(head Atom) (body (ArrayList Atom))])
-
-(defn arity-of [(rels (ArrayList Relation)) (c (mut dsl/Cur)) (a Atom)] (-> i64)
-  (let [(mut out) -1]
-    (for r rels (when (= (.name r) (.rel a)) (set! out (.arity r))))
-    (when (< out 0)
-      (dsl/die (mut c) (.tok a) (dsl/join3 "no relation named " (.rel a) "")))
-    (when (!= out (len (.args a)))
-      (dsl/die (mut c) (.tok a) (dsl/join3 "wrong number of columns for " (.rel a) "")))
-    out))
-
-(defn read-atom [(c (mut dsl/Cur))] (-> Atom)
-  (let [t (dsl/name! (mut c) "a relation")
-        (mut args) (ArrayList::new [rt/Tok] (malloc-allocator))]
-    (dsl/expect! (mut c) "(")
-    (while (not (dsl/accept! (mut c) ")"))
-      (when (> (len args) 0) (dsl/expect! (mut c) ","))
-      (push! (mut args) (dsl/name! (mut c) "a variable")))
-    (Atom :rel (.text t) :args args :tok t)))
 
 (defn field-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "." n))
 (defn var-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "v-" n))
 (defn row-sym [(i i64)] (-> Code) (primitive/code-symbol "row" i))
 (defn ix-sym [(i i64)] (-> Code) (primitive/code-symbol "ix" i))
+(defn bucket-sym [(i i64)] (-> Code) (primitive/code-symbol "bucket" i))
 (defn count-sym [(i i64)] (-> Code) (primitive/code-symbol "count" i))
-(defn column [(index i64)] (-> Code) (if (= index 0) `.a `.b))
+
+(defn arity-of [(rels (ArrayList Relation)) (c (mut dsl/Cur)) (a Atom)] (-> i64)
+  (let [(mut out) -1]
+    (for r rels (when (= (.name r) (.rel a)) (set! out (.arity r))))
+    (when (< out 0)
+      (dsl/die (mut c) (.tok a) (dsl/join2 "no relation named " (.rel a))))
+    (when (!= out (len (.args a)))
+      (dsl/die (mut c) (.tok a) (dsl/join2 "wrong number of columns for " (.rel a))))
+    out))
+
+(defn read-atom [(c (mut dsl/Cur))] (-> Atom)
+  (let [negated (dsl/accept! (mut c) "!")
+        t (dsl/name! (mut c) "a relation")
+        (mut args) (ArrayList::new [rt/Tok] (malloc-allocator))]
+    (dsl/expect! (mut c) "(")
+    (while (not (dsl/accept! (mut c) ")"))
+      (when (> (len args) 0) (dsl/expect! (mut c) ","))
+      (push! (mut args) (dsl/name! (mut c) "a variable")))
+    (Atom :rel (.text t) :args args :negated negated :tok t)))
 
 (defn bound? [(bound (ArrayList (slice u8))) (n (slice u8))] (-> bool)
   (let [(mut hit) false]
     (for b bound (when (= b n) (set! hit true)))
     hit))
 
-;;; The innermost action: every head variable is bound by here, or it is an error.
+;;; The four column arguments for a row call, unused columns as 0.
+(defn row-args [(a Atom)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for i (range 0 4)
+      (if (< i (len (.args a)))
+          (push! (mut out) (var-sym (.text (get (.args a) i))))
+          (push! (mut out) `0)))
+    `(~@out)))
+
 (defn head-add [(c (mut dsl/Cur)) (a Atom) (bound (ArrayList (slice u8)))] (-> Code)
   (for t (.args a)
     (unless (bound? bound (.text t))
       (dsl/die (mut c) t (dsl/join3 "the head variable " (.text t) " is not bound by the body"))))
-  (let [x (var-sym (.text (get (.args a) 0)))
-        y (if (= (len (.args a)) 2) (var-sym (.text (get (.args a) 1))) `0)]
-    `(when (rt/rel-add! (mut (~(field-sym (.rel a)) db)) ~x ~y)
-       (set! changed true))))
+  `(rt/rel-queue! (mut (~(field-sym (.rel a)) db)) ~@(row-args a)))
 
-;;; Bind or test column `col` of body atom `i`, then continue.
+;;; Test or bind column `col` of the row atom `i` holds, then continue.
 (defn columns-code [(c (mut dsl/Cur)) (k Clause) (i i64) (col i64)
                     (bound (mut (ArrayList (slice u8))))] (-> Code)
   (let [a (get (.body k) i)]
     (if (>= col (len (.args a)))
         (atoms-code (mut c) k (+ i 1) (mut bound))
         (let [n (.text (get (.args a) col))
-              value `(~(column col) ~(row-sym i))]
+              value `(rt/rel-at (mut (~(field-sym (.rel a)) db)) ~(row-sym i) ~col)]
           (if (bound? bound n)
               `(when (= ~value ~(var-sym n))
                  ~(columns-code (mut c) k i (+ col 1) (mut bound)))
@@ -78,79 +90,141 @@
                 `(let [~(var-sym n) ~value]
                    ~(columns-code (mut c) k i (+ col 1) (mut bound)))))))))
 
-;;; A scan of body atom `i`, over the rows present when the scan starts.
+;;; Atom `i`: a membership test when negated; otherwise a scan, through an index on
+;;; its first bound column if it has one.
 (defn atoms-code [(c (mut dsl/Cur)) (k Clause) (i i64)
                   (bound (mut (ArrayList (slice u8))))] (-> Code)
   (if (>= i (len (.body k)))
       (head-add (mut c) (.head k) bound)
       (let [a (get (.body k) i)
             rel (field-sym (.rel a))]
-        `(let [~(count-sym i) (len (.rows (~rel db)))]
-           (for ~(ix-sym i) (range 0 ~(count-sym i))
-             (let [~(row-sym i) (get (.rows (~rel db)) ~(ix-sym i))]
-               ~(columns-code (mut c) k i 0 (mut bound))))))))
+        (if (.negated a)
+            (do
+              (for t (.args a)
+                (unless (bound? bound (.text t))
+                  (dsl/die (mut c) t (dsl/join3 "the negated variable " (.text t)
+                                                " must be bound earlier in the body"))))
+              `(unless (rt/rel-has? (mut (~rel db)) ~@(row-args a))
+                 ~(atoms-code (mut c) k (+ i 1) (mut bound))))
+            (let [(mut key-col) -1]
+              (for j (range 0 (len (.args a)))
+                (when (and (< key-col 0) (bound? bound (.text (get (.args a) j))))
+                  (set! key-col j)))
+              (if (>= key-col 0)
+                  (let [key (var-sym (.text (get (.args a) key-col)))
+                        body (columns-code (mut c) k i 0 (mut bound))]
+                    `(let [~(bucket-sym i) (rt/rel-bucket (mut (~rel db)) ~key-col ~key)]
+                       (for ~(ix-sym i) (range 0 (len ~(bucket-sym i)))
+                         (let [~(row-sym i) (get ~(bucket-sym i) ~(ix-sym i))]
+                           ~body))))
+                  (let [body (columns-code (mut c) k i 0 (mut bound))]
+                    `(for ~(row-sym i) (range 0 (.count (~rel db)))
+                       ~body))))))))
+
+;;; Stratum of each relation: at least a body relation's, above a negated one's.
+(defn stratify! [(rels (mut (ArrayList Relation))) (clauses (ArrayList Clause)) (c (mut dsl/Cur))] (-> i64)
+  (let [(mut changed) true (mut top) 0 limit (+ (len rels) 1)]
+    (while changed
+      (set! changed false)
+      (for k clauses
+        (let [head-at (rel-index rels (.rel (.head k)))
+              (mut need) (.stratum (get rels head-at))]
+          (for a (.body k)
+            (let [s (.stratum (get rels (rel-index rels (.rel a))))
+                  required (if (.negated a) (+ s 1) s)]
+              (when (> required need) (set! need required))))
+          (when (> need (.stratum (get rels head-at)))
+            (when (> need limit)
+              (dsl/die (mut c) (.tok (.head k)) "this rule depends on its own negation"))
+            (let [r (get rels head-at)]
+              (set! (mut rels) head-at
+                    (Relation :name (.name r) :arity (.arity r) :stratum need)))
+            (when (> need top) (set! top need))
+            (set! changed true)))))
+    top))
+
+(defn rel-index [(rels (ArrayList Relation)) (n (slice u8))] (-> i64)
+  (let [(mut out) -1]
+    (for i (range 0 (len rels))
+      (when (= (.name (get rels i)) n) (set! out i)))
+    out))
 
 (defn module-text [(context Code)] (-> (slice u8))
-  (let [(mut c) (dsl/cursor (dsl/source-of context) (dsl/path-of context) ":- ( ) , ;")
+  (let [(mut c) (dsl/cursor (dsl/source-of context) (dsl/path-of context) ":- ( ) , ; !")
         (mut rels) (ArrayList::new [Relation] (malloc-allocator))
         (mut clauses) (ArrayList::new [Clause] (malloc-allocator))]
     (dsl/expect! (mut c) "facts")
-    (while (dsl/accept! (mut c) "relation")
-      (let [a (read-atom (mut c))
-            n (len (.args a))]
-        (when (or (< n 1) (> n 2))
-          (dsl/die (mut c) (.tok a) "the PoC supports relations with 1 or 2 columns"))
-        (push! (mut rels) (Relation :name (.rel a) :arity n))))
     (while (not (dsl/eof? (mut c)))
-      (let [head (read-atom (mut c))
-            (mut body) (ArrayList::new [Atom] (malloc-allocator))]
-        (arity-of rels (mut c) head)
-        (dsl/expect! (mut c) ":-")
-        (push! (mut body) (read-atom (mut c)))
-        (while (dsl/accept! (mut c) ",")
-          (push! (mut body) (read-atom (mut c))))
-        (dsl/expect! (mut c) ";")
-        (for a body (arity-of rels (mut c) a))
-        (push! (mut clauses) (Clause :head head :body body))))
-    (let [(mut fields) (primitive/code-list-new)
+      (if (dsl/accept! (mut c) "relation")
+          (let [a (read-atom (mut c))
+                n (len (.args a))]
+            (when (or (< n 1) (> n 4))
+              (dsl/die (mut c) (.tok a) "a relation has 1 to 4 columns"))
+            (push! (mut rels) (Relation :name (.rel a) :arity n :stratum 0)))
+          (let [head (read-atom (mut c))
+                (mut body) (ArrayList::new [Atom] (malloc-allocator))]
+            (dsl/expect! (mut c) ":-")
+            (push! (mut body) (read-atom (mut c)))
+            (while (dsl/accept! (mut c) ",")
+              (push! (mut body) (read-atom (mut c))))
+            (dsl/expect! (mut c) ";")
+            (push! (mut clauses) (Clause :head head :body body)))))
+    ;; Checked after reading, so a rule may precede its relation's declaration.
+    (for k clauses
+      (arity-of rels (mut c) (.head k))
+      (for a (.body k) (arity-of rels (mut c) a)))
+    (let [top (stratify! (mut rels) clauses (mut c))
+          (mut fields) (primitive/code-list-new)
           (mut inits) (primitive/code-list-new)
           (mut api) (primitive/code-list-new)
-          (mut rounds) (primitive/code-list-new)]
+          (mut strata) (primitive/code-list-new)]
       (for r rels
         (let [field (primitive/code-symbol (.name r))
               access (field-sym (.name r))
               add (primitive/code-symbol "add-" (.name r) "!")
-              has (primitive/code-symbol "has-" (.name r) "?")]
+              has (primitive/code-symbol "has-" (.name r) "?")
+              (mut params) (primitive/code-list-new)
+              (mut args) (primitive/code-list-new)]
           (push! (mut fields) `(~field rt/Rel))
           (push! (mut inits) (primitive/code-symbol ":" (.name r)))
-          (push! (mut inits) `(rt/rel-new))
-          (if (= (.arity r) 1)
-              (do
-                (push! (mut api) `(defn ~add [(db (mut Db)) (a i64)] (-> bool)
-                                    (rt/rel-add! (mut (~access db)) a 0)))
-                (push! (mut api) `(defn ~has [(db Db) (a i64)] (-> bool)
-                                    (rt/rel-has? (~access db) a 0))))
-              (do
-                (push! (mut api) `(defn ~add [(db (mut Db)) (a i64) (b i64)] (-> bool)
-                                    (rt/rel-add! (mut (~access db)) a b)))
-                (push! (mut api) `(defn ~has [(db Db) (a i64) (b i64)] (-> bool)
-                                    (rt/rel-has? (~access db) a b)))))))
-      (for k clauses
-        (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))]
-          (push! (mut rounds) (atoms-code (mut c) k 0 (mut bound)))))
+          (push! (mut inits) `(rt/rel-new ~(.arity r)))
+          (for i (range 0 4)
+            (if (< i (.arity r))
+                (let [p (primitive/code-symbol "a" i)]
+                  (push! (mut params) `(~p i64))
+                  (push! (mut args) p))
+                (push! (mut args) `0)))
+          (push! (mut api)
+                 `(defn ~add [(db (mut Db)) ~@params] (-> bool)
+                    (rt/rel-add! (mut (~access db)) ~@args)))
+          (push! (mut api)
+                 `(defn ~has [(db (mut Db)) ~@params] (-> bool)
+                    (rt/rel-has? (mut (~access db)) ~@args)))))
+      (for s (range 0 (+ top 1))
+        (let [(mut rounds) (primitive/code-list-new)]
+          (for k clauses
+            (when (= (.stratum (get rels (rel-index rels (.rel (.head k))))) s)
+              (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
+                    flush (field-sym (.rel (.head k)))]
+                (push! (mut rounds) (atoms-code (mut c) k 0 (mut bound)))
+                (push! (mut rounds)
+                       `(when (rt/rel-flush! (mut (~flush db))) (set! changed true))))))
+          (push! (mut strata)
+                 `(let [(mut changed) true]
+                    (while changed
+                      (set! changed false)
+                      (set! rounds (+ rounds 1))
+                      ~@rounds)))))
       (dsl/render
         `(do
            (import "hl.rt" :as rt)
            (defstruct Db [~@fields])
            (defn new-db [] (-> Db) (Db ~@inits))
            ~@api
-           ;;; Run every rule until a whole round adds nothing. Answers the rounds.
+           ;;; Run each stratum until a whole round adds nothing. Answers the rounds.
            (defn solve! [(db (mut Db))] (-> i64)
-             (let [(mut changed) true (mut rounds) 0]
-               (while changed
-                 (set! changed false)
-                 (set! rounds (+ rounds 1))
-                 ~@rounds)
+             (let [(mut rounds) 0]
+               ~@strata
                rounds)))))))
 
 (defn read-facts [(context Code)] (-> Code)
