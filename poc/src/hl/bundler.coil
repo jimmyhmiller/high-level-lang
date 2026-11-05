@@ -1,22 +1,31 @@
-;;; `.bundler`: the top of the tower. A spec names the languages a build is made from
-;;; and describes its targets. It compiles to a program: each target is a function
-;;; filling in `api/Options`, so settings cost nothing at run time, and each plugin is a
+;;; `.bundler`: the top of the tower. A spec names the languages a build is made from, defines
+;;; its output formats and describes its targets. It compiles to a program: each target is a
+;;; function filling in `api/Options`, so settings cost nothing at run time, and each step is a
 ;;; direct call into a module another language generated.
 ;;;
 ;;;   bundler
 ;;;   use rewrite strip-debug = plugins.strip-debug
 ;;;   use rewrite minify = bundle.minify
+;;;   use rules virtual = myproject.plugins/virtual-files
 ;;;   use rules banner = myproject.passes/banner
+;;;
+;;;   format umd                       # a format is written here, not chosen from a list
+;;;     prefix "(function(){"
+;;;     suffix "})();\n"
+;;;     exports "globalThis.lib = %;"  # % is the entry's namespace object
+;;;   end
 ;;;
 ;;;   target client
 ;;;     entry "app/main.js"
 ;;;     outfile "dist/client.js"
-;;;     format iife
+;;;     format umd
 ;;;     define SERVER = false
-;;;     define process.env.NODE_ENV = "production"
-;;;     main-fields module main
-;;;     conditions import browser
-;;;     minify
+;;;     alias "react" = "preact/compat"
+;;;     loader ".txt" = text
+;;;     banner "/* mine */"
+;;;     tree-shaking off
+;;;     on-resolve virtual             # called first for every import
+;;;     on-load virtual-source         # may supply a file's text
 ;;;     transform strip-debug          # each file, before linking
 ;;;     optimize minify                # the whole program, for --minify-syntax
 ;;;   end
@@ -74,7 +83,7 @@
 ;;; The Str token's content, or a Name or Num as it stands: JavaScript text for a define.
 (defn define-text [(v g/Node)] (-> (slice u8)) (.text v))
 
-(defn str-of [(n g/Node)] (-> (slice u8)) (subslice (.text n) 1 (- (len (.text n)) 1)))
+(defn str-of [(n g/Node)] (-> (slice u8)) (dsl/unescape (subslice (.text n) 1 (- (len (.text n)) 1))))
 
 (defn word-pushes [(list g/Node) (field (slice u8))] (-> Code)
   (let [(mut pushes) (primitive/code-list-new)
@@ -83,7 +92,7 @@
     `(do (set! (~access o) (api/clear-words)) ~@pushes)))
 
 ;;; One `target … end`: its helper functions, then a function that builds it.
-(defn compile-target [(c (mut dsl/Cur)) (src (slice u8)) (target g/Node) (passes (ArrayList Pass)) (names (mut (ArrayList (slice u8))))] (-> Code)
+(defn compile-target [(c (mut dsl/Cur)) (src (slice u8)) (target g/Node) (passes (ArrayList Pass)) (formats (ArrayList (slice u8))) (names (mut (ArrayList (slice u8))))] (-> Code)
   (let [start (get (.kids target) 0)
         name (.text start)
         (mut entry) ""
@@ -96,11 +105,10 @@
         (g/KOutfile [] (set! outfile (str-of (get (.kids s) 0))))
         (g/KFormat []
           (let [f (get (.kids s) 0)]
-            (cond
-              (= (.text f) "iife") (push! (mut sets) `(set! (.format o) (api/Iife)))
-              (= (.text f) "esm") (push! (mut sets) `(set! (.format o) (api/Esm)))
-              (= (.text f) "cjs") (push! (mut sets) `(set! (.format o) (api/Cjs)))
-              :else (dsl/die (mut c) (tok-of src f) "the format is iife, esm or cjs"))))
+            (unless (has-format? formats (.text f))
+              (dsl/die (mut c) (tok-of src f)
+                       (dsl/join3 "no format named " (.text f) "; define one with `format … end`")))
+            (push! (mut sets) `(set! (.format o) (~(format-sym (.text f)))))))
         (g/KGlobal [] (push! (mut sets) `(set! (.global-name o) ~(str-of (get (.kids s) 0)))))
         (g/KDefine []
           (push! (mut sets) `(api/define! (mut o) ~(.text (get (.kids s) 0)) ~(define-text (get (.kids s) 1)))))
@@ -130,6 +138,27 @@
             (for w (.kids (get (.kids s) 0))
               (push! (mut pushes) `(push! (mut (.external o)) ~(.text w))))
             (push! (mut sets) `(do ~@pushes))))
+        (g/KAlias []
+          (push! (mut sets) `(api/alias! (mut o) ~(str-of (get (.kids s) 0)) ~(str-of (get (.kids s) 1)))))
+        (g/KLoader []
+          (let [kind (.text (get (.kids s) 1))]
+            (unless (or (= kind "js") (= kind "json") (= kind "text") (= kind "base64") (= kind "dataurl") (= kind "empty"))
+              (dsl/die (mut c) (tok-of src (get (.kids s) 1)) "the loader is js, json, text, base64, dataurl or empty"))
+            (push! (mut sets) `(api/loader! (mut o) ~(str-of (get (.kids s) 0)) ~kind))))
+        (g/KBanner [] (push! (mut sets) `(set! (.banner o) ~(str-of (get (.kids s) 0)))))
+        (g/KFooter [] (push! (mut sets) `(set! (.footer o) ~(str-of (get (.kids s) 0)))))
+        (g/KTreeShaking []
+          (let [v (.text (get (.kids s) 0))]
+            (cond
+              (= v "on") 0
+              (= v "off") (push! (mut sets) `(set! (.tree-shaking o) false))
+              :else (dsl/die (mut c) (tok-of src (get (.kids s) 0)) "tree-shaking is on or off"))))
+        (g/KOnResolve []
+          (for p (steps-of (mut c) src (get (.kids s) 0) passes)
+            (push! (mut sets) `(push! (mut (.on-resolve o)) (fnptr-of ~(call-sym p))))))
+        (g/KOnLoad []
+          (for p (steps-of (mut c) src (get (.kids s) 0) passes)
+            (push! (mut sets) `(push! (mut (.on-load o)) (fnptr-of ~(call-sym p))))))
         (g/KTransform []
           (let [fname (primitive/code-symbol (dsl/join2 name "-transform"))]
             (push! (mut forms) (pipeline-fn fname (steps-of (mut c) src (get (.kids s) 0) passes)))
@@ -150,6 +179,33 @@
            ~@sets
            (api/build o))))))
 
+(defn format-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "format-" n))
+
+(defn has-format? [(formats (ArrayList (slice u8))) (n (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for f formats (when (= f n) (set! hit true)))
+    hit))
+
+;;; `format x … end`, as a function answering the description `api/build` follows.
+(defn compile-format [(c (mut dsl/Cur)) (src (slice u8)) (d g/Node)] (-> Code)
+  (let [name (.text (get (.kids d) 0))
+        (mut prefix) ""
+        (mut suffix) ""
+        (mut exports) ""
+        (mut names) false
+        (mut hoist) false]
+    (for part (.kids (get (.kids d) 1))
+      (match (.kind part)
+        (g/KPrefix [] (set! prefix (str-of (get (.kids part) 0))))
+        (g/KSuffix [] (set! suffix (str-of (get (.kids part) 0))))
+        (g/KExportsVia [] (set! exports (str-of (get (.kids part) 0))))
+        (g/KExportsNames [] (set! names true))
+        (g/KHoistExternals [] (set! hoist true))
+        (_ (dsl/die (mut c) (tok-of src part) "this part of a format is not handled"))))
+    `(defn ~(format-sym name) [] (-> api/Format)
+       (api/Format :prefix ~prefix :suffix ~suffix :exports ~exports
+                   :export-names ~names :hoist-externals ~hoist))))
+
 (defn module-text [(context Code)] (-> (slice u8))
   (let [src (dsl/source-of context)
         path (dsl/path-of context)
@@ -161,7 +217,8 @@
         (mut targets) (primitive/code-list-new)
         (mut names) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut calls) (primitive/code-list-new)
-        (mut imports) (primitive/code-list-new)]
+        (mut imports) (primitive/code-list-new)
+        (mut format-code) `(do)]
     (for u (.kids (get (.kids tree) 0))
       (let [sort (get (.kids u) 0)
             n (get (.kids u) 1)
@@ -175,16 +232,28 @@
                 :else (dsl/die (mut c) (tok-of src sort) "expected rewrite or rules"))]
         (push! (mut passes) p)
         (push! (mut imports) `(import ~(.module p) :as ~(alias-sym p)))))
-    (for t (.kids (get (.kids tree) 1))
-      (push! (mut targets) (compile-target (mut c) src t passes (mut names))))
-    (for n names
-      (push! (mut calls) `(~(primitive/code-symbol "build-" n))))
+    (let [(mut formats) (ArrayList::new [(slice u8)] (malloc-allocator))
+          (mut format-forms) (primitive/code-list-new)]
+      (for name ["iife" "esm" "cjs"]
+        (push! (mut formats) name)
+        (push! (mut format-forms)
+               `(defn ~(format-sym name) [] (-> api/Format)
+                  (~(primitive/code-symbol "api/" name "-format")))))
+      (for d (.kids (get (.kids tree) 1))
+        (push! (mut formats) (.text (get (.kids d) 0)))
+        (push! (mut format-forms) (compile-format (mut c) src d)))
+      (for t (.kids (get (.kids tree) 2))
+        (push! (mut targets) (compile-target (mut c) src t passes formats (mut names))))
+      (for n names
+        (push! (mut calls) `(~(primitive/code-symbol "build-" n))))
+      (set! format-code `(do ~@format-forms)))
     (dsl/render
       `(do
          (import "bundle.js" :as syn)
          (import "bundle.api" :as api)
          (import "hl.rt" :as rt)
          ~@imports
+         ~format-code
          ~@targets
          (defn build-all [] (-> void) ~@calls)
          (defn bundler-worker [(arg (ptr i8))] (-> (ptr i8)) (build-all) arg)

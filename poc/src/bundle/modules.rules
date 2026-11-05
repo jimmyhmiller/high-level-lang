@@ -31,6 +31,8 @@ record Module {
   pure-at: {Int:Bool}
 }
 
+record TextPair { key: Text, value: Text }
+
 # `define process.env.NODE_ENV = "production"`: a dotted name and its replacement.
 record Define { key: Text, value: Node }
 
@@ -45,6 +47,11 @@ state names: rt.Names = names-new()
 state entry: Int = -1
 state defines: [Define] = []
 state transform: Fn(Node)->Node = keep-as-is
+state aliases: [TextPair] = []
+state loaders: [TextPair] = []
+state on-resolve: [Fn(Text,Text)->Text?] = []
+state on-load: [Fn(Text)->Text?] = []
+state hook-answers: {Text:Text} = {}
 
 fn keep-as-is(n: Node) -> Node = n
 
@@ -292,14 +299,67 @@ fn external-module(spec: Text) -> Int {
   id
 }
 
+# An alias replaces a package name, and carries any subpath along.
+fn aliased(spec: Text) -> Text {
+  for a in aliases {
+    if spec == a.key { return a.value }
+    if starts-with(spec, a.key ++ "/") { return a.value ++ spec[len(a.key)..len(spec)] }
+  }
+  spec
+}
+
+# What a resolve hook says about this import. Asked once per place it could appear from.
+fn hook-path(spec: Text, importer: Text) -> Text? {
+  if len(on-resolve) == 0 { return none }
+  let key = dir-of(importer) ++ "\n" ++ spec
+  if let some(p) = hook-answers[key] { return if len(p) == 0 then none else some(p) }
+  let answer = first hook in on-resolve: hook(spec, importer)
+  hook-answers[key] = answer ?? ""
+  answer
+}
+
+# Is this import left for the runtime? A hook's answer overrides that, as an alias does.
+fn stays-external?(spec: Text, importer: Text) -> Bool =
+  is-none(hook-path(aliased(spec), importer)) and res.external?(aliased(spec), options)
+
+# Where an import leads: resolve hooks first, then the search.
+fn resolve-import(spec: Text, importer: Text) -> res.Resolved {
+  let wanted = aliased(spec)
+  match hook-path(wanted, importer) {
+    some(p) => res.Resolved(path: p, side-effects: true)
+    none => res.resolve(wanted, importer, options)
+  }
+}
+
 fn dep-add(m: Int, spec: Text, path: Text) -> Int {
-  let d = if res.external?(spec, options) then external-module(spec) else {
-    let r = res.resolve(spec, path, options)
+  let d = if stays-external?(spec, path) then external-module(aliased(spec)) else {
+    let r = resolve-import(spec, path)
     load-file(r.path, r.side-effects)
   }
   modules[m].deps += d
   d
 }
+
+fn loader-of(path: Text) -> Text {
+  for l in loaders {
+    if ends-with(path, l.key) { return l.value }
+  }
+  if ends-with(path, ".json") then "json" else "js"
+}
+
+# A file's text as a module, by what its loader says it is.
+fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
+  "js" => text
+  "json" => "module.exports = " ++ text
+  "text" => "export default " ++ host.js-string(text) ++ ";"
+  "base64" => "export default \"" ++ host.base64(text) ++ "\";"
+  "dataurl" => "export default \"data:text/plain;base64," ++ host.base64(text) ++ "\";"
+  "empty" => ""
+  other => panic "{}: no loader named {}", path, other
+}
+
+# A load hook may supply a file's text, or the file does.
+fn source-of(path: Text) -> Text = (first hook in on-load: hook(path)) ?? read-file(path)
 
 # The specifier a statement imports from, or nothing.
 fn import-spec-of(s: Node) -> Text? = match s {
@@ -312,8 +372,7 @@ fn import-spec-of(s: Node) -> Text? = match s {
 # come before it, as they do in esbuild's output.
 fn load-file(path: Text, effects: Bool) -> Int {
   if let some(id) = by-path[path] { return id }
-  let src0 = read-file(path)
-  let src = if ends-with(path, ".json") then "module.exports = " ++ src0 else src0
+  let src = as-module(source-of(path), path)
   let tree0 = transform(parse-file(src, path))
   let base = base-name(path)
   let id = len(modules)

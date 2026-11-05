@@ -16,7 +16,22 @@ use bundle.sourcemap as map
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
-enum Format { Iife, Esm, Cjs }
+# An output format: text around the program, and how the entry's exports get out. `exports` is a
+# statement in which `%` stands for the entry's namespace object.
+record Format {
+  prefix: Text,
+  suffix: Text,
+  exports: Text,
+  export-names: Bool,
+  hoist-externals: Bool
+}
+
+fn iife-format() -> Format =
+  Format(prefix: "(()=>{", suffix: "})();\n", exports: "", export-names: false, hoist-externals: false)
+fn cjs-format() -> Format =
+  Format(prefix: "", suffix: "\n", exports: "module.exports=%;", export-names: false, hoist-externals: false)
+fn esm-format() -> Format =
+  Format(prefix: "", suffix: "\n", exports: "", export-names: true, hoist-externals: true)
 
 record DefineText { key: Text, value: Text }
 
@@ -36,6 +51,13 @@ record Options {
   extensions: [Text],
   external: [Text],
   platform-node: Bool,
+  aliases: [m.TextPair],
+  loaders: [m.TextPair],
+  banner: Text,
+  footer: Text,
+  tree-shaking: Bool,
+  on-resolve: [Fn(Text,Text)->Text?],
+  on-load: [Fn(Text)->Text?],
   transform: Fn(Node)->Node,
   optimize: Fn(Node)->Node
 }
@@ -46,10 +68,12 @@ fn keep-as-is(n: Node) -> Node = n
 fn default-optimize(n: Node) -> Node = host.templates(final.run(minify.run(n)))
 
 fn options-new(entry: Text, outfile: Text) -> Options =
-  Options(entry: entry, outfile: outfile, format: Iife, global-name: "",
+  Options(entry: entry, outfile: outfile, format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
           extensions: [".js", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
+          aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true,
+          on-resolve: [], on-load: [],
           transform: keep-as-is, optimize: default-optimize)
 
 # Node's module system: builtins stay external, and packages resolve for node.
@@ -61,6 +85,15 @@ fn platform-node!(o: mut Options) -> Void {
 
 fn define!(o: mut Options, key: Text, value: Text) -> Void {
   o.defines += DefineText(key: key, value: value)
+}
+
+fn alias!(o: mut Options, from: Text, to: Text) -> Void {
+  o.aliases += m.TextPair(key: from, value: to)
+}
+
+fn loader!(o: mut Options, extension: Text, kind: Text) -> Void {
+  o.loaders += m.TextPair(key: extension, value: kind)
+  if not (extension in o.extensions) { o.extensions += extension }
 }
 
 fn clear-words() -> [Text] = []
@@ -125,23 +158,32 @@ fn printed(o: Options, p: Node, prefix: Text, suffix: Text) -> Printed {
   Printed(text: prefix ++ r.text ++ suffix, base: len(prefix), marks: r.marks)
 }
 
-fn wrap-format(o: Options, p: Node) -> Printed = match o.format {
-  Iife =>
-    if len(o.global-name) > 0 {
-      let value = to-common-js()
-      printed(o, program-plus(p, stmt`return $value;`), "var " ++ o.global-name ++ "=(()=>{", "})();\n")
-    } else {
-      printed(o, p, "(()=>{", "})();\n")
-    }
-  Cjs => {
-    let value = to-common-js()
-    printed(o, program-plus(p, stmt`module.exports = $value;`), "", "\n")
+# Every `%` in a format's statement, as this text.
+fn fill-in(template: Text, value: Text) -> Text {
+  var b = buf-new()
+  for c in template {
+    if c == '%' { buf-add!(b, value) } else { buf-byte!(b, c) }
   }
-  Esm => match esm-exports() {
-    some(x) => printed(o, program-plus(p, x), "", "\n")
-    none => printed(o, p, "", "\n")
-  }
+  buf-text(b)
 }
+
+# A format's statement, once the names it refers to are final.
+fn export-statement(f: Format) -> Node? {
+  if f.export-names { return esm-exports() }
+  if len(f.exports) == 0 { return none }
+  let ns = js.render(to-common-js(), false)
+  some(js.parse(fill-in(f.exports, ns), "<format>").kids[1].kids[0])
+}
+
+fn wrap-format(o: Options, f: Format, p: Node) -> Printed = match export-statement(f) {
+  some(x) => printed(o, program-plus(p, x), f.prefix, f.suffix)
+  none => printed(o, p, f.prefix, f.suffix)
+}
+
+# `--global-name`: an IIFE whose value is the entry's namespace.
+fn named(f: Format, global-name: Text) -> Format =
+  if len(global-name) == 0 then f
+  else f with { prefix: "var " ++ global-name ++ "=" ++ f.prefix, exports: "return %;" }
 
 fn base-of-path(path: Text) -> Text {
   var cut = -1
@@ -171,12 +213,18 @@ fn build(options: Options) -> Void {
     define!(o, "process.env.NODE_ENV", if o.minify-syntax then "\"production\"" else "\"development\"")
   }
   m.defines = [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines]
+  let f = if o.format.export-names or len(o.format.exports) > 0 then o.format else named(o.format, o.global-name)
+  m.aliases = o.aliases
+  m.loaders = o.loaders
+  m.on-resolve = o.on-resolve
+  m.on-load = o.on-load
+  an.tree-shaking = o.tree-shaking
   e.void-undefined = o.minify-syntax
   e.sourcemap = o.sourcemap
   m.transform = o.transform
-  an.keep-entry-exports = o.format == Esm
-  e.esm-output = o.format == Esm
-  an.entry-namespace = o.format == Cjs or (o.format == Iife and len(o.global-name) > 0)
+  an.keep-entry-exports = f.export-names
+  e.esm-output = f.hoist-externals
+  an.entry-namespace = len(f.exports) > 0
   m.load-runtime(include-text("runtime.js"))
   m.load-tree(o.entry)
   lap(o, "load: resolve, parse, scopes")
@@ -188,12 +236,17 @@ fn build(options: Options) -> Void {
   lap(o, "emit: rewrite identifiers")
   let p = if o.minify-syntax then o.optimize(emitted) else fold.run(emitted)
   lap(o, "minify rules")
-  let out0 = wrap-format(o, p)
-  # Hoisted external imports come first, ahead of everything the map describes.
+  let out0 = wrap-format(o, f, p)
+  # The banner and hoisted external imports come first, ahead of everything the map describes.
   var hoisted = buf-new()
+  if len(o.banner) > 0 {
+    buf-add!(hoisted, o.banner)
+    buf-add!(hoisted, "\n")
+  }
   for line in e.external-imports { buf-add!(hoisted, line) }
   let head = buf-text(hoisted)
-  let full = head ++ out0.text
+  let footer = if len(o.footer) > 0 then o.footer ++ "\n" else ""
+  let full = head ++ out0.text ++ footer
   let base = len(head) + out0.base
   let text = if o.sourcemap then full ++ "//# sourceMappingURL=" ++ base-of-path(o.outfile) ++ ".map\n" else full
   lap(o, "print")
