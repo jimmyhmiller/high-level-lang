@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Every output format, ours against esbuild's, by what a consumer sees.
-S=/private/tmp/claude-501/-Users-jimmyhmiller-Documents-Code-projects-high-level-lang/42c609f3-96d2-4d12-b20e-26987dd12610/scratchpad
+S="$(cd "$(dirname $0)/.." && pwd)/out/bin"; mkdir -p $S/mt
 cd "$(dirname $0)/.."
 cat > $S/mt/uselib.mjs <<'EOT'
 import(process.argv[2]).then((m) => { console.log(Object.keys(m).sort().join(), m.answer, m.hello("x"), new m.default().hi()); });

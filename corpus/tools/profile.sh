@@ -1,6 +1,6 @@
 #!/bin/zsh
 # usage: profile.sh ESB APP [TOP]: sample a long in-process run, print self time by function.
-S=/private/tmp/claude-501/-Users-jimmyhmiller-Documents-Code-projects-high-level-lang/42c609f3-96d2-4d12-b20e-26987dd12610/scratchpad
+S="$(cd "$(dirname $0)/.." && pwd)/out/bin"; mkdir -p $S/mt
 $1 app/$2.js --minify --repeat=${4:-40} --outfile=$S/mt/p.js > /dev/null &
 pid=$!
 sleep 0.2

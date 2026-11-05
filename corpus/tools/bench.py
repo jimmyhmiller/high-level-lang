@@ -6,6 +6,6 @@ def run(cmd):
     return best*1000
 S=sys.argv[1]
 for a in ['named','all','cjs']:
-    o=run([S+'/esb3',f'app/{a}.js','--minify',f'--outfile=out/ours/{a}.min.js'])
+    o=run([S+'/esb',f'app/{a}.js','--minify',f'--outfile=out/ours/{a}.min.js'])
     e=run(['node_modules/.bin/esbuild',f'app/{a}.js','--bundle','--minify','--format=iife',f'--outfile=out/esb/{a}.min.js','--log-level=error'])
     print(f'{a:6} ours {o:7.1f} ms   esbuild {e:7.1f} ms   ratio {o/e:5.2f}x')
