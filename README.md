@@ -16,7 +16,7 @@ build.bundler        targets, formats, defines, plugins          → the build p
 Every language except `.syntax` is itself defined by a `.syntax` grammar, in
 `poc/src/hl/grammars/`. `.syntax` keeps a hand-written parser, because it is the bootstrap.
 
-The compiled bundler is about 100 KB of native code, specialised to its spec.
+The compiled bundler is about 530 KB of native code, specialised to its spec.
 
 ## Running it
 
@@ -106,7 +106,8 @@ Being explicit, because "everything esbuild does" is a lot:
   the top level of an ES module that is `require`d or `import()`ed.
 - **Simplifications:** `sideEffects` as an array counts as "has effects", which is safe but
   keeps more. Source maps have no `names`. Regex patterns are not validated. Labels are not
-  renamed. `const` inlining is missing, which is most of the remaining size difference.
+  renamed. Single-use `const` inlining is missing, because it needs use counts the rewrite
+  rules cannot see yet.
 
 ## Layout
 
