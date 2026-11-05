@@ -28,7 +28,9 @@ for name, files in lists.items():
     open(listfile, "w").write("\n".join(files) + "\n")
     outdir = f"{SCRATCH}/rt-{name.replace(' ', '_')}"
     subprocess.run(["rm", "-rf", outdir]); os.makedirs(outdir)
-    t = time.time(); code, out = sh([PARSE, "check", listfile], 300); ms = (time.time() - t) * 1000
+    # test262 is a script unless named otherwise; library code decides by its own syntax.
+    mode = "strict" if name == "test262 pass" else "check"
+    t = time.time(); code, out = sh([PARSE, mode, listfile], 300); ms = (time.time() - t) * 1000
     tail = out.strip().split("\n")[-1]
     check("failed 0" in tail, f"{name}: {tail} ({ms:.0f} ms)")
     sh([PARSE, "printall", listfile, outdir], 300)
@@ -40,7 +42,9 @@ for name in ["fail", "early"]:
     files = sorted(glob.glob(f"vendor/test262-parser-tests/{name}/*.js"))
     listfile = f"{SCRATCH}/{name}.list"; open(listfile, "w").write("\n".join(files) + "\n")
     code, out = sh([PARSE, "accepted", listfile], 300)
-    print(f"  info test262 {name}/ rejected: {out.strip().split(chr(10))[-1]}")
+    tail = out.strip().split(chr(10))[-1]
+    m = re.match(r"parsed (\d+) failed (\d+)", tail)
+    print(f"  info test262 {name}/: rejected {m.group(2)} of {int(m.group(1)) + int(m.group(2))}")
 
 print("== bundles against esbuild")
 for a in "named all cjs features three zod rx datefns preact immer react d3".split():

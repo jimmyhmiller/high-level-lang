@@ -8,6 +8,7 @@
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
 (import "bundle.js" :as js)
+(import "bundle.early" :as early)
 (import "hl.rt" :as rt)
 
 (defn module-file? [(path (slice u8))] (-> bool)
@@ -25,11 +26,24 @@
         (set! start (+ i 1))))
     out))
 
-(defn check-list [(list (slice u8)) (quiet bool)] (-> i64)
+(defstruct CheckOpts [(allow-return bool) (script-goal bool)])
+
+(defn check-list [(list (slice u8)) (quiet bool) (opts CheckOpts)] (-> i64)
   (let [(mut good) 0 (mut bad) 0]
     (for path (lines-of (rt/read-all list))
       (match (js/parse-result (rt/read-all path) path (flags-for path))
-        (Ok [_] (set! good (+ good 1)) (when quiet (println "OK {}" path)))
+        (Ok [tree]
+          ;; Library code here is CommonJS or an ES module, which the syntax decides. A
+          ;; test262 file says so by its name.
+          (let [module (or (module-file? path)
+                           (and (not (.script-goal opts)) (early/program-has-module-syntax? tree)))]
+            (match (early/check tree module (.allow-return opts))
+              (None [] (set! good (+ good 1)) (when quiet (println "OK {}" path)))
+              (Some [p]
+                (set! bad (+ bad 1))
+                (unless quiet
+                  (let [at (rt/line-col (rt/read-all path) (.at p))]
+                    (println "FAIL {}:{}:{} {}" path (.line at) (.col at) (.message p))))))))
         (Err [e]
           (set! bad (+ bad 1))
           (unless quiet
@@ -60,6 +74,8 @@
             (Ok [tree] (println "{}" (js/render tree false)) 0)
             (Err [e] (rt/parse-failed e))))
       (= cmd "printall") (print-all arg (args/nth 3))
-      (= cmd "check") (check-list arg false)
-      (= cmd "accepted") (check-list arg true)
+      (= cmd "check") (check-list arg false (CheckOpts :allow-return true :script-goal false))
+      ;; test262 is strict about a top-level return; library code is often CommonJS.
+      (= cmd "strict") (check-list arg false (CheckOpts :allow-return false :script-goal true))
+      (= cmd "accepted") (check-list arg true (CheckOpts :allow-return false :script-goal true))
       :else (do (println "usage: jsparse print FILE | check LIST | accepted LIST") 1))))
