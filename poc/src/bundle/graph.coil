@@ -38,7 +38,8 @@
    (ns-sym i64)
    (init-sym i64)
    (wrapped bool)
-   (dynamic-deps (ArrayList i64))])
+   (dynamic-deps (ArrayList i64))
+   (pure-at (HashMap i64 bool))])
 
 ;;; A symbol an import from a CommonJS module turned into a property read.
 (defstruct CjsImport [(importer i64) (import-var i64) (name (slice u8)) (namespace bool)])
@@ -150,6 +151,40 @@
       (let [name (get (.kids (get (.kids s) 0)) 0)]
         (Some (if (= (.kind name) (js/KNone)) "" (.text name)))))
     (_ (None [(slice u8)]))))
+
+;;; Offsets of the tokens that `/* @__PURE__ */` or `/* #__PURE__ */` comments precede.
+;;; Comments are not in the tree, so this scans for them. A match inside a string only
+;;; records an offset no call starts at, unless one really does follow: esbuild makes
+;;; the same call about annotations being advice.
+(defn pure-annotations [(src (slice u8))] (-> (HashMap i64 bool))
+  (let [(mut out) (HashMap::new-scalar [i64 bool] (malloc-allocator))
+        (mut i) 0
+        n (len src)]
+    (while (< (+ i 1) n)
+      (if (and (= (get src i) #\/) (= (get src (+ i 1)) #\*))
+          (let [start i
+                (mut j) (+ i 2)
+                (mut pure) false]
+            (while (and (< (+ j 1) n) (not (and (= (get src j) #\*) (= (get src (+ j 1)) #\/))))
+              (when (or (rt/at? src j "@__PURE__") (rt/at? src j "#__PURE__")) (set! pure true))
+              (set! j (+ j 1)))
+            (set! i (+ j 2))
+            (when pure
+              (let [(mut k) i]
+                ;; Past space and further comments, to the token it annotates.
+                (let [(mut go) true]
+                  (while (and go (< k n))
+                    (let [c (get src k)]
+                      (cond
+                        (or (= c #\space) (= c #\newline) (= c #\tab) (= c #\return)) (set! k (+ k 1))
+                        (rt/at? src k "/*")
+                          (let [(mut m) (+ k 2)]
+                            (while (and (< (+ m 1) n) (not (rt/at? src m "*/"))) (set! m (+ m 1)))
+                            (set! k (+ m 2)))
+                        :else (set! go false)))))
+                (set! (mut out) k true))))
+          (set! i (+ i 1))))
+    out))
 
 (defn has-esm-syntax? [(tree js/Node)] (-> bool)
   (let [(mut hit) false]
@@ -382,7 +417,8 @@
                        :free (real-free free-names cjs)
                        :text-for-freq src
                        :ns-sym -1 :init-sym -1 :wrapped false
-                       :dynamic-deps (ArrayList::new [i64] (malloc-allocator))))
+                       :dynamic-deps (ArrayList::new [i64] (malloc-allocator))
+                       :pure-at (pure-annotations src)))
         (set! (mut (.by-path g)) path id)
         ;; Imports in source order. Statements `define` removed import nothing.
         (for s (source-stmts final-tree tree0)
@@ -534,6 +570,65 @@
     (js/KShorthand [] (pure-expr? (mut g) m (get (.kids n) 0)))
     (js/KMethod [] (!= (.kind (get (.kids n) 0)) (js/KComputed)))
     (js/KClassExpr [] (pure-class? (mut g) m n))
+    (js/KCallExpr [] (pure-call? (mut g) m n))
+    (js/KNewExpr [] (or (pure-call? (mut g) m n) (pure-new? (mut g) m n)))
+    (js/KNewNoArgs [] (or (annotated? m n) (known-collection? (mut g) m (get (.kids n) 0))))
+    (js/KMember [] (known-global-read? (mut g) m n))
+    (_ false)))
+
+(defn annotated? [(m Module) (n js/Node)] (-> bool)
+  (match (get (.pure-at m) (.lo n)) (Some [_] true) (None [] false)))
+
+;;; An annotated call goes if nothing it was given has an effect.
+(defn pure-call? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
+  (and (annotated? m n)
+       (all-pure-list? (mut g) m (get (.kids (get (.kids n) 1)) 0))))
+
+(defn free-ident? [(m Module) (n js/Node)] (-> bool)
+  (and (= (.kind n) (js/KIdent))
+       (match (get (.bindings m) (.lo n)) (Some [_] false) (None [] true))))
+
+;;; `new Map()` and friends cannot run anyone's code when given nothing.
+(defn known-collection? [(g (mut Graph)) (m Module) (callee js/Node)] (-> bool)
+  (and (free-ident? m callee)
+       (let [t (.text callee)]
+         (or (= t "Map") (= t "Set") (= t "WeakMap") (= t "WeakSet")))))
+
+(defn pure-new? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
+  (and (known-collection? (mut g) m (get (.kids n) 0))
+       (= (len (.kids (get (.kids (get (.kids n) 1)) 0))) 0)))
+
+;;; Reading a property of `Math` cannot run code, unless someone replaced Math.
+(defn known-global-read? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
+  (let [o (get (.kids n) 0)]
+    (and (free-ident? m o) (= (.text o) "Math"))))
+
+;;; A computed class key runs `ToPropertyKey`, so only a literal or a well-known symbol
+;;; is known to do nothing.
+(defn pure-key? [(g (mut Graph)) (m Module) (key js/Node)] (-> bool)
+  (if (= (.kind key) (js/KComputed))
+      (let [e (get (.kids key) 0)]
+        (or (= (.kind e) (js/KStr)) (= (.kind e) (js/KNum))
+            (and (= (.kind e) (js/KMember))
+                 (free-ident? m (get (.kids e) 0))
+                 (= (.text (get (.kids e) 0)) "Symbol"))))
+      true))
+
+(defn pure-member? [(g (mut Graph)) (m Module) (member js/Node)] (-> bool)
+  (match (.kind member)
+    (js/KClassEmpty [] true)
+    (js/KMethod [] (pure-key? (mut g) m (get (.kids member) 0)))
+    (js/KGenMethod [] (pure-key? (mut g) m (get (.kids member) 0)))
+    (js/KAsyncMethod [] (pure-key? (mut g) m (get (.kids member) 0)))
+    (js/KAsyncGenMethod [] (pure-key? (mut g) m (get (.kids member) 0)))
+    (js/KGetter [] (pure-key? (mut g) m (get (.kids member) 0)))
+    (js/KSetter [] (pure-key? (mut g) m (get (.kids member) 0)))
+    (js/KStaticMethod [] (pure-member? (mut g) m (get (.kids member) 0)))
+    ;; An instance field runs at construction, not here.
+    (js/KField [] (pure-key? (mut g) m (get (.kids member) 0)))
+    (js/KStaticField []
+      (and (pure-key? (mut g) m (get (.kids member) 0))
+           (pure-expr? (mut g) m (get (.kids member) 1))))
     (_ false)))
 
 (defn all-pure? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
@@ -550,16 +645,11 @@
 (defn pure-class? [(g (mut Graph)) (m Module) (n js/Node)] (-> bool)
   (let [heritage (get (.kids n) 1)
         body (get (.kids (get (.kids n) 2)) 0)
-        (mut ok) (= (.kind heritage) (js/KNone))]
+        ;; `extends` a pure expression: evaluating it runs nothing.
+        (mut ok) (or (= (.kind heritage) (js/KNone))
+                     (pure-expr? (mut g) m (get (.kids heritage) 0)))]
     (for member (.kids body)
-      (match (.kind member)
-        (js/KMethod [] (when (= (.kind (get (.kids member) 0)) (js/KComputed)) (set! ok false)))
-        (js/KClassEmpty [] 0)
-        (js/KGetter [] (when (= (.kind (get (.kids member) 0)) (js/KComputed)) (set! ok false)))
-        (js/KSetter [] (when (= (.kind (get (.kids member) 0)) (js/KComputed)) (set! ok false)))
-        (js/KField []
-          (when (or (= (.kind (get (.kids member) 0)) (js/KComputed))) (set! ok false)))
-        (_ (set! ok false))))
+      (unless (pure-member? (mut g) m member) (set! ok false)))
     ok))
 
 ;;; Globals esbuild treats as safe to read.
@@ -841,7 +931,8 @@
                    :free free-names
                    :text-for-freq text
                    :ns-sym -1 :init-sym -1 :wrapped false
-                   :dynamic-deps (ArrayList::new [i64] (malloc-allocator))))
+                   :dynamic-deps (ArrayList::new [i64] (malloc-allocator))
+                   :pure-at (HashMap::new-scalar [i64 bool] (malloc-allocator))))
     (push! (mut (.order g)) 0)))
 
 ;;; Load everything from `entry` and solve the link facts.
