@@ -1,6 +1,8 @@
 ;;; Command line: esb ENTRY [--format=iife|esm] [--outfile=PATH] [--pretty]
 (module tools.esb)
 (import "coil.args" :as args)
+(import "coil.var" :use [var-static])
+(import "coil.time" :use [monotonic-now-ms])
 (import "coil.thread" :use [Thread ThreadConfig])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
@@ -21,6 +23,18 @@
     (push! (mut out) b)
     out))
 
+;;; With HL_TIMING in the environment, time per stage goes to stderr.
+(def LAST-MS (var-static i64 0))
+(def SHOW-TIMING (var-static bool false))
+
+(defn lap! [(label (slice u8))] (-> void)
+  (when (get SHOW-TIMING)
+    (match (monotonic-now-ms)
+      (Ok [now]
+        (when (> (get LAST-MS) 0) (println "{:>6} ms  {}" (- now (get LAST-MS)) label))
+        (set LAST-MS now))
+      (Err [_] 0))))
+
 (defn run [] (-> i64)
   (let [entry (args/nth 1)
         (mut outfile) ""
@@ -28,7 +42,7 @@
         (mut minify-ids) false
         (mut minify-syntax) false
         (mut exts) (strs ".js" ".mjs")
-        o (res/Options :main-fields (strs "module" "main") :conditions (strs "import" "browser") :extensions exts)
+        o (res/Options :main-fields (strs "module" "main") :conditions (strs "import" "browser") :extensions exts :cache (res/cache-new))
         (mut gr) (g/graph-new o)]
     (push! (mut exts) ".cjs")
     (push! (mut exts) ".json")
@@ -38,19 +52,30 @@
           (rt/at? a 0 "--outfile=") (set! outfile (subslice a 10 (len a)))
           (= a "--pretty") (set! pretty true)
           (= a "--minify-identifiers") (set! minify-ids true)
+          (= a "--timing") (set SHOW-TIMING true)
           (= a "--minify-syntax") (set! minify-syntax true)
           (= a "--minify")
             (do (set! minify-ids true) (set! minify-syntax true))
           :else (panic "unknown option {}" a))))
     (set! (.void-undefined gr) minify-syntax)
-    (g/load-runtime! (mut gr) (include-str "../bundle/runtime.js"))
-    (g/build! (mut gr) entry)
+        (g/load-runtime! (mut gr) (include-str "../bundle/runtime.js"))
+    (lap! "startup")
+    (g/load-tree! (mut gr) entry)
+    (lap! "load: resolve, parse, scopes")
+    (g/link! (mut gr))
+    (lap! "link: facts and Datalog")
     (if minify-ids (mangle/assign-minified! (mut gr)) (e/assign-names! (mut gr)))
-    (let [p0 (fold/run (e/program (mut gr)))
-          p (if minify-syntax (final/run (minify/run p0)) p0)
-          body (js/render p pretty)
+    (lap! "naming")
+    (let [p00 (e/program (mut gr))
+          ;; The minifier's rules include the folds.
+          p (do
+              (lap! "emit: rewrite identifiers")
+              (if minify-syntax (final/run (minify/run p00)) (fold/run p00)))
+          body (do (lap! "minify rules") (js/render p pretty))
           text (rt/join (rt/join "(()=>{" body) "})();\n")]
+      (lap! "print")
       (rt/write-output outfile text)
+      (lap! "write")
       (println "{} bytes -> {}" (len text) outfile))
     0))
 

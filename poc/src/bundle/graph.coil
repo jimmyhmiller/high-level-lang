@@ -52,7 +52,8 @@
    (part-stmt (ArrayList js/Node))
    (part-module (ArrayList i64))
    (helpers (HashMap (slice u8) i64))
-   (void-undefined bool)])
+   (void-undefined bool)
+   (entry i64)])
 
 (defn name-id! [(g (mut Graph)) (s (slice u8))] (-> i64)
   (let [id (rt/intern! (mut (.names g)) s)]
@@ -224,8 +225,8 @@
         (Err [_] (rt/parse-failed first))))))
 
 ;;; Is this file in node compatibility mode: `.mjs`, or under "type": "module"?
-(defn node-mode? [(path (slice u8))] (-> bool)
-  (or (ends-with? path ".mjs") (res/package-type-module? path)))
+(defn node-mode? [(path (slice u8)) (o res/Options)] (-> bool)
+  (or (ends-with? path ".mjs") (res/package-type-module? path o)))
 
 (defn ends-with? [(s (slice u8)) (suffix (slice u8))] (-> bool)
   (and (>= (len s) (len suffix))
@@ -252,29 +253,35 @@
             id (len (.modules g))
             esm (has-esm-syntax? tree0)
             tree (normalized-tree tree0 base)
-            ;; First pass on a scratch table, only to see which names are free.
-            (mut scratch) (sym/table-new)
-            (mut scratch-b) (HashMap::new-scalar [i64 i64] (malloc-allocator))
-            scratch-root (sc/analyze tree (mut scratch) -1 (mut scratch-b))
-            cjs (and (not esm)
-                     (or (free-name? (mut scratch) "module")
-                         (free-name? (mut scratch) "exports")
-                         (free-name? (mut scratch) "require")))
             (mut bindings) (HashMap::new-scalar [i64 i64] (malloc-allocator))
-            parent (if cjs
-                       (let [w (sym/new-scope! (mut (.table g)) (.bundle-scope g) true)]
-                         (sym/declare! (mut (.table g)) w "exports")
-                         (sym/declare! (mut (.table g)) w "module")
-                         w)
-                       (.bundle-scope g))
-            root (do scratch-root (sc/analyze tree (mut (.table g)) parent (mut bindings)))]
+            ;; Free names per module: this file's go to a fresh map for the moment.
+            outer-free (.free (.table g))
+            _ (set! (.free (.table g)) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+            first-root (sc/analyze tree (mut (.table g)) (.bundle-scope g) (mut bindings))
+            cjs (and (not esm)
+                     (or (free-name? (mut (.table g)) "module")
+                         (free-name? (mut (.table g)) "exports")
+                         (free-name? (mut (.table g)) "require")))
+            ;; CommonJS is analysed again inside its (exports, module) wrapper. The
+            ;; first attempt's scope is detached, so naming never sees it.
+            root (if cjs
+                     (let [w (do
+                               (pop! (mut (.children (elem (mut (.scopes (.table g))) (.bundle-scope g)))))
+                               (sym/new-scope! (mut (.table g)) (.bundle-scope g) true))]
+                       (sym/declare! (mut (.table g)) w "exports")
+                       (sym/declare! (mut (.table g)) w "module")
+                       (clear! (mut bindings))
+                       (sc/analyze tree (mut (.table g)) w (mut bindings)))
+                     first-root)
+            free-names (keys-of (.free (.table g)))
+            _2 (set! (.free (.table g)) outer-free)]
         (push! (mut (.modules g))
                (Module :id id :path path :kind (if cjs (Cjs) (Esm)) :tree tree :root root
                        :bindings bindings :side-effects effects
                        :deps (ArrayList::new [i64] (malloc-allocator))
                        :base base :first-part 0 :part-count 0 :default-sym -1 :require-sym -1
                        :source (.kids (get (.kids tree0) 1))
-                       :free (real-free (keys-of (.free scratch)) cjs)
+                       :free (real-free free-names cjs)
                        :text-for-freq src))
         (set! (mut (.by-path g)) path id)
         ;; Imports in source order.
@@ -593,30 +600,35 @@
            :part-stmt (js/new-kids)
            :part-module (ArrayList::new [i64] (malloc-allocator))
            :helpers (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
-           :void-undefined false)))
+           :void-undefined false
+           :entry -1)))
 
 ;;; The runtime is an ordinary module, id 0, that nothing makes live unless a part
 ;;; mentions one of its helpers.
 (defn load-runtime! [(g (mut Graph)) (text (slice u8))] (-> void)
   (let [tree (js/parse text "<runtime>")
         (mut bindings) (HashMap::new-scalar [i64 i64] (malloc-allocator))
-        (mut scratch) (sym/table-new)
-        (mut scratch-b) (HashMap::new-scalar [i64 i64] (malloc-allocator))
-        scratch-root (sc/analyze tree (mut scratch) -1 (mut scratch-b))
-        root (do scratch-root (sc/analyze tree (mut (.table g)) (.bundle-scope g) (mut bindings)))]
+        outer-free (.free (.table g))
+        _ (set! (.free (.table g)) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+        root (sc/analyze tree (mut (.table g)) (.bundle-scope g) (mut bindings))
+        free-names (keys-of (.free (.table g)))
+        _2 (set! (.free (.table g)) outer-free)]
     (push! (mut (.modules g))
            (Module :id 0 :path "<runtime>" :kind (Runtime) :tree tree :root root
                    :bindings bindings :side-effects false
                    :deps (ArrayList::new [i64] (malloc-allocator))
                    :base "runtime" :first-part 0 :part-count 0 :default-sym -1 :require-sym -1
                    :source (js/new-kids)
-                   :free (keys-of (.free scratch))
+                   :free free-names
                    :text-for-freq text))
     (push! (mut (.order g)) 0)))
 
 ;;; Load everything from `entry` and solve the link facts.
-(defn build! [(g (mut Graph)) (entry (slice u8))] (-> void)
-  (let [e (load! (mut g) entry true)]
+(defn load-tree! [(g (mut Graph)) (entry (slice u8))] (-> void)
+  (set! (.entry g) (load! (mut g) entry true)))
+
+(defn link! [(g (mut Graph))] (-> void)
+  (let [e (.entry g)]
     (for id (.order g)
       (let [m (module-at (mut g) id)]
         (when (= (.kind m) (Cjs))

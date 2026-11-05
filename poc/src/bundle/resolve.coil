@@ -1,7 +1,7 @@
 ;;; Node-style module resolution. Hand-written Coil: it is a filesystem algorithm,
 ;;; and its knobs (main fields, conditions, extensions) come from the options.
 (module bundle.resolve)
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :use [malloc-allocator box!])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap])
 (import "coil.slice" :use [subslice])
@@ -10,15 +10,51 @@
 (import "bundle.package" :as pkg)
 (import "hl.rt" :as rt)
 
+;;; Everything the filesystem answered, so each question is asked once.
+(defstruct Cache
+  [(files (HashMap (slice u8) bool))
+   (docs (HashMap (slice u8) pkg/Node))
+   (resolved (HashMap (slice u8) (slice u8)))
+   (effects (HashMap (slice u8) bool))
+   (type-module (HashMap (slice u8) bool))])
+
 (defstruct Options
   [(main-fields (ArrayList (slice u8)))
    (conditions (ArrayList (slice u8)))
-   (extensions (ArrayList (slice u8)))])
+   (extensions (ArrayList (slice u8)))
+   (cache (ptr Cache))])
+
+(defn cache-new [] (-> (ptr Cache))
+  (box! (malloc-allocator) Cache
+        (Cache :files (HashMap::new [(slice u8) bool] (malloc-allocator) (str/keyops))
+               :docs (HashMap::new [(slice u8) pkg/Node] (malloc-allocator) (str/keyops))
+               :resolved (HashMap::new [(slice u8) (slice u8)] (malloc-allocator) (str/keyops))
+               :effects (HashMap::new [(slice u8) bool] (malloc-allocator) (str/keyops))
+               :type-module (HashMap::new [(slice u8) bool] (malloc-allocator) (str/keyops)))))
 
 (defstruct Resolved [(path (slice u8)) (side-effects bool)])
 
-(defn file? [(path (slice u8))] (-> bool)
-  (match (fs/read-file (malloc-allocator) path) (Ok [_] true) (Err [_] false)))
+;;; Does this name a readable file? Most probes are misses, which `exists?` answers
+;;; without opening anything; a directory exists but cannot be read.
+(defn file? [(path (slice u8)) (o Options)] (-> bool)
+  (match (get (.files (.cache o)) path)
+    (Some [known] known)
+    (None []
+      (let [there (match (fs/exists? (malloc-allocator) path)
+                    (Ok [e] (and e (match (fs/read-file (malloc-allocator) path)
+                                     (Ok [_] true)
+                                     (Err [_] false))))
+                    (Err [_] false))]
+        (set! (mut (.files (.cache o))) path there)
+        there))))
+
+(defn doc-of [(pj (slice u8)) (o Options)] (-> pkg/Node)
+  (match (get (.docs (.cache o)) pj)
+    (Some [d] d)
+    (None []
+      (let [d (pkg/parse (rt/read-all pj) pj)]
+        (set! (mut (.docs (.cache o))) pj d)
+        d))))
 
 ;;; Remove `.` and `..` segments.
 (defn normalize [(path (slice u8))] (-> (slice u8))
@@ -85,18 +121,18 @@
 
 (defn try-file [(base (slice u8)) (o Options)] (-> (Option (slice u8)))
   (block :found
-    (when (file? base) (return-from :found (Some base)))
+    (when (file? base o) (return-from :found (Some base)))
     (for ext (.extensions o)
       (let [p (rt/join base ext)]
-        (when (file? p) (return-from :found (Some p)))))
+        (when (file? p o) (return-from :found (Some p)))))
     (None [(slice u8)])))
 
 ;;; A directory: its package.json entry, then its index.
 (defn try-dir [(dir (slice u8)) (o Options)] (-> (Option (slice u8)))
   (block :found
     (let [pj (rt/join dir "/package.json")]
-      (when (file? pj)
-        (let [doc (pkg/parse (rt/read-all pj) pj)]
+      (when (file? pj o)
+        (let [doc (doc-of pj o)]
           (for field (.main-fields o)
             (match (member doc field)
               (Some [v]
@@ -112,39 +148,49 @@
     (Some [p] (Some p))
     (None [] (try-dir base o))))
 
-;;; Is the package.json governing a file `"type": "module"`?
-(defn package-type-module? [(path (slice u8))] (-> bool)
-  (let [(mut dir) (rt/dir-of path) (mut out) false (mut go) true]
+;;; The package.json governing a directory: the nearest one at or above it.
+(defn package-json-for [(start (slice u8)) (o Options)] (-> (Option (slice u8)))
+  (let [(mut dir) start (mut out) (None [(slice u8)]) (mut go) true]
     (while go
       (let [pj (if (= dir ".") "package.json" (rt/join dir "/package.json"))]
-        (if (file? pj)
-            (do
-              (match (member (pkg/parse (rt/read-all pj) pj) "type")
-                (Some [v]
-                  (when (and (= (.kind v) (pkg/KStr)) (= (strip-quotes (.text v)) "module"))
-                    (set! out true)))
-                (None [] 0))
-              (set! go false))
+        (if (file? pj o)
+            (do (set! out (Some pj)) (set! go false))
             (if (or (= dir ".") (= (len dir) 0) (= dir "/"))
                 (set! go false)
                 (set! dir (rt/dir-of dir))))))
     out))
 
-;;; The package.json governing a file, for its `sideEffects`.
-(defn side-effects-of [(path (slice u8))] (-> bool)
-  (let [(mut dir) (rt/dir-of path) (mut out) true (mut go) true]
-    (while go
-      (let [pj (rt/join dir "/package.json")]
-        (if (file? pj)
-            (do
-              (match (member (pkg/parse (rt/read-all pj) pj) "sideEffects")
-                (Some [v] (when (= (.kind v) (pkg/KFalse)) (set! out false)))
-                (None [] 0))
-              (set! go false))
-            (if (or (= dir ".") (= (len dir) 0) (= dir "/"))
-                (set! go false)
-                (set! dir (rt/dir-of dir))))))
-    out))
+;;; Is the package.json governing a file `"type": "module"`?
+(defn package-type-module? [(path (slice u8)) (o Options)] (-> bool)
+  (let [dir (rt/dir-of path)]
+    (match (get (.type-module (.cache o)) dir)
+      (Some [known] known)
+      (None []
+        (let [answer
+                (match (package-json-for dir o)
+                  (None [] false)
+                  (Some [pj]
+                    (match (member (doc-of pj o) "type")
+                      (Some [v] (and (= (.kind v) (pkg/KStr)) (= (strip-quotes (.text v)) "module")))
+                      (None [] false))))]
+          (set! (mut (.type-module (.cache o))) dir answer)
+          answer)))))
+
+;;; `"sideEffects": false` in the package.json governing a file.
+(defn side-effects-of [(path (slice u8)) (o Options)] (-> bool)
+  (let [dir (rt/dir-of path)]
+    (match (get (.effects (.cache o)) dir)
+      (Some [known] known)
+      (None []
+        (let [answer
+                (match (package-json-for dir o)
+                  (None [] true)
+                  (Some [pj]
+                    (match (member (doc-of pj o) "sideEffects")
+                      (Some [v] (!= (.kind v) (pkg/KFalse)))
+                      (None [] true))))]
+          (set! (mut (.effects (.cache o))) dir answer)
+          answer)))))
 
 (defn split-package [(spec (slice u8))] (-> i64)
   (let [(mut slashes) 0 (mut out) (len spec)
@@ -169,8 +215,8 @@
                        (rt/join "node_modules/" name)
                        (rt/join (rt/join dir "/node_modules/") name))
               pj (rt/join pdir "/package.json")]
-          (when (file? pj)
-            (let [doc (pkg/parse (rt/read-all pj) pj)]
+          (when (file? pj o)
+            (let [doc (doc-of pj o)]
               (match (package-exports doc sub o)
                 (Some [target]
                   (return-from :found (Some (normalize (rt/join (rt/join pdir "/") target)))))
@@ -189,7 +235,16 @@
 
 (defn resolve [(spec (slice u8)) (importer (slice u8)) (o Options)] (-> Resolved)
   (let [from-dir (rt/dir-of importer)
-        target
+        key (rt/join (rt/join from-dir "\n") spec)]
+    (match (get (.resolved (.cache o)) key)
+      (Some [p] (Resolved :path p :side-effects (side-effects-of p o)))
+      (None []
+        (let [r (resolve-uncached spec importer from-dir o)]
+          (set! (mut (.resolved (.cache o))) key (.path r))
+          r)))))
+
+(defn resolve-uncached [(spec (slice u8)) (importer (slice u8)) (from-dir (slice u8)) (o Options)] (-> Resolved)
+  (let [target
           (if (or (rt/at? spec 0 "./") (rt/at? spec 0 "../") (= spec ".") (= spec "..")
                   (rt/at? spec 0 "/"))
               (try-path (normalize (if (rt/at? spec 0 "/")
@@ -198,5 +253,5 @@
                         o)
               (resolve-bare spec from-dir o))]
     (match target
-      (Some [p] (Resolved :path p :side-effects (side-effects-of p)))
+      (Some [p] (Resolved :path p :side-effects (side-effects-of p o)))
       (None [] (panic "{}: could not resolve {}" importer spec)))))

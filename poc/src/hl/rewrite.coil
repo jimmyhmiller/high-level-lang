@@ -47,7 +47,9 @@
   (SStrEq [(subject i64) (text (slice u8))]))
 
 (defstruct Use [(where (slice u8)) (name (slice u8)) (arity i64)])
-(defstruct Rule [(name (slice u8)) (head (slice u8))])
+;;; A window rule rewrites a run in the middle of a list and leaves the rest alone:
+;;; `List(xs..., P, ys...) => List(xs..., R, ys...)`. `width` is P's length, 0 otherwise.
+(defstruct Rule [(name (slice u8)) (head (slice u8)) (width i64)])
 (defstruct Guard [(negated bool) (name (slice u8)) (args (ArrayList (slice u8)))])
 
 (defstruct Comp
@@ -60,7 +62,10 @@
    (vars (ArrayList Var))
    (guards (ArrayList Guard))
    (next-subject i64)
-   (next-scan i64)])
+   (next-scan i64)
+   (window-prefix (slice u8))
+   (window-suffix (slice u8))
+   (window-width i64)])
 
 (defn kind-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "syn/K" n))
 (defn subj-sym [(i i64)] (-> Code) (primitive/code-symbol "s" i))
@@ -163,6 +168,12 @@
           (set! (mut (.steps k)) scan-at
                 (SScan :subject subject :scan scan :middle count
                        :prefix (> (len prefix) 0) :suffix (> (len suffix) 0)))
+          ;; The whole-list pattern of a rule might be a window rule: note its shape
+          ;; and let `read-rule` decide once it has seen the right-hand side.
+          (when (and (= subject 0) (> (len prefix) 0) (> (len suffix) 0))
+            (set! (.window-prefix k) prefix)
+            (set! (.window-suffix k) suffix)
+            (set! (.window-width k) count))
           (when (> (len prefix) 0)
             (push! (mut (.steps k)) (SPrefix :subject subject :scan scan :name prefix)))
           (when (> (len suffix) 0)
@@ -321,8 +332,12 @@
 (defn wrap-steps [(steps (ArrayList Step)) (i i64) (inner Code)] (-> Code)
   (if (>= i (len steps))
       inner
-      (let [rest (wrap-steps steps (+ i 1) inner)]
-        (match (get steps i)
+      (wrap-one-step (get steps i) (wrap-steps steps (+ i 1) inner))))
+
+(defn wrap-one-step [(step Step) (rest Code)] (-> Code)
+  (do
+      (do
+        (match step
           (STest [s kind arity]
             `(if (and (= (.kind ~(subj-sym s)) (~(kind-sym kind)))
                       (= (len (.kids ~(subj-sym s))) ~arity))
@@ -370,6 +385,37 @@
           (SStrEq [s text]
             `(if (rt/str-is? (.text ~(subj-sym s)) ~text) ~rest ~(no-match)))))))
 
+;;; Steps for a window rule's whole-list pattern. The window sits at the end of the
+;;; children it is handed, so there is nothing to scan, and no rests to bind.
+(defn wrap-steps-window [(steps (ArrayList Step)) (i i64) (inner Code)] (-> Code)
+  (if (>= i (len steps))
+      inner
+      (let [rest (wrap-steps-window steps (+ i 1) inner)]
+        (match (get steps i)
+          (SScan [s scan middle _ _]
+            (if (= s 0)
+                `(let [~(scan-sym scan) (- (len (.kids s0)) ~middle)] ~rest)
+                (wrap-one-step (get steps i) rest)))
+          (SPrefix [s _ _] (if (= s 0) rest (wrap-one-step (get steps i) rest)))
+          (SSuffix [s _ _ _] (if (= s 0) rest (wrap-one-step (get steps i) rest)))
+          (_ (wrap-one-step (get steps i) rest))))))
+
+;;; `R` of a window rule must be exactly `List(xs..., …, ys...)`, the same two rests
+;;; at the same two ends: then nothing outside the window can change.
+(defn window-rhs? [(k (mut Comp)) (c (mut dsl/Cur)) (head (slice u8)) (start i64) (end i64)] (-> bool)
+  (let [first (get (.toks c) start)
+        pre (dsl/join2 (.window-prefix k) "...")
+        suf (dsl/join2 (.window-suffix k) "...")
+        (mut count) 0]
+    (for i (range start end)
+      (when (= (.text (get (.toks c) i)) pre) (set! count (+ count 1)))
+      (when (= (.text (get (.toks c) i)) suf) (set! count (+ count 1))))
+    (and (= (.text first) head)
+         (= count 2)
+         (> (- end start) 4)
+         (= (.text (get (.toks c) (+ start 2))) pre)
+         (= (.text (get (.toks c) (- end 2))) suf))))
+
 (defn read-guards! [(k (mut Comp)) (c (mut dsl/Cur))] (-> void)
   (when (dsl/accept! (mut c) "when")
     (let [(mut go) true]
@@ -408,6 +454,9 @@
     (clear! (mut (.guards k)))
     (set! (.next-subject k) 1)
     (set! (.next-scan k) 0)
+    (set! (.window-prefix k) "")
+    (set! (.window-suffix k) "")
+    (set! (.window-width k) 0)
     (let [head (read-pat! (mut k) (mut c) 0)]
       (when (= (len head) 0)
         (dsl/die (mut c) name "a rule's pattern must start with a node"))
@@ -417,18 +466,33 @@
           (push! (mut (.steps k)) (SVar :subject 0 :name (.text v)))))
       (read-guards! (mut k) (mut c))
       (dsl/expect! (mut c) "=>")
-      (let [rhs (read-rhs (mut k) (mut c))
-            guarded `(if ~(guards-code (mut k)) (Some ~rhs) ~(no-match))]
+      (let [start (.pos c)
+            rhs (read-rhs (mut k) (mut c))
+            guarded `(if ~(guards-code (mut k)) (Some ~rhs) ~(no-match))
+            end (.pos c)
+            is-window (and (> (.window-width k) 0)
+                           (window-rhs? (mut k) (mut c) head start end))]
         (dsl/expect! (mut c) ";")
-        (push! (mut (.rules k)) (Rule :name (.text name) :head head))
-        `(defn ~(rule-sym (mut k) index) [(s0 syn/Node)] (-> (Option syn/Node))
-           (block :r ~(wrap-steps (.steps k) 0 guarded)))))))
+        (push! (mut (.rules k))
+               (Rule :name (.text name) :head head :width (if is-window (.window-width k) 0)))
+        (if is-window
+            ;; The tail of `s0`'s children is the window: `scan` is where it starts.
+            ;; The rest variables are bound to empty lists, so the result holds only the
+            ;; replacement.
+            `(defn ~(rule-sym (mut k) index) [(s0 syn/Node)] (-> (Option syn/Node))
+               (let [empty (syn/new-kids)
+                     ~(var-sym (.window-prefix k)) empty
+                     ~(var-sym (.window-suffix k)) empty]
+                 (block :r ~(wrap-steps-window (.steps k) 0 guarded))))
+            `(defn ~(rule-sym (mut k) index) [(s0 syn/Node)] (-> (Option syn/Node))
+               (block :r ~(wrap-steps (.steps k) 0 guarded))))))))
 
 ;;; Try each rule with this head in order.
 (defn try-rules [(k (mut Comp)) (head (slice u8)) (i i64)] (-> Code)
   (cond
     (>= i (len (.rules k))) (no-match)
-    (!= (.head (get (.rules k) i)) head) (try-rules (mut k) head (+ i 1))
+    (or (!= (.head (get (.rules k) i)) head) (> (.width (get (.rules k) i)) 0))
+      (try-rules (mut k) head (+ i 1))
     :else
       `(match (~(rule-sym (mut k) i) n)
          (Some [r] (Some r))
@@ -447,10 +511,15 @@
                   :vars (ArrayList::new [Var] (malloc-allocator))
                   :guards (ArrayList::new [Guard] (malloc-allocator))
                   :next-subject 1
-                  :next-scan 0)
+                  :next-scan 0
+                  :window-prefix ""
+                  :window-suffix ""
+                  :window-width 0)
         (mut forms) (primitive/code-list-new)
         (mut arms) (primitive/code-list-new)
         (mut uses) (primitive/code-list-new)
+        (mut windows) (primitive/code-list-new)
+        feed (primitive/code-symbol (dsl/join2 prefix "feed"))
         (mut index) 0]
     (while (not (dsl/eof? (mut c)))
       (push! (mut forms) (read-rule (mut k) (mut c) index))
@@ -461,6 +530,21 @@
           (when (= (.head (get (.rules k) j)) head) (set! first false)))
         (when first
           (push! (mut arms) `(~(kind-sym head) [] ~(try-rules (mut k) head 0))))))
+    (for i (range 0 (len (.rules k)))
+      (let [r (get (.rules k) i)]
+        (when (> (.width r) 0)
+          (push! (mut windows)
+                 `(when (>= (len out) ~(.width r))
+                    (let [probe (syn/mk (syn/KList) out 0 0)]
+                      (match (~(rule-sym (mut k) i) probe)
+                        (Some [repl]
+                          (for _ (range 0 ~(.width r)) (pop! (mut out)))
+                          (set! fuel (- fuel 1))
+                          (when (< fuel 0)
+                            (panic "rewrite rules did not terminate within 100000000 firings"))
+                          (for each (.kids repl) (~feed each pass (mut fuel) (mut out)))
+                          (return-from :window 0))
+                        (None [] 0))))))))
     (for u (.uses k)
       (push! (mut uses) `(~(.where u) ~(.name u) ~(.arity u))))
     (let [step (pfx-sym (mut k) "step")
@@ -471,6 +555,15 @@
          ~@forms
          (defn ~step [(n syn/Node)] (-> (Option syn/Node))
            (match (.kind n) ~@arms (_ ~(no-match))))
+         ;;; Window rules run as a peephole: normalise each element, push it, and try
+         ;;; the rules on the end of the output. A replacement is fed back in. Earlier
+         ;;; elements are already stable, so a long list costs one pass over it.
+         (defn ~feed [(item syn/Node) (pass i64) (fuel (mut i64)) (out (mut (ArrayList syn/Node)))] (-> void)
+           (push! (mut out) (~go item pass (mut fuel)))
+           (block :window
+             ~@windows
+             0)
+           0)
          ;;; Bottom up: normal children first, then rules here until none applies. A
          ;;; node stamped with this pass is already normal, so a rule's reused children
          ;;; are not walked again, and the whole pass stays linear.
@@ -482,7 +575,10 @@
                (if (= (.gen cur) pass)
                    (set! go-on false)
                    (let [(mut kids) (syn/new-kids)]
-                     (for child (.kids cur) (push! (mut kids) (~go child pass (mut fuel))))
+                     (reserve! (mut kids) (len (.kids cur)))
+                     (if (= (.kind cur) (syn/KList))
+                         (for child (.kids cur) (~feed child pass (mut fuel) (mut kids)))
+                         (for child (.kids cur) (push! (mut kids) (~go child pass (mut fuel)))))
                      (let [(mut rebuilt) (syn/mk (.kind cur) kids (.lo cur) (.hi cur))]
                        (set! (.text rebuilt) (.text cur))
                        (match (~step rebuilt)
@@ -507,6 +603,7 @@
     (when (> (len host) 0) (push! (mut extra) `(import ~host :as host)))
     `(do
        (import "coil.control" :use [return-from])
+       (import "coil.arraylist" :use [ArrayList])
        (import "hl.rt" :as rt)
        (import "hl.check" :as check)
        (import ~syntax :as syn)
