@@ -290,6 +290,14 @@ sh([ESB, "app/opts/charset.js", f"--outfile={SCRATCH}/op.o.cjs"])
 lines = [l for l in open(f"{SCRATCH}/op.o.cjs", encoding="utf-8").read().split("\n") if any(ord(c) > 127 for c in l)]
 check(len(lines) == 1 and "/[" in lines[0], f"ASCII output: only the regular expressions keep their bytes ({len(lines)} line)")
 
+print("== decorators against esbuild")
+for flags in [[], ["--minify"], ["--target=es2020"]]:
+    a, b = f"{SCRATCH}/dc.o.cjs", f"{SCRATCH}/dc.e.cjs"
+    code, _ = sh([ESB, "app/dec/main.ts", f"--outfile={a}"] + flags)
+    sh([E, "app/dec/main.ts", "--bundle", f"--outfile={b}", "--log-level=error"] + flags)
+    ra, rb = sh(["node", a], 30), sh(["node", b], 30)
+    check(code == 0 and ra[0] == 0 and ra[1] and ra[1] == rb[1], f"experimentalDecorators {' '.join(flags)}: same output, in the same order, as esbuild's")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)

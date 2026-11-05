@@ -11,7 +11,8 @@ use bundle.minhost as host
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
-record Lowered { tree: Node, pure-calls: {Int:Int} }
+# `helpers`: runtime helpers the lowered code calls by name, for the linker to supply.
+record Lowered { tree: Node, pure-calls: {Int:Int}, helpers: [Text] }
 
 state src: Text = ""
 state next-offset: Int = -1000
@@ -22,6 +23,8 @@ state namespace-exports: {Text:[Text]} = {}
 state assign-fields: Bool = false
 # `verbatimModuleSyntax`: an import is kept unless it says it is a type.
 state keeping-imports: Bool = false
+state experimental-decorators: Bool = false
+state helpers-used: [Text] = []
 context namespace-path: Text = ""
 
 # Scope analysis finds a name's symbol by offset. Real offsets are not negative.
@@ -587,6 +590,128 @@ fn class-body(n: Node, derived: Bool) -> Node = match n {
   _ => panic "expected a class body"
 }
 
+# ---------------------------------------------------------------- decorators
+
+fn helper-ref(name: Text) -> Node {
+  if not (name in helpers-used) { helpers-used += name }
+  ident(name)
+}
+
+fn decorators-of(list: Node) -> [Node] = [lowered(d.kids[0]) for d in list.kids]
+
+fn member-core(m: Node) -> Node = match m {
+  TsDecoratedMember(_, inner) => inner
+  _ => m
+}
+
+fn static-member?(m: Node) -> Bool = member-core(m) is StaticMethod(_) | StaticField(...)
+
+fn member-inner(m: Node) -> Node = match member-core(m) {
+  StaticMethod(x) => x
+  other => other
+}
+
+# esbuild's kinds: 1 for a method or accessor, 2 for a field.
+fn member-kind(m: Node) -> Int = if member-inner(m) is Field(...) | StaticField(...) then 2 else 1
+
+fn decorated-key(m: Node) -> Node = match member-inner(m).kids[0] {
+  PropName(x) => string-node(x)
+  Str(raw) => Str(raw)
+  Num(t) => string-node(t)
+  PrivateName(_) => panic "a decorator on a private member is not allowed"
+  _ => panic "a decorator on a member with a computed name is not implemented yet"
+}
+
+fn params-of-member(m: Node) -> [Node] = match member-inner(m) {
+  Method(_, Params(List(ps...)), _) | GenMethod(_, Params(List(ps...)), _) | AsyncMethod(_, Params(List(ps...)), _)
+    | AsyncGenMethod(_, Params(List(ps...)), _) | Setter(_, Params(List(ps...)), _) => ps
+  _ => []
+}
+
+# `__decorateParam(i, d)` for each decorated parameter.
+fn param-decorators(ps: [Node]) -> [Node] {
+  var out: [Node] = []
+  for i in 0..len(ps) {
+    match ps[i] {
+      TsDecoratedParam(List(ds...), _) => for d in ds {
+        let index = Num(int-text(i))
+        let f = helper-ref("__decorateParam")
+        let dec = lowered(d.kids[0])
+        out += exp`$f($index, $dec)`
+      }
+      _ => {}
+    }
+  }
+  out
+}
+
+# The class without its decorators: they become calls after it.
+fn undecorated(n: Node) -> Node = match n {
+  TsDecoratedMember(_, inner) => undecorated(inner)
+  TsDecoratedParam(_, inner) => inner
+  _ => if len(n.kids) == 0 then n else n with { kids: [undecorated(k) for k in n.kids] }
+}
+
+fn decorated-anything?(n: Node) -> Bool = match n {
+  TsDecoratedMember(...) | TsDecoratedParam(...) => true
+  _ => any k in n.kids: decorated-anything?(k)
+}
+
+fn decorate-call(decorators: [Node], target: Node, key: Node?, kind: Int) -> Node {
+  let f = helper-ref("__decorateClass")
+  let slots = [if i == len(decorators) - 1 then ElemLast(decorators[i]) else Elem(decorators[i]) for i in 0..len(decorators)]
+  let list = ArrayLit(List(slots...))
+  match key {
+    some(k) => {
+      let kind-node = Num(int-text(kind))
+      exp`$f($list, $target, $k, $kind_node)`
+    }
+    none => exp`$f($list, $target)`
+  }
+}
+
+# `class A { @d m() {} }` and `@c class A {}`, as TypeScript's experimentalDecorators runs them:
+# members first, instance before static, then the class, which the decorators may replace.
+fn decorated-class!(class-decorators: [Node], cls: Node, exported: Bool, out: mut [Node]) -> Void {
+  if not experimental-decorators {
+    panic "JavaScript decorators are not implemented yet; set \"experimentalDecorators\": true in tsconfig.json for TypeScript's"
+  }
+  let name = cls.kids[0].text
+  let members = cls.kids[2].kids[0].kids
+  var after: [Node] = []
+  var constructor-params: [Node] = []
+  for pass in [false, true] {
+    for m in members {
+      let core = member-core(m)
+      if not (core is ClassEmpty() | TsErased()) and static-member?(m) == pass {
+        if core is Method(PropName("constructor"), ...) {
+          constructor-params = param-decorators(params-of-member(m))
+        } else {
+          let own: [Node] = match m {
+            TsDecoratedMember(List(ds...), _) => [lowered(d.kids[0]) for d in ds]
+            _ => []
+          }
+          let all-decorators = own ++ param-decorators(params-of-member(m))
+          if len(all-decorators) > 0 {
+            let holder = ident(name)
+            let target = if pass then holder else Member(holder, PropName("prototype"))
+            after += ExprStmt(decorate-call(all-decorators, target, some(decorated-key(m)), member-kind(m)))
+          }
+        }
+      }
+    }
+  }
+  let whole = class-decorators ++ constructor-params
+  if len(whole) > 0 {
+    let holder = ident(name)
+    let value = decorate-call(whole, ident(name), none, 0)
+    after += stmt`$holder = $value;`
+  }
+  let plain = lowered(undecorated(cls))
+  out += if exported then ExportClass(plain) with { lo: cls.lo, hi: cls.hi } else plain
+  out ++= after
+}
+
 # ---------------------------------------------------------------- the walk
 
 # Names the statements in one list declare by way of a function or a class, which a namespace or
@@ -610,6 +735,12 @@ fn lowered-statements(xs: [Node]) -> [Node] {
   for x in xs {
     match x {
       TsErased() => {}
+      TsDecoratedClass(List(ds...), cls) => decorated-class!([lowered(d.kids[0]) for d in ds], cls, false, out)
+      TsDecoratedExport(List(ds...), cls) | TsExportDecorated(List(ds...), cls) =>
+        decorated-class!([lowered(d.kids[0]) for d in ds], cls, true, out)
+      TsDecoratedDefault(...) | TsDefaultDecorated(...) => panic "a decorated `export default class` is not implemented yet; name the class and export it"
+      ClassDecl(...) => if decorated-anything?(x) then decorated-class!([], x, false, out) else { out += lowered(x) }
+      ExportClass(c) => if decorated-anything?(c) then decorated-class!([], c, true, out) else { out += lowered(x) }
       TsEnum(...) => { out += VarDecl(List(enum-declarator(x))) with { lo: x.lo, hi: x.hi } }
       TsExportEnum(e) => { out += ExportVar(List(enum-declarator(e))) with { lo: x.lo, hi: x.hi } }
       TsNamespace(...) => namespace-statements!(x, false, declared, out)
@@ -645,6 +776,9 @@ fn lowered-statements(xs: [Node]) -> [Node] {
 
 fn lowered(n: Node) -> Node = match n {
   List(xs...) => n with { kids: lowered-statements(xs) }
+  TsDecoratedClassExpr(...) => panic "a decorated class expression is not implemented yet; declare the class"
+  TsDecoratedMember(...) | TsDecoratedParam(...) => panic "decorators in a class expression are not implemented yet; declare the class"
+
   ClassDecl(name, heritage, body) | ClassExpr(name, heritage, body) =>
     n with { kids: [lowered(name), lowered(heritage), class-body(body, not (heritage is None()))] }
   ClassBody(...) => class-body(n, false)
@@ -737,8 +871,10 @@ fn pruned(tree: Node, keep: [Text]) -> Node {
 
 # ---------------------------------------------------------------- the whole file
 
-fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool) -> Lowered {
+fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool, decorators: Bool) -> Lowered {
   src = source
+  experimental-decorators = decorators
+  helpers-used = []
   assign-fields = not define-fields
   keeping-imports = keep-imports
   next-offset = -1000
@@ -747,5 +883,5 @@ fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-impor
   namespace-exports = {}
   let stmts = lowered-statements(tree.kids[1].kids)
   let whole = Program(tree.kids[0], List(stmts...))
-  Lowered(tree: pruned(whole, keep), pure-calls: pure)
+  Lowered(tree: pruned(whole, keep), pure-calls: pure, helpers: helpers-used)
 }

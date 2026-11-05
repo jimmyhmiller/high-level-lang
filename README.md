@@ -138,7 +138,7 @@ MIME types, file, css, empty), CSS bundling (`@import` in place with media queri
 loaders, whitespace minified, stylesheets imported from JavaScript), legal comments (eof, linked,
 external, none, with esbuild's grouping for packages), TypeScript (types erased by the grammar, enums, namespaces, parameter properties, unused
 imports, `import x = …`, `export =`, `./x.js` meaning `./x.ts`, and `tsconfig.json` with `extends`, `paths`, `baseUrl`, JSX settings,
-`useDefineForClassFields` and `verbatimModuleSyntax`), JSX (classic, automatic and dev runtimes, preserve, pragmas in block comments), banner and
+`useDefineForClassFields` and `verbatimModuleSyntax`, and `experimentalDecorators`), JSX (classic, automatic and dev runtimes, preserve, pragmas in block comments), banner and
 footer, tree shaking off, iife/esm/cjs and spec-defined output formats, `--target=es2015` and later (`??`, `?.`, logical
 assignment, `**`, numeric separators, optional catch binding, object spread and rest, async
 functions, async generators and `for await`, class fields, private members and static blocks, each
