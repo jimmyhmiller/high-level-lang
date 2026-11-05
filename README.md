@@ -58,13 +58,14 @@ is regex pattern validation, some Annex B cases, and tests newer JavaScript made
 | all of lodash-es | 91,647 | 92,958 | -1.4% |
 | lodash (CommonJS) | 74,093 | 74,092 | 0.0% |
 | three | 263,047 | 258,124 | +1.9% |
-| zod | 387,473 | 454,182 | -14.7% (+1.5% against `--charset=utf8`) |
+| zod | 387,473 | 454,182 | -14.7% (+0.7% against `--charset=utf8`, 384,756 bytes) |
 | rxjs | 18,199 | 17,510 | +3.9% |
 | date-fns | 23,240 | 22,915 | +1.4% |
 | preact | 11,047 | 11,045 | 0.0% |
 | immer | 9,562 | 9,431 | +1.4% |
 | react + react-dom/server | 217,450 | 216,850 | +0.3% |
 | d3 | 47,246 | 46,294 | +2.1% |
+| features test app (small) | 2,679 | 2,520 | +6.3% |
 
 Unminified, tree-shaken lodash-es and all of lodash-es are **byte-identical** to esbuild's
 output after normalising. That covers tree shaking, module order and renaming.
