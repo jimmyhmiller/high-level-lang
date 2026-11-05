@@ -21,6 +21,7 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "hl.rt" :as rt)
 (import "hl.dsl" :as dsl)
+(import "hl.grammars.facts" :as g)
 
 (reader-provider "hl.facts" read-facts)
 
@@ -44,15 +45,21 @@
       (dsl/die (mut c) (.tok a) (dsl/join2 "wrong number of columns for " (.rel a))))
     out))
 
-(defn read-atom [(c (mut dsl/Cur))] (-> Atom)
-  (let [negated (dsl/accept! (mut c) "!")
-        t (dsl/name! (mut c) "a relation")
+;;; A grammar node's name as the token the error messages locate.
+(defn tok-of [(src (slice u8)) (n g/Node)] (-> rt/Tok)
+  (let [at (rt/line-col src (.lo n))]
+    (rt/Tok :kind (rt/TIdent) :text (.text n) :line (.line at) :col (.col at))))
+
+(defn atom-of [(src (slice u8)) (n g/Node) (negated bool)] (-> Atom)
+  (let [name (get (.kids n) 0)
         (mut args) (ArrayList::new [rt/Tok] (malloc-allocator))]
-    (dsl/expect! (mut c) "(")
-    (while (not (dsl/accept! (mut c) ")"))
-      (when (> (len args) 0) (dsl/expect! (mut c) ","))
-      (push! (mut args) (dsl/name! (mut c) "a variable")))
-    (Atom :rel (.text t) :args args :negated negated :tok t)))
+    (for arg (.kids (get (.kids n) 1)) (push! (mut args) (tok-of src arg)))
+    (Atom :rel (.text name) :args args :negated negated :tok (tok-of src name))))
+
+(defn body-atom-of [(src (slice u8)) (n g/Node)] (-> Atom)
+  (if (= (.kind n) (g/KNegated))
+      (atom-of src (get (.kids n) 0) true)
+      (atom-of src n false)))
 
 (defn bound? [(bound (ArrayList (slice u8))) (n (slice u8))] (-> bool)
   (let [(mut hit) false]
@@ -150,24 +157,24 @@
     out))
 
 (defn module-text [(context Code)] (-> (slice u8))
-  (let [(mut c) (dsl/cursor (dsl/source-of context) (dsl/path-of context) ":- ( ) , ; !")
+  (let [src (dsl/source-of context)
+        path (dsl/path-of context)
+        (mut c) (dsl/cursor "" path "")
+        tree (match (g/parse-result src path 0)
+               (Ok [t] t)
+               (Err [e] (dsl/fail-at path (.line e) (.col e) (dsl/join2 "expected " (.want e)))))
         (mut rels) (ArrayList::new [Relation] (malloc-allocator))
         (mut clauses) (ArrayList::new [Clause] (malloc-allocator))]
-    (dsl/expect! (mut c) "facts")
-    (while (not (dsl/eof? (mut c)))
-      (if (dsl/accept! (mut c) "relation")
-          (let [a (read-atom (mut c))
+    (for item (.kids (get (.kids tree) 0))
+      (if (= (.kind item) (g/KRelation))
+          (let [a (atom-of src item false)
                 n (len (.args a))]
             (when (or (< n 1) (> n 4))
               (dsl/die (mut c) (.tok a) "a relation has 1 to 4 columns"))
             (push! (mut rels) (Relation :name (.rel a) :arity n :stratum 0)))
-          (let [head (read-atom (mut c))
+          (let [head (atom-of src (get (.kids item) 0) false)
                 (mut body) (ArrayList::new [Atom] (malloc-allocator))]
-            (dsl/expect! (mut c) ":-")
-            (push! (mut body) (read-atom (mut c)))
-            (while (dsl/accept! (mut c) ",")
-              (push! (mut body) (read-atom (mut c))))
-            (dsl/expect! (mut c) ";")
+            (for b (.kids (get (.kids item) 1)) (push! (mut body) (body-atom-of src b)))
             (push! (mut clauses) (Clause :head head :body body)))))
     ;; Checked after reading, so a rule may precede its relation's declaration.
     (for k clauses

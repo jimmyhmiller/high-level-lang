@@ -89,7 +89,7 @@
   (POp [(op Op)])
   (PLeaf []))
 
-(defstruct Kind [(name (slice u8)) (arity i64) (level i64) (print Print)])
+(defstruct KindDef [(name (slice u8)) (arity i64) (level i64) (print Print)])
 (defstruct Named [(name (slice u8)) (value i64)])
 (defstruct Lit [(text (slice u8)) (id i64)])
 
@@ -107,7 +107,7 @@
    (keep-min (slice u8))
    (keep-forbid (ArrayList (slice u8)))
    (decls (ArrayList Decl))
-   (kinds (ArrayList Kind))
+   (kinds (ArrayList KindDef))
    (lits (ArrayList Lit))
    (reps (ArrayList (slice u8)))
    (memo-count i64)
@@ -115,8 +115,9 @@
    (aux (ArrayList (slice u8)))
    (path (slice u8))])
 
-(const NO-LEVEL-VALUE 1000000)
-(defn no-level [] (-> i64) NO-LEVEL-VALUE)
+;;; A function, not a const: a const is lost when this runs from `(meta (… (include-str …)))`.
+;;; See experiments/repros/h-const-in-provider.
+(defn no-level [] (-> i64) 1000000)
 
 ;; ---------------------------------------------------------------- reading
 
@@ -494,7 +495,7 @@
     (OWith [] (sig-item g (mut c) (get (.kids e) 0)))
     (_ "")))
 
-(defn add-kind! [(g (mut Grammar)) (c (mut dsl/Cur)) (t rt/Tok) (k Kind)] (-> void)
+(defn add-kind! [(g (mut Grammar)) (c (mut dsl/Cur)) (t rt/Tok) (k KindDef)] (-> void)
   (let [(mut dup) false]
     (for old (.kinds g)
       (when (= (.name old) (.name k))
@@ -516,7 +517,7 @@
     (let [k (get (.kinds g) i)]
       (when (= (.name k) name)
         (set! (mut (.kinds g)) i
-              (Kind :name (.name k) :arity (.arity k) :level level :print (.print k)))))))
+              (KindDef :name (.name k) :arity (.arity k) :level level :print (.print k)))))))
 
 (defn set-kind-base! [(g (mut Grammar)) (name (slice u8)) (base-min i64)] (-> void)
   (for i (range 0 (len (.kinds g)))
@@ -527,7 +528,7 @@
           (PAlt [a old]
             (when (> base-min old)
               (set! (mut (.kinds g)) i
-                    (Kind :name (.name k) :arity (.arity k) :level (.level k)
+                    (KindDef :name (.name k) :arity (.arity k) :level (.level k)
                           :print (PAlt a base-min)))))
           (_ 0))))))
 
@@ -545,7 +546,7 @@
       (cond
         (> (len (.label a)) 0)
           (add-kind! (mut g) (mut c) (.tok (.seq a))
-                     (Kind :name (.label a) :arity (+ n extra) :level (no-level)
+                     (KindDef :name (.label a) :arity (+ n extra) :level (no-level)
                            :print (PAlt a 0)))
         (and (= extra 0) (!= n 1))
           (dsl/die (mut c) (.tok (.seq a))
@@ -568,12 +569,12 @@
             (for op (.ops d)
               (add-lit! (mut g) (.lit op))
               (add-kind! (mut g) (mut c) (.tok op)
-                         (Kind :name (.kind op) :arity 2 :level (no-level) :print (POp op)))))
+                         (KindDef :name (.kind op) :arity 2 :level (no-level) :print (POp op)))))
         (= k (DToken))
           (do
             (check-refs! g (mut c) (.body d))
             (add-kind! (mut g) (mut c) (.tok d)
-                       (Kind :name (.name d) :arity 0 :level (no-level) :print (PLeaf))))
+                       (KindDef :name (.name d) :arity 0 :level (no-level) :print (PLeaf))))
         (= k (DHidden))
           (do (check-refs! g (mut c) (.body d))
               (collect-lits! (mut g) (mut c) (.body d)))
@@ -1197,7 +1198,7 @@
         `(for each (.kids ~source)
            (print-at each ~min (mut w))))))
 
-(defn print-arm [(g Grammar) (c (mut dsl/Cur)) (levels (ArrayList Named)) (k Kind)] (-> Code)
+(defn print-arm [(g Grammar) (c (mut dsl/Cur)) (levels (ArrayList Named)) (k KindDef)] (-> Code)
   (match (.print k)
     (PLeaf []
       `(~(kind-sym (.name k)) [] (rt/tok! (mut w) (.text n))))
@@ -1261,16 +1262,28 @@
         (mut arms) (primitive/code-list-new)
         (mut level-arms) (primitive/code-list-new)
         (mut flag-consts) (primitive/code-list-new)
+        (mut tag-arms) (primitive/code-list-new)
+        (mut name-arms) (primitive/code-list-new)
+        (mut tag) 0
         (mut bit) 1]
     (for f (.flags g)
       (push! (mut flag-consts) `(const ~(flag-sym f) ~bit))
       (set! bit (* bit 2)))
     (for k (.kinds g)
+      (push! (mut tag-arms) `(~(kind-sym (.name k)) [] ~tag))
+      (push! (mut name-arms) `(~(kind-sym (.name k)) [] ~(.name k)))
+      (set! tag (+ tag 1))
       (push! (mut variants) `(~(kind-sym (.name k)) []))
       (push! (mut table) `(~(.name k) ~(.arity k)))
       (push! (mut arms) (print-arm g (mut c) levels k))
       (when (< (.level k) (no-level))
         (push! (mut level-arms) `(~(kind-sym (.name k)) [] ~(.level k)))))
+    (push! (mut tag-arms) `(KList [] ~tag))
+    (push! (mut tag-arms) `(KNone [] ~(+ tag 1)))
+    (push! (mut tag-arms) `(KFlag [] ~(+ tag 2)))
+    (push! (mut name-arms) `(KList [] "List"))
+    (push! (mut name-arms) `(KNone [] "None"))
+    (push! (mut name-arms) `(KFlag [] "Flag"))
     `(do
        (import "coil.alloc" :use [malloc-allocator box!])
        (import "coil.arraylist" :use [ArrayList])
@@ -1279,7 +1292,14 @@
        ~@flag-consts
 
        (defsum Kind ~@variants (KList []) (KNone []) (KFlag []))
-       (derive Eq Debug Kind)
+       ;; Not `derive`: it cannot see a type declared by the same macro expansion, and a
+       ;; grammar may be expanded by a macro when a reader needs its parser.
+       (defn kind-tag [(k Kind)] (-> i64)
+         (match k ~@tag-arms))
+       (impl Eq Kind
+         (= [(a Kind) (b Kind)] (-> bool) (= (kind-tag a) (kind-tag b))))
+       (defn kind-name [(k Kind)] (-> (slice u8))
+         (match k ~@name-arms))
        (defstruct Node [(kind Kind) (text (slice u8)) (kids (ArrayList Node)) (lo i64) (hi i64) (gen i64)])
 
        (defn node-table [] (-> Code)
@@ -1424,7 +1444,7 @@
                   :opaque (empty-strs) :precedence (empty-strs)
                   :keep-min "" :keep-forbid (empty-strs)
                   :decls (ArrayList::new [Decl] (malloc-allocator))
-                  :kinds (ArrayList::new [Kind] (malloc-allocator))
+                  :kinds (ArrayList::new [KindDef] (malloc-allocator))
                   :lits (ArrayList::new [Lit] (malloc-allocator))
                   :reps (empty-strs)
                   :memo-count 0 :next-aux 0
