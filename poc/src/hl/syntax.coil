@@ -48,7 +48,7 @@
   (OStar) (OPlus) (OOpt) (OSepStar) (OSepPlus)
   (ONot) (OAnd) (OKeep)
   (OWith) (OIf) (OUnless)
-  (OEof) (OBof) (ONl) (ONoNl))
+  (OEof) (OBof) (OLineStart) (ONl) (ONoNl))
 (derive Eq PEOp)
 
 (defstruct Range [(lo i64) (hi i64)])
@@ -270,6 +270,7 @@
         (let [n (dsl/name! (mut c) "eof, nl or nonl")]
           (cond (= (.text n) "eof") (pe-new (OEof) "" t)
                 (= (.text n) "bof") (pe-new (OBof) "" t)
+                (= (.text n) "linestart") (pe-new (OLineStart) "" t)
                 (= (.text n) "nl") (pe-new (ONl) "" t)
                 (= (.text n) "nonl") (pe-new (ONoNl) "" t)
                 :else (dsl/die (mut c) n "expected @eof, @nl or @nonl")))
@@ -720,6 +721,7 @@
          hit))
     (OEof [] `(rt/eof? (mut p)))
     (OBof [] `(= (.pos p) 0))
+    (OLineStart [] `(rt/at-line-start? (mut p)))
     (_ (dsl/die (mut c) (.tok e) "this item is not allowed in a token or fragment"))))
 
 ;; ---------------------------------------------------------------- recognisers
@@ -1196,7 +1198,7 @@
            (for i (range 0 (len items))
              (when (> i 0) (rt/tok! (mut w) ","))
              (print-at (get items i) ~min (mut w))))
-        `(for each (.kids ~source)
+        `(for (ref each) (.kids ~source)
            (print-at each ~min (mut w))))))
 
 (defn print-arm [(g Grammar) (c (mut dsl/Cur)) (levels (ArrayList Named)) (k KindDef)] (-> Code)
@@ -1219,6 +1221,67 @@
                  ~(print-items g (mut c) levels items 1 false)))
             `(~(kind-sym (.name k)) []
                ~(print-items g (mut c) levels items 0 false)))))))
+
+;; ---------------------------------------------------------------- first bytes
+
+;;; The bytes `e` can start with. True when `e` can also match nothing, so what follows it
+;;; counts too. A negated class gives up: `known` goes false.
+(defstruct First [(ranges (ArrayList Range)) (known bool)])
+
+(defn first-of! [(g Grammar) (e PE) (f (mut First)) (depth i64)] (-> bool)
+  (match (.op e)
+    (OLit []
+      (let [b (cast i64 (get (.text e) 0))]
+        (push! (mut (.ranges f)) (Range :lo b :hi b))
+        false))
+    (OClass []
+      (if (.neg e)
+          (do (set! (.known f) false) false)
+          (do (for r (.ranges e) (push! (mut (.ranges f)) r)) false)))
+    (OAny [] (set! (.known f) false) false)
+    (ORef []
+      (if (> depth 16)
+          (do (set! (.known f) false) false)
+          (match (find-decl g (.text e))
+            (Some [d] (first-of! g (.body d) (mut f) (+ depth 1)))
+            (None [] (set! (.known f) false) false))))
+    (OSeq []
+      (let [(mut empty) true]
+        (for k (.kids e)
+          (when empty (set! empty (first-of! g k (mut f) depth))))
+        empty))
+    (OChoice []
+      (let [(mut empty) false]
+        (for k (.kids e)
+          (when (first-of! g k (mut f) depth) (set! empty true)))
+        empty))
+    (OStar [] (first-of! g (get (.kids e) 0) (mut f) depth) true)
+    (OOpt [] (first-of! g (get (.kids e) 0) (mut f) depth) true)
+    (OPlus [] (first-of! g (get (.kids e) 0) (mut f) depth))
+    ;; Zero width: they consume nothing, so what follows decides.
+    (ONot [] true)
+    (OAnd [] true)
+    (OBof [] true)
+    (OLineStart [] true)
+    (OEof [] true)
+    (_ (set! (.known f) false) false)))
+
+;;; A bool over `c`: could a space begin here?
+(defn space-start-test [(g (mut Grammar)) (cu (mut dsl/Cur))] (-> Code)
+  (match (find-decl g (.space g))
+    (None [] (dsl/die (mut cu) (dsl/peek (mut cu)) "the grammar has no space rule"))
+    (Some [d]
+      (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+            (mut tests) (primitive/code-list-new)]
+        (first-of! g (.body d) (mut f) 0)
+        (if (.known f)
+            (do
+              (for r (.ranges f)
+                (if (= (.lo r) (.hi r))
+                    (push! (mut tests) `(= c ~(.lo r)))
+                    (push! (mut tests) `(and (>= c ~(.lo r)) (<= c ~(.hi r))))))
+              `(or ~@tests))
+            `true)))))
 
 ;; ---------------------------------------------------------------- the module
 
@@ -1334,14 +1397,20 @@
        (defn box-node [(n Node)] (-> i64)
          (cast i64 (box! (rt/tree-allocator) Node n)))
 
+       ;;; Most tokens have no space before them, and the grammar says which bytes could
+       ;;; begin some: anything else needs no look at all.
        (defn skip! [(p (mut rt/P))] (-> void)
          (if (= (.ws-from p) (.pos p))
              (set! (.pos p) (.ws-to p))
-             (let [from (.pos p)]
-               (~(lex-sym (.space g)) (mut p))
+             (let [from (.pos p)
+                   c (rt/peek (mut p))]
+               (set! (.ws-scan p) from)
+               (if ~(space-start-test (mut g) (mut c))
+                   (~(lex-sym (.space g)) (mut p))
+                   0)
                (set! (.ws-from p) from)
                (set! (.ws-to p) (.pos p))
-               (set! (.ws-nl p) (rt/has-newline? (.src p) from (.pos p))))))
+               (set! (.ws-nl p) (and (> (.pos p) from) (rt/has-newline? (.src p) from (.pos p)))))))
 
        ;;; Is there a line terminator between here and the next token?
        (defn newline-ahead? [(p (mut rt/P))] (-> bool)
