@@ -1,12 +1,20 @@
 // A differential oracle: call every lodash function on a matrix of inputs and print
 // everything, so two builds of lodash can be compared by their stdout.
-export function exercise(_) {
+export function exercise(_, opts = {}) {
+  // Anything clock-driven, random, or that schedules work is not comparable.
   const skip = new Set(["now", "random", "uniqueId", "debounce", "throttle", "delay", "defer", "shuffle",
-    "sample", "sampleSize", "runInContext", "noConflict", "mixin", "bindAll", "templateSettings", "memoize"]);
+    "sample", "sampleSize", "runInContext", "noConflict", "mixin", "bindAll", "templateSettings", "memoize",
+    "timer", "timeout", "interval", "timerFlush", "shuffler", "isToday", "isTomorrow", "isYesterday",
+    "isPast", "isFuture", "isThisWeek", "isThisMonth", "isThisYear", "isThisHour", "isThisMinute",
+    "isThisSecond", "isThisQuarter", "isThisISOWeek", "isThisISOYear", "startOfToday", "startOfTomorrow",
+    "startOfYesterday", "endOfToday", "endOfTomorrow", "endOfYesterday", "formatDistanceToNow",
+    "formatDistanceToNowStrict", "formatRelative", "roundToNearestMinutes", "differenceInBusinessDays",
+    "transition", "active", "interrupt", "select", "selectAll", "create", "pointer", "pointers",
+    "constructNow", "range", "ticks", "tickStep", "tickIncrement", "thresholdFreedmanDiaconis", "thresholdScott", "thresholdSturges", "dispatch", "drag", "zoom", "brush", "brushX", "brushY", "forceSimulation"]);
   // Fixed text for functions: a build's minification must not show through a stringify.
   const fn = (f) => { Object.defineProperty(f, "toString", { value: () => "FN", enumerable: false }); return f; };
   const inputs = () => [
-    undefined, null, 0, 1, -2.5, NaN, Infinity, "", "hello big World", "a.b[0]", true, false,
+    undefined, null, 0, 1, -2.5, NaN, opts.bounded ? 3 : Infinity, "", "hello big World", "a.b[0]", true, false,
     [], [1, 2, 3, 2], ["b", "a", "c"], [[1, [2]], [3]], [{ a: 1, b: "x" }, { a: 2, b: "y" }, { a: 1, b: "z" }],
     {}, { a: 1, b: { c: [1, 2] } }, { x: "1", y: 2 }, new Date(0), /a+/g, new Map([[1, 2]]), new Set([1]),
     Symbol.iterator, fn((x) => x), fn((a, b) => (a < b ? -1 : 1)), "a", 2, ["a"], { a: 1 },
@@ -26,7 +34,7 @@ export function exercise(_) {
     if (v instanceof Set) return "Set" + show([...v], depth + 1);
     return "{" + Object.keys(v).slice(0, 40).map((k) => k + ":" + show(v[k], depth + 1)).join(",") + "}";
   };
-  const names = Object.keys(_).filter((k) => typeof _[k] === "function" && !skip.has(k)).sort();
+  const names = Object.keys(_).filter((k) => typeof _[k] === "function" && !skip.has(k) && !/^random/.test(k)).sort();
   let calls = 0, hash = 0;
   const record = (s) => { for (let i = 0; i < s.length; i++) hash = (hash * 31 + s.charCodeAt(i)) | 0; };
   for (const name of names) {
@@ -35,6 +43,7 @@ export function exercise(_) {
       calls++;
       let out;
       try { out = show(_[name](...args)); } catch (e) { out = "throws"; }
+      if (out.length > 400) out = out.slice(0, 400);
       lines.push(out);
     };
     const one = inputs(), two = inputs();
