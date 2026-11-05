@@ -1,0 +1,1082 @@
+# Modern syntax as an older target can run it. This works on the final program, once names are final
+# and the minifier is done, so nothing turns `a != null ? a : b` back into `??`.
+rules bundle.lower over bundle.js
+use bundle.js as js
+use bundle.scopes as sc
+use bundle.minhost as host
+
+quote stmt at 1 0 ;
+quote exp at 1 0 0 ;
+
+const no-lowering: Int = 9999
+
+state target: Int = 9999
+state short-names: Bool = false
+state taken: {Text:Bool} = {}
+state frames: [[Text]] = []
+state helpers: [Text] = []
+state next-temp: Int = 0
+
+record Private {
+  holder: Text,   # the WeakMap or WeakSet
+  method: Text,   # the function, for a private method
+  getter: Text,
+  setter: Text
+}
+
+context privates: {Text:Private} = {}
+
+fn before?(year: Int) -> Bool = target < year
+
+# ---------------------------------------------------------------- names
+
+const temp-letters: Text = "abcdefghijklmnopqrstuvwxyz"
+
+fn fresh-name(prefix: Text) -> Text {
+  var name = prefix ++ byte-text(temp-letters[next-temp % 26])
+  var round = next-temp / 26
+  if round > 0 { name = name ++ int-text(round) }
+  next-temp += 1
+  if name in taken { return fresh-name(prefix) }
+  taken[name] = true
+  name
+}
+
+# A variable of the function being lowered.
+fn temp() -> Text {
+  let name = fresh-name("_")
+  frames[len(frames) - 1] += name
+  name
+}
+
+fn helper(name: Text) -> Text {
+  if not (name in helpers) { helpers += name }
+  name
+}
+
+fn list-of(xs: [Node]) -> Node = List(xs...)
+fn helper-call(name: Text, args: [Node]) -> Node = CallExpr(Ident(helper(name)), Args(List(args...)))
+fn assign(t: Node, v: Node) -> Node = Assignment(t, AssignOp("="), v)
+fn undefined-value() -> Node = Void(Num("0"))
+fn string-of(s: Text) -> Node = Str(host.js-string(s))
+
+fn seq(xs: [Node]) -> Node {
+  var out = xs[0]
+  for i in 1..len(xs) { out = Seq(out, xs[i]) }
+  out
+}
+
+# Can this be read twice without running anything twice?
+fn repeatable?(n: Node) -> Bool = n is Ident(_) | This() | Str(_) | Num(_)
+
+# ---------------------------------------------------------------- ?? and ?.
+
+fn coalesced(a: Node, b: Node) -> Node {
+  if repeatable?(a) { return Cond(Ne(a, Null()), a, b) }
+  let t = temp()
+  let held = Ident(t)
+  Cond(Ne(assign(held, a), Null()), held, b)
+}
+
+fn spine-optional?(n: Node) -> Bool = match n {
+  OptMember(...) | OptIndex(...) | OptCall(...) => true
+  Member(o, _) | Index(o, _) | CallExpr(o, _) | Tagged(o, _) => spine-optional?(o)
+  _ => false
+}
+
+fn spine-private?(n: Node) -> Bool = match n {
+  Member(_, PrivateName(_)) | OptMember(_, PrivateName(_)) => true
+  Member(o, _) | Index(o, _) | CallExpr(o, _) | Tagged(o, _) | OptMember(o, _) | OptIndex(o, _) | OptCall(o, _) => spine-private?(o)
+  _ => false
+}
+
+# Does this chain have to come apart? Below ES2020 always, and below ES2022 if a private name is in it.
+fn chain-lowers?(n: Node) -> Bool =
+  spine-optional?(n) and (before?(2020) or (before?(2022) and spine-private?(n)))
+
+fn tested(value: Node) -> Node = Eq(value, Null())
+
+enum LinkKind { ByName, ByIndex, Called, TaggedBy }
+
+record Link { kind: LinkKind, optional: Bool, part: Node }
+
+# A chain from its root upward. Answers the root.
+fn links-of!(n: Node, out: mut [Link]) -> Node {
+  let link: Link? = match n {
+    Member(_, p) => some(Link(kind: ByName, optional: false, part: p))
+    OptMember(_, p) => some(Link(kind: ByName, optional: true, part: p))
+    Index(_, e) => some(Link(kind: ByIndex, optional: false, part: e))
+    OptIndex(_, e) => some(Link(kind: ByIndex, optional: true, part: e))
+    CallExpr(_, Args(list)) => some(Link(kind: Called, optional: false, part: list))
+    OptCall(_, list) => some(Link(kind: Called, optional: true, part: list))
+    Tagged(_, t) => some(Link(kind: TaggedBy, optional: false, part: t))
+    _ => none
+  }
+  match link {
+    none => n
+    some(l) => {
+      let root = links-of!(n.kids[0], out)
+      out += l
+      root
+    }
+  }
+}
+
+fn read-link(base: Node, l: Link) -> Node = match l.kind {
+  ByIndex => Index(base, lowered(l.part))
+  _ => match l.part {
+    PrivateName(x) => if before?(2022) then private-get(base, x) else Member(base, l.part)
+    _ => Member(base, l.part)
+  }
+}
+
+# `a?.b.c?.()` becomes `a == null ? void 0 : (_x = a.b.c) == null ? void 0 : _x.call(a.b)`. Walking up
+# the chain, each `?.` adds a test and leaves the value in hand somewhere it can be read twice. A
+# call that needs its `this` by hand has the object kept from the link before.
+fn chain(n: Node, miss: Node, deleting: Bool) -> Node {
+  var links: [Link] = []
+  let root = links-of!(n, links)
+  var value = if root is Super() then root else lowered(root)
+  var self: Node? = none
+  var tests: [Node] = []
+  for i in 0..len(links) {
+    let l = links[i]
+    let next-called = i + 1 < len(links) and links[i + 1].kind == Called
+    match l.kind {
+      Called => {
+        let args = [lowered(a) for a in l.part.kids]
+        if l.optional {
+          match self {
+            some(s) => {
+              let f = Ident(temp())
+              tests += tested(assign(f, value))
+              let passed = [s] ++ args
+              value = CallExpr(Member(f, PropName("call")), Args(List(passed...)))
+            }
+            none => {
+              if repeatable?(value) {
+                tests += tested(value)
+              } else {
+                let f = Ident(temp())
+                tests += tested(assign(f, value))
+                value = f
+              }
+              value = CallExpr(value, Args(List(args...)))
+            }
+          }
+        } else {
+          match self {
+            some(s) => {
+              let passed = [s] ++ args
+              value = CallExpr(Member(value, PropName("call")), Args(List(passed...)))
+            }
+            none => { value = CallExpr(value, Args(List(args...))) }
+          }
+        }
+        self = none
+      }
+      TaggedBy => {
+        value = Tagged(value, lowered(l.part))
+        self = none
+      }
+      _ => {
+        if l.optional {
+          if repeatable?(value) {
+            tests += tested(value)
+          } else {
+            let held = Ident(temp())
+            tests += tested(assign(held, value))
+            value = held
+          }
+        }
+        let private-link = l.part is PrivateName(_) and before?(2022)
+        if next-called and (links[i + 1].optional or private-link) {
+          if value is Super() {
+            self = some(This())
+            value = read-link(value, l)
+          } else if repeatable?(value) {
+            self = some(value)
+            value = read-link(value, l)
+          } else {
+            let held = Ident(temp())
+            self = some(held)
+            value = read-link(assign(held, value), l)
+          }
+        } else {
+          self = none
+          value = read-link(value, l)
+        }
+      }
+    }
+  }
+  var out = if deleting then Delete(value) else value
+  var at = len(tests)
+  while at > 0 {
+    at = at - 1
+    out = Cond(tests[at], miss, out)
+  }
+  out
+}
+
+# ---------------------------------------------------------------- assignment operators
+
+record Target { read: Node, write: Node }
+
+# A target read and then written, evaluating what it is made of once.
+fn captured(t: Node) -> Target = match t {
+  Member(o, name) => {
+    let inner = lowered(o)
+    if repeatable?(inner) {
+      let same = Member(inner, name)
+      Target(read: same, write: same)
+    } else {
+      let held = Ident(temp())
+      Target(read: Member(assign(held, inner), name), write: Member(held, name))
+    }
+  }
+  Index(o, key) => {
+    let inner = lowered(o)
+    let k = lowered(key)
+    let self = if repeatable?(inner) then inner else Ident(temp())
+    let first-self = if repeatable?(inner) then inner else assign(self, inner)
+    let index = if repeatable?(k) then k else Ident(temp())
+    let first-index = if repeatable?(k) then k else assign(index, k)
+    Target(read: Index(first-self, first-index), write: Index(self, index))
+  }
+  _ => Target(read: t, write: t)
+}
+
+fn pattern-with-rest?(n: Node) -> Bool = match n {
+  SpreadProp(_) => true
+  ObjectLit(...) | ArrayLit(...) | Elem(_) | ElemLast(_) | Prop(...) | List(...) => any k in n.kids: pattern-with-rest?(k)
+  _ => false
+}
+
+fn assignment(n: Node, t: Node, op: Text, v: Node) -> Node {
+  if t is Member(_, PrivateName(_)) and before?(2022) { return private-assignment(t, op, v) }
+  if (t is ObjectLit(...) | ArrayLit(...)) and before?(2018) and pattern-with-rest?(t) {
+    panic "object rest in an assignment is not implemented for this target; use a declaration"
+  }
+  match op {
+    "||=" | "&&=" | "??=" => if before?(2021) {
+      let parts = captured(t)
+      let set-it = assign(parts.write, lowered(v))
+      return match op {
+        "||=" => Or(parts.read, set-it)
+        "&&=" => And(parts.read, set-it)
+        _ => if before?(2020) then coalesced(parts.read, set-it) else Coalesce(parts.read, set-it)
+      }
+    }
+    "**=" => if before?(2016) {
+      let parts = captured(t)
+      return assign(parts.write, CallExpr(Ident(helper("__pow")), Args(List(parts.read, lowered(v)))))
+    }
+    _ => {}
+  }
+  n with { kids: [if t is ObjectLit(...) | ArrayLit(...) then lowered-pattern-target(t) else lowered(t), n.kids[1], lowered(v)] }
+}
+
+# A destructuring target's spreads are rest elements, already refused above.
+fn lowered-pattern-target(t: Node) -> Node = match t {
+  ObjectLit(List(xs...)) => t with { kids: [list-of([lowered(x) for x in xs]) with { lo: t.kids[0].lo, hi: t.kids[0].hi }] }
+  _ => lowered(t)
+}
+
+# ---------------------------------------------------------------- object spread and rest
+
+fn object-spread(items: [Node]) -> Node {
+  var base: Node? = none
+  var plain: [Node] = []
+  for x in items {
+    match x {
+      SpreadProp(e) => {
+        base = some(helper-call("__spreadValues", [spread-base(base, plain), lowered(e)]))
+        plain = []
+      }
+      _ => { plain += lowered(x) }
+    }
+  }
+  if len(plain) == 0 { return base ?? ObjectLit(List()) }
+  match base {
+    some(b) => helper-call("__spreadProps", [b, ObjectLit(List(plain...))])
+    none => ObjectLit(List(plain...))
+  }
+}
+
+fn spread-base(base: Node?, plain: [Node]) -> Node = match base {
+  some(b) => if len(plain) == 0 then b else helper-call("__spreadProps", [b, ObjectLit(List(plain...))])
+  none => ObjectLit(List(plain...))
+}
+
+fn top-rest?(p: Node) -> Bool = match p {
+  ObjectPattern(List(props...)) => any x in props: x is PatPropRest(_)
+  _ => false
+}
+
+fn nested-rest?(n: Node) -> Bool = match n {
+  PatPropRest(_) => true
+  ObjectPattern(...) | ArrayPattern(...) | List(...) | PatItem(_) | PatLast(_) | PatProp(...) | BindElement(...) | PatRest(_) =>
+    any k in n.kids: nested-rest?(k)
+  _ => false
+}
+
+fn excluded-key(p: Node) -> Node = match p {
+  PatProp(PropName(x), _) => string-of(x)
+  PatProp(Str(raw), _) => Str(raw)
+  PatProp(Num(t), _) => string-of(t)
+  PatShort(BindName(x), _) => string-of(x)
+  _ => panic "object rest with a computed key is not implemented for this target"
+}
+
+# `const { a, ...r } = o` is `const _a = o, { a } = _a, r = __objRest(_a, ["a"])`.
+fn rest-declarators(pattern: Node, init: Node, at: Node) -> [Node] {
+  let props = pattern.kids[0].kids
+  var plain: [Node] = []
+  var keys: [Node] = []
+  var rest: Node = None()
+  for p in props {
+    match p {
+      PatPropRest(t) => { rest = t }
+      _ => {
+        if nested-rest?(p) { panic "object rest inside another pattern is not implemented for this target" }
+        plain += p
+        keys += excluded-key(p)
+      }
+    }
+  }
+  let holder = fresh-name("_")
+  let slots = [if i == len(keys) - 1 then ElemLast(keys[i]) else Elem(keys[i]) for i in 0..len(keys)]
+  let excluded = ArrayLit(List(slots...))
+  var out = [Declarator(BindName(holder), init)]
+  if len(plain) > 0 {
+    let rebuilt = ObjectPattern(List(plain...))
+    out += Declarator(lowered(rebuilt), Ident(holder))
+  }
+  out += Declarator(rest, helper-call("__objRest", [Ident(holder), excluded]))
+  out
+}
+
+# ---------------------------------------------------------------- functions
+
+fn with-temps(stmts: [Node], temps: [Text]) -> [Node] {
+  if len(temps) == 0 { return stmts }
+  let decls = [Declarator(BindName(t), None()) for t in temps]
+  var at = 0
+  var going = true
+  for s in stmts {
+    if going and s is ExprStmt(Str(_)) { at += 1 } else { going = false }
+  }
+  stmts[0..at] ++ [VarDecl(List(decls...))] ++ stmts[at..len(stmts)]
+}
+
+fn mentions-this?(n: Node) -> Bool = match n {
+  This() => true
+  _ => if sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...)) then false
+       else any k in n.kids: mentions-this?(k)
+}
+
+fn mentions-arguments?(n: Node) -> Bool = match n {
+  Ident("arguments") => true
+  _ => if sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...)) then false
+       else any k in n.kids: mentions-arguments?(k)
+}
+
+fn mentions-super?(n: Node) -> Bool = match n {
+  Super() => true
+  _ => if sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...)) then false
+       else any k in n.kids: mentions-super?(k)
+}
+
+fn simple-parameters?(params: Node) -> Bool = match params {
+  BindName(_) => true
+  Params(List(ps...)) => all p in ps: p is Param(BindName(_), None())
+  _ => false
+}
+
+fn replaced-await(n: Node) -> Node = match n {
+  Await(x) => Yield(replaced-await(x))
+  _ => if len(n.kids) == 0 or sc.function?(n.kind) then n
+       else n with { kids: [replaced-await(k) for k in n.kids] }
+}
+
+# Inside an async generator, `await x` yields a marker the driver waits on, and `yield* x` delegates.
+fn replaced-await-in-generator(n: Node) -> Node = match n {
+  Await(x) => Yield(NewExpr(Ident(helper("__await")), Args(List(replaced-await-in-generator(x)))))
+  YieldStar(x) => YieldStar(helper-call("__yieldStar", [replaced-await-in-generator(x)]))
+  _ => if len(n.kids) == 0 or sc.function?(n.kind) then n
+       else n with { kids: [replaced-await-in-generator(k) for k in n.kids] }
+}
+
+record Wrapped { params: Node, body: Node }
+
+fn body-statements(body: Node) -> [Node] = match body {
+  FuncBody(List(ss...)) => ss
+  ExprBody(e) => [Return(e)]
+  _ => panic "unexpected function body"
+}
+
+fn params-node(params: Node) -> Node = match params {
+  BindName(_) => Params(List(Param(params, None())))
+  _ => params
+}
+
+fn outer-parameter-count(params: Node) -> Int {
+  var count = 0
+  var go = true
+  for p in params.kids[0].kids {
+    if go and p is Param(_, None()) { count += 1 } else { go = false }
+  }
+  count
+}
+
+# `function f(x) { await x; }` is `function f(x) { return __async(this, null, function* () { yield x; }); }`.
+# Parameters that run code must run inside, so that they reject the promise.
+fn wrapped-in-generator(params: Node, body: Node, self: Node, driver: Text, generator: Bool) -> Wrapped {
+  if mentions-super?(body) { panic "`super` in an async function is not implemented for this target" }
+  let stmts = [if generator then replaced-await-in-generator(s) else replaced-await(s) for s in body-statements(body)]
+  let simple = simple-parameters?(params)
+  let inner-params = if simple then Params(List()) else params-node(params)
+  let outer-params = if simple then params-node(params) else {
+    let names = [Param(BindName(fresh-name("_")), None()) for i in 0..outer-parameter-count(params)]
+    Params(List(names...))
+  }
+  let pass = if not simple or mentions-arguments?(body) then Ident("arguments") else Null()
+  let inner = GenExpr(None(), inner-params, FuncBody(List(stmts...)))
+  let driven = helper-call(driver, [self, pass, inner])
+  Wrapped(params: outer-params, body: FuncBody(List(Return(driven))))
+}
+
+fn arrow-self(body: Node) -> Node = if mentions-this?(body) then This() else Null()
+
+fn rest-prologue(params: Node) -> Wrapped {
+  match params {
+    Params(List(ps...)) => {
+      var out: [Node] = []
+      var decls: [Node] = []
+      for p in ps {
+        match p {
+          Param(t, init) => {
+            if top-rest?(t) {
+              let name = fresh-name("_")
+              out += Param(BindName(name), init) with { lo: p.lo, hi: p.hi }
+              decls ++= rest-declarators(t, Ident(name), p)
+            } else {
+              out += p
+            }
+          }
+          _ => { out += p }
+        }
+      }
+      let stmts: [Node] = if len(decls) > 0 then [VarDecl(List(decls...))] else []
+      Wrapped(params: Params(List(out...)) with { lo: params.lo, hi: params.hi }, body: FuncBody(List(stmts...)))
+    }
+    _ => Wrapped(params: params, body: FuncBody(List()))
+  }
+}
+
+fn arrow?(n: Node) -> Bool = n is Arrow(...) | AsyncArrow(...)
+
+# Lower a function: its parameters belong to the function around it, its body to itself.
+fn function-node(n: Node) -> Node {
+  var prologue: [Node] = []
+  var params: Node = None()
+  var body: Node = None()
+  for k in n.kids {
+    match k {
+      Params(_) => {
+        let split = if before?(2018) then rest-prologue(k) else Wrapped(params: k, body: FuncBody(List()))
+        prologue = split.body.kids[0].kids
+        params = generic(split.params)
+      }
+      FuncBody(_) | ExprBody(_) => { body = k }
+      BindName(_) => if arrow?(n) { params = k }
+      _ => {}
+    }
+  }
+  frames += []
+  let stmts: [Node] = match body {
+    FuncBody(List(ss...)) => lowered-list(prologue ++ ss)
+    ExprBody(e) => if len(prologue) > 0 then lowered-list(prologue ++ [Return(e)]) else []
+    _ => []
+  }
+  let plain-expression: Node? = match body {
+    ExprBody(e) => if len(prologue) > 0 then none else some(lowered(e))
+    _ => none
+  }
+  let temps = frames[len(frames) - 1]
+  pop(frames)
+  let new-body: Node = match plain-expression {
+    some(e) => if len(temps) == 0 then body with { kids: [e] }
+               else FuncBody(list-of(with-temps([Return(e)], temps)))
+    none => if body is ExprBody(_) then FuncBody(list-of(with-temps(stmts, temps)))
+            else body with { kids: [list-of(with-temps(stmts, temps))] }
+  }
+  rebuilt-function(n, params, new-body)
+}
+
+fn rebuilt-function(n: Node, params: Node, body: Node) -> Node {
+  var fresh-kids: [Node] = []
+  for k in n.kids {
+    match k {
+      Params(_) => { fresh-kids += params }
+      FuncBody(_) | ExprBody(_) => { fresh-kids += body }
+      BindName(_) => { fresh-kids += k }
+      _ => { fresh-kids += lowered(k) }
+    }
+  }
+  let same = n with { kids: fresh-kids }
+  let old = before?(2017)
+  let old-generators = before?(2018)
+  match same {
+    AsyncFuncDecl(name, p, b) => if not old then same else {
+      let w = wrapped-in-generator(p, b, This(), "__async", false)
+      FuncDecl(name, w.params, w.body) with { lo: n.lo, hi: n.hi }
+    }
+    AsyncFuncExpr(name, p, b) => if not old then same else {
+      let w = wrapped-in-generator(p, b, This(), "__async", false)
+      FuncExpr(name, w.params, w.body) with { lo: n.lo, hi: n.hi }
+    }
+    AsyncArrow(p, b) => if not old then same else {
+      let w = wrapped-in-generator(p, b, arrow-self(b), "__async", false)
+      Arrow(w.params, ExprBody(w.body.kids[0].kids[0].kids[0])) with { lo: n.lo, hi: n.hi }
+    }
+    AsyncMethod(key, p, b) => if not old then same else {
+      let w = wrapped-in-generator(p, b, This(), "__async", false)
+      Method(key, w.params, w.body) with { lo: n.lo, hi: n.hi }
+    }
+    AsyncGenDecl(name, p, b) => if not old-generators then same else {
+      let w = wrapped-in-generator(p, b, This(), "__asyncGenerator", true)
+      FuncDecl(name, w.params, w.body) with { lo: n.lo, hi: n.hi }
+    }
+    AsyncGenExpr(name, p, b) => if not old-generators then same else {
+      let w = wrapped-in-generator(p, b, This(), "__asyncGenerator", true)
+      FuncExpr(name, w.params, w.body) with { lo: n.lo, hi: n.hi }
+    }
+    AsyncGenMethod(key, p, b) => if not old-generators then same else {
+      let w = wrapped-in-generator(p, b, This(), "__asyncGenerator", true)
+      Method(key, w.params, w.body) with { lo: n.lo, hi: n.hi }
+    }
+    _ => same
+  }
+}
+
+# ---------------------------------------------------------------- for await
+
+# The loop esbuild writes: drive the iterator by hand, and close it however the body ends.
+fn for-await(n: Node) -> Node = match n {
+  ForOf(_, left, right, body) => {
+    let iter = temp()
+    let more = temp()
+    let cell = temp()
+    let failed = temp()
+    let source = lowered(right)
+    let inner = lowered(body)
+    let bound: Node = match left {
+      VarLeft(t) => stmt`var $t = $cell.value;`
+      LetLeft(t) => stmt`let $t = $cell.value;`
+      ConstLeft(t) => stmt`const $t = $cell.value;`
+      _ => {
+        let target = lowered(left)
+        stmt`$target = $cell.value;`
+      }
+    }
+    let start = helper-call("__forAwait", [source])
+    let stmts = [bound, inner]
+    # `await` is not a word a template can parse: templates are scripts.
+    let stepped = Await(exp`$iter.next()`)
+    let closed = Await(exp`$cell.call($iter)`)
+    stmt`try {
+      for ($iter = $start, $more = false, $failed = false; $more = !($cell = $stepped).done; $more = false) {
+        $$stmts
+      }
+    } catch ($cell) {
+      $failed = [$cell];
+    } finally {
+      try {
+        $more && ($cell = $iter.return) && $closed;
+      } finally {
+        if ($failed) throw $failed[0];
+      }
+    }`
+  }
+  _ => panic "expected a for-of loop"
+}
+
+# ---------------------------------------------------------------- classes
+
+fn class-needs-lowering?(body: Node) -> Bool = any m in body.kids[0].kids:
+  m is Field(...) | StaticField(...) | StaticBlock(...) or private-member?(m)
+
+fn inner-member(m: Node) -> Node = match m {
+  StaticMethod(x) => x
+  _ => m
+}
+
+fn private-key(m: Node) -> Text? = match inner-member(m) {
+  Field(PrivateName(x), _) | StaticField(PrivateName(x), _) => some(x)
+  Method(PrivateName(x), ...) | GenMethod(PrivateName(x), ...) | AsyncMethod(PrivateName(x), ...)
+    | AsyncGenMethod(PrivateName(x), ...) | Getter(PrivateName(x), ...) | Setter(PrivateName(x), ...) => some(x)
+  _ => none
+}
+
+fn private-member?(m: Node) -> Bool = is-some(private-key(m))
+
+fn private-get(o: Node, name: Text) -> Node {
+  let p = privates[name] ?? panic "no private name {} in scope", name
+  if len(p.getter) > 0 then helper-call("__privateGet", [o, Ident(p.holder), Ident(p.getter)])
+  else if len(p.method) > 0 then helper-call("__privateMethod", [o, Ident(p.holder), Ident(p.method)])
+  else helper-call("__privateGet", [o, Ident(p.holder)])
+}
+
+fn private-set(o: Node, name: Text, value: Node) -> Node {
+  let p = privates[name] ?? panic "no private name {} in scope", name
+  if len(p.setter) > 0 then helper-call("__privateSet", [o, Ident(p.holder), value, Ident(p.setter)])
+  else helper-call("__privateSet", [o, Ident(p.holder), value])
+}
+
+fn private-assignment(t: Node, op: Text, v: Node) -> Node = match t {
+  Member(o, PrivateName(x)) => {
+    let inner = lowered(o)
+    let value = lowered(v)
+    if op == "=" { return private-set(inner, x, value) }
+    let self = if repeatable?(inner) then inner else Ident(temp())
+    let first = if repeatable?(inner) then inner else assign(self, inner)
+    let read = private-get(first, x)
+    match op {
+      "||=" => Or(read, private-set(self, x, value))
+      "&&=" => And(read, private-set(self, x, value))
+      "??=" => coalesced(read, private-set(self, x, value))
+      _ => private-set(self, x, compound-value(op, read, value))
+    }
+  }
+  _ => panic "expected a private member"
+}
+
+fn compound-value(op: Text, a: Node, b: Node) -> Node = match op {
+  "+=" => Add(a, b)
+  "-=" => Sub(a, b)
+  "*=" => Mul(a, b)
+  "/=" => Div(a, b)
+  "%=" => Mod(a, b)
+  "**=" => if before?(2016) then helper-call("__pow", [a, b]) else Pow(a, b)
+  "<<=" => Shl(a, b)
+  ">>=" => Shr(a, b)
+  ">>>=" => Ushr(a, b)
+  "&=" => BitAnd(a, b)
+  "|=" => BitOr(a, b)
+  "^=" => BitXor(a, b)
+  other => panic "unexpected assignment operator {}", other
+}
+
+# `this` in a static initializer is the class, and so is the class's own inner name.
+fn as-class(n: Node, ref: Node, inner-name: Text) -> Node = as-class-name(this-is(n, ref), ref, inner-name)
+
+fn this-is(n: Node, ref: Node) -> Node = match n {
+  This() => ref
+  _ => if len(n.kids) == 0 or (sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...))) then n
+       else n with { kids: [this-is(k, ref) for k in n.kids] }
+}
+
+# A field's name is evaluated once, when the class is. So a computed one goes in a variable first.
+fn field-key(k: Node, setup: mut [Node]) -> Node = match k {
+  PropName(x) => string-of(x)
+  Str(_) | Num(_) => k
+  Computed(e) => {
+    let held = Ident(temp())
+    setup += assign(held, lowered(e))
+    held
+  }
+  _ => panic "unexpected field name"
+}
+
+fn field-init(v: Node) -> Node = if v is None() then undefined-value() else v
+
+record ClassParts { body: Node, before: [Node], after: [Node], statics: [Node] }
+
+fn function-expr-of(m: Node) -> Node = match m {
+  Method(_, p, b) | Getter(_, p, b) | Setter(_, p, b) => FuncExpr(None(), p, b)
+  GenMethod(_, p, b) => GenExpr(None(), p, b)
+  AsyncMethod(_, p, b) => AsyncFuncExpr(None(), p, b)
+  AsyncGenMethod(_, p, b) => AsyncGenExpr(None(), p, b)
+  _ => panic "expected a method"
+}
+
+fn scan-privates(members: [Node], outer: {Text:Private}, setup: mut [Node]) -> {Text:Private} {
+  var out: {Text:Private} = {}
+  for k in keys(outer) { out[k] = outer[k] ?? panic "lost a private name" }
+  var instances = ""
+  var static-set = ""
+  for m in members {
+    if let some(name) = private-key(m) {
+      let plain = name[1..len(name)]
+      let is-static = m is StaticMethod(_) | StaticField(...)
+      match inner-member(m) {
+        Field(...) | StaticField(...) => {
+          let holder = temp()
+          let map-new = NewExpr(Ident("WeakMap"), Args(List()))
+          setup += assign(Ident(holder), map-new)
+          out[name] = Private(holder: holder, method: "", getter: "", setter: "")
+        }
+        _ => {
+          let set-name = if is-static then static-set else instances
+          let holder = if len(set-name) > 0 then set-name else {
+            let h = temp()
+            let set-new = NewExpr(Ident("WeakSet"), Args(List()))
+            setup += assign(Ident(h), set-new)
+            h
+          }
+          if is-static { static-set = holder } else { instances = holder }
+          let f = temp()
+          let known = out[name] ?? Private(holder: holder, method: "", getter: "", setter: "")
+          out[name] = match inner-member(m) {
+            Getter(...) => known with { getter: f }
+            Setter(...) => known with { setter: f }
+            _ => known with { method: f }
+          }
+        }
+      }
+    }
+  }
+  out
+}
+
+fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Text] {
+  var out: [Text] = []
+  for m in members {
+    if let some(name) = private-key(m) {
+      let is-static = m is StaticMethod(_)
+      let is-field = inner-member(m) is Field(...) | StaticField(...)
+      if not is-field and is-static == want-static {
+        let p = table[name] ?? panic "lost a private name"
+        if not (p.holder in out) { out += p.holder }
+      }
+    }
+  }
+  out
+}
+
+fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> ClassParts {
+  let members = body.kids[0].kids
+  var setup: [Node] = []
+  let table = scan-privates(members, privates, setup)
+  var after: [Node] = []
+  var statics: [Node] = []
+  var fields: [Node] = []
+  var kept: [Node] = []
+  var constructor: Node? = none
+  with privates = table {
+    for h in set-holders(members, table, false) {
+      fields += ExprStmt(helper-call("__privateAdd", [This(), Ident(h)]))
+    }
+    for h in set-holders(members, table, true) {
+      statics += ExprStmt(helper-call("__privateAdd", [ref, Ident(h)]))
+    }
+    for m in members {
+      match m {
+        ClassEmpty() => {}
+        Field(PrivateName(x), v) => {
+          let p = table[x] ?? panic "lost a private name"
+          fields += ExprStmt(helper-call("__privateAdd", [This(), Ident(p.holder), field-init(lowered(v))]))
+        }
+        Field(key, v) => {
+          fields += ExprStmt(helper-call("__publicField", [This(), field-key(key, setup), field-init(lowered(v))]))
+        }
+        StaticField(PrivateName(x), v) => {
+          let p = table[x] ?? panic "lost a private name"
+          statics += ExprStmt(helper-call("__privateAdd", [ref, Ident(p.holder), as-class(field-init(lowered(v)), ref, inner-name)]))
+        }
+        StaticField(key, v) => {
+          statics += ExprStmt(helper-call("__publicField", [ref, field-key(key, setup), as-class(field-init(lowered(v)), ref, inner-name)]))
+        }
+        StaticBlock(b) => {
+          let f = Arrow(Params(List()), lowered-function-body(b))
+          statics += ExprStmt(CallExpr(as-class(f, ref, inner-name), Args(List())))
+        }
+        _ => {
+          if constructor-method?(m) {
+            constructor = some(lowered(m))
+          } else if let some(name) = private-key(m) {
+            let p = table[name] ?? panic "lost a private name"
+            let inner = lowered(inner-member(m))
+            let slot = match inner-member(m) {
+              Getter(...) => p.getter
+              Setter(...) => p.setter
+              _ => p.method
+            }
+            after += as-class-name(ExprStmt(assign(Ident(slot), function-expr-of(inner))), ref, inner-name)
+          } else {
+            kept += lowered(m)
+          }
+        }
+      }
+    }
+  }
+  var out: [Node] = []
+  if len(fields) > 0 or is-some(constructor) {
+    out += constructor-with-fields(constructor, fields, derived)
+  }
+  let whole = out ++ kept
+  ClassParts(body: body with { kids: [List(whole...)] }, before: setup, after: after, statics: statics)
+}
+
+fn as-class-name(n: Node, ref: Node, inner-name: Text) -> Node = match n {
+  Ident(x) => if len(inner-name) > 0 and x == inner-name then ref else n
+  _ => if len(n.kids) == 0 then n else n with { kids: [as-class-name(k, ref, inner-name) for k in n.kids] }
+}
+
+fn lowered-function-body(b: Node) -> Node {
+  frames += []
+  let stmts = lowered-list(b.kids[0].kids)
+  let temps = frames[len(frames) - 1]
+  pop(frames)
+  FuncBody(list-of(with-temps(stmts, temps)))
+}
+
+fn constructor-method?(m: Node) -> Bool = m is Method(PropName("constructor"), _, _)
+
+fn directive-count(stmts: [Node]) -> Int {
+  var at = 0
+  var going = true
+  for s in stmts {
+    if going and s is ExprStmt(Str(_)) { at += 1 } else { going = false }
+  }
+  at
+}
+
+fn plain-super-at(stmts: [Node]) -> Int? {
+  for i in 0..len(stmts) {
+    if stmts[i] is ExprStmt(CallExpr(Super(), _)) { return some(i) }
+  }
+  none
+}
+
+fn calls-super?(n: Node) -> Bool = match n {
+  CallExpr(Super(), _) => true
+  _ => if sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...)) then false
+       else any k in n.kids: calls-super?(k)
+}
+
+fn super-through(n: Node, name: Text) -> Node = match n {
+  CallExpr(Super(), args) => CallExpr(Ident(name), super-through(args, name))
+  _ => if len(n.kids) == 0 or (sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...))) then n
+       else n with { kids: [super-through(k, name) for k in n.kids] }
+}
+
+# Fields are set the moment `super()` returns. When that call is a statement of its own they follow
+# it. Anywhere else, as in `if (a) super()` or what the minifier made of it, every such call goes
+# through an arrow that does both.
+fn constructor-with-fields(existing: Node?, fields: [Node], derived: Bool) -> Node = match existing {
+  some(Method(key, params, FuncBody(List(ss...)))) => {
+    if len(fields) == 0 { return Method(key, params, FuncBody(List(ss...))) }
+    if let some(i) = plain-super-at(ss) {
+      return Method(key, params, FuncBody(list-of(ss[0..i + 1] ++ fields ++ ss[i + 1..len(ss)])))
+    }
+    let at = directive-count(ss)
+    if not (any x in ss: calls-super?(x)) {
+      return Method(key, params, FuncBody(list-of(ss[0..at] ++ fields ++ ss[at..len(ss)])))
+    }
+    let name = fresh-name("__super")
+    let passed = fresh-name("_")
+    let inner = [ExprStmt(CallExpr(Super(), Args(List(Spread(Ident(passed))))))] ++ fields ++ [Return(This())]
+    let through = Arrow(Params(List(RestParam(BindName(passed)))), FuncBody(list-of(inner)))
+    let holder = VarDecl(List(Declarator(BindName(name), through)))
+    let rest = [super-through(x, name) for x in ss[at..len(ss)]]
+    Method(key, params, FuncBody(list-of(ss[0..at] ++ [holder] ++ rest)))
+  }
+  none => {
+    let calls: [Node] = if derived then [stmt`super(...arguments);`] else []
+    let stmts = calls ++ fields
+    Method(PropName("constructor"), Params(List()), FuncBody(List(stmts...)))
+  }
+  _ => panic "expected a constructor"
+}
+
+fn class-statements!(n: Node, out: mut [Node]) -> Void = match n {
+  ClassDecl(name, heritage, body) => {
+    if not class-needs-lowering?(body) {
+      out += lowered(n)
+    } else {
+      let parts = lowered-class(body, not (heritage is None()), "", Ident(name.text))
+      for b in parts.before { out += ExprStmt(b) }
+      out += ClassDecl(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }
+      out ++= parts.after
+      out ++= parts.statics
+    }
+  }
+  _ => panic "expected a class declaration"
+}
+
+# `(_a = class { … }, __publicField(_a, "x", 1), _a)`
+fn class-expression(n: Node) -> Node = match n {
+  ClassExpr(name, heritage, body) => {
+    if not class-needs-lowering?(body) { return n with { kids: [name, lowered(heritage), lowered(body)] } }
+    let holder = Ident(temp())
+    let inner-name = if name is BindName(_) then name.text else ""
+    let parts = lowered-class(body, not (heritage is None()), inner-name, holder)
+    let plain = ClassExpr(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }
+    if len(parts.before) == 0 and len(parts.after) == 0 and len(parts.statics) == 0 { return plain }
+    var items = parts.before
+    items += assign(holder, plain)
+    for s in parts.after { items += s.kids[0] }
+    for s in parts.statics { items += s.kids[0] }
+    items += holder
+    seq(items)
+  }
+  _ => panic "expected a class expression"
+}
+
+# ---------------------------------------------------------------- the walk
+
+# A statement list, lowered: one statement may become several.
+fn lowered-list(xs: [Node]) -> [Node] {
+  var out: [Node] = []
+  for x in xs {
+    match x {
+      ClassDecl(...) => if before?(2022) then class-statements!(x, out) else { out += lowered(x) }
+      Declarator(t, init) => {
+        if before?(2018) and top-rest?(t) {
+          out ++= rest-declarators(t, lowered(init), x)
+        } else {
+          out += lowered(x)
+        }
+      }
+      _ => { out += lowered(x) }
+    }
+  }
+  out
+}
+
+fn check-number(n: Node, t: Text) -> Node {
+  if before?(2020) and ends-with(t, "n") {
+    panic "big integer literals are not available in the configured target"
+  }
+  if before?(2021) and (any c in t: c == '_') {
+    var b = buf-new()
+    for c in t {
+      if c != '_' { buf-byte!(b, c) }
+    }
+    return Num(buf-text(b)) with { lo: n.lo, hi: n.hi }
+  }
+  n
+}
+
+fn lowered(n: Node) -> Node = match n {
+  Num(t) => check-number(n, t)
+  Coalesce(a, b) => if before?(2020) then coalesced(lowered(a), lowered(b)) else generic(n)
+  Pow(a, b) => if before?(2016) then helper-call("__pow", [lowered(a), lowered(b)]) else generic(n)
+  OptMember(...) | OptIndex(...) | OptCall(...) => if chain-lowers?(n) then chain(n, undefined-value(), false) else generic(n)
+  Member(o, PrivateName(x)) => if not before?(2022) then generic(n)
+    else if chain-lowers?(n) then chain(n, undefined-value(), false)
+    else private-get(lowered(o), x)
+  Member(...) | Index(...) | Tagged(...) => if chain-lowers?(n) then chain(n, undefined-value(), false) else generic(n)
+  CallExpr(Paren(inner), _) => {
+    if chain-lowers?(inner) {
+      panic "a parenthesized optional chain being called is not implemented for this target"
+    }
+    generic(n)
+  }
+  CallExpr(Member(o, PrivateName(x)), Args(List(args...))) => {
+    if not before?(2022) { return generic(n) }
+    if chain-lowers?(n) { return chain(n, undefined-value(), false) }
+    let inner = lowered(o)
+    let self = if repeatable?(inner) then inner else Ident(temp())
+    let first = if repeatable?(inner) then inner else assign(self, inner)
+    let f = Member(private-get(first, x), PropName("call"))
+    let passed = [self] ++ [lowered(a) for a in args]
+    CallExpr(f, Args(List(passed...))) with { lo: n.lo, hi: n.hi }
+  }
+  CallExpr(...) => if chain-lowers?(n) then chain(n, undefined-value(), false) else generic(n)
+  Delete(x) => if chain-lowers?(x) then chain(x, True(), true) else generic(n)
+  Assignment(t, AssignOp(op), v) => assignment(n, t, op, v)
+  In(PrivateName(x), o) => {
+    if not before?(2022) { return generic(n) }
+    let p = privates[x] ?? panic "no private name {} in scope", x
+    helper-call("__privateIn", [Ident(p.holder), lowered(o)])
+  }
+  PreInc(Member(o, PrivateName(x))) | PreDec(Member(o, PrivateName(x))) | PostInc(Member(o, PrivateName(x))) | PostDec(Member(o, PrivateName(x))) => {
+    if not before?(2022) { return generic(n) }
+    let p = privates[x] ?? panic "no private name {} in scope", x
+    let wrap = helper-call("__privateWrapper", [lowered(o), Ident(p.holder)] ++
+                    (if len(p.setter) > 0 or len(p.getter) > 0
+                     then [if len(p.setter) > 0 then Ident(p.setter) else undefined-value(),
+                           if len(p.getter) > 0 then Ident(p.getter) else undefined-value()]
+                     else []))
+    n with { kids: [Member(wrap, PropName("_"))] }
+  }
+  ObjectLit(List(xs...)) => if before?(2018) and (any x in xs: x is SpreadProp(_)) then object-spread(xs) else generic(n)
+  Catch(None(), block) => if before?(2019) then Catch(CatchHead(BindName(fresh-name("_"))), lowered(block)) with { lo: n.lo, hi: n.hi } else generic(n)
+  ForOf(flag, ...) => if flag is Flag() and before?(2018) then for-await(n) else generic(n)
+  ClassExpr(...) => if before?(2022) then class-expression(n) else generic(n)
+  List(xs...) => n with { kids: lowered-list(xs) }
+  _ => if sc.function?(n.kind) then function-node(n) else generic(n)
+}
+
+fn generic(n: Node) -> Node = if len(n.kids) == 0 then n else n with { kids: [lowered(k) for k in n.kids] }
+
+# ---------------------------------------------------------------- helpers
+
+fn helper-definitions() -> [Node] {
+  if len(helpers) == 0 { return [] }
+  let all-stmts = js.parse(include-text("lower_runtime.js"), "<lower runtime>").kids[1].kids
+  var wanted: {Text:Bool} = {}
+  for h in helpers { wanted[h] = true }
+  # What a wanted helper mentions is wanted too.
+  var changed = true
+  while changed {
+    changed = false
+    for s in all-stmts {
+      if helper-name-of(s) in wanted {
+        var mentioned: [Text] = []
+        idents!(s, mentioned)
+        for x in mentioned {
+          if starts-with(x, "__") and not (x in wanted) {
+            wanted[x] = true
+            changed = true
+          }
+        }
+      }
+    }
+  }
+  [s for s in all-stmts if helper-name-of(s) in wanted]
+}
+
+fn idents!(n: Node, out: mut [Text]) -> Void {
+  if n is Ident(_) { out += n.text }
+  for k in n.kids { idents!(k, out) }
+}
+
+# Under --minify the helpers get short names like everything else.
+fn shortened(n: Node, short: {Text:Text}) -> Node = match n {
+  Ident(x) | BindName(x) => match short[x] {
+    some(y) => n with { text: y }
+    none => n
+  }
+  Shorthand(Ident(x)) => match short[x] {
+    some(y) => Prop(PropName(x), Ident(y))
+    none => n
+  }
+  _ => if len(n.kids) == 0 then n else n with { kids: [shortened(k, short) for k in n.kids] }
+}
+
+fn helper-name-of(s: Node) -> Text = s.kids[0].kids[0].kids[0].text
+
+# A program for an older target. `names` is every name already in use.
+fn run(program: Node, year: Int, names: [Text], minify: Bool) -> Node {
+  if year >= no-lowering { return program }
+  if year < 2015 { panic "the configured target is older than esbuild supports: es{}", year }
+  target = year
+  taken = {}
+  for x in names { taken[x] = true }
+  frames = [[]]
+  helpers = []
+  next-temp = 0
+  let stmts = lowered-list(program.kids[1].kids)
+  let temps = frames[0]
+  let defs = helper-definitions()
+  let whole = defs ++ with-temps(stmts, temps)
+  let plain = Program(program.kids[0], List(whole...))
+  if not minify { return plain }
+  var short: {Text:Text} = {}
+  for d in defs { short[helper-name-of(d)] = fresh-name("$") }
+  shortened(plain, short)
+}

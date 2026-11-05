@@ -197,6 +197,24 @@ for label, entries, flags in [("fixture", ["app/split/a.js", "app/split/b.js"], 
         same = same and x[0] == 0 and x[1] and x[1] == y[1]
     check(same and ours == theirs, f"{label}: same output as esbuild's, in the same {len(ours)} files")
 
+print("== lowering for older targets, against esbuild and acorn")
+def lowered_check(entry, year, flags, label):
+    a, b = f"{SCRATCH}/low.o.cjs", f"{SCRATCH}/low.e.cjs"
+    code, text = sh([ESB, entry, f"--target=es{year}", f"--outfile={a}"] + flags, 120)
+    sh([E, entry, "--bundle", f"--target=es{year}", "--log-level=error", f"--outfile={b}"] + flags, 120)
+    parsed = sh(["node", "tools/check-target.mjs", a, str(year)], 60)[1].strip()
+    ra, rb = sh(["node", a], 60), sh(["node", b], 60)
+    check(code == 0 and parsed == "ok" and ra[0] == 0 and ra[1] and ra[1] == rb[1],
+          f"{label} at es{year} {' '.join(flags)}: {parsed[:120]}, same output as esbuild's")
+for year in [2021, 2019, 2017, 2015]:
+    lowered_check("app/lower/all.js", year, [], "every lowered feature")
+lowered_check("app/lower/all.js", 2015, ["--minify"], "every lowered feature")
+for app in ["immer", "rx", "zod", "preact", "features", "datefns", "exes", "excjs", "exdate", "eximmer"]:
+    lowered_check(f"app/{app}.js", 2015, ["--minify"], app)
+lowered_check("app/react.js", 2017, ["--platform=node"], "react")
+for app in ["rx", "zod4", "immer", "main"]:
+    lowered_check(f"app/ts/{app}.ts", 2018, [], f"{app}.ts")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)
@@ -206,6 +224,9 @@ check(got == '1.2.3 greetings, "friend"', f"plugins, a spec-defined format, a lo
 check(open("out/spec/plugged.js").read().startswith("/* built by the spec */\n"), "a spec's banner")
 got = sh(["node", "out/spec/ui.cjs"], 15)[1].strip()
 check(got == '["a",{"x":"1"},["b"]]', f"a spec's JSX settings: {got}")
+old = sh(["node", "tools/check-target.mjs", "out/spec/old.js", "2017"], 30)[1].strip()
+ran = sh(["node", "out/spec/old.js"], 30)[1].strip()
+check(old == "ok" and ran == "4 4", f"a spec's syntax target: {old}, {ran}")
 
 print("== source maps")
 for a in ["named.js", "cjs.js", "features.js", "jsx/main.jsx"]:

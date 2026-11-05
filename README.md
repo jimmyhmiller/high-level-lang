@@ -135,7 +135,10 @@ purity, CommonJS wrapping, re-exports from CommonJS, `__esm` wrapping for `requi
 of ES modules, namespace objects, `define`, aliases, loaders (js, json, text, base64, dataurl,
 empty), TypeScript (types erased by the grammar, enums, namespaces, parameter properties, unused
 imports, `import x = …`, `export =`, `./x.js` meaning `./x.ts`), JSX (classic, automatic and dev runtimes, preserve, pragmas in block comments), banner and
-footer, tree shaking off, iife/esm/cjs and spec-defined output formats, several entries with `--outdir`, code splitting with
+footer, tree shaking off, iife/esm/cjs and spec-defined output formats, `--target=es2015` and later (`??`, `?.`, logical
+assignment, `**`, numeric separators, optional catch binding, object spread and rest, async
+functions, async generators and `for await`, class fields, private members and static blocks, each
+checked by acorn at that version), several entries with `--outdir`, code splitting with
 shared chunks and `import()` (`--splitting`, `--entry-names`, `--chunk-names`, `--outbase`), global
 names, `--external`, `--platform=node`, identifier and syntax minification, source maps, and resolve,
 load, transform and optimize hooks.
@@ -144,14 +147,18 @@ load, transform and optimize hooks.
 
 Being explicit, because "everything esbuild does" is a lot:
 
-- **Not built:** the CSS loader, syntax lowering for older targets, watch and serve,
+- **Not built:** the CSS loader, watch and serve,
   legal comments in output, `tsconfig.json`, TypeScript decorators, `accessor` fields, inlining enum
   values across files.
 - **Hard errors for now:** `export *` from a CommonJS or external module in the entry point of ES
   module output.
 - **Hard errors for now:** the automatic JSX runtime in a CommonJS module, and `--jsx=preserve` with
   `--pretty`.
-- **Simplifications:** Data URLs are spelled out or base64, without esbuild's percent escaping. Source maps have no
+- **Hard errors when lowering:** `super` inside an async function, object rest nested inside another
+  pattern or in an assignment, a computed key in an object rest, and calling a parenthesized optional
+  chain, all below the version that has them; browser names in `--target`.
+- **Simplifications:** a computed class field name is evaluated before the class's computed method
+  names when lowered, not in source order. Data URLs are spelled out or base64, without esbuild's percent escaping. Source maps have no
   `names`. Regex patterns are not validated. Labels are not renamed. Single-use `const` inlining is
   missing.
 
