@@ -1,0 +1,420 @@
+# JSX becomes calls, before anything else looks at the program, so the rest of the bundler never
+# meets it. Which call is the build's choice, or a pragma comment's.
+rules bundle.jsx over bundle.js
+use bundle.js as js
+use bundle.comments as cm
+use bundle.minhost as host
+
+enum Runtime { Classic, Automatic, Preserve }
+
+record Options {
+  runtime: Runtime,
+  factory: Text,
+  fragment: Text,
+  import-source: Text,
+  dev: Bool,
+  side-effects: Bool
+}
+
+fn options-new() -> Options =
+  Options(runtime: Classic, factory: "React.createElement", fragment: "React.Fragment",
+          import-source: "react", dev: false, side-effects: false)
+
+# What one file is being lowered under.
+record Lowered { tree: Node, pure-calls: {Int:Int}, imports: Bool }
+
+state now: Options = options-new()
+state src: Text = ""
+state path: Text = ""
+state pure-calls: {Int:Int} = {}
+state imported: {Text:Text} = {}
+state import-order: [Text] = []
+state entities: {Text:Int} = {}
+
+# ---------------------------------------------------------------- pragmas
+
+fn word-end(s: Text, from: Int) -> Int {
+  var i = from
+  while i < len(s) and not (s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or s[i] == '\r' or s[i] == '*') { i += 1 }
+  i
+}
+
+# The word after `@name` in a comment, if the comment has it.
+fn pragma(comment: Text, name: Text) -> Text? {
+  let tag = "@" ++ name
+  for i in 0..len(comment) {
+    if at?(comment, i, tag) {
+      let after = i + len(tag)
+      if after < len(comment) and (comment[after] == ' ' or comment[after] == '\t') {
+        var from = after
+        while from < len(comment) and (comment[from] == ' ' or comment[from] == '\t') { from += 1 }
+        let end = word-end(comment, from)
+        if end > from { return some(comment[from..end]) }
+      }
+    }
+  }
+  none
+}
+
+fn runtime-named(s: Text) -> Runtime = match s {
+  "automatic" => Automatic
+  "classic" => Classic
+  other => panic "{}: @jsxRuntime is automatic or classic, not {}", path, other
+}
+
+# A file's comments may override the build, unless the build keeps JSX as it is.
+fn with-pragmas(o: Options) -> Options {
+  if not contains-text?(src, "@jsx") { return o }
+  var out = o
+  match cm.parse(src, "<comments>") {
+    cm.Scan(List(parts...)) => for p in parts {
+      if p is cm.Comment(_) {
+        if let some(v) = pragma(p.text, "jsx") { out.factory = v }
+        if let some(v) = pragma(p.text, "jsxFrag") { out.fragment = v }
+        if let some(v) = pragma(p.text, "jsxImportSource") { out.import-source = v }
+        if let some(v) = pragma(p.text, "jsxRuntime") {
+          if o.runtime != Preserve { out.runtime = runtime-named(v) }
+        }
+      }
+    }
+    _ => panic "a source scans to pieces"
+  }
+  out
+}
+
+# ---------------------------------------------------------------- text
+
+fn load-entities() -> Void {
+  if "amp" in entities { return }
+  var start = 0
+  let table = include-text("jsx_entities.txt")
+  for i in 0..len(table) {
+    if table[i] == '\n' {
+      var space = start
+      while table[space] != ' ' { space += 1 }
+      entities[table[start..space]] = parse-int(table[space + 1..i])
+      start = i + 1
+    }
+  }
+}
+
+fn digit-value(c: Int, base: Int) -> Int {
+  let v = if digit-byte?(c) then c - '0'
+          else if c >= 'a' and c <= 'f' then c - 'a' + 10
+          else if c >= 'A' and c <= 'F' then c - 'A' + 10
+          else 99
+  if v < base then v else -1
+}
+
+# The value of `#38` or `#x26`, if it is one. Past 32 bits it is not.
+fn numeric-entity(e: Text) -> Int? {
+  let hex = len(e) > 2 and e[1] == 'x'
+  let from = if hex then 2 else 1
+  let base = if hex then 16 else 10
+  if len(e) <= from { return none }
+  var v = 0
+  for i in from..len(e) {
+    let d = digit-value(e[i], base)
+    if d < 0 { return none }
+    v = v * base + d
+    if v > 2147483647 { return none }
+  }
+  some(v)
+}
+
+fn entity-value(e: Text) -> Int? {
+  if e[0] == '#' { return numeric-entity(e) }
+  load-entities()
+  entities[e]
+}
+
+# `&amp;` and friends in code points [from, to). Anything that isn't one stays as written.
+fn decoded!(points: [Int], from: Int, to: Int, out: mut [Int]) -> Void {
+  var i = from
+  while i < to {
+    let c = points[i]
+    i += 1
+    var value = c
+    if c == '&' {
+      var semi = i
+      while semi < to and points[semi] != ';' { semi += 1 }
+      if semi < to and semi > i {
+        if let some(v) = entity-value(text-of-points([points[k] for k in i..semi])) {
+          value = v
+          i = semi + 1
+        }
+      }
+    }
+    out += value
+  }
+}
+
+fn line-break?(c: Int) -> Bool = c == 13 or c == 10 or c == 8232 or c == 8233
+
+const other-spaces: [Int] = [11, 12, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200,
+                             8201, 8202, 8239, 8287, 12288, 65279]
+
+# Text between tags, per JSX: lines are trimmed and joined by one space, and blank ones go.
+fn child-text(raw: Text) -> Text {
+  let points = code-points-of(raw)
+  var out: [Int] = []
+  var line-first = 0
+  var line-end = -1
+  for i in 0..len(points) {
+    let c = points[i]
+    if line-break?(c) {
+      if line-first != -1 and line-end != -1 {
+        if len(out) > 0 { out += 32 }
+        decoded!(points, line-first, line-end, out)
+        line-end = -1
+      }
+      line-first = -1
+    } else if c != 9 and c != 32 and not (c in other-spaces) {
+      line-end = i + 1
+      if line-first == -1 { line-first = i }
+    }
+  }
+  if line-first != -1 {
+    if len(out) > 0 { out += 32 }
+    decoded!(points, line-first, len(points), out)
+  }
+  text-of-points(out)
+}
+
+# A quoted attribute value keeps its line breaks.
+fn attr-text(raw: Text) -> Text {
+  let points = code-points-of(raw[1..len(raw) - 1])
+  var out: [Int] = []
+  decoded!(points, 0, len(points), out)
+  text-of-points(out)
+}
+
+# A source map should point at the text, not at the line break before it.
+fn leading-space(raw: Text) -> Int {
+  var i = 0
+  while i < len(raw) and (raw[i] == ' ' or raw[i] == '\t' or raw[i] == '\n' or raw[i] == '\r') { i += 1 }
+  i
+}
+
+fn string-at(text: Text, at: Node) -> Node = Str(host.js-string(text)) with { lo: at.lo, hi: at.hi }
+
+# ---------------------------------------------------------------- names
+
+# Scope analysis finds a name's symbol by offset, so each generated reference takes an offset no
+# other reference has. A node has its own `<`, and the byte after it.
+fn dotted(text: Text, lo: Int) -> Node = placed(js.parse(text ++ ";", "<jsx>").kids[1].kids[0].kids[0], lo)
+
+fn placed(n: Node, lo: Int) -> Node =
+  if len(n.kids) == 0 then n with { lo: lo, hi: lo }
+  else n with { lo: lo, hi: lo, kids: [placed(k, lo) for k in n.kids] }
+
+fn fresh-name(base: Text) -> Text {
+  var name = base
+  var n = 1
+  while contains-text?(src, name) {
+    name = base ++ "_" ++ int-text(n)
+    n += 1
+  }
+  name
+}
+
+fn imported-ref(name: Text, from: Text, lo: Int) -> Node {
+  let key = from ++ "\n" ++ name
+  if not (key in imported) {
+    imported[key] = fresh-name(name)
+    import-order += key
+  }
+  let local = imported[key] ?? panic "{} has no local name", name
+  Ident(local) with { lo: lo, hi: lo }
+}
+
+fn runtime-module() -> Text =
+  now.import-source ++ (if now.dev then "/jsx-dev-runtime" else "/jsx-runtime")
+
+fn cut-at-newline(key: Text) -> Int {
+  var i = 0
+  while key[i] != '\n' { i += 1 }
+  i
+}
+
+# `import { jsx } from "react/jsx-runtime"`, one statement per name, at the top of the file. A
+# binding's offset identifies it too, and real offsets are not negative.
+fn import-statements() -> [Node] {
+  var out: [Node] = []
+  var at = -2
+  for key in import-order {
+    let cut = cut-at-newline(key)
+    let local = imported[key] ?? panic "an import without a local name"
+    let bind = BindName(local) with { lo: at, hi: at }
+    let from = Str(host.js-string(key[0..cut]))
+    let name = PropName(key[cut + 1..len(key)])
+    out += Import(ImportNamed(List(ImportAs(name, bind))), from)
+    at = at - 1
+  }
+  out
+}
+
+# ---------------------------------------------------------------- the calls
+
+fn tag-value(tag: Node) -> Node = match tag {
+  JsxTagText(t) => string-at(t, tag)
+  JsxNs(a, b) => string-at(a.text ++ ":" ++ b.text, tag)
+  _ => tag
+}
+
+fn key-of(name: Node) -> Node = match name {
+  JsxName(t) => if all c in t: c != '-' then PropName(t) with { lo: name.lo, hi: name.hi } else string-at(t, name)
+  JsxNs(a, b) => string-at(a.text ++ ":" ++ b.text, name)
+  _ => panic "unexpected attribute name"
+}
+
+fn value-of(v: Node) -> Node = match v {
+  None() => True()
+  JsxStr(raw) => string-at(attr-text(raw), v)
+  JsxValue(e) => lowered(e)
+  _ => lowered(v)
+}
+
+fn prop-of(attr: Node) -> Node = match attr {
+  JsxSpreadAttr(e) => SpreadProp(lowered(e)) with { lo: attr.lo, hi: attr.hi }
+  JsxAttr(name, v) => Prop(key-of(name), value-of(v)) with { lo: attr.lo, hi: attr.hi }
+  _ => panic "unexpected attribute"
+}
+
+fn child-values(kids: [Node]) -> [Node] {
+  var out: [Node] = []
+  for k in kids {
+    match k {
+      JsxText(raw) => {
+        let t = child-text(raw)
+        if len(t) > 0 { out += string-at(t, k) with { lo: k.lo + leading-space(raw) } }
+      }
+      JsxContainer(None()) => {}
+      JsxContainer(e) => { out += lowered(e) }
+      JsxSpreadChild(e) => { out += Spread(lowered(e)) with { lo: k.lo, hi: k.hi } }
+      _ => { out += lowered(k) }
+    }
+  }
+  out
+}
+
+fn call-of(callee: Node, args: [Node], at: Node) -> Node {
+  if not now.side-effects { pure-calls[at.lo] = at.hi }
+  CallExpr(callee, Args(List(args...))) with { lo: at.lo, hi: at.hi }
+}
+
+fn classic(tag: Node, props: [Node], children: [Node], at: Node) -> Node {
+  let shown = if len(props) == 0 then Null() else ObjectLit(List(props...))
+  call-of(dotted(now.factory, at.lo), [tag, shown] ++ children, at)
+}
+
+fn key-prop?(p: Node) -> Bool = p is Prop(PropName("key"), _)
+
+# `<a {...b} key="c"/>` has to go through `createElement`: `b` may hold a key of its own, and
+# which one wins depends on the order.
+fn key-after-spread?(props: [Node]) -> Bool {
+  var spread = false
+  for p in props {
+    if p is SpreadProp(_) { spread = true }
+    if spread and key-prop?(p) { return true }
+  }
+  false
+}
+
+fn spread-free?(xs: [Node]) -> Bool = all x in xs: not (x is Spread(_))
+
+# The children as a `children` prop: one is itself, and several, or a spread, are an array.
+fn children-prop(children: [Node], at: Node) -> [Node] {
+  if len(children) == 0 { return [] }
+  let value = if len(children) == 1 and spread-free?(children) then children[0] else array-of(children)
+  [Prop(PropName("children"), value) with { lo: at.lo, hi: at.hi }]
+}
+
+fn array-of(xs: [Node]) -> Node {
+  var slots: [Node] = []
+  for i in 0..len(xs) {
+    slots += if i == len(xs) - 1 then ElemLast(xs[i]) else Elem(xs[i])
+  }
+  ArrayLit(List(slots...))
+}
+
+fn dev-source(at: Node) -> Node {
+  let props = [Prop(PropName("fileName"), Str(host.js-string(path))),
+               Prop(PropName("lineNumber"), Num(int-text(line-of(src, at.lo)))),
+               Prop(PropName("columnNumber"), Num(int-text(col-of(src, at.lo) + 1)))]
+  ObjectLit(List(props...))
+}
+
+fn automatic(tag: Node, attrs: [Node], children: [Node], at: Node) -> Node {
+  if key-after-spread?(attrs) {
+    return call-of(imported-ref("createElement", now.import-source, at.lo),
+                   [tag, ObjectLit(List(attrs...))] ++ children, at)
+  }
+  var key: Node? = none
+  var props: [Node] = []
+  for a in attrs {
+    match a {
+      Prop(PropName("key"), v) => {
+        if v is True() { panic "{}: `key` needs an explicit value", path }
+        key = some(v)
+      }
+      _ => { props += a }
+    }
+  }
+  let many = len(children) > 1 or (len(children) == 1 and not spread-free?(children))
+  let fields = props ++ children-prop(children, at)
+  let whole = ObjectLit(List(fields...))
+  let name = if now.dev then "jsxDEV" else if many then "jsxs" else "jsx"
+  var args = [tag, whole]
+  if let some(k) = key { args += k }
+  if now.dev {
+    if is-none(key) { args += Void(Num("0")) }
+    args += if many then True() else False()
+    args += dev-source(at)
+    args += This()
+  }
+  call-of(imported-ref(name, runtime-module(), at.lo), args, at)
+}
+
+fn fragment-tag(at: Node) -> Node = match now.runtime {
+  Automatic => imported-ref("Fragment", runtime-module(), at.lo + 1)
+  _ => dotted(now.fragment, at.lo + 1)
+}
+
+fn lowered-element(n: Node) -> Node = match n {
+  JsxFragment(List(kids...)) => {
+    let children = child-values(kids)
+    if now.runtime == Automatic then automatic(fragment-tag(n), [], children, n)
+    else classic(fragment-tag(n), [], children, n)
+  }
+  JsxElement(tag, List(attrs...), rest) => {
+    let props = [prop-of(a) for a in attrs]
+    let children = match rest {
+      JsxClose(List(kids...), _) => child-values(kids)
+      _ => []
+    }
+    if now.runtime == Automatic then automatic(tag-value(tag), props, children, n)
+    else classic(tag-value(tag), props, children, n)
+  }
+  _ => panic "unexpected JSX node"
+}
+
+fn lowered(n: Node) -> Node = match n {
+  JsxFragment(...) | JsxElement(...) => lowered-element(n)
+  _ => if len(n.kids) == 0 then n else n with { kids: [lowered(k) for k in n.kids] }
+}
+
+# A tree with no JSX left in it, and which of its calls may go if unused.
+fn lower(tree: Node, source: Text, file: Text, o: Options) -> Lowered {
+  src = source
+  path = file
+  now = with-pragmas(o)
+  pure-calls = {}
+  imported = {}
+  import-order = []
+  if now.runtime == Preserve { return Lowered(tree: tree, pure-calls: {}, imports: false) }
+  let body = [lowered(s) for s in tree.kids[1].kids]
+  let stmts = import-statements() ++ body
+  let whole = Program(tree.kids[0], List(stmts...))
+  Lowered(tree: whole, pure-calls: pure-calls, imports: len(import-order) > 0)
+}

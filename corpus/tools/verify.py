@@ -113,6 +113,33 @@ check(top.startswith("/* top */\n") and top.endswith("/* end */\n"), "banner and
 kept = open(f"{SCRATCH}/opt-tree_shaking_off.js").read()
 check("UNUSED_MARKER" in kept and "OTHER_MARKER" in kept, "tree shaking off: unused statements stay")
 
+print("== JSX against esbuild")
+JSX = "app/jsx"
+NODE = ["--platform=node"]
+for entry, flags in [("main.jsx", []), ("main.jsx", ["--minify"]), ("main.jsx", ["--minify-syntax"]),
+                     ("main.jsx", ["--jsx-side-effects"]), ("pragma.jsx", []), ("preact.jsx", []), ("preact.jsx", ["--minify"]),
+                     ("plain.js", ["--loader:.js=jsx", "--jsx-factory=h"]),
+                     ("auto.jsx", ["--jsx=automatic"] + NODE), ("auto.jsx", ["--jsx=automatic", "--minify"] + NODE),
+                     ("pragma2.jsx", NODE), ("dev.jsx", ["--jsx=automatic", "--jsx-dev"] + NODE)]:
+    a, b = f"{SCRATCH}/jsx.o.cjs", f"{SCRATCH}/jsx.e.cjs"
+    code, text = sh([ESB, f"{JSX}/{entry}", f"--outfile={a}"] + flags)
+    sh([E, f"{JSX}/{entry}", "--bundle", "--log-level=error", f"--outfile={b}"] + flags)
+    ra, rb = sh(["node", a], 30), sh(["node", b], 30)
+    label = " ".join([entry] + flags)
+    check(code == 0 and ra[0] == 0 and ra[1] and ra[1] == rb[1], f"{label}: same output as esbuild's ({len(ra[1])} bytes)")
+# Kept JSX has to be JSX that still means the same: run both through esbuild's own lowering.
+SHIM = '--banner:js=const React={createElement:(t,p,...c)=>({type:typeof t=="function"?"fn":t,props:p,children:c}),Fragment:"<fragment>"};'
+for flags in [[], ["--minify"]]:
+    a, b = f"{SCRATCH}/jsx.po.jsx", f"{SCRATCH}/jsx.pe.jsx"
+    sh([ESB, f"{JSX}/main.jsx", "--jsx=preserve", f"--outfile={a}"] + flags)
+    sh([E, f"{JSX}/main.jsx", "--bundle", "--jsx=preserve", "--log-level=error", f"--outfile={b}"] + flags)
+    sh([E, a, "--bundle", "--log-level=error", SHIM, f"--outfile={a}.cjs"])
+    sh([E, b, "--bundle", "--log-level=error", SHIM, f"--outfile={b}.cjs"])
+    ra, rb = sh(["node", a + ".cjs"], 30), sh(["node", b + ".cjs"], 30)
+    check(ra[0] == 0 and ra[1] and ra[1] == rb[1], f"--jsx=preserve {' '.join(flags)}: means what esbuild's means")
+code, text = sh([ESB, f"{JSX}/mismatch.jsx", f"--outfile={SCRATCH}/jsx.bad.js"])
+check(code != 0 and "does not match" in text, "a closing tag that does not match is an error")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)
@@ -120,11 +147,13 @@ check(code == 0, "the spec builds all its targets")
 got = sh(["node", "-e", "require('./out/spec/plugged.js');console.log(globalThis.bundled.summary)"], 15)[1].strip()
 check(got == '1.2.3 greetings, "friend"', f"plugins, a spec-defined format, a loader: {got}")
 check(open("out/spec/plugged.js").read().startswith("/* built by the spec */\n"), "a spec's banner")
+got = sh(["node", "out/spec/ui.cjs"], 15)[1].strip()
+check(got == '["a",{"x":"1"},["b"]]', f"a spec's JSX settings: {got}")
 
 print("== source maps")
-for a in ["named", "cjs", "features"]:
-    out = f"{SCRATCH}/{a}.sm.js"
-    sh([ESB, f"app/{a}.js", "--sourcemap", f"--outfile={out}"])
+for a in ["named.js", "cjs.js", "features.js", "jsx/main.jsx"]:
+    out = f"{SCRATCH}/{a.replace('/', '_')}.sm.js"
+    sh([ESB, f"app/{a}", "--sourcemap", f"--outfile={out}"])
     code, text = sh(["node", "tools/checkmap.mjs", out])
     m = re.search(r"(\d+) sources, (\d+) mappings, (\d+) check out", text)
     check(m and m.group(2) == m.group(3), f"{a}: {m.group(0) if m else text[:80]}")
