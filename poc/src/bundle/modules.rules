@@ -260,6 +260,14 @@ fn require-calls!(n: Node, out: mut [Text]) -> Void {
   for k in n.kids { require-calls!(k, out) }
 }
 
+# What a final tree loads at run time: its `require`s, then its `import()`s, in source order.
+fn calls-in(tree: Node) -> [Text] {
+  var reqs: [Text] = []
+  for s in tree.kids[1].kids { require-calls!(s, reqs) }
+  for s in tree.kids[1].kids { import-calls!(s, reqs) }
+  reqs
+}
+
 fn import-calls!(n: Node, out: mut [Text]) -> Void {
   match n {
     ImportCall(Str(raw), ...) => { out += unquote(raw) }
@@ -486,8 +494,13 @@ record Parsed {
   targets: {Text:Text}, # where each specifier led, when it was resolved ahead
   analysed: Bool,       # whether `scopes` and `analysis` hold its scope analysis already
   scopes: sym.Table,
-  analysis: Analysis
+  analysis: Analysis,
+  calls: [Text],        # with the analysis: what its final tree `require`s, then `import()`s
+  role: Role,           # in the walk: a whole file, a big file's pieces to come, a piece, or the
+  pieces: Int           # resolution of one of its imports
 }
+
+enum Role { Whole, Split, Piece, Resolved }
 
 # A file's scope analysis: its tree once defines are applied, its root scope, which symbol each name
 # leaf is, the names it leaves free, and whether it is CommonJS.
@@ -582,7 +595,11 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
 fn parsed-file(item: Pending) -> Parsed {
   let path = item.path
   let src = if item.ready then item.text else module-text(read-file(path), path)
-  let parsed = parse-file(src, path)
+  parsed-from(path, src, parse-file(src, path))
+}
+
+# Everything after parsing, for a file parsed whole or put together from its pieces.
+fn parsed-from(path: Text, src: Text, parsed: Node) -> Parsed {
   let loader = loader-of(path)
   let config = tsc.for-file(path)
   let file-jsx = configured-jsx(jsx-options, config)
@@ -604,7 +621,7 @@ fn parsed-file(item: Pending) -> Parsed {
   Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
          legal: legal.of-file(src, parsed), specs: specs, targets: {},
-         analysed: false, scopes: sym.table-new(), analysis: no-analysis())
+         analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], role: Whole, pieces: 1)
 }
 
 # The same, with scopes analysed too, in a table of the file's own. Not while a spec's transform
@@ -614,20 +631,268 @@ fn analysed-file(p: Parsed) -> Parsed {
   var own = sym.table-new()
   let top = sym.new-scope!(own, -1, true)
   let a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers, own, top)
-  p with { analysed: true, scopes: own, analysis: a }
+  p with { analysed: true, scopes: own, analysis: a, calls: calls-in(a.tree) }
 }
 
 # A file found by walking: parsed, and its imports resolved, all on one worker.
-fn visit-file(path: Text) -> Parsed {
-  let p = analysed-file(parsed-file(Pending(path: path, text: "", ready: false)))
+# What the walk does with one item: a file, one piece of a big file, or a big file put together.
+fn visit-file(item: Text) -> Parsed {
+  if has-byte?(item, '\n') {
+    let path = item-file(item)
+    let what = item-part(item)
+    if what == "all" { return joined-file(path) }
+    if what[0] == '?' {
+      let spec = what[1..len(what)]
+      var found: {Text:Text} = {}
+      if let some(t) = unhooked-target(spec, path) { found[spec] = t }
+      return blank-parsed(path) with { role: Resolved, targets: found }
+    }
+    let pc = piece-of(item)
+    return blank-parsed(item) with { role: Piece, targets: pc.targets }
+  }
+  let sp = split-source(item)
+  if len(sp.starts) > 1 { return blank-parsed(item) with { role: Split, pieces: len(sp.starts) } }
+  let p = analysed-file(parsed-file(Pending(path: item, text: sp.src, ready: true)))
+  # Many imports are resolved as items of their own, at once.
+  if len(p.specs) > resolve-alone { return p }
+  targets-of(p)
+}
+
+const resolve-alone: Int = 16
+
+fn targets-of(p: Parsed) -> Parsed {
   var targets: {Text:Text} = {}
   for spec in p.specs {
-    if let some(t) = unhooked-target(spec, path) { targets[spec] = t }
+    if let some(t) = unhooked-target(spec, p.path) { targets[spec] = t }
   }
   p with { targets: targets }
 }
 
-fn next-files(p: Parsed) -> [Text] = [t for t in values-of(p.targets) if ahead?(t)]
+# The files what a result imports lead to, visited after what waits already.
+fn next-files(p: Parsed) -> [Text] = match p.role {
+  Split => []
+  _ => [t for t in values-of(p.targets) if ahead?(t)]
+}
+
+# What carries on with an item's own work, ahead of everything waiting: a big file's pieces, each
+# taken by whoever comes first, and then the whole, which waits for any still being parsed; or
+# the resolution of each of a file's many imports.
+fn first-files(p: Parsed) -> [Text] = match p.role {
+  Split => [p.path ++ "\n" ++ int-text(k) for k in 0..p.pieces] ++ [p.path ++ "\nall"]
+  Whole => if len(p.specs) > resolve-alone and len(keys(p.targets)) == 0
+           then [p.path ++ "\n?" ++ s for s in p.specs] else []
+  _ => []
+}
+
+fn blank-parsed(path: Text) -> Parsed =
+  Parsed(path: path, src: "", parsed: None(), tree: None(), pure-calls: {}, helpers: [], jsx-imports: false,
+         pure-at: {}, legal: [], specs: [], targets: {}, analysed: false, scopes: sym.table-new(),
+         analysis: no-analysis(), calls: [], role: Whole, pieces: 1)
+
+fn item-file(item: Text) -> Text {
+  var at = 0
+  while item[at] != '\n' { at += 1 }
+  item[0..at]
+}
+
+fn item-part(item: Text) -> Text {
+  var at = 0
+  while item[at] != '\n' { at += 1 }
+  item[at + 1..len(item)]
+}
+
+# ---------------------------------------------------------------- big files, in pieces
+
+# A big file of plain JavaScript is parsed in pieces, on several threads. A piece starts on a line
+# that begins a declaration in its first column, outside every bracket, string, template, comment
+# and regular expression, as a scan of the bytes sees them. The scan can be wrong only one way that
+# matters: a piece before a wrong start is no program by itself, and then the file is parsed whole.
+const piece-bytes: Int = 12288
+
+record Parts { src: Text, starts: [Int] }
+
+# A file's text, and where its pieces start: at 0 alone unless it is big plain JavaScript.
+memo fn split-source(path: Text) -> Parts {
+  let src = module-text(read-file(path), path)
+  if has-transform or loader-of(path) != "js" or len(src) < 3 * piece-bytes { return Parts(src: src, starts: [0]) }
+  Parts(src: src, starts: [0] ++ piece-starts(src))
+}
+
+record PieceTree { tree: Node?, specs: [Text], targets: {Text:Text} }
+
+# One piece: its statements, parsed as a program of their own, and where what they import leads.
+memo fn piece-of(item: Text) -> PieceTree {
+  let path = item-file(item)
+  let k = parse-int(item-part(item))
+  let sp = split-source(path)
+  let from = sp.starts[k]
+  let to = if k + 1 < len(sp.starts) then sp.starts[k + 1] else len(sp.src)
+  match js.parse-piece(sp.src[0..to], path, 0, from) {
+    none => PieceTree(tree: none, specs: [], targets: {})
+    some(tree) => {
+      var specs: [Text] = []
+      for s in tree.kids[1].kids {
+        if let some(spec) = import-spec-of(s) { specs += spec }
+      }
+      require-calls!(tree, specs)
+      import-calls!(tree, specs)
+      var targets: {Text:Text} = {}
+      for spec in specs {
+        if let some(t) = unhooked-target(spec, path) { targets[spec] = t }
+      }
+      PieceTree(tree: some(tree), specs: specs, targets: targets)
+    }
+  }
+}
+
+# The pieces as one program, as if parsed whole; or the file parsed whole, when one of them is no
+# program by itself.
+fn joined-file(path: Text) -> Parsed {
+  let sp = split-source(path)
+  var trees: [Node] = []
+  var whole = true
+  for k in 0..len(sp.starts) {
+    match piece-of(path ++ "\n" ++ int-text(k)).tree {
+      some(t) => { trees += t }
+      none => { whole = false }
+    }
+  }
+  if not whole { return targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true)))) }
+  var stmts: [Node] = []
+  for t in trees { stmts ++= t.kids[1].kids }
+  let first = trees[0]
+  let final = trees[len(trees) - 1]
+  let body = first.kids[1] with { kids: stmts, hi: final.kids[1].hi }
+  let tree = first with { kids: [first.kids[0], body], hi: final.hi }
+  let a = analysed-file(parsed-from(path, sp.src, checked-early(tree, sp.src, path)))
+  var targets: {Text:Text} = {}
+  for k in 0..len(sp.starts) {
+    let pt = piece-of(path ++ "\n" ++ int-text(k)).targets
+    for spec in keys(pt) { targets[spec] = pt[spec] ?? spec }
+  }
+  a with { targets: targets }
+}
+
+# Early errors, which `parse-file` checks of a file parsed whole.
+fn checked-early(tree: Node, src: Text, path: Text) -> Node {
+  let is-module = early.program-has-module-syntax?(tree)
+  match early.check(tree, is-module, not is-module, false) {
+    none => tree
+    some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
+  }
+}
+
+fn declaration-at?(src: Text, i: Int) -> Bool =
+  starts-at?(src, i, "function ") or starts-at?(src, i, "function*") or starts-at?(src, i, "async function")
+  or starts-at?(src, i, "class ") or starts-at?(src, i, "export ") or starts-at?(src, i, "var ")
+  or starts-at?(src, i, "let ") or starts-at?(src, i, "const ")
+
+fn starts-at?(src: Text, i: Int, word: Text) -> Bool =
+  i + len(word) <= len(src) and src[i..i + len(word)] == word
+
+fn word-byte?(c: Int) -> Bool =
+  (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$' or c >= 128
+
+const regex-after-words: [Text] = ["return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+                                  "throw", "case", "do", "else", "yield", "await"]
+
+# Whether a `/` at `i` begins a regular expression: what comes before it says.
+fn regex-at?(src: Text, i: Int) -> Bool {
+  var j = i - 1
+  while j >= 0 and (src[j] == ' ' or src[j] == '\t' or src[j] == '\n' or src[j] == '\r') { j = j - 1 }
+  if j < 0 { return true }
+  let c = src[j]
+  if c == ')' or c == ']' or c == '}' or c == '"' or c == '\'' or c == '`' { return false }
+  if not word-byte?(c) { return true }
+  var start = j
+  while start > 0 and word-byte?(src[start - 1]) { start = start - 1 }
+  src[start..j + 1] in regex-after-words
+}
+
+# Where a string from the quote at `i` ends: just past its closing quote, or at the line's end.
+fn string-end(src: Text, i: Int, quote: Int) -> Int {
+  var j = i + 1
+  while j < len(src) and src[j] != quote and src[j] != '\n' {
+    j = j + (if src[j] == '\\' then 2 else 1)
+  }
+  j + 1
+}
+
+fn regex-end(src: Text, i: Int) -> Int {
+  var j = i + 1
+  var in-class = false
+  while j < len(src) and src[j] != '\n' and (in-class or src[j] != '/') {
+    if src[j] == '\\' { j += 1 } else if src[j] == '[' { in-class = true } else if src[j] == ']' { in-class = false }
+    j += 1
+  }
+  j + 1
+}
+
+# Template text from `i`: where it ends, past the closing backquote; or, negated, just past a `${`.
+fn template-text-end(src: Text, i: Int) -> Int {
+  var j = i
+  while j < len(src) {
+    if src[j] == '\\' { j += 2 }
+    else if src[j] == '`' { return j + 1 }
+    else if src[j] == '$' and j + 1 < len(src) and src[j + 1] == '{' { return 0 - (j + 2) }
+    else { j += 1 }
+  }
+  j
+}
+
+fn piece-starts(src: Text) -> [Int] {
+  var out: [Int] = []
+  var depth = 0
+  var holes: [Int] = []  # the depth at each open `${`
+  var cut-at = 0
+  var i = 0
+  let n = len(src)
+  while i < n {
+    let c = src[i]
+    if c == '\n' {
+      i += 1
+      if depth == 0 and i - cut-at >= piece-bytes and n - i >= piece-bytes and declaration-at?(src, i) {
+        out += i
+        cut-at = i
+      }
+    } else if c == '/' and i + 1 < n and src[i + 1] == '/' {
+      while i < n and src[i] != '\n' { i += 1 }
+    } else if c == '/' and i + 1 < n and src[i + 1] == '*' {
+      i += 2
+      while i + 1 < n and not (src[i] == '*' and src[i + 1] == '/') { i += 1 }
+      i += 2
+    } else if c == '"' or c == '\'' {
+      i = string-end(src, i, c)
+    } else if c == '/' and regex-at?(src, i) {
+      i = regex-end(src, i)
+    } else if c == '`' {
+      let e = template-text-end(src, i + 1)
+      if e < 0 {
+        holes += depth
+        depth += 1
+        i = 0 - e
+      } else {
+        i = e
+      }
+    } else if c == '}' and len(holes) > 0 and last(holes) == depth - 1 {
+      depth = depth - 1
+      pop(holes)
+      let e = template-text-end(src, i + 1)
+      if e < 0 {
+        holes += depth
+        depth += 1
+        i = 0 - e
+      } else {
+        i = e
+      }
+    } else {
+      if c == '(' or c == '[' or c == '{' { depth += 1 }
+      if c == ')' or c == ']' or c == '}' { depth = depth - 1 }
+      i += 1
+    }
+  }
+  out
+}
 
 fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
 
@@ -665,7 +930,22 @@ fn parse-ahead!(paths: [Text]) -> Void {
   # Without hooks, a worker can resolve what it parsed: a walk that never waits for a wave.
   if len(on-load) == 0 and len(on-resolve) == 0 {
     let roots = [p for p in paths if ahead?(p)]
-    for d in parallel-walk(roots, visit-file, next-files, load-threads) { parsed-ahead[d.path] = d }
+    var resolved: [Parsed] = []
+    for d in parallel-walk(roots, visit-file, next-files, first-files, load-threads) {
+      match d.role {
+        Whole => { parsed-ahead[d.path] = d }
+        Resolved => { resolved += d }
+        _ => {}
+      }
+    }
+    # Imports resolved as items of their own join their file's.
+    for r in resolved {
+      if let some(p) = parsed-ahead[r.path] {
+        var targets = p.targets
+        for s in keys(r.targets) { targets[s] = r.targets[s] ?? s }
+        parsed-ahead[r.path] = p with { targets: targets }
+      }
+    }
     return
   }
   var seen: {Text:Bool} = {}
@@ -719,9 +999,7 @@ fn load-file(path: Text, effects: Bool) -> Int {
   for s in tree0.kids[1].kids {
     if let some(spec) = import-spec-of(s) { ids[spec] = dep-add(id, spec, path) }
   }
-  var reqs: [Text] = []
-  for s in final-tree.kids[1].kids { require-calls!(s, reqs) }
-  for s in final-tree.kids[1].kids { import-calls!(s, reqs) }
+  let reqs = if ahead.analysed then ahead.calls else calls-in(final-tree)
   for spec in reqs { ids[spec] = dep-add(id, spec, path) }
   modules[id].dep-ids = ids
   order += id

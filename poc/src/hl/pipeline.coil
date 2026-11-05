@@ -87,12 +87,26 @@
    (consts (ArrayList (slice u8)))
    (alias-names (ArrayList (slice u8)))
    (alias-modules (ArrayList (slice u8)))
-   (funs (ArrayList Fun))])
+   (funs (ArrayList Fun))
+   ;; States whose type is a module's record, and the alias of that module: a database's queries
+   ;; read it.
+   (typed-names (ArrayList (slice u8)))
+   (typed-aliases (ArrayList (slice u8)))
+   (facts bool)])
 
 (defn info-new [(name (slice u8)) (kind Kind)] (-> Info)
   (Info :name name :kind kind :shared (texts) :task (texts) :consts (texts)
         :alias-names (texts) :alias-modules (texts)
-        :funs (ArrayList::new [Fun] (malloc-allocator))))
+        :funs (ArrayList::new [Fun] (malloc-allocator))
+        :typed-names (texts) :typed-aliases (texts) :facts false))
+
+;;; A state declared with a type `alias.Record`: remember which module it comes from.
+(defn note-typed! [(info (mut Info)) (d gr/Node)] (-> void)
+  (let [ty (kid d 1)]
+    (when (= (.kind ty) (gr/KTQual))
+      (push! (mut (.typed-names info)) (.text (kid d 0)))
+      (push! (mut (.typed-aliases info)) (.text (kid ty 0))))
+    0))
 
 (defn kid [(n gr/Node) (i i64)] (-> gr/Node) (get (.kids n) i))
 
@@ -151,8 +165,8 @@
         (gr/KUse []
           (push! (mut (.alias-names info)) (.text (kid d 1)))
           (push! (mut (.alias-modules info)) (.text (kid d 0))))
-        (gr/KState [] (push! (mut (.shared info)) (.text (kid d 0))))
-        (gr/KTaskState [] (push! (mut (.task info)) (.text (kid d 0))))
+        (gr/KState [] (do (push! (mut (.shared info)) (.text (kid d 0))) (note-typed! (mut info) d)))
+        (gr/KTaskState [] (do (push! (mut (.task info)) (.text (kid d 0))) (note-typed! (mut info) d)))
         (gr/KContext [] (push! (mut (.task info)) (.text (kid d 0))))
         (gr/KConst [] (push! (mut (.consts info)) (.text (kid d 0))))
         ;; A memo's caching is invisible: what it does is what its body does.
@@ -211,7 +225,9 @@
                        (add-unique! (mut (.depends c)) path)
                        (cond
                          (rt/ends-with path ".rules") (rules-info name (rt/read-all path) path)
-                         (or (rt/ends-with path ".facts") (rt/ends-with path ".scopes")) (info-new name (KindMutating))
+                         (rt/ends-with path ".facts")
+                           (let [(mut i) (info-new name (KindMutating))] (set! (.facts i) true) i)
+                         (rt/ends-with path ".scopes") (info-new name (KindMutating))
                          :else (info-new name (KindPure)))))]
           (push! (mut (.infos c)) info)
           info))))
@@ -318,6 +334,8 @@
                     (Some [t] (foreign-mut-writes! (mut c) info f locals (mut out) t args where))
                     (None [] 0)))))))
       (gr/KFieldE []
+        (if (database-query? (mut c) info f locals (kid callee 0))
+            0
         (let [base (kid callee 0)
               fname (.text (kid callee 1))
               module (if (and (= (.kind base) (gr/KName)) (not (has? locals (.text base)))
@@ -337,10 +355,34 @@
                     (match (foreign-fun (mut c) m fname)
                       (Some [t] (foreign-mut-writes! (mut c) info f locals (mut out) t args where))
                       (None [] 0))))))
-            (None [] (add-unique! (mut (.hooks out)) (dsl/join3 where " calls a function value " fname))))))
+            (None [] (add-unique! (mut (.hooks out)) (dsl/join3 where " calls a function value " fname)))))))
       ;; `module.Record(…)` builds a value.
       (gr/KMember [] 0)
       (_ (add-unique! (mut (.hooks out)) (dsl/join3 where " calls a function value: " (gr/kind-name (.kind callee))))))))
+
+;;; `db.relation(…)` or `m.db.relation(…)`, where `db` is a state whose type a `.facts` module
+;;; defines: a query, which reads. (`assert` is the write, and `link.solve!(db)` another.)
+(defn database-query? [(c (mut Checker)) (info Info) (f Fun) (locals (ArrayList (slice u8))) (base gr/Node)] (-> bool)
+  (let [own (and (= (.kind base) (gr/KName)) (not (has? locals (.text base))) (< (param-index f (.text base)) 0))
+        other (and (= (.kind base) (gr/KFieldE)) (= (.kind (kid base 0)) (gr/KName))
+                   (not (has? locals (.text (kid base 0)))) (< (param-index f (.text (kid base 0))) 0))]
+    (cond
+      own (facts-typed? (mut c) info (.text base))
+      other (match (alias-of info (.text (kid base 0)))
+              (Some [m]
+                (let [holder (info-of (mut c) m)]
+                  (facts-typed? (mut c) holder (.text (kid base 1)))))
+              (None [] false))
+      :else false)))
+
+(defn facts-typed? [(c (mut Checker)) (info Info) (state (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for i (range 0 (len (.typed-names info)))
+      (when (= (get (.typed-names info) i) state)
+        (match (alias-of info (get (.typed-aliases info) i))
+          (Some [m] (when (.facts (info-of (mut c) m)) (set! hit true)))
+          (None [] 0))))
+    hit))
 
 (defn walk! [(c (mut Checker)) (info Info) (f Fun) (locals (ArrayList (slice u8))) (out (mut Effect)) (n gr/Node)] (-> void)
   (let [where (dsl/join3 (.name info) "/" (.name f))]

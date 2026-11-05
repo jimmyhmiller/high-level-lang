@@ -14,12 +14,18 @@ state void-undefined: Bool = false
 state esm-output: Bool = false
 state sourcemap: Bool = false
 state external-imports: [Text] = []
-# Code splitting: the statements of the chunk being printed, and how to write another chunk's path.
+# What the module being emitted needs hoisted, gathered on its own thread.
+task state found-externals: [Text] = []
+# How many threads emit modules.
+state emit-threads: Int = 1
+# Code splitting: the statements of the chunk being printed, and what to write for the path of the
+# chunk each root module starts.
 state in-chunk: Bool = false
 state chunk-parts: {Int:Bool} = {}
-state chunk-path: Fn(Int)->Text = no-chunks
+state chunk-paths: {Int:Text} = {}
 
-fn no-chunks(root: Int) -> Text = panic "no chunks in this build"
+fn chunk-path(root: Int) -> Text =
+  chunk-paths[root] ?? panic "{} starts no chunk in this build", m.modules[root].path
 
 # Name-collision state: every name taken at the bundle's top level or reserved, plus a stack of
 # names taken in the nested scopes around the current one.
@@ -193,9 +199,13 @@ fn namespace-property(target: Int, name: Text) -> Node = Member(Ident(final-of(m
 # `ns.name` when `ns` is `import * as` of an ES module: the export itself.
 fn namespace-read(n: Node) -> Node? = match an.namespace-of(here, n.kids[0]) {
   none => none
-  some(target) => match resolved-export(target, intern!(m.names, n.kids[1].text)) {
-    some(s) => some(symbol-read(s))
-    none => some(if m.db.dynamic(target) then namespace-property(target, n.kids[1].text) else void-zero())
+  # A name never interned is in no fact, so nothing exports it.
+  some(target) => {
+    let id = known-name(m.names, n.kids[1].text)
+    match if id < 0 then none else resolved-export(target, id) {
+      some(s) => some(symbol-read(s))
+      none => some(if m.db.dynamic(target) then namespace-property(target, n.kids[1].text) else void-zero())
+    }
   }
 }
 
@@ -295,7 +305,7 @@ fn rw(n: Node, depth: Int) -> Node = match n {
       Member(o, property) with { lo: o.lo, hi: property.hi }
     }
   }
-  ImportCall(...) => match an.import-call-target(here, n) {
+  ImportCall(...) => match an.known-import-call-target(here, n) {
     some(t) => if m.modules[t].kind == External then n
                else if an.splitting then import-chunk(m.modules[t])
                else import-call(m.modules[t])
@@ -314,8 +324,8 @@ fn rw(n: Node, depth: Int) -> Node = match n {
 fn rw-call(n: Node, depth: Int) -> Node {
   let callee = n.kids[0]
   let args = n.kids[1]
-  if is-some(an.require-target(here, n)) {
-    let t = m.modules[an.dep-of-str(here, args.kids[0].kids[0])]
+  if let some(target) = an.known-require-target(here, n) {
+    let t = m.modules[target]
     return match t.kind {
       Cjs => require-of(t)
       External => rw-kids(n, depth)
@@ -344,7 +354,7 @@ fn external-object(t: m.Module) -> Node {
   if esm-output {
     let name = "__external_" ++ t.base
     let line = "import * as " ++ name ++ " from \"" ++ t.path ++ "\";"
-    if not (line in external-imports) { external-imports += line }
+    if not (line in found-externals) { found-externals += line }
     Ident(name)
   } else {
     let path = Str(quote-text(t.path))
@@ -355,7 +365,7 @@ fn external-object(t: m.Module) -> Node {
 # `var import_x = __toESM(require_x(), 1);` Files in node mode (.mjs, or a package with
 # "type": "module") get the second argument, so `default` is module.exports.
 fn import-cjs-stmt(t: m.Module) -> Node {
-  let v = final-of(an.import-var-of(here, t.id))
+  let v = final-of(an.known-import-var(here, t.id))
   let value = to-esm-call(t)
   stmt`var $v = $value;`
 }
@@ -379,7 +389,7 @@ fn import-or-init(t: m.Module) -> Node? = if an.opaque?(t) then some(import-cjs-
 # The body statements of a part, ready to print. None for a part with no code.
 fn part-output(s: Node) -> Node? = match s {
   ImportBare(from) => {
-    let t = m.modules[an.dep-of-str(here, from)]
+    let t = m.modules[an.known-dep(here, from)]
     match t.kind {
       Cjs => {
         let call-me = final-of(t.require-sym)
@@ -393,12 +403,12 @@ fn part-output(s: Node) -> Node? = match s {
     }
   }
   ExportAll(from) => {
-    let t = m.modules[an.dep-of-str(here, from)]
+    let t = m.modules[an.known-dep(here, from)]
     if an.opaque?(t) then some(reexport-all(t)) else init-call(t)
   }
-  ExportAllAs(_, from) | ExportFrom(_, from) => import-or-init(m.modules[an.dep-of-str(here, from)])
+  ExportAllAs(_, from) | ExportFrom(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
   ExportNamed(...) => none
-  Import(_, from) => import-or-init(m.modules[an.dep-of-str(here, from)])
+  Import(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
   ExportVar(list) => some(rw(VarDecl(list) with { lo: s.lo, hi: s.hi }, 0))
   ExportLexical(d) | ExportFunction(d) | ExportClass(d) => some(rw(d, 0))
   _ => some(rw(s, 0))
@@ -570,33 +580,50 @@ fn in-this-chunk?(p: Int) -> Bool = not in-chunk or p in chunk-parts
 
 fn any-part-here?(id: Int) -> Bool = any p in parts-of(id): in-this-chunk?(p)
 
-fn program() -> Node {
+# One module's statements, its namespace object's, and the imports it needs hoisted. Each module
+# is emitted on its own: they read what linking and naming decided, and change nothing shared.
+record Emitted { body: [Node], namespace: [Node], externals: [Text] }
+
+fn module-emitted(id: Int) -> Emitted {
+  found-externals = []
   var out: [Node] = []
-  var namespaces: [Node] = []
-  var runtime-count = 0
-  for id in m.order {
-    if included?(id) and any-part-here?(id) {
-      with here = m.modules[id] {
-        if here.kind == Cjs {
-          out += cjs-part()
-        } else {
-          var outputs: [Node] = []
-          for p in parts-of(id) {
-            if live?(p) and in-this-chunk?(p) {
-              match an.part-stmt[p] {
-                None() => namespace-stmts!(namespaces)
-                Flag() => {}
-                s => if let some(o) = part-output(s) {
-                  if here.wrapped { outputs += stamped(o) } else { out += stamped(o) }
-                }
+  var namespace: [Node] = []
+  if included?(id) and any-part-here?(id) {
+    with here = m.modules[id] {
+      if here.kind == Cjs {
+        out += cjs-part()
+      } else {
+        var outputs: [Node] = []
+        for p in parts-of(id) {
+          if live?(p) and in-this-chunk?(p) {
+            match an.part-stmt[p] {
+              None() => namespace-stmts!(namespace)
+              Flag() => {}
+              s => if let some(o) = part-output(s) {
+                if here.wrapped { outputs += stamped(o) } else { out += stamped(o) }
               }
             }
           }
-          if here.wrapped { wrapped-module!(outputs, out) }
         }
+        if here.wrapped { wrapped-module!(outputs, out) }
       }
     }
-    if id == 0 { runtime-count = len(out) }
+  }
+  Emitted(body: out, namespace: namespace, externals: found-externals)
+}
+
+fn program() -> Node {
+  let emitted = parallel-map(m.order, module-emitted, emit-threads)
+  var out: [Node] = []
+  var namespaces: [Node] = []
+  var runtime-count = 0
+  for i in 0..len(m.order) {
+    out ++= emitted[i].body
+    namespaces ++= emitted[i].namespace
+    for line in emitted[i].externals {
+      if not (line in external-imports) { external-imports += line }
+    }
+    if m.order[i] == 0 { runtime-count = len(out) }
   }
   let all-stmts = out[0..runtime-count] ++ namespaces ++ out[runtime-count..len(out)]
   Program(None(), List(all-stmts...))

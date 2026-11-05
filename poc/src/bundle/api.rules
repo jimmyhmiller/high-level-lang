@@ -51,11 +51,12 @@ record Plan {
   optimize-threads: Int,
   print-parts: Int,
   print-threads: Int,
-  facts-threads: Int
+  facts-threads: Int,
+  emit-threads: Int
 }
 
 fn serial-plan() -> Plan =
-  Plan(name: "serial", load-threads: 1, optimize-parts: 1, optimize-threads: 1, print-parts: 1, print-threads: 1, facts-threads: 1)
+  Plan(name: "serial", load-threads: 1, optimize-parts: 1, optimize-threads: 1, print-parts: 1, print-threads: 1, facts-threads: 1, emit-threads: 1)
 
 record Options {
   entry: Text,
@@ -193,7 +194,17 @@ fn names-in-use() -> [Text] {
 fn for-target(o: Options, p: Node) -> Node {
   let dropped = if o.drop-console or o.drop-debugger then without-dropped(o, p) else p
   let lowered = if o.target >= lower.no-lowering then dropped else lower.run(dropped, o.target, names-in-use(), o.minify-identifiers)
-  if o.charset-ascii then ascii.run(lowered, o.target) else lowered
+  if o.charset-ascii {
+    ascii.prepare!(o.target)
+    return in-parts(o, lowered, ascii.converted)
+  }
+  lowered
+}
+
+# `f` on each part of the program at once.
+fn in-parts(o: Options, p: Node, f: Fn(Node)->Node) -> Node {
+  if o.plan.optimize-parts <= 1 { return f(p) }
+  joined(p, parallel-map(parts-of(p, o.plan.optimize-parts), f, o.plan.optimize-threads))
 }
 
 # `--drop:console` and `--drop:debugger`. Names are final here, and every free name was kept free, so
@@ -419,6 +430,7 @@ fn has-define?(o: Options, key: Text) -> Bool = any d in o.defines: d.key == key
 
 fn reset-all() -> Void {
   m.reset-state!()
+  m.forget-memos!()
   an.reset-state!()
   e.reset-state!()
   chunks.reset-state!()
@@ -512,6 +524,8 @@ fn build-one(options: Options) -> Void {
   m.out-dir = dir-of(o.outfile)
   m.load-threads = o.plan.load-threads
   an.facts-threads = o.plan.facts-threads
+  e.emit-threads = o.plan.emit-threads
+  mangle.count-threads = o.plan.emit-threads
   m.has-transform = o.has-transform
   if o.pretty and o.jsx.runtime == jsx.Preserve {
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
@@ -680,6 +694,8 @@ fn build-split(options: Options) -> Void {
   m.out-dir = o.outdir
   m.load-threads = o.plan.load-threads
   an.facts-threads = o.plan.facts-threads
+  e.emit-threads = o.plan.emit-threads
+  mangle.count-threads = o.plan.emit-threads
   m.load-runtime(include-text("runtime.js"))
   m.load-trees(o.entries)
   if len(m.css-imports()) > 0 { panic "stylesheets with --splitting are not implemented yet" }
@@ -692,7 +708,8 @@ fn build-split(options: Options) -> Void {
   for c in chunks.chunks {
     if c.root >= 0 { chunk-of-root[c.root] = c.id }
   }
-  e.chunk-path = path-of-root
+  e.chunk-paths = {}
+  for root in roots { e.chunk-paths[root] = path-of-root(root) }
   let printed-chunks = [chunk-program(o, c) for c in chunks.chunks]
   let texts = [p.text for p in printed-chunks]
   let holes = [chunks.holes-in(t) for t in texts]

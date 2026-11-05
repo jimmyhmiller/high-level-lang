@@ -14,20 +14,50 @@ state freq: [Int] = []         # per byte value
 state tags: {Int:Bool} = {}    # symbols a kept JSX tag names
 state capital: {Int:Bool} = {} # slots holding one of those
 
-fn bump(s: Int) -> Void {
-  uses[s] = (uses[s] ?? 0) + 1
-}
+# What one module's live code uses: how often each symbol, which name kept JSX tags, how often
+# each byte, and the top-level symbols its parts declare, in order. Modules are counted at once;
+# the sums do not depend on the order they are added in.
+record Usage { uses: {Int:Int}, tags: [Int], freq: [Int], toplevel: [Int] }
+
+task state module-uses: {Int:Int} = {}
+task state module-tags: [Int] = []
 
 # Count uses in live code only, attributing an import to what it resolves to.
 fn count-uses(mo: m.Module, n: Node) -> Void {
   if n is Ident(_) | BindName(_) {
-    if let some(s) = mo.bindings[n.lo] { bump(e.target-of(s)) }
+    if let some(s) = mo.bindings[n.lo] {
+      let t = e.target-of(s)
+      module-uses[t] = (module-uses[t] ?? 0) + 1
+    }
   }
   if n is JsxElement(Ident(_), ...) {
-    if let some(s) = mo.bindings[n.kids[0].lo] { tags[e.target-of(s)] = true }
+    if let some(s) = mo.bindings[n.kids[0].lo] { module-tags += e.target-of(s) }
   }
   for k in n.kids { count-uses(mo, k) }
 }
+
+fn module-usage(id: Int) -> Usage {
+  module-uses = {}
+  module-tags = []
+  var bytes = [0 for i in 0..256]
+  var toplevel: [Int] = []
+  if e.included?(id) {
+    let mo = m.modules[id]
+    for c in mo.text { bytes[c] = bytes[c] + 1 }
+    for p in e.parts-of(id) {
+      if e.live?(p) {
+        count-uses(mo, an.part-stmt[p])
+        for m.db.declares(p, ?s) {
+          if not e.import-symbol?(s) { toplevel += s }
+        }
+      }
+    }
+  }
+  Usage(uses: module-uses, tags: module-tags, freq: bytes, toplevel: toplevel)
+}
+
+# How many threads count.
+state count-threads: Int = 1
 
 fn take-slot(s: Int, at: Int) -> Void {
   while len(counts) <= at { counts += 0 }
@@ -47,10 +77,6 @@ fn nested-slots(scope: Int, from: Int) -> Void {
     }
   }
   for child in now.children { nested-slots(child, next) }
-}
-
-fn scan-freq(src: Text) -> Void {
-  for c in src { freq[c] = freq[c] + 1 }
 }
 
 # Name characters, commonest first, so frequent symbols compress well.
@@ -89,19 +115,11 @@ fn assign-minified() -> Void {
     }
   }
   # Live code: uses, character frequency, and the top-level symbols in order.
-  for id in m.order {
-    if e.included?(id) {
-      let mo = m.modules[id]
-      scan-freq(mo.text)
-      for p in e.parts-of(id) {
-        if e.live?(p) {
-          count-uses(mo, an.part-stmt[p])
-          for m.db.declares(p, ?s) {
-            if not e.import-symbol?(s) { toplevel += s }
-          }
-        }
-      }
-    }
+  for u in parallel-map(m.order, module-usage, count-threads) {
+    for s in keys(u.uses) { uses[s] = (uses[s] ?? 0) + (u.uses[s] ?? 0) }
+    for s in u.tags { tags[s] = true }
+    for c in 0..256 { freq[c] = freq[c] + u.freq[c] }
+    toplevel ++= u.toplevel
   }
   # Nested slots first, so top-level symbols never collide with them.
   for id in m.order {

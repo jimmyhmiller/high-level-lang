@@ -989,12 +989,38 @@
       (add-aux! (mut g)
                 `(defn ~(rule-sym (.name d)) [(p (mut rt/P))] (-> (Option Node)) ~body))))
 
-(defn emit-rule! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl)] (-> void)
+(defn emit-rule! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl) (memo (mut FirstMemo))] (-> void)
   (for i (range 0 (len (.alts d)))
     (emit-alt-fn! (mut g) (mut c) (.name d) i (get (.alts d) i) 0))
-  (emit-rule-fn! (mut g) d
-                 `(let [save (.pos p)]
-                    ~(try-alts (.name d) 0 (len (.alts d)) false))))
+  (let [(mut guards) (ArrayList::new [Code] (malloc-allocator))
+        (mut guarded) (ArrayList::new [bool] (malloc-allocator))
+        (mut any) false]
+    (for a (.alts d)
+      (let [s (pe-start g (.seq a) (mut memo))
+            known (and (.known (.bytes s)) (not (.empty s)))]
+        (push! (mut guards) (if known (byte-test (.bytes s)) `true))
+        (push! (mut guarded) known)
+        (when known (set! any true))))
+    (emit-rule-fn! (mut g) d
+                   (if any
+                       `(let [save (.pos p) c (next-byte (mut p))]
+                          ~(guarded-alts (.name d) guards guarded 0))
+                       `(let [save (.pos p)]
+                          ~(try-alts (.name d) 0 (len (.alts d)) false))))))
+
+;;; Alternatives in order, each tried only when the next token's first byte is one it can begin with.
+(defn guarded-alts [(name (slice u8)) (guards (ArrayList Code)) (guarded (ArrayList bool)) (i i64)] (-> Code)
+  (if (>= i (len guards))
+      (none-fail)
+      (let [g (get guards i)
+            call (if (get guarded i)
+                     `(if ~g (~(alt-sym name i) (mut p)) (None [Node]))
+                     `(~(alt-sym name i) (mut p)))]
+        `(match ~call
+           (Some [r] (Some r))
+           (None []
+             (set! (.pos p) save)
+             ~(guarded-alts name guards guarded (+ i 1)))))))
 
 ;;; A base, then alternatives that extend it: repeatedly, or at most once.
 (defn emit-chain! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl) (repeat bool)] (-> void)
@@ -1352,6 +1378,131 @@
 ;;; counts too. A negated class gives up: `known` goes false.
 (defstruct First [(ranges (ArrayList Range)) (known bool)])
 
+;;; A set of bytes, as 256 bits, for what a rule's next token may begin with. `known` false: anything.
+(defstruct Bytes [(w0 i64) (w1 i64) (w2 i64) (w3 i64) (known bool)])
+
+(defn bytes-none [] (-> Bytes) (Bytes :w0 0 :w1 0 :w2 0 :w3 0 :known true))
+
+(defn bytes-union [(a Bytes) (b Bytes)] (-> Bytes)
+  (Bytes :w0 (| (.w0 a) (.w0 b)) :w1 (| (.w1 a) (.w1 b)) :w2 (| (.w2 a) (.w2 b)) :w3 (| (.w3 a) (.w3 b))
+         :known (and (.known a) (.known b))))
+
+(defn bytes-of-first [(f First)] (-> Bytes)
+  (let [(mut out) (bytes-none)]
+    (set! (.known out) (.known f))
+    (for r (.ranges f)
+      (for b (range (.lo r) (+ (.hi r) 1))
+        (when (and (>= b 0) (< b 256))
+          (let [bit (<< 1 (% b 64))]
+            (cond
+              (< b 64) (set! (.w0 out) (| (.w0 out) bit))
+              (< b 128) (set! (.w1 out) (| (.w1 out) bit))
+              (< b 192) (set! (.w2 out) (| (.w2 out) bit))
+              :else (set! (.w3 out) (| (.w3 out) bit)))))))
+    out))
+
+;;; A bool over `c`, the byte: is it in the set?
+(defn byte-test [(b Bytes)] (-> Code)
+  (let [w0 (.w0 b) w1 (.w1 b) w2 (.w2 b) w3 (.w3 b)]
+    `(rt/byte-in? c ~w0 ~w1 ~w2 ~w3)))
+
+;;; What a reference begins with, and whether it can match nothing.
+(defstruct Start [(bytes Bytes) (empty bool)])
+
+;;; Each rule's start, worked out once for the grammar. A rule met again while its own is being
+;;; worked out is a cycle: unknown.
+(defstruct FirstMemo [(names (ArrayList (slice u8))) (starts (ArrayList Start)) (busy (ArrayList (slice u8)))])
+
+(defn first-memo-new [] (-> FirstMemo)
+  (FirstMemo :names (ArrayList::new [(slice u8)] (malloc-allocator))
+             :starts (ArrayList::new [Start] (malloc-allocator))
+             :busy (ArrayList::new [(slice u8)] (malloc-allocator))))
+
+(defn unknown-start [] (-> Start) (Start :bytes (Bytes :w0 0 :w1 0 :w2 0 :w3 0 :known false) :empty false))
+
+(defn lexical-start [(g Grammar) (body PE)] (-> Start)
+  (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+        empty (first-of! g body (mut f) 0)]
+    (Start :bytes (bytes-of-first f) :empty empty)))
+
+;;; The bytes the next token can begin with when a rule matches, space skipped first.
+(defn rule-start [(g Grammar) (name (slice u8)) (m (mut FirstMemo))] (-> Start)
+  (let [(mut at) -1]
+    (for i (range 0 (len (.names m))) (when (= (get (.names m) i) name) (set! at i)))
+    (cond
+      (>= at 0) (get (.starts m) at)
+      (contains? (.busy m) name) (unknown-start)
+      :else
+        (match (find-decl g name)
+          (None [] (unknown-start))
+          (Some [d]
+            (push! (mut (.busy m)) name)
+            (let [s (cond
+                      (= (.kind d) (DFragment)) (lexical-start g (.body d))
+                      (and (= (.kind d) (DToken)) (not (.raw d))) (lexical-start g (.body d))
+                      (= (.kind d) (DHidden)) (pe-start g (.body d) (mut m))
+                      (= (.kind d) (DRule))
+                        (let [(mut acc) (Start :bytes (bytes-none) :empty false)]
+                          (for a (.alts d)
+                            (let [s1 (pe-start g (.seq a) (mut m))]
+                              (set! acc (Start :bytes (bytes-union (.bytes acc) (.bytes s1))
+                                               :empty (or (.empty acc) (.empty s1))))))
+                          acc)
+                      (and (= (.kind d) (DPostfix)) (> (len (.over d)) 0)) (rule-start g (.over d) (mut m))
+                      :else (unknown-start))]
+              (pop! (mut (.busy m)))
+              (push! (mut (.names m)) name)
+              (push! (mut (.starts m)) s)
+              s))))))
+
+(defn seq-start [(a Start) (b Start)] (-> Start)
+  (if (.empty a)
+      (Start :bytes (bytes-union (.bytes a) (.bytes b)) :empty (.empty b))
+      a))
+
+(defn maybe [(s Start)] (-> Start) (Start :bytes (.bytes s) :empty true))
+
+(defn zero-width [] (-> Start) (Start :bytes (bytes-none) :empty true))
+
+;;; The same for a parsing expression of a rule.
+(defn pe-start [(g Grammar) (e PE) (m (mut FirstMemo))] (-> Start)
+  (match (.op e)
+    (OLit []
+      (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+            b (cast i64 (get (.text e) 0))]
+        (push! (mut (.ranges f)) (Range :lo b :hi b))
+        (Start :bytes (bytes-of-first f) :empty false)))
+    (ORef [] (rule-start g (.text e) (mut m)))
+    (OSeq []
+      (let [(mut acc) (zero-width)]
+        (for k (.kids e)
+          (when (.empty acc) (set! acc (seq-start acc (pe-start g k (mut m))))))
+        acc))
+    (OChoice []
+      (let [(mut acc) (Start :bytes (bytes-none) :empty false)]
+        (for k (.kids e)
+          (let [s (pe-start g k (mut m))]
+            (set! acc (Start :bytes (bytes-union (.bytes acc) (.bytes s)) :empty (or (.empty acc) (.empty s))))))
+        acc))
+    (OStar [] (maybe (pe-start g (get (.kids e) 0) (mut m))))
+    (OOpt [] (maybe (pe-start g (get (.kids e) 0) (mut m))))
+    (OSepStar [] (maybe (pe-start g (get (.kids e) 0) (mut m))))
+    (OPlus [] (pe-start g (get (.kids e) 0) (mut m)))
+    (OSepPlus [] (pe-start g (get (.kids e) 0) (mut m)))
+    (OWith [] (pe-start g (get (.kids e) 0) (mut m)))
+    (OKeep [] (pe-start g (get (.kids e) 0) (mut m)))
+    ;; Zero width: what follows decides.
+    (OIf [] (zero-width))
+    (OUnless [] (zero-width))
+    (ONot [] (zero-width))
+    (OAnd [] (zero-width))
+    (ONl [] (zero-width))
+    (ONoNl [] (zero-width))
+    (OEof [] (zero-width))
+    (OBof [] (zero-width))
+    (OLineStart [] (zero-width))
+    (_ (unknown-start))))
+
 (defn first-of! [(g Grammar) (e PE) (f (mut First)) (depth i64)] (-> bool)
   (match (.op e)
     (OLit []
@@ -1541,18 +1692,24 @@
 
        ;;; Most tokens have no space before them, and the grammar says which bytes could
        ;;; begin some: anything else needs no look at all.
+       ;;; Space depends only on where it starts, so each run of it is scanned once.
        (defn skip! [(p (mut rt/P))] (-> void)
          (if (= (.ws-from p) (.pos p))
              (set! (.pos p) (.ws-to p))
              (let [from (.pos p)
                    c (rt/peek (mut p))]
-               (set! (.ws-scan p) from)
                (if ~(space-start-test (mut g) (mut c))
-                   (~(lex-sym (.space g)) (mut p))
-                   0)
+                   (let [known (rt/ws-known (mut p) from)]
+                     (if (> known 0)
+                         (do (set! (.pos p) (+ from (- (/ known 2) 1)))
+                             (set! (.ws-nl p) (= (% known 2) 1)))
+                         (do (set! (.ws-scan p) from)
+                             (~(lex-sym (.space g)) (mut p))
+                             (set! (.ws-nl p) (and (> (.pos p) from) (rt/has-newline? (.src p) from (.pos p))))
+                             (rt/ws-remember! (mut p) from (.pos p) (.ws-nl p)))))
+                   (set! (.ws-nl p) false))
                (set! (.ws-from p) from)
-               (set! (.ws-to p) (.pos p))
-               (set! (.ws-nl p) (and (> (.pos p) from) (rt/has-newline? (.src p) from (.pos p)))))))
+               (set! (.ws-to p) (.pos p)))))
 
        ;;; Is there a line terminator between here and the next token?
        (defn newline-ahead? [(p (mut rt/P))] (-> bool)
@@ -1568,6 +1725,14 @@
              (set! (.pos p) s)
              at-end)))
 
+       ;;; The first byte of the next token, without consuming anything.
+       (defn next-byte [(p (mut rt/P))] (-> i64)
+         (let [s (.pos p)]
+           (skip! (mut p))
+           (let [b (rt/peek (mut p))]
+             (set! (.pos p) s)
+             b)))
+
        ;;; Where the next token begins, without consuming the space before it.
        (defn token-start [(p (mut rt/P))] (-> i64)
          (let [s (.pos p)]
@@ -1582,16 +1747,22 @@
        ~(primitive/code-symbol "@@AUX@@")
 
        (defn parse-result [(src (slice u8)) (path (slice u8)) (flags i64)] (-> (Result Node rt/ParseError))
-         (let [(mut p) (rt/p-new src path flags ~(.memo-count g))]
-           (match (~(rule-sym (.start g)) (mut p))
-             (Some [n]
-               (skip! (mut p))
-               (if (rt/eof? (mut p))
-                   (Ok n)
-                   (do
-                     (rt/note-fail! (mut p) "end of input")
-                     (Err (rt/parse-error (mut p))))))
-             (None [] (Err (rt/parse-error (mut p)))))))
+         (parse-result-from src path flags 0))
+
+       ;;; The program from `from` to the end of `src`, positions counted from the start of `src`.
+       (defn parse-result-from [(src (slice u8)) (path (slice u8)) (flags i64) (from i64)] (-> (Result Node rt/ParseError))
+         (let [(mut p) (rt/p-new src path flags ~(.memo-count g) from)
+               result (match (~(rule-sym (.start g)) (mut p))
+                        (Some [n]
+                          (skip! (mut p))
+                          (if (rt/eof? (mut p))
+                              (Ok n)
+                              (do
+                                (rt/note-fail! (mut p) "end of input")
+                                (Err (rt/parse-error (mut p))))))
+                        (None [] (Err (rt/parse-error (mut p)))))]
+           (rt/p-free! (mut p))
+           result))
 
        ;;; Parse a whole file. Syntax errors stop the program with file:line:col.
        (defn parse [(src (slice u8)) (path (slice u8))] (-> Node)
@@ -1613,6 +1784,13 @@
          (match (parse-result src path flags)
            (Ok [t] (Some t))
            (Err [e] (set! (.last (rt/last-parse-error)) e) (None [Node]))))
+
+       ;;; A piece of a program: the statements from `from` to the end of `src`, or nothing when
+       ;;; they are not a program by themselves.
+       (defn parse-piece [(src (slice u8)) (path (slice u8)) (flags i64) (from i64)] (-> (Option Node))
+         (match (parse-result-from src path flags from)
+           (Ok [t] (Some t))
+           (Err [_] (None [Node]))))
 
        ;;; A flag's bit, by name.
        (defn flag-bit [(name (slice u8))] (-> i64)
@@ -1831,16 +2009,17 @@
     (add-lit! (mut g) ",")
     (assign-levels! (mut g) (mut c) (mut levels))
     ;; Code generation order: bodies first, so literals and reps are all known.
+    (let [(mut firsts) (first-memo-new)]
     (for d (.decls g)
       (let [k (.kind d)]
         (cond
           (or (= k (DFragment)) (= k (DToken))) (emit-token! (mut g) (mut c) d)
           (= k (DHidden)) (emit-hidden! (mut g) (mut c) d)
-          (= k (DRule)) (emit-rule! (mut g) (mut c) d)
+          (= k (DRule)) (emit-rule! (mut g) (mut c) d (mut firsts))
           (= k (DPostfix)) (emit-chain! (mut g) (mut c) d true)
           (= k (DSuffix)) (emit-chain! (mut g) (mut c) d false)
           (= k (DInfix)) (emit-infix! (mut g) (mut c) d)
-          :else 0)))
+          :else 0))))
     (emit-reps! (mut g))
     (for l (.lits g) (emit-lit! (mut g) l))
     (let [shell (dsl/render (emit-module! (mut g) (mut c) levels))]

@@ -349,6 +349,10 @@
     (let [(mut f) (func-of "parse-opt" (cat node "?"))]
       (param (mut f) "src" "Text" false) (param (mut f) "path" "Text" false) (param (mut f) "flags" "Int" false)
       (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "parse-piece" (cat node "?"))]
+      (param (mut f) "src" "Text" false) (param (mut f) "path" "Text" false) (param (mut f) "flags" "Int" false)
+      (param (mut f) "from" "Int" false)
+      (push! (mut (.funcs m)) f))
     (let [(mut f) (func-of "flag-bit" "Int")]
       (param (mut f) "name" "Text" false)
       (push! (mut (.funcs m)) f))
@@ -1215,14 +1219,18 @@
                                ~(sym res-v))))
                         (cat3 "[" r "]"))))))
       ;; `parallel-walk(roots, visit, next, n)`: a graph found as it is walked. Each name is visited
-      ;; once, on whichever of `n` threads takes it, and `next` of its result names more. A thread
-      ;; that finds work waiting never waits for a whole wave to finish. Results come in the order
-      ;; they finish.
-      (and (= name "parallel-walk") (= count 4))
+      ;; once, on whichever of `n` threads takes it, and `next` of its result names more, visited
+      ;; after what is waiting already. A thread that finds work waiting never waits for a whole
+      ;; wave to finish. Results come in the order they finish.
+      ;; `parallel-walk(roots, visit, next, first, n)`: `first` of a result names what goes on with
+      ;; that item's own work, visited before anything waiting.
+      (and (= name "parallel-walk") (or (= count 4) (= count 5)))
         (let [roots (expect (mut k) (get args 0) (expr (mut k) (get args 0) "[Text]") "[Text]")
               visit (expr (mut k) (get args 1) "")
               follow (expr (mut k) (get args 2) "")
-              threads (expect (mut k) (get args 3) (expr (mut k) (get args 3) "Int") "Int")]
+              urgent (if (= count 5) (expr (mut k) (get args 3) "") follow)
+              has-urgent (= count 5)
+              threads (expect (mut k) (get args (- count 1)) (expr (mut k) (get args (- count 1)) "Int") "Int")]
           (unless (fn? (.ty visit)) (die (mut k) n "parallel-walk needs a function to visit with"))
           (let [ps (fn-params (.ty visit))
                 r (fn-ret (.ty visit))]
@@ -1230,6 +1238,8 @@
               (die (mut k) n "parallel-walk visits names: its function takes one Text"))
             (unless (= (.ty follow) (cat3 "Fn(" r ")->[Text]"))
               (die (mut k) n (cat3 "parallel-walk's next must take a " r " and give [Text]")))
+            (unless (= (.ty urgent) (cat3 "Fn(" r ")->[Text]"))
+              (die (mut k) n (cat3 "parallel-walk's first must take a " r " and give [Text]")))
             (let [cr (coil-type (mut k) r)
                   job (fresh (mut k) "WJob")
                   body (fresh (mut k) "wjob-body")
@@ -1238,45 +1248,84 @@
                   root-v (fresh (mut k) "wroot")]
               (push! (mut (.aux k))
                      `(defstruct ~(sym job)
-                        [(lock i64) (head i64) (busy i64)
+                        [(gate (ptr rt/Gate)) (head i64) (busy i64) (waiting i64) (done i64)
                          (queue (ArrayList (slice u8))) (seen (HashMap (slice u8) bool))
                          (results (ArrayList ~cr))
                          (visit (fnptr (cc/C) [(slice u8)] ~cr))
-                         (follow (fnptr (cc/C) [~cr] (ArrayList (slice u8))))]))
+                         (follow (fnptr (cc/C) [~cr] (ArrayList (slice u8))))
+                         (urgent (fnptr (cc/C) [~cr] (ArrayList (slice u8))))
+                         (has-urgent bool)]))
               (push! (mut (.aux k))
                      `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
+                        ;; A worker with nothing to do sleeps until another adds work or finishes
+                        ;; the last of it.
                         (let [j (cast (ptr ~(sym job)) arg)
-                              word (cast (ptr i64) j)
+                              g (.gate j)
                               visit (.visit j)
                               follow (.follow j)
+                              urgent (.urgent j)
                               (mut go) true]
+                          (rt/gate-lock! g)
                           (while go
-                            (rt/spin-lock! word)
                             (if (< (.head j) (len (.queue j)))
                                 (let [item (get (.queue j) (.head j))]
                                   (set! (.head j) (+ (.head j) 1))
                                   (set! (.busy j) (+ (.busy j) 1))
-                                  (rt/spin-unlock! word)
+                                  (rt/gate-unlock! g)
                                   (let [r (visit item)
-                                        more (follow r)]
-                                    (rt/spin-lock! word)
+                                        more (follow r)
+                                        now (if (.has-urgent j) (urgent r) (ArrayList::new [(slice u8)] (malloc-allocator)))
+                                        (mut added) false]
+                                    (rt/gate-lock! g)
                                     (push! (mut (.results j)) r)
+                                    ;; Ahead of what waits: into the places already taken, or a new queue.
+                                    (let [(mut fresh) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                                      (for x now
+                                        (unless (match (get (.seen j) x) (Some [_] true) (None [] false))
+                                          (set! (mut (.seen j)) x true)
+                                          (push! (mut fresh) x)))
+                                      (when (> (len fresh) 0)
+                                        (set! added true)
+                                        (if (>= (.head j) (len fresh))
+                                            (let [start (- (.head j) (len fresh))]
+                                              (for i (range 0 (len fresh))
+                                                (set! (mut (.queue j)) (+ start i) (get fresh i)))
+                                              (set! (.head j) start))
+                                            (do
+                                              (for i (range (.head j) (len (.queue j)))
+                                                (push! (mut fresh) (get (.queue j) i)))
+                                              (set! (.queue j) fresh)
+                                              (set! (.head j) 0)))))
                                     (for x more
                                       (unless (match (get (.seen j) x) (Some [_] true) (None [] false))
                                         (set! (mut (.seen j)) x true)
-                                        (push! (mut (.queue j)) x)))
+                                        (push! (mut (.queue j)) x)
+                                        (set! added true)))
                                     (set! (.busy j) (- (.busy j) 1))
-                                    (rt/spin-unlock! word)))
+                                    (atomic/store (field j waiting) (- (len (.queue j)) (.head j)))
+                                    (when (= (.busy j) 0) (atomic/store (field j done) 1))
+                                    (when (or added (= (.busy j) 0)) (rt/gate-wake-all! g))))
                                 (if (= (.busy j) 0)
-                                    (do (rt/spin-unlock! word) (set! go false))
-                                    (do (rt/spin-unlock! word) (rt/pause!)))))
+                                    (do (atomic/store (field j done) 1) (set! go false))
+                                    ;; A while looking for new work, then asleep until some comes.
+                                    (do (atomic/store (field j waiting) (- (len (.queue j)) (.head j)))
+                                        (rt/gate-unlock! g)
+                                        (let [(mut spins) 0]
+                                          (while (and (< spins 4000) (= (atomic/read (field j waiting)) 0)
+                                                      (= (atomic/read (field j done)) 0))
+                                            (set! spins (+ spins 1)))
+                                          (rt/gate-lock! g)
+                                          (when (and (= spins 4000) (>= (.head j) (len (.queue j))) (> (.busy j) 0))
+                                            (rt/gate-wait! g)))))))
+                          (rt/gate-unlock! g)
                           arg)))
               (Some (te `(let [(mut ~(sym job-v))
-                                 (~(sym job) :lock 0 :head 0 :busy 0
+                                 (~(sym job) :gate (rt/gate-new) :head 0 :busy 0 :waiting 0 :done 0
                                             :queue (ArrayList::new [(slice u8)] (malloc-allocator))
                                             :seen (HashMap::new [(slice u8) bool] (malloc-allocator) (str/keyops))
                                             :results (ArrayList::new [~cr] (malloc-allocator))
-                                            :visit ~(.code visit) :follow ~(.code follow))]
+                                            :visit ~(.code visit) :follow ~(.code follow)
+                                            :urgent ~(.code urgent) :has-urgent ~(if has-urgent `true `false))]
                            (for ~(sym root-v) ~(.code roots)
                              (unless (match (get (.seen ~(sym job-v)) ~(sym root-v)) (Some [_] true) (None [] false))
                                (set! (mut (.seen ~(sym job-v))) ~(sym root-v) true)
@@ -2155,8 +2204,9 @@
 ;; ---------------------------------------------------------------- memo functions
 
 ;;; `memo fn f(k: K) -> R`: each answer is computed once per build, by whichever worker asks
-;;; first, and every worker shares it. Each keeps a table of its own in front of the shared one,
-;;; so a question asked again costs no lock. The answer must not be changed by whoever gets it.
+;;; first, and every worker shares it; one that asks while another computes it waits. Each keeps a
+;;; table of its own in front of the shared one, so a question asked again costs no lock. The
+;;; answer must not be changed by whoever gets it.
 (defn memo-check! [(k (mut Comp)) (d g/Node)] (-> Func)
   (let [f (match (find-func (self-mod (mut k)) (.text (kid d 0)))
             (Some [x] x)
@@ -2172,6 +2222,10 @@
 
 (defn memo-map-type [(f Func)] (-> (slice u8))
   (cat4 "{" (.ty (get (.params f) 0)) ":" (cat (.ret f) "}")))
+
+;;; Who is computing an answer: the worker's slot plus one.
+(defn memo-busy-type [(f Func)] (-> (slice u8))
+  (cat3 "{" (.ty (get (.params f) 0)) ":Int}"))
 
 (defn memo-near [(name (slice u8))] (-> (slice u8)) (cat "memo-near--" name))
 (defn memo-near-gen [(name (slice u8))] (-> (slice u8)) (cat "memo-near-gen--" name))
@@ -2206,7 +2260,8 @@
         rt (coil-type (mut k) (.ret f))]
     (emit! (mut out) (compile-fn-as (mut k) d compute))
     ;; The lock word comes first, so the store's address is the word's.
-    (emit! (mut out) `(defstruct ~store [(lock i64) (ready bool) (gen i64) (table ~(coil-type (mut k) mt))]))
+    (emit! (mut out) `(defstruct ~store [(lock i64) (ready bool) (gen i64) (table ~(coil-type (mut k) mt))
+                                         (busy ~(coil-type (mut k) (memo-busy-type f)))]))
     (emit! (mut out)
            `(defn ~store-fn [] (-> (ptr ~store))
               (let [s (primitive/alloc-static ~store)]
@@ -2214,6 +2269,7 @@
                   (rt/init-lock!)
                   (unless (.ready s)
                     (set! (.table s) ~(new-map (mut k) mt))
+                    (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
                   (rt/init-unlock!))
@@ -2229,22 +2285,33 @@
                 (match (get (~near t) key)
                   (Some [v] v)
                   (None []
-                    (rt/spin-lock! word)
-                    (let [shared (get (.table s) key)]
-                      (rt/spin-unlock! word)
-                      (let [v (match shared
-                                (Some [x] x)
-                                (None []
-                                  (let [made (~(sym compute) key)]
-                                    (rt/spin-lock! word)
-                                    ;; Another worker may have answered meanwhile: its answer stands.
-                                    (let [won (match (get (.table s) key)
-                                                (Some [w] w)
-                                                (None [] (do (set! (mut (.table s)) key made) made)))]
+                    (let [me (+ (rt/worker-slot) 1)
+                          (mut answer) (None [~rt])
+                          (mut go) true]
+                      (while go
+                        (rt/spin-lock! word)
+                        (match (get (.table s) key)
+                          (Some [x] (do (rt/spin-unlock! word) (set! answer (Some x)) (set! go false)))
+                          (None []
+                            (let [owner (match (get (.busy s) key) (Some [o] o) (None [] 0))]
+                              (cond
+                                (= owner me)
+                                  (do (rt/spin-unlock! word)
+                                      (panic "memo fn {} asks for its own answer" ~name))
+                                (> owner 0) (do (rt/spin-unlock! word) (rt/pause!))
+                                :else
+                                  (do (set! (mut (.busy s)) key me)
                                       (rt/spin-unlock! word)
-                                      won))))]
-                        (set! (mut (~near t)) key v)
-                        v)))))))))
+                                      (let [made (~(sym compute) key)]
+                                        (rt/spin-lock! word)
+                                        (set! (mut (.table s)) key made)
+                                        (set! (mut (.busy s)) key 0)
+                                        (rt/spin-unlock! word)
+                                        (set! answer (Some made))
+                                        (set! go false))))))))
+                      (match answer
+                        (Some [v] (do (set! (mut (~near t)) key v) v))
+                        (None [] (panic "memo fn {} lost its answer" ~name)))))))))))
 
 ;;; Every memo of the module starts over. Only while no other worker runs.
 (defn compile-forget! [(k (mut Comp)) (decls (ArrayList g/Node))] (-> Code)
@@ -2256,6 +2323,7 @@
           (push! (mut body)
                  `(let [s (~(sym (cat "memo-store--" name)))]
                     (set! (.table s) ~(new-map (mut k) (memo-map-type f)))
+                    (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
                     (set! (.gen s) (rt/next-pass!)))))))
     `(defn forget-memos! [] (-> void) ~@body 0)))
 
