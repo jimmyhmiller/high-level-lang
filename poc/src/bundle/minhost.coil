@@ -1,0 +1,201 @@
+;;; Predicates and builders the minifier's rules call: what is easier to say in Coil
+;;; than in a pattern. Each is a plain question about a node or a piece of text.
+(module bundle.minhost)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.slice" :use [subslice])
+(import "coil.str" :as str)
+(import "bundle.js" :as js)
+(import "hl.rt" :as rt)
+
+(defn opaque [(n js/Node)] (-> bool) (js/opaque-spine? n))
+(defn some [(n js/Node)] (-> bool) (!= (.kind n) (js/KNone)))
+
+;;; A string expression statement might be a directive, which must stay one.
+(defn directive [(n js/Node)] (-> bool) (= (.kind n) (js/KStr)))
+
+;;; Declarations a block scopes to itself.
+(defn not-lexical [(n js/Node)] (-> bool)
+  (match (.kind n)
+    (js/KLetDecl []  false)
+    (js/KConstDecl [] false)
+    (js/KClassDecl [] false)
+    (js/KFuncDecl [] false)
+    (js/KGenDecl [] false)
+    (js/KAsyncFuncDecl [] false)
+    (js/KAsyncGenDecl [] false)
+    (_ true)))
+
+(defn all-plain [(xs (ArrayList js/Node))] (-> bool)
+  (let [(mut ok) true]
+    (for x xs (unless (not-lexical x) (set! ok false)))
+    ok))
+
+;;; Would this statement grab a following `else` if it lost its braces?
+(defn trailing-if? [(n js/Node)] (-> bool)
+  (match (.kind n)
+    (js/KIf []
+      (let [e (get (.kids n) 2)]
+        (or (= (.kind e) (js/KNone)) (trailing-if? e))))
+    (js/KFor [] (trailing-if? (get (.kids n) 3)))
+    (js/KForIn [] (trailing-if? (get (.kids n) 2)))
+    (js/KForOf [] (trailing-if? (get (.kids n) 3)))
+    (js/KWhile [] (trailing-if? (get (.kids n) 1)))
+    (js/KWith [] (trailing-if? (get (.kids n) 1)))
+    (js/KLabeled [] (trailing-if? (get (.kids n) 1)))
+    (_ false)))
+
+(defn no-dangling [(n js/Node)] (-> bool) (not (trailing-if? n)))
+
+;;; Does control never fall out of this statement?
+(defn jumps [(n js/Node)] (-> bool)
+  (match (.kind n)
+    (js/KReturn [] true)
+    (js/KThrow [] true)
+    (js/KBreak [] true)
+    (js/KContinue [] true)
+    (_ false)))
+
+;;; Removing dead code must keep what hoists out of it.
+(defn no-hoist [(n js/Node)] (-> bool)
+  (match (.kind n)
+    (js/KVarDecl [] false)
+    (js/KVarInit [] false)
+    (js/KVarLeft [] false)
+    (js/KVarLeftInit [] false)
+    (js/KFuncDecl [] false)
+    (js/KGenDecl [] false)
+    (js/KAsyncFuncDecl [] false)
+    (js/KAsyncGenDecl [] false)
+    ;; Nested functions have their own scope.
+    (js/KFuncExpr [] true) (js/KArrow [] true) (js/KMethod [] true)
+    (_
+      (let [(mut ok) true]
+        (for k (.kids n) (unless (no-hoist k) (set! ok false)))
+        ok))))
+
+(defn plain-key [(raw (slice u8))] (-> bool)
+  (let [s (rt/str-content raw)
+        (mut ok) (and (> (len s) 0) (rt/name-start? (get s 0)))]
+    (for c s (unless (rt/name-char? c) (set! ok false)))
+    ok))
+
+(defn dot [(o js/Node) (raw (slice u8))] (-> js/Node)
+  (js/node2 (js/KMember) o (js/leaf (js/KPropName) (rt/str-content raw) 0 0)))
+
+(defn plain-prop [(raw (slice u8)) (v js/Node)] (-> js/Node)
+  (js/node2 (js/KProp) (js/leaf (js/KPropName) (rt/str-content raw) 0 0) v))
+
+;; ---------------------------------------------------------------- numbers
+
+;;; A decimal integer, or None.
+(defn int-value [(s (slice u8))] (-> (Option i64)) (rt/parse-num s))
+
+(defn hex-value [(s (slice u8))] (-> (Option i64))
+  (if (and (> (len s) 2) (= (get s 0) #\0) (or (= (get s 1) #\x) (= (get s 1) #\X)))
+      (let [(mut v) 0 (mut ok) (< (len s) 16)]
+        (for i (range 2 (len s))
+          (let [c (get s i)
+                d (cond (rt/digit? c) (- (cast i64 c) 48)
+                        (and (>= c #\a) (<= c #\f)) (+ (- (cast i64 c) 97) 10)
+                        (and (>= c #\A) (<= c #\F)) (+ (- (cast i64 c) 65) 10)
+                        :else -1)]
+            (if (>= d 0) (set! v (+ (* v 16) d)) (set! ok false))))
+        (if ok (Some v) (None [i64])))
+      (None [i64])))
+
+;;; An integer's shortest decimal spelling: 1000 as 1e3.
+(defn int-spelling [(v i64)] (-> (slice u8))
+  (let [text (rt/num-text v)
+        n (len text)
+        (mut zeros) 0
+        (mut i) (- n 1)]
+    (while (and (> i 0) (= (get text i) #\0))
+      (set! zeros (+ zeros 1))
+      (set! i (- i 1)))
+    (if (>= zeros 3)
+        (rt/join (rt/join (subslice text 0 (- n zeros)) "e") (rt/num-text zeros))
+        text)))
+
+;;; `0.5` as `.5`, `1.50` as `1.5`, `2.0` as `2`, `1e+21` as `1e21`.
+(defn float-spelling [(s (slice u8))] (-> (slice u8))
+  (let [(mut mantissa) s (mut exponent) ""]
+    (for i (range 0 (len s))
+      (when (and (= (len exponent) 0) (or (= (get s i) #\e) (= (get s i) #\E)))
+        (set! mantissa (subslice s 0 i))
+        (let [rest (subslice s (+ i 1) (len s))]
+          (set! exponent (if (and (> (len rest) 0) (= (get rest 0) #\+))
+                             (subslice rest 1 (len rest))
+                             rest)))))
+    (let [(mut dot) -1]
+      (for i (range 0 (len mantissa)) (when (= (get mantissa i) #\.) (set! dot i)))
+      (when (>= dot 0)
+        (let [(mut end) (len mantissa)]
+          (while (= (get mantissa (- end 1)) #\0) (set! end (- end 1)))
+          (when (= (get mantissa (- end 1)) #\.) (set! end (- end 1)))
+          (set! mantissa (subslice mantissa 0 end)))
+        (when (and (> (len mantissa) 1) (= (get mantissa 0) #\0) (= (get mantissa 1) #\.))
+          (set! mantissa (subslice mantissa 1 (len mantissa))))))
+    (if (> (len exponent) 0)
+        (rt/join (rt/join mantissa "e") exponent)
+        mantissa)))
+
+(defn plain-number? [(s (slice u8))] (-> bool)
+  (let [(mut ok) (> (len s) 0)]
+    (for c s
+      (unless (or (rt/digit? c) (= c #\.) (= c #\e) (= c #\E) (= c #\+) (= c #\-))
+        (set! ok false)))
+    (and ok
+         ;; A leading zero with more digits is legacy octal.
+         (not (and (> (len s) 1) (= (get s 0) #\0) (rt/digit? (get s 1)))))))
+
+(defn best-number [(s (slice u8))] (-> (slice u8))
+  (match (int-value s)
+    (Some [v] (int-spelling v))
+    (None []
+      (match (hex-value s)
+        (Some [v]
+          (let [d (int-spelling v)]
+            (if (< (len d) (len s)) d s)))
+        (None [] (if (plain-number? s) (float-spelling s) s))))))
+
+(defn num-shorter [(n js/Node)] (-> bool)
+  (< (len (best-number (.text n))) (len (.text n))))
+
+(defn num-short [(n js/Node)] (-> js/Node)
+  (js/leaf (js/KNum) (best-number (.text n)) (.lo n) (.hi n)))
+
+;; ---------------------------------------------------------------- strings
+
+;;; The same string in the given quote, with its escapes adjusted.
+(defn requote [(raw (slice u8)) (quote u8)] (-> (slice u8))
+  (let [content (rt/str-content raw)
+        (mut b) (ArrayList::new [u8] (malloc-allocator))
+        (mut i) 0]
+    (push! (mut b) quote)
+    (while (< i (len content))
+      (let [c (get content i)]
+        (cond
+          (and (= c #\\) (< (+ i 1) (len content)))
+            (let [e (get content (+ i 1))]
+              (if (and (or (= e #\") (= e #\')) (!= e quote))
+                  (push! (mut b) e)
+                  (do (push! (mut b) c) (push! (mut b) e)))
+              (set! i (+ i 2)))
+          (= c quote)
+            (do (push! (mut b) #\\) (push! (mut b) c) (set! i (+ i 1)))
+          :else (do (push! (mut b) c) (set! i (+ i 1))))))
+    (push! (mut b) quote)
+    (slice b)))
+
+;;; Double quotes, unless single quotes are shorter.
+(defn best-string [(raw (slice u8))] (-> (slice u8))
+  (let [d (requote raw #\")
+        s (requote raw #\')]
+    (if (< (len s) (len d)) s d)))
+
+(defn str-better [(n js/Node)] (-> bool)
+  (!= (best-string (.text n)) (.text n)))
+
+(defn str-best [(n js/Node)] (-> js/Node)
+  (js/leaf (js/KStr) (best-string (.text n)) (.lo n) (.hi n)))

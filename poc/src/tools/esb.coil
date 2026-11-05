@@ -1,6 +1,7 @@
 ;;; Command line: esb ENTRY [--format=iife|esm] [--outfile=PATH] [--pretty]
 (module tools.esb)
 (import "coil.args" :as args)
+(import "coil.thread" :use [Thread ThreadConfig])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
@@ -9,6 +10,8 @@
 (import "bundle.emit" :as e)
 (import "bundle.mangle" :as mangle)
 (import "bundle.fold" :as fold)
+(import "bundle.minify" :as minify)
+(import "bundle.final" :as final)
 (import "bundle.resolve" :as res)
 (import "hl.rt" :as rt)
 
@@ -18,12 +21,12 @@
     (push! (mut out) b)
     out))
 
-(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
-  (args/init! argc argv)
+(defn run [] (-> i64)
   (let [entry (args/nth 1)
         (mut outfile) ""
         (mut pretty) false
         (mut minify-ids) false
+        (mut minify-syntax) false
         (mut exts) (strs ".js" ".mjs")
         o (res/Options :main-fields (strs "module" "main") :conditions (strs "import" "browser") :extensions exts)
         (mut gr) (g/graph-new o)]
@@ -35,13 +38,36 @@
           (rt/at? a 0 "--outfile=") (set! outfile (subslice a 10 (len a)))
           (= a "--pretty") (set! pretty true)
           (= a "--minify-identifiers") (set! minify-ids true)
+          (= a "--minify-syntax") (set! minify-syntax true)
+          (= a "--minify")
+            (do (set! minify-ids true) (set! minify-syntax true))
           :else (panic "unknown option {}" a))))
+    (set! (.void-undefined gr) minify-syntax)
     (g/load-runtime! (mut gr) (include-str "../bundle/runtime.js"))
     (g/build! (mut gr) entry)
     (if minify-ids (mangle/assign-minified! (mut gr)) (e/assign-names! (mut gr)))
-    (let [p (fold/run (e/program (mut gr)))
+    (let [p0 (fold/run (e/program (mut gr)))
+          p (if minify-syntax (final/run (minify/run p0)) p0)
           body (js/render p pretty)
           text (rt/join (rt/join "(()=>{" body) "})();\n")]
       (rt/write-output outfile text)
       (println "{} bytes -> {}" (len text) outfile))
+    0))
+
+(defn worker [(arg (ptr i8))] (-> (ptr i8))
+  (run)
+  arg)
+
+;;; Trees can be as deep as a merged statement list is long, so the build runs on a
+;;; thread with room for that.
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args/init! argc argv)
+  (let [(mut t) (Thread :handle (cast (ptr i8) 0))]
+    (when (!= (Thread::spawn-configured (cast (ptr Thread) (mut t))
+                                        (fnptr-of worker)
+                                        (cast (ptr i8) 0)
+                                        (ThreadConfig :stack-size 1073741824 :guard-size 0))
+              (: 0 i32))
+      (panic "could not start the build thread"))
+    (join (cast (ptr Thread) (mut t)))
     0))
