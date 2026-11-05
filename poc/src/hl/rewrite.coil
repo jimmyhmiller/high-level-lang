@@ -5,18 +5,16 @@
 ;;;   host bundle.minhost               # optional: Coil predicates and builders
 ;;;   leaves Num Str Ident PropName ;   # node kinds that hold text
 ;;;
-;;;   rule fold-add : Add(Num(a), Num(b)) => Num(a + b) ;
+;;;   rule fold-add : Add(Num(a), Num(b)) when @add-fits(a, b) => @add-num(a, b) ;
 ;;;   rule if-true  : If(True(), t, _) => t ;
 ;;;   rule merge    : List(xs..., ExprStmt(a), ExprStmt(b), ys...)
 ;;;                     => List(xs..., ExprStmt(Seq(a, b)), ys...) ;
 ;;;   rule unparen  : Paren(x) when !@opaque(x) => x ;
-;;;   rule concat   : Add(Str(a), Str(b)) => Str(a ++ b) ;
 ;;;   rule shorter  : Num(_) as n when @shortens(n) => @shortest(n) ;
 ;;;
-;;; A name binds a child; `_` ignores one; `name...` binds a run of children, at the
-;;; ends of a node's arguments. Inside a leaf a name binds its text, or its integer value
-;;; for Num, where arithmetic that leaves [0, 2^53) simply makes the rule not fire.
-;;; `when` lists guards, `@name(vars)` calls the host, and `!` negates a guard.
+;;; A name binds a child; `_` ignores one; `name...` binds a run of children, at the ends of a
+;;; node's arguments. Inside a leaf a name binds its text, and a string on the left matches it,
+;;; quoted or not. `when` lists guards, `@name(vars)` calls the host, and `!` negates a guard.
 (module hl.rewrite)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
@@ -28,7 +26,7 @@
 
 (reader-provider "hl.rewrite" read-rewrite)
 
-(defsum VarSort (VNode) (VNum) (VText) (VList))
+(defsum VarSort (VNode) (VText) (VList))
 (derive Eq VarSort)
 (defstruct Var [(name (slice u8)) (sort VarSort)])
 
@@ -42,10 +40,8 @@
   (SPrefix [(subject i64) (scan i64) (name (slice u8))])
   (SSuffix [(subject i64) (scan i64) (middle i64) (name (slice u8))])
   (SVar [(subject i64) (name (slice u8))])
-  (SNum [(subject i64) (name (slice u8))])
   (SText [(subject i64) (name (slice u8))])
-  (STextEq [(subject i64) (text (slice u8))])
-  (SStrEq [(subject i64) (text (slice u8))]))
+  (STextEq [(subject i64) (text (slice u8))]))
 
 (defstruct Use [(where (slice u8)) (name (slice u8)) (arity i64)])
 ;;; A window rule rewrites a run in the middle of a list and leaves the rest alone:
@@ -118,19 +114,11 @@
 (defn pat-leaf! [(k (mut Comp)) (c (mut dsl/Cur)) (kind (slice u8)) (subject i64) (arg g/Node)] (-> void)
   (cond
     (= (.kind arg) (g/KStr))
-      (push! (mut (.steps k))
-             (if (= kind "Str")
-                 (SStrEq :subject subject :text (raw-str arg))
-                 (STextEq :subject subject :text (raw-str arg))))
+      (push! (mut (.steps k)) (STextEq :subject subject :text (raw-str arg)))
     (= (.kind arg) (g/KName))
       (unless (= (.text arg) "_")
-        (if (= kind "Num")
-            (do
-              (bind-var! (mut k) (mut c) arg (.text arg) (VNum))
-              (push! (mut (.steps k)) (SNum :subject subject :name (.text arg))))
-            (do
-              (bind-var! (mut k) (mut c) arg (.text arg) (VText))
-              (push! (mut (.steps k)) (SText :subject subject :name (.text arg))))))
+        (bind-var! (mut k) (mut c) arg (.text arg) (VText))
+        (push! (mut (.steps k)) (SText :subject subject :name (.text arg))))
     :else (die (mut k) (mut c) arg "a leaf's pattern is a name, _ or a string")))
 
 ;;; The children of a node pattern. With a rest they are found by scanning.
@@ -222,21 +210,6 @@
       (Some [s] s)
       (None [] (die (mut k) (mut c) t (dsl/join3 "the variable " name " is not bound by the pattern"))))))
 
-;;; Arithmetic in a right-hand side, as a chain over (Option i64).
-(defn num-expr [(k (mut Comp)) (c (mut dsl/Cur)) (e g/Node)] (-> Code)
-  (match (.kind e)
-    (g/KNum [] `(rt/parse-num ~(.text e)))
-    (g/KName []
-      (do
-        (unless (= (var-sort (mut k) (mut c) e (.text e)) (VNum))
-          (die (mut k) (mut c) e (dsl/join3 "the variable " (.text e) " is not a number")))
-        `(Some ~(var-sym (.text e)))))
-    (g/KGroup [] (num-expr (mut k) (mut c) (get (.kids e) 0)))
-    (g/KPlus [] `(rt/num-add ~(num-expr (mut k) (mut c) (get (.kids e) 0)) ~(num-expr (mut k) (mut c) (get (.kids e) 1))))
-    (g/KMinus [] `(rt/num-sub ~(num-expr (mut k) (mut c) (get (.kids e) 0)) ~(num-expr (mut k) (mut c) (get (.kids e) 1))))
-    (g/KTimes [] `(rt/num-mul ~(num-expr (mut k) (mut c) (get (.kids e) 0)) ~(num-expr (mut k) (mut c) (get (.kids e) 1))))
-    (_ (die (mut k) (mut c) e "expected arithmetic"))))
-
 (defn host-call [(k (mut Comp)) (c (mut dsl/Cur)) (e g/Node)] (-> Code)
   (let [name (get (.kids e) 0)
         (mut args) (primitive/code-list-new)]
@@ -247,24 +220,18 @@
       (push! (mut args) (var-sym (.text a))))
     `(~(host-sym (.text name)) ~@args)))
 
-;;; A leaf's text on a right-hand side: a literal, a variable, or `a ++ b`.
-(defn leaf-value [(k (mut Comp)) (c (mut dsl/Cur)) (kind (slice u8)) (a g/Node)] (-> Code)
+;;; A leaf's text on a right-hand side: a literal or a variable.
+(defn leaf-value [(k (mut Comp)) (c (mut dsl/Cur)) (a g/Node)] (-> Code)
   (match (.kind a)
-    (g/KStr [] (if (= kind "Str") `(rt/quote-str ~(raw-str a)) `~(raw-str a)))
+    (g/KStr [] `~(raw-str a))
     (g/KName []
       (do
         (unless (= (var-sort (mut k) (mut c) a (.text a)) (VText))
           (die (mut k) (mut c) a (dsl/join3 "the variable " (.text a) " is not text")))
         (var-sym (.text a))))
-    (g/KConcat []
-      (let [x (get (.kids a) 0) y (get (.kids a) 1)]
-        (var-sort (mut k) (mut c) x (.text x))
-        (var-sort (mut k) (mut c) y (.text y))
-        `(rt/str-concat ~(var-sym (.text x)) ~(var-sym (.text y)))))
     (_ (die (mut k) (mut c) a "a leaf holds a string or a text variable"))))
 
-;;; A right-hand side: a Node expression that can leave the rule through :r when
-;;; arithmetic is out of range.
+;;; A right-hand side: a Node expression.
 (defn rhs [(k (mut Comp)) (c (mut dsl/Cur)) (e g/Node)] (-> Code)
   (match (.kind e)
     (g/KHostCall [] (host-call (mut k) (mut c) e))
@@ -277,18 +244,11 @@
       (let [t (get (.kids e) 0)
             args (.kids (get (.kids e) 1))]
         (cond
-          (= (.text t) "Num")
-            (do
-              (unless (= (len args) 1) (die (mut k) (mut c) t "Num holds one expression"))
-              (push! (mut (.uses k)) (Use :where (where-of (mut k) (mut c) t) :name "Num" :arity 0))
-              `(match ~(num-expr (mut k) (mut c) (get args 0))
-                 (Some [v] (syn/leaf (syn/KNum) (rt/num-text v) 0 0))
-                 (None [] (return-from :r (None [syn/Node])))))
           (leaf? (mut k) (.text t))
             (do
               (unless (= (len args) 1) (die (mut k) (mut c) t "a leaf holds one value"))
               (push! (mut (.uses k)) (Use :where (where-of (mut k) (mut c) t) :name (.text t) :arity 0))
-              `(syn/leaf (~(kind-sym (.text t))) ~(leaf-value (mut k) (mut c) (.text t) (get args 0)) 0 0))
+              `(syn/leaf (~(kind-sym (.text t))) ~(leaf-value (mut k) (mut c) (get args 0)) 0 0))
           :else
             (let [(mut pushes) (primitive/code-list-new)
                   (mut count) 0
@@ -359,15 +319,9 @@
                                   (len (.kids ~(subj-sym s))))]
                ~rest))
           (SVar [s name] `(let [~(var-sym name) ~(subj-sym s)] ~rest))
-          (SNum [s name]
-            `(match (rt/parse-num (.text ~(subj-sym s)))
-               (Some [~(var-sym name)] ~rest)
-               (None [] ~(no-match))))
           (SText [s name] `(let [~(var-sym name) (.text ~(subj-sym s))] ~rest))
           (STextEq [s text]
-            `(if (= (.text ~(subj-sym s)) ~text) ~rest ~(no-match)))
-          (SStrEq [s text]
-            `(if (rt/str-is? (.text ~(subj-sym s)) ~text) ~rest ~(no-match)))))))
+            `(if (rt/leaf-is? (.text ~(subj-sym s)) ~text) ~rest ~(no-match)))))))
 
 ;;; Steps for a window rule's whole-list pattern. The window sits at the end of the
 ;;; children it is handed, so there is nothing to scan, and no rests to bind.

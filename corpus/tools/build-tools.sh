@@ -3,7 +3,7 @@
 S="$(cd "$(dirname $0)/.." && pwd)/out/bin"; mkdir -p $S/mt
 cd "$(dirname $0)/../../poc"
 cp Coil.toml $S/Coil.tools.bak
-for pair in esb:src/tools/esb.coil jsparse:src/tools/jsparse.coil; do
+for pair in esb:src/boot/esb.coil jsparse:src/boot/jsparse.coil; do
   name=${pair%%:*}; file=${pair#*:}
   sed -i '' "s#^entry = .*#entry = \"$file\"#" Coil.toml
   coil build ${1:--O1} -o $S/$name 2>&1 | grep -v '^wrote' | sed -E "s#$PWD/##g" | cut -c1-260

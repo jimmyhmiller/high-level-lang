@@ -311,25 +311,53 @@
 ;;; `marks`, when `tracking`, records where each leaf token landed, for source maps.
 (defstruct Mark [(out i64) (src i64)])
 (defstruct Rendered [(text (slice u8)) (marks (ArrayList Mark))])
-(defstruct W [(buf (ArrayList u8)) (pretty bool) (pending bool) (keep i64) (after-int bool)
-              (tracking bool) (marks (ArrayList Mark)) (next-src i64)])
+;;; How a language's tokens sit next to each other. A grammar declares it; nothing here knows
+;;; any language. `word` holds a true for each byte value that belongs to a word; `apart` is
+;;; pairs of bytes that must not touch; `apart-digits` may not follow a token of only digits.
+(defstruct PrintStyle
+  [(word (ArrayList bool))
+   (apart (slice u8))
+   (apart-digits (slice u8))
+   (soft-close (slice u8))
+   (breaks (ArrayList (slice u8)))])
 
-(defn w-new [(pretty bool)] (-> W)
+(defstruct W [(buf (ArrayList u8)) (pretty bool) (pending bool) (keep i64) (after-int bool)
+              (tracking bool) (marks (ArrayList Mark)) (next-src i64) (style PrintStyle)])
+
+(defn w-new [(pretty bool) (style PrintStyle)] (-> W)
   (W :buf (ArrayList::new [u8] (malloc-allocator)) :pretty pretty :pending false :keep 0
      :after-int false :tracking false :marks (ArrayList::new [Mark] (malloc-allocator))
-     :next-src 0))
+     :next-src 0 :style style))
 
-(defn printed-name-char? [(c u8)] (-> bool)
-  (or (name-char? c) (>= c (: 128 u8)) (= c #\\)))
+;;; `bytes` are word characters; `high` makes every byte above ASCII one too.
+(defn print-style [(bytes (slice u8)) (high bool) (apart (slice u8)) (apart-digits (slice u8))
+                   (soft-close (slice u8)) (breaks (ArrayList (slice u8)))] (-> PrintStyle)
+  (let [(mut word) (ArrayList::new [bool] (malloc-allocator))]
+    (for i (range 0 256) (push! (mut word) (and high (>= i 128))))
+    (for c bytes (set! (mut word) (cast i64 c) true))
+    (PrintStyle :word word :apart apart :apart-digits apart-digits :soft-close soft-close :breaks breaks)))
+
+(defn word-byte? [(w (mut W)) (c u8)] (-> bool) (get (.word (.style w)) (cast i64 c)))
 
 ;;; Two tokens that would read differently run together get a space between them.
-(defn must-separate? [(a u8) (next (slice u8))] (-> bool)
+(defn must-separate? [(w (mut W)) (a u8) (next (slice u8))] (-> bool)
   (let [b (get next 0)]
-    (or (and (printed-name-char? a) (printed-name-char? b))
-        (and (= a #\+) (= b #\+))
-        (and (= a #\-) (= b #\-))
-        (and (= a #\/) (= b #\/))
-        (and (= a #\<) (= b #\!)))))
+    (or (and (word-byte? (mut w) a) (word-byte? (mut w) b))
+        (let [pairs (.apart (.style w)) (mut hit) false (mut i) 0]
+          (while (< (+ i 1) (len pairs))
+            (when (and (= (get pairs i) a) (= (get pairs (+ i 1)) b)) (set! hit true))
+            (set! i (+ i 2)))
+          hit))))
+
+(defn digit-guarded? [(w (mut W)) (c u8)] (-> bool)
+  (let [(mut hit) false]
+    (for x (.apart-digits (.style w)) (when (= x c) (set! hit true)))
+    hit))
+
+(defn breaks-line? [(w (mut W)) (s (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for b (.breaks (.style w)) (when (= b s) (set! hit true)))
+    hit))
 
 (defn all-digits? [(s (slice u8))] (-> bool)
   (let [(mut ok) (> (len s) 0)]
@@ -345,23 +373,23 @@
     (push! (mut (.buf w)) #\;)
     (when (.pretty w) (push! (mut (.buf w)) #\newline))))
 
-;;; Write one token. Pretty output breaks lines after `; { }`; compact never does.
+;;; Write one token. Pretty output breaks lines after the tokens the style names.
 (defn tok! [(w (mut W)) (s (slice u8))] (-> void)
   (when (> (len s) 0)
-    (if (and (.pending w) (= s "}"))
+    (if (and (.pending w) (= s (.soft-close (.style w))))
         (set! (.pending w) false)
         (flush-semi! (mut w)))
     (let [n (len (.buf w))]
       (when (and (> n 0)
-                 (or (must-separate? (get (.buf w) (- n 1)) s)
-                     (and (.after-int w) (= (get s 0) #\.))))
+                 (or (must-separate? (mut w) (get (.buf w) (- n 1)) s)
+                     (and (.after-int w) (digit-guarded? (mut w) (get s 0)))))
         (push! (mut (.buf w)) #\space)))
     (w-bytes! (mut w) s)
     (when (> (.next-src w) 0)
       (push! (mut (.marks w)) (Mark :out (- (len (.buf w)) (len s)) :src (.next-src w)))
       (set! (.next-src w) 0))
     (set! (.after-int w) (all-digits? s))
-    (when (and (.pretty w) (or (= s ";") (= s "{") (= s "}")))
+    (when (and (.pretty w) (breaks-line? (mut w) s))
       (push! (mut (.buf w)) #\newline))))
 
 ;;; A leaf: its text, and where it came from.
@@ -399,7 +427,7 @@
         end (+ i (len s))]
     (and (at? (slice (.buf w)) i s)
          (or (>= end (len (.buf w)))
-             (not (printed-name-char? (get (.buf w) end)))))))
+             (not (word-byte? (mut w) (get (.buf w) end)))))))
 
 ;;; Parenthesise everything printed since `mark`.
 (defn w-wrap! [(w (mut W)) (mark i64) (open (slice u8)) (close (slice u8))] (-> void)
@@ -429,9 +457,6 @@
 (defn str-content [(raw (slice u8))] (-> (slice u8))
   (subslice raw 1 (- (len raw) 1)))
 
-(defn str-is? [(raw (slice u8)) (want (slice u8))] (-> bool)
-  (= (str-content raw) want))
-
 ;;; A double-quoted token holding this already-escaped content.
 (defn quote-str [(content (slice u8))] (-> (slice u8))
   (let [(mut b) (str/StrBuf::new (malloc-allocator))]
@@ -439,36 +464,6 @@
     (push-str! (mut b) content)
     (push-str! (mut b) "\"")
     (finish! (mut b))))
-
-;;; Content rewritten for double quotes: a `\'` loses its slash, a bare `"` gains one.
-(defn to-double-quoted [(raw (slice u8))] (-> (slice u8))
-  (let [content (str-content raw)
-        single (= (get raw 0) #\')
-        (mut b) (str/StrBuf::new (malloc-allocator))
-        (mut i) 0]
-    (while (< i (len content))
-      (let [c (get content i)]
-        (cond
-          (and (= c #\\) (< (+ i 1) (len content)))
-            (do
-              (if (and single (= (get content (+ i 1)) #\'))
-                  (push! (mut (.bytes b)) #\')
-                  (do (push! (mut (.bytes b)) c)
-                      (push! (mut (.bytes b)) (get content (+ i 1)))))
-              (set! i (+ i 2)))
-          (and single (= c #\"))
-            (do (push-str! (mut b) "\\\"") (set! i (+ i 1)))
-          :else (do (push! (mut (.bytes b)) c) (set! i (+ i 1))))))
-    (finish! (mut b))))
-
-;;; Two string tokens as one.
-(defn str-concat [(a (slice u8)) (b (slice u8))] (-> (slice u8))
-  (let [(mut out) (str/StrBuf::new (malloc-allocator))]
-    (push-str! (mut out) "\"")
-    (push-str! (mut out) (to-double-quoted a))
-    (push-str! (mut out) (to-double-quoted b))
-    (push-str! (mut out) "\"")
-    (finish! (mut out))))
 
 ;;; Each run of a rewrite gets a number; a node stamped with it is already normal.
 (defstruct PassCounter [(n i64)])
@@ -480,45 +475,15 @@
 
 ;; ---------------------------------------------------------------- integers
 
-;;; JavaScript numbers are doubles, so folding is exact only below 2^53. Every
-;;; helper answers None outside [0, 2^53), and a rule then simply does not fire.
-(const SAFE-LIMIT 9007199254740992)
-
-;;; A leading zero is a legacy octal literal in sloppy JavaScript, so `010` is 8
-;;; there. Those answer None and stay unfolded rather than folding as decimal.
+;;; A run of decimal digits, or nothing when it is not one or will not fit.
 (defn parse-num [(s (slice u8))] (-> (Option i64))
-  (let [(mut v) 0
-        (mut ok) (and (> (len s) 0) (or (= (len s) 1) (!= (get s 0) #\0)))]
+  (let [(mut v) 0 (mut ok) (> (len s) 0)]
     (for c s
       (when ok
-        (if (and (digit? c) (<= v (/ (- SAFE-LIMIT 10) 10)))
+        (if (and (digit? c) (< v 900000000000000000))
             (set! v (+ (* v 10) (- (cast i64 c) 48)))
             (set! ok false))))
     (if ok (Some v) (None [i64]))))
-
-(defn safe [(v i64)] (-> (Option i64))
-  (if (and (>= v 0) (< v SAFE-LIMIT)) (Some v) (None [i64])))
-
-(defn num-add [(a (Option i64)) (b (Option i64))] (-> (Option i64))
-  (match a
-    (None [] (None [i64]))
-    (Some [x] (match b (None [] (None [i64])) (Some [y] (safe (+ x y)))))))
-
-(defn num-sub [(a (Option i64)) (b (Option i64))] (-> (Option i64))
-  (match a
-    (None [] (None [i64]))
-    (Some [x] (match b (None [] (None [i64])) (Some [y] (safe (- x y)))))))
-
-(defn num-mul [(a (Option i64)) (b (Option i64))] (-> (Option i64))
-  (match a
-    (None [] (None [i64]))
-    (Some [x]
-          (match b
-            (None [] (None [i64]))
-            (Some [y]
-                  (if (and (> x 0) (> y (/ (- SAFE-LIMIT 1) x)))
-                      (None [i64])
-                      (safe (* x y))))))))
 
 (defn num-text [(v i64)] (-> (slice u8))
   (let [(mut b) (str/StrBuf::new (malloc-allocator))]
@@ -808,9 +773,8 @@
 (defn join-thread! [(t (mut Thread))] (-> void) (join (cast (ptr Thread) (mut t))) 0)
 
 ;;; Command-line arguments, for a program written in `.rules`.
+(defn args-init! [(argc i32) (argv (ptr (ptr i8)))] (-> void) (args/init! argc argv) 0)
 (defn arg-count [] (-> i64) (args/count))
 (defn arg-at [(i i64)] (-> (slice u8)) (args/nth i))
 
 (defn digit-i64? [(c i64)] (-> bool) (and (>= c 48) (<= c 57)))
-(defn name-start-i64? [(c i64)] (-> bool) (and (>= c 0) (< c 256) (name-start? (cast u8 c))))
-(defn name-char-i64? [(c i64)] (-> bool) (and (>= c 0) (< c 256) (name-char? (cast u8 c))))

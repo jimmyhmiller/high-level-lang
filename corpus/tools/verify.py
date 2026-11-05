@@ -6,12 +6,13 @@ ESB, PARSE = sys.argv[1], sys.argv[2]
 SCRATCH = "out/verify"; os.makedirs(SCRATCH, exist_ok=True)
 E = "node_modules/.bin/esbuild"
 failures = []
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import guard
 def sh(cmd, timeout=120):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout + r.stderr
-    except subprocess.TimeoutExpired:
-        return 124, "TIMEOUT"
+    # Everything runs under a memory cap as well as a clock: a runaway fails one check.
+    code, out, err, peak, reason = guard.run(cmd, 4000, timeout, quiet=True)
+    if reason: return 124, "STOPPED: " + reason
+    return code, out + err
 def check(ok, label):
     print(("  ok   " if ok else "  FAIL ") + label)
     if not ok: failures.append(label)
