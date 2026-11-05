@@ -260,6 +260,15 @@ for app in ["react", "named", "three", "all", "cjs"]:
     tails = [open(o).read()[open(o).read().rindex("})();") + 5:] for o in outs]
     check(tails[0] == tails[1] and len(tails[0]) > 1, f"{app}: the same license block as esbuild's, byte for byte ({len(tails[0])} bytes)")
 
+print("== tsconfig.json against esbuild")
+for entry, flags in [("app/tsc/src/main.tsx", ["--platform=node"]), ("app/tsc/src/main.tsx", ["--platform=node", "--minify"]),
+                     ("app/tsc2/main.ts", []), ("app/tsc2/main.ts", ["--minify"]), ("app/tsc2/main.ts", ["--tsconfig=app/tsc/tsconfig.json"])]:
+    a, b = f"{SCRATCH}/tc.o.cjs", f"{SCRATCH}/tc.e.cjs"
+    code, _ = sh([ESB, entry, f"--outfile={a}"] + flags)
+    sh([E, entry, "--bundle", f"--outfile={b}", "--log-level=error"] + flags)
+    ra, rb = sh(["node", a], 30), sh(["node", b], 30)
+    check(code == 0 and ra[0] == 0 and ra[1] and ra[1] == rb[1], f"{entry} {' '.join(flags)}: same output as esbuild's")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)

@@ -1,0 +1,203 @@
+# tsconfig.json and jsconfig.json: the settings a TypeScript project gives its files. Comments and
+# trailing commas are allowed, and `extends` builds one on another.
+rules bundle.tsconfig over bundle.package
+use bundle.package as pkg
+use bundle.resolve as res
+
+record PathRule { pattern: Text, targets: [Text], base: Text }
+
+record Config {
+  path: Text,
+  jsx: Text,
+  jsx-factory: Text,
+  jsx-fragment: Text,
+  jsx-import-source: Text,
+  define-fields: Text,   # "true", "false", or "" for what `target` implies
+  target: Text,
+  base-url: Text,        # already joined to its file's directory
+  paths: [PathRule],
+  paths-base: Text,
+  verbatim: Bool
+}
+
+fn none-config() -> Config =
+  Config(path: "", jsx: "", jsx-factory: "", jsx-fragment: "", jsx-import-source: "", define-fields: "",
+         target: "", base-url: "", paths: [], paths-base: "", verbatim: false)
+
+state by-dir: {Text:Config} = {}
+state forced: Text = ""
+
+fn member(object: pkg.Node, key: Text) -> pkg.Node? = match object {
+  pkg.Object(List(ms...)) => first m in ms: if unquote(m.kids[0].text) == key then some(m.kids[1]) else none
+  _ => none
+}
+
+fn text-of(v: pkg.Node?) -> Text = match v {
+  some(pkg.Str(raw)) => unquote(raw)
+  _ => ""
+}
+
+fn flag-of(v: pkg.Node?) -> Text = match v {
+  some(pkg.True()) => "true"
+  some(pkg.False()) => "false"
+  _ => ""
+}
+
+fn joined(dir: Text, rel: Text) -> Text = if starts-with(rel, "/") then rel else res.normalize(dir ++ "/" ++ rel)
+
+# What `extends` names: a file beside this one, or one in a package.
+fn extended-path(spec: Text, from: Text) -> Text {
+  if starts-with(spec, "./") or starts-with(spec, "../") or starts-with(spec, "/") {
+    let p = joined(dir-of(from), spec)
+    return if file-exists?(p) then p else if file-exists?(p ++ ".json") then p ++ ".json"
+           else panic "{}: cannot find the tsconfig it extends, {}", from, spec
+  }
+  var dir = dir-of(from)
+  while true {
+    let candidate = (if dir == "." then "" else dir ++ "/") ++ "node_modules/" ++ spec
+    for c in [candidate, candidate ++ ".json", candidate ++ "/tsconfig.json"] {
+      if file-exists?(c) and not (file-exists?(c ++ "/package.json")) { return c }
+    }
+    if dir == "." or dir == "/" or len(dir) == 0 { panic "{}: cannot find the tsconfig it extends, {}", from, spec }
+    dir = dir-of(dir)
+  }
+  panic "unreachable"
+}
+
+fn either(a: Text, b: Text) -> Text = if len(a) > 0 then a else b
+
+# The file's settings over those of what it extends.
+fn config-at(path: Text) -> Config {
+  let doc = pkg.parse(read-file(path), path)
+  var base = none-config()
+  match member(doc, "extends") {
+    some(pkg.Str(raw)) => { base = config-at(extended-path(unquote(raw), path)) }
+    some(pkg.Array(List(items...))) => for item in items {
+      if item is pkg.Str(_) { base = layered(base, config-at(extended-path(unquote(item.text), path))) }
+    }
+    _ => {}
+  }
+  let co = member(doc, "compilerOptions")
+  let opts: pkg.Node = co ?? pkg.Object(List())
+  let dir = dir-of(path)
+  let base-url-raw = text-of(member(opts, "baseUrl"))
+  var rules: [PathRule] = []
+  if let some(pkg.Object(List(entries...))) = member(opts, "paths") {
+    for e in entries {
+      let targets = match e.kids[1] {
+        pkg.Array(List(ts...)) => [unquote(t.text) for t in ts if t is pkg.Str(_)]
+        _ => []
+      }
+      rules += PathRule(pattern: unquote(e.kids[0].text), targets: targets, base: "")
+    }
+  }
+  let mine = Config(path: path,
+    jsx: text-of(member(opts, "jsx")),
+    jsx-factory: text-of(member(opts, "jsxFactory")),
+    jsx-fragment: text-of(member(opts, "jsxFragmentFactory")),
+    jsx-import-source: text-of(member(opts, "jsxImportSource")),
+    define-fields: flag-of(member(opts, "useDefineForClassFields")),
+    target: text-of(member(opts, "target")),
+    base-url: if len(base-url-raw) > 0 then joined(dir, base-url-raw) else "",
+    paths: rules,
+    paths-base: if len(rules) > 0 then dir else "",
+    verbatim: flag-of(member(opts, "verbatimModuleSyntax")) == "true"
+              or flag-of(member(opts, "preserveValueImports")) == "true"
+              or text-of(member(opts, "importsNotUsedAsValues")) == "preserve")
+  layered(base, mine)
+}
+
+fn layered(base: Config, mine: Config) -> Config =
+  Config(path: either(mine.path, base.path),
+         jsx: either(mine.jsx, base.jsx),
+         jsx-factory: either(mine.jsx-factory, base.jsx-factory),
+         jsx-fragment: either(mine.jsx-fragment, base.jsx-fragment),
+         jsx-import-source: either(mine.jsx-import-source, base.jsx-import-source),
+         define-fields: either(mine.define-fields, base.define-fields),
+         target: either(mine.target, base.target),
+         base-url: either(mine.base-url, base.base-url),
+         paths: if len(mine.paths) > 0 then mine.paths else base.paths,
+         paths-base: if len(mine.paths) > 0 then mine.paths-base else base.paths-base,
+         verbatim: mine.verbatim or base.verbatim)
+
+fn inside-packages?(path: Text) -> Bool = contains-text?(path, "node_modules/")
+
+# The config governing a file: the nearest tsconfig.json or jsconfig.json above it. A package's own
+# files are not the project's to configure.
+fn for-file(path: Text) -> Config {
+  if len(forced) > 0 {
+    let key = "\n" ++ forced
+    if let some(c) = by-dir[key] { return c }
+    let c = config-at(forced)
+    by-dir[key] = c
+    return c
+  }
+  if inside-packages?(path) { return none-config() }
+  let dir = dir-of(path)
+  if let some(c) = by-dir[dir] { return c }
+  let here = if dir == "." then "" else dir ++ "/"
+  let found = if file-exists?(here ++ "tsconfig.json") then config-at(here ++ "tsconfig.json")
+              else if file-exists?(here ++ "jsconfig.json") then config-at(here ++ "jsconfig.json")
+              else if dir == "." or dir == "/" or len(dir) == 0 then none-config()
+              else for-file((if dir-of(dir) == "." then "" else dir-of(dir) ++ "/") ++ "file")
+  by-dir[dir] = found
+  found
+}
+
+# Class fields have define semantics unless the config turns them off, or targets an older JavaScript.
+fn define-fields?(c: Config) -> Bool {
+  if c.define-fields == "true" { return true }
+  if c.define-fields == "false" { return false }
+  let t = c.target
+  if len(t) == 0 { return true }
+  let lower = [x for x in ["es3", "es5", "es6", "es2015", "es2016", "es2017", "es2018", "es2019", "es2020", "es2021"]]
+  not (any x in lower: x == t or x == upper-less(t))
+}
+
+fn upper-less(t: Text) -> Text {
+  var b = buf-new()
+  for c in t { buf-byte!(b, if c >= 'A' and c <= 'Z' then c + 32 else c) }
+  buf-text(b)
+}
+
+# `paths`: the pattern with the longest prefix before its `*` wins, and its targets are tried in order.
+fn path-candidates(c: Config, spec: Text) -> [Text] {
+  var best = -1
+  var best-len = -1
+  var star = ""
+  for i in 0..len(c.paths) {
+    let p = c.paths[i].pattern
+    var cut = -1
+    for j in 0..len(p) {
+      if p[j] == '*' { cut = j }
+    }
+    if cut < 0 {
+      if p == spec and len(p) > best-len {
+        best = i
+        best-len = len(p)
+        star = ""
+      }
+    } else if starts-with(spec, p[0..cut]) and ends-with(spec, p[cut + 1..len(p)])
+              and len(spec) >= len(p) - 1 and cut > best-len {
+      best = i
+      best-len = cut
+      star = spec[cut..len(spec) - (len(p) - cut - 1)]
+    }
+  }
+  if best < 0 { return [] }
+  let root = either(c.base-url, c.paths-base)
+  [joined(root, replace-star(t, star)) for t in c.paths[best].targets]
+}
+
+fn replace-star(t: Text, star: Text) -> Text {
+  var b = buf-new()
+  for c in t {
+    if c == '*' { buf-add!(b, star) } else { buf-byte!(b, c) }
+  }
+  buf-text(b)
+}
+
+fn reset(tsconfig: Text) -> Void {
+  by-dir = {}
+  forced = tsconfig
+}

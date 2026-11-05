@@ -12,6 +12,7 @@ use bundle.jsx as jsx
 use bundle.ts as ts
 use bundle.cssbundle as cssb
 use bundle.legal as legal
+use bundle.tsconfig as tsc
 
 # `External` is an import left for the runtime: it has no source and no statements.
 enum ModuleKind { Esm, Cjs, Runtime, External }
@@ -187,12 +188,25 @@ fn mentions-name?(n: Node, name: Text) -> Bool = match n {
 # A class has a binding of its own name inside it, which is there before the `var` around it is
 # assigned: `static x = new A()` needs that. A second, inner name is only worth it if something
 # in the class says the name.
+# Inside the class its name means the inner binding, which esbuild calls `_Name`. That is what
+# `this.constructor.name` says, so it is part of what the program does.
+fn renamed-inside(n: Node, from: Text, to: Text) -> Node = match n {
+  Ident(x) => if x == from then Ident(to) with { lo: n.lo, hi: n.hi } else n
+  Shorthand(Ident(x)) => if x == from then Prop(PropName(x), Ident(to)) with { lo: n.lo, hi: n.hi } else n
+  _ => if len(n.kids) == 0 then n
+       else if from in ts.shadowed-by(n) then n
+       else n with { kids: [renamed-inside(k, from, to) for k in n.kids] }
+}
+
 fn declarator-of-class(c: Node) -> Node = match c {
   ClassDecl(name, h, b) => {
-    let inner = if mentions-name?(h, name.text) or mentions-name?(b, name.text)
-                then BindName(name.text) with { lo: c.lo, hi: c.lo }
-                else None()
-    let init = at-source(ClassExpr(inner, h, b), c)
+    let own = name.text
+    let says = mentions-name?(h, own) or mentions-name?(b, own)
+    let inner-name = "_" ++ own
+    let inner = if says then BindName(inner-name) with { lo: c.lo, hi: c.lo } else None()
+    let heritage = if says then renamed-inside(h, own, inner-name) else h
+    let body = if says then renamed-inside(b, own, inner-name) else b
+    let init = at-source(ClassExpr(inner, heritage, body), c)
     Declarator(name, init) with { lo: name.lo, hi: init.hi }
   }
   _ => panic "expected a class declaration"
@@ -303,6 +317,26 @@ fn parse-file(src: Text, path: Text) -> Node {
   }
 }
 
+# A project's JSX settings, unless the build gave its own.
+fn configured-jsx(o: jsx.Options, c: tsc.Config) -> jsx.Options {
+  if o.explicit { return o }
+  var out = o
+  match c.jsx {
+    "react" => { out.runtime = jsx.Classic }
+    "react-jsx" => { out.runtime = jsx.Automatic }
+    "react-jsxdev" => {
+      out.runtime = jsx.Automatic
+      out.dev = true
+    }
+    "preserve" | "react-native" => { out.runtime = jsx.Preserve }
+    _ => {}
+  }
+  if len(c.jsx-factory) > 0 { out.factory = c.jsx-factory }
+  if len(c.jsx-fragment) > 0 { out.fragment = c.jsx-fragment }
+  if len(c.jsx-import-source) > 0 { out.import-source = c.jsx-import-source }
+  out
+}
+
 # Is this file in node compatibility mode: `.mjs`, or under "type": "module"?
 fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-module?(path)
 
@@ -344,11 +378,26 @@ fn hook-path(spec: Text, importer: Text) -> Text? {
 fn stays-external?(spec: Text, importer: Text) -> Bool =
   is-none(hook-path(aliased(spec), importer)) and res.external?(aliased(spec), options)
 
-# Where an import leads: resolve hooks first, then the search.
+# A project's `paths` and `baseUrl` come before node_modules, for a bare specifier.
+fn configured-path(spec: Text, importer: Text) -> Text? {
+  if res.relative?(spec) or starts-with(spec, "/") { return none }
+  let c = tsc.for-file(importer)
+  for candidate in tsc.path-candidates(c, spec) {
+    if let some(p) = res.try-path(candidate, options) { return some(p) }
+  }
+  if len(c.base-url) > 0 { return res.try-path(c.base-url ++ "/" ++ spec, options) }
+  none
+}
+
+# Where an import leads: resolve hooks first, then the project's paths, then the search.
 fn resolve-import(spec: Text, importer: Text) -> res.Resolved {
   let wanted = aliased(spec)
   match hook-path(wanted, importer) {
     some(p) => res.Resolved(path: p, side-effects: true)
+    none if is-some(configured-path(wanted, importer)) => {
+      let p = configured-path(wanted, importer) ?? panic "lost a configured path"
+      res.Resolved(path: p, side-effects: res.side-effects-of(p))
+    }
     # A relative alias is relative to where the build runs, not to the importing file.
     none => res.resolve(wanted, if wanted != spec and res.relative?(wanted) then "alias" else importer, options)
   }
@@ -408,9 +457,11 @@ fn load-file(path: Text, effects: Bool) -> Int {
   let src = as-module(source-of(path), path)
   let parsed = parse-file(src, path)
   let loader = loader-of(path)
-  let lowered = if loader == "jsx" or loader == "tsx" then jsx.lower(parsed, src, path, jsx-options)
+  let config = tsc.for-file(path)
+  let file-jsx = configured-jsx(jsx-options, config)
+  let lowered = if loader == "jsx" or loader == "tsx" then jsx.lower(parsed, src, path, file-jsx)
                 else jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
-  let typed = if loader == "ts" or loader == "tsx" then ts.lower(lowered.tree, src, jsx.kept-names(src, path, jsx-options))
+  let typed = if loader == "ts" or loader == "tsx" then ts.lower(lowered.tree, src, jsx.kept-names(src, path, file-jsx), tsc.define-fields?(config), config.verbatim)
               else ts.Lowered(tree: lowered.tree, pure-calls: {})
   var pure-calls = lowered.pure-calls
   for k in keys(typed.pure-calls) { pure-calls[k] = typed.pure-calls[k] ?? k }

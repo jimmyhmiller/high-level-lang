@@ -18,6 +18,10 @@ state next-offset: Int = -1000
 state pure: {Int:Int} = {}
 state aliases: {Int:Bool} = {}
 state namespace-exports: {Text:[Text]} = {}
+# `useDefineForClassFields: false`: fields are assignments in the constructor, as TypeScript once did.
+state assign-fields: Bool = false
+# `verbatimModuleSyntax`: an import is kept unless it says it is a type.
+state keeping-imports: Bool = false
 context namespace-path: Text = ""
 
 # Scope analysis finds a name's symbol by offset. Real offsets are not negative.
@@ -495,14 +499,9 @@ fn assignments-at(stmts: [Node]) -> Int {
   at
 }
 
-fn constructor-with-properties(m: Node, props: [Node]) -> Node = match m {
+# The constructor, with what it now sets right after `super()`: parameter properties, then fields.
+fn constructor-with-assignments(m: Node, assigns: [Node]) -> Node = match m {
   Method(key, Params(List(ps...)), FuncBody(List(ss...))) => {
-    var assigns: [Node] = []
-    for p in props {
-      let name = p.kids[0].text
-      let value = ident(name)
-      assigns += stmt`this.$name = $value;`
-    }
     let body = lowered-statements(ss)
     let at = assignments-at(body)
     var out: [Node] = []
@@ -523,25 +522,66 @@ fn parameter-properties(m: Node) -> [Node] = match m {
   _ => []
 }
 
-# A parameter property is a field, declared ahead of the others, set by the constructor.
-fn class-body(n: Node) -> Node = match n {
+# `this.x = v`, `this["a b"] = v`, `this.#x = v`.
+fn assigned(target: Node, key: Node, value: Node) -> Node {
+  let place = match key {
+    PropName(_) | PrivateName(_) => Member(target, key)
+    Str(_) | Num(_) => Index(target, key)
+    _ => panic "a computed field name with useDefineForClassFields false is not implemented yet"
+  }
+  ExprStmt(Assignment(place, AssignOp("="), value))
+}
+
+fn synthesized-constructor(derived: Bool) -> Node {
+  let calls: [Node] = if derived then [stmt`super(...arguments);`] else []
+  Method(PropName("constructor"), Params(List()), FuncBody(List(calls...)))
+}
+
+# A parameter property is a field, declared ahead of the others, set by the constructor. Without
+# define semantics a field is an assignment there too, and a static one an assignment in a static
+# block where it stood. A private field stays declared, since only the class can declare it.
+fn class-body(n: Node, derived: Bool) -> Node = match n {
   ClassBody(List(members...)) => {
     var props: [Node] = []
     for m in members {
       if constructor?(m) { props ++= parameter-properties(m) }
     }
-    if len(props) == 0 { return n with { kids: [lowered(n.kids[0])] } }
-    var out: [Node] = []
+    let has-fields = any m in members: m is Field(...) | StaticField(...)
+    if len(props) == 0 and not (assign-fields and has-fields) { return n with { kids: [lowered(n.kids[0])] } }
+    var assigns: [Node] = []
+    for p in props {
+      let name = p.kids[0].text
+      let value = ident(name)
+      assigns += stmt`this.$name = $value;`
+    }
+    var rest: [Node] = []
     for m in members {
-      if constructor?(m) { out += constructor-with-properties(m, props) }
+      match m {
+        Field(key, init) => if not assign-fields { rest += lowered(m) } else {
+          if key is PrivateName(_) { rest += Field(key, None()) with { lo: m.lo, hi: m.hi } }
+          if not (init is None()) { assigns += assigned(This(), key, lowered(init)) }
+        }
+        StaticField(key, init) => if not assign-fields { rest += lowered(m) } else {
+          if key is PrivateName(_) { rest += StaticField(key, None()) with { lo: m.lo, hi: m.hi } }
+          if not (init is None()) {
+            rest += StaticBlock(FuncBody(List(assigned(This(), key, lowered(init))))) with { lo: m.lo, hi: m.hi }
+          }
+        }
+        TsErased() => {}
+        _ => if not constructor?(m) { rest += lowered(m) }
+      }
+    }
+    var out: [Node] = []
+    let existing = first m in members: if constructor?(m) then some(m) else none
+    let needs-constructor = len(assigns) > 0 or is-some(existing)
+    if needs-constructor {
+      out += constructor-with-assignments(existing ?? synthesized-constructor(derived), assigns)
     }
     for p in props {
       let key = PropName(p.kids[0].text) with { lo: p.kids[0].lo, hi: p.kids[0].hi }
-      out += Field(key, None()) with { lo: p.lo, hi: p.hi }
+      if not assign-fields { out += Field(key, None()) with { lo: p.lo, hi: p.hi } }
     }
-    for m in members {
-      if not constructor?(m) and not (m is TsErased()) { out += lowered(m) }
-    }
+    out ++= rest
     n with { kids: [List(out...) with { lo: n.kids[0].lo, hi: n.kids[0].hi }] }
   }
   _ => panic "expected a class body"
@@ -605,7 +645,9 @@ fn lowered-statements(xs: [Node]) -> [Node] {
 
 fn lowered(n: Node) -> Node = match n {
   List(xs...) => n with { kids: lowered-statements(xs) }
-  ClassBody(...) => class-body(n)
+  ClassDecl(name, heritage, body) | ClassExpr(name, heritage, body) =>
+    n with { kids: [lowered(name), lowered(heritage), class-body(body, not (heritage is None()))] }
+  ClassBody(...) => class-body(n, false)
   TsParamProp(...) => panic "a parameter property is only allowed in a constructor"
   _ => if len(n.kids) == 0 then n else n with { kids: [lowered(k) for k in n.kids] }
 }
@@ -676,7 +718,7 @@ fn pruned(tree: Node, keep: [Text]) -> Node {
   let declared = early.module-names(tree.kids[1].kids)
   for s in plain.kids {
     match s {
-      Import(clause, from) => match pruned-clause(clause, bindings, used, exported, keep) {
+      Import(clause, from) => if keeping-imports { out += s } else match pruned-clause(clause, bindings, used, exported, keep) {
         some(c) => { out += s with { kids: [c, from] } }
         none => {}
       }
@@ -695,8 +737,10 @@ fn pruned(tree: Node, keep: [Text]) -> Node {
 
 # ---------------------------------------------------------------- the whole file
 
-fn lower(tree: Node, source: Text, keep: [Text]) -> Lowered {
+fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool) -> Lowered {
   src = source
+  assign-fields = not define-fields
+  keeping-imports = keep-imports
   next-offset = -1000
   pure = {}
   aliases = {}
