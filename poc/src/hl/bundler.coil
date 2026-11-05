@@ -30,11 +30,16 @@
 (import "coil.slice" :use [subslice])
 (import "hl.rt" :as rt)
 (import "hl.dsl" :as dsl)
+(import "hl.grammars.bundler" :as g)
 
 (reader-provider "hl.bundler" read-bundler)
 
 ;;; A step: the module holding it, and the function to call.
 (defstruct Pass [(name (slice u8)) (module (slice u8)) (function (slice u8))])
+
+(defn tok-of [(src (slice u8)) (n g/Node)] (-> rt/Tok)
+  (let [at (rt/line-col src (.lo n))]
+    (rt/Tok :kind (rt/TIdent) :text (.text n) :line (.line at) :col (.col at))))
 
 (defn split-function [(c (mut dsl/Cur)) (t rt/Tok)] (-> Pass)
   (let [s (.text t) (mut cut) -1]
@@ -52,28 +57,6 @@
     (for p passes (when (= (.name p) n) (set! out (Some p))))
     out))
 
-;;; Words up to the end of a line-ish clause: until the next clause keyword.
-(defn clause-word? [(c (mut dsl/Cur))] (-> bool)
-  (let [t (dsl/peek (mut c))]
-    (and (= (.kind t) (rt/TIdent))
-         (not (or (dsl/at? (mut c) "entry") (dsl/at? (mut c) "outfile") (dsl/at? (mut c) "format")
-                  (dsl/at? (mut c) "global") (dsl/at? (mut c) "define") (dsl/at? (mut c) "main-fields")
-                  (dsl/at? (mut c) "conditions") (dsl/at? (mut c) "minify") (dsl/at? (mut c) "pretty")
-                  (dsl/at? (mut c) "transform") (dsl/at? (mut c) "optimize") (dsl/at? (mut c) "end"))))))
-
-(defn read-words [(c (mut dsl/Cur))] (-> (ArrayList rt/Tok))
-  (let [(mut out) (ArrayList::new [rt/Tok] (malloc-allocator))]
-    (while (clause-word? (mut c)) (push! (mut out) (dsl/advance! (mut c))))
-    out))
-
-;;; A define's value, as the JavaScript text the build will parse.
-(defn define-value [(c (mut dsl/Cur)) (v rt/Tok)] (-> (slice u8))
-  (cond
-    (= (.kind v) (rt/TStr)) (dsl/join3 "\"" (.text v) "\"")
-    (= (.kind v) (rt/TNum)) (.text v)
-    (= (.kind v) (rt/TIdent)) (.text v)
-    :else (dsl/die (mut c) v "a define's value is a name, a number or a string")))
-
 ;;; A pass wrapper the options can hold as a function pointer: the composition of the
 ;;; named steps, resolved here, so a build pays one direct call per step.
 (defn pipeline-fn [(name Code) (steps (ArrayList Pass))] (-> Code)
@@ -82,79 +65,72 @@
     `(defn ~name [(in (ptr syn/Node)) (out (ptr syn/Node))] (-> void)
        (store! out ~body))))
 
-(defn read-steps [(c (mut dsl/Cur)) (passes (ArrayList Pass))] (-> (ArrayList Pass))
+(defn steps-of [(c (mut dsl/Cur)) (src (slice u8)) (list g/Node) (passes (ArrayList Pass))] (-> (ArrayList Pass))
   (let [(mut out) (ArrayList::new [Pass] (malloc-allocator))]
-    (for t (read-words (mut c))
+    (for t (.kids list)
       (match (find-pass passes (.text t))
         (Some [p] (push! (mut out) p))
-        (None [] (dsl/die (mut c) t (dsl/join3 "no step named " (.text t) "; declare it with `use`")))))
+        (None [] (dsl/die (mut c) (tok-of src t) (dsl/join3 "no step named " (.text t) "; declare it with `use`")))))
     out))
 
+;;; The Str token's content, or a Name or Num as it stands: JavaScript text for a define.
+(defn define-text [(v g/Node)] (-> (slice u8)) (.text v))
+
+(defn str-of [(n g/Node)] (-> (slice u8)) (subslice (.text n) 1 (- (len (.text n)) 1)))
+
+(defn word-pushes [(list g/Node) (field (slice u8))] (-> Code)
+  (let [(mut pushes) (primitive/code-list-new)
+        access (primitive/code-symbol "." field)]
+    (for w (.kids list) (push! (mut pushes) `(push! (mut (~access o)) ~(.text w))))
+    `(do (set! (~access o) (api/clear-words)) ~@pushes)))
+
 ;;; One `target … end`: its helper functions, then a function that builds it.
-(defn read-target [(c (mut dsl/Cur)) (passes (ArrayList Pass)) (names (mut (ArrayList (slice u8))))] (-> Code)
-  (let [start (dsl/name! (mut c) "a target name")
+(defn compile-target [(c (mut dsl/Cur)) (src (slice u8)) (target g/Node) (passes (ArrayList Pass)) (names (mut (ArrayList (slice u8))))] (-> Code)
+  (let [start (get (.kids target) 0)
         name (.text start)
         (mut entry) ""
         (mut outfile) ""
         (mut sets) (primitive/code-list-new)
-        (mut forms) (primitive/code-list-new)
-        (mut go) true]
-    (while go
-      (let [t (dsl/peek (mut c))]
-        (cond
-          (dsl/accept! (mut c) "end") (set! go false)
-          (dsl/accept! (mut c) "entry")
-            (set! entry (.text (dsl/string! (mut c) "an entry path")))
-          (dsl/accept! (mut c) "outfile")
-            (set! outfile (.text (dsl/string! (mut c) "an output path")))
-          (dsl/accept! (mut c) "format")
-            (let [f (dsl/name! (mut c) "iife, esm or cjs")]
-              (cond
-                (= (.text f) "iife") (push! (mut sets) `(set! (.format o) (api/Iife)))
-                (= (.text f) "esm") (push! (mut sets) `(set! (.format o) (api/Esm)))
-                (= (.text f) "cjs") (push! (mut sets) `(set! (.format o) (api/Cjs)))
-                :else (dsl/die (mut c) f "the format is iife, esm or cjs")))
-          (dsl/accept! (mut c) "global")
-            (let [g (dsl/string! (mut c) "a global name")]
-              (push! (mut sets) `(set! (.global-name o) ~(.text g))))
-          (dsl/accept! (mut c) "define")
-            (let [key (dsl/name! (mut c) "a name to define")]
-              (dsl/expect! (mut c) "=")
-              (let [v (dsl/advance! (mut c))]
-                (push! (mut sets) `(api/define! (mut o) ~(.text key) ~(define-value (mut c) v)))))
-          (dsl/accept! (mut c) "main-fields")
-            (let [(mut pushes) (primitive/code-list-new)]
-              (for w (read-words (mut c)) (push! (mut pushes) `(push! (mut (.main-fields o)) ~(.text w))))
-              (push! (mut sets) `(set! (.main-fields o) (api/clear-words)))
-              (push! (mut sets) `(do ~@pushes)))
-          (dsl/accept! (mut c) "conditions")
-            (let [(mut pushes) (primitive/code-list-new)]
-              (for w (read-words (mut c)) (push! (mut pushes) `(push! (mut (.conditions o)) ~(.text w))))
-              (push! (mut sets) `(set! (.conditions o) (api/clear-words)))
-              (push! (mut sets) `(do ~@pushes)))
-          (dsl/accept! (mut c) "minify")
-            (let [parts (read-words (mut c))]
-              (if (= (len parts) 0)
-                  (do
-                    (push! (mut sets) `(set! (.minify-identifiers o) true))
-                    (push! (mut sets) `(set! (.minify-syntax o) true)))
-                  (for w parts
-                    (cond
-                      (= (.text w) "identifiers") (push! (mut sets) `(set! (.minify-identifiers o) true))
-                      (= (.text w) "syntax") (push! (mut sets) `(set! (.minify-syntax o) true))
-                      :else (dsl/die (mut c) w "minify takes identifiers and syntax, or nothing for both")))))
-          (dsl/accept! (mut c) "pretty") (push! (mut sets) `(set! (.pretty o) true))
-          (dsl/accept! (mut c) "transform")
-            (let [fname (primitive/code-symbol (dsl/join2 name "-transform"))]
-              (push! (mut forms) (pipeline-fn fname (read-steps (mut c) passes)))
-              (push! (mut sets) `(set! (.transform o) (Some (fnptr-of ~fname)))))
-          (dsl/accept! (mut c) "optimize")
-            (let [fname (primitive/code-symbol (dsl/join2 name "-optimize"))]
-              (push! (mut forms) (pipeline-fn fname (read-steps (mut c) passes)))
-              (push! (mut sets) `(set! (.optimize o) (Some (fnptr-of ~fname)))))
-          :else (dsl/die (mut c) t (dsl/join2 "expected a target setting, found " (.text t))))))
-    (when (= (len entry) 0) (dsl/die (mut c) start (dsl/join3 "target " name " has no entry")))
-    (when (= (len outfile) 0) (dsl/die (mut c) start (dsl/join3 "target " name " has no outfile")))
+        (mut forms) (primitive/code-list-new)]
+    (for s (.kids (get (.kids target) 1))
+      (match (.kind s)
+        (g/KEntry [] (set! entry (str-of (get (.kids s) 0))))
+        (g/KOutfile [] (set! outfile (str-of (get (.kids s) 0))))
+        (g/KFormat []
+          (let [f (get (.kids s) 0)]
+            (cond
+              (= (.text f) "iife") (push! (mut sets) `(set! (.format o) (api/Iife)))
+              (= (.text f) "esm") (push! (mut sets) `(set! (.format o) (api/Esm)))
+              (= (.text f) "cjs") (push! (mut sets) `(set! (.format o) (api/Cjs)))
+              :else (dsl/die (mut c) (tok-of src f) "the format is iife, esm or cjs"))))
+        (g/KGlobal [] (push! (mut sets) `(set! (.global-name o) ~(str-of (get (.kids s) 0)))))
+        (g/KDefine []
+          (push! (mut sets) `(api/define! (mut o) ~(.text (get (.kids s) 0)) ~(define-text (get (.kids s) 1)))))
+        (g/KMainFields [] (push! (mut sets) (word-pushes (get (.kids s) 0) "main-fields")))
+        (g/KConditions [] (push! (mut sets) (word-pushes (get (.kids s) 0) "conditions")))
+        (g/KMinify []
+          (let [parts (.kids (get (.kids s) 0))]
+            (if (= (len parts) 0)
+                (do
+                  (push! (mut sets) `(set! (.minify-identifiers o) true))
+                  (push! (mut sets) `(set! (.minify-syntax o) true)))
+                (for w parts
+                  (cond
+                    (= (.text w) "identifiers") (push! (mut sets) `(set! (.minify-identifiers o) true))
+                    (= (.text w) "syntax") (push! (mut sets) `(set! (.minify-syntax o) true))
+                    :else (dsl/die (mut c) (tok-of src w) "minify takes identifiers and syntax, or nothing for both"))))))
+        (g/KPretty [] (push! (mut sets) `(set! (.pretty o) true)))
+        (g/KTransform []
+          (let [fname (primitive/code-symbol (dsl/join2 name "-transform"))]
+            (push! (mut forms) (pipeline-fn fname (steps-of (mut c) src (get (.kids s) 0) passes)))
+            (push! (mut sets) `(set! (.transform o) (Some (fnptr-of ~fname))))))
+        (g/KOptimize []
+          (let [fname (primitive/code-symbol (dsl/join2 name "-optimize"))]
+            (push! (mut forms) (pipeline-fn fname (steps-of (mut c) src (get (.kids s) 0) passes)))
+            (push! (mut sets) `(set! (.optimize o) (Some (fnptr-of ~fname))))))
+        (_ (dsl/die (mut c) (tok-of src s) "this setting is not handled"))))
+    (when (= (len entry) 0) (dsl/die (mut c) (tok-of src start) (dsl/join3 "target " name " has no entry")))
+    (when (= (len outfile) 0) (dsl/die (mut c) (tok-of src start) (dsl/join3 "target " name " has no outfile")))
     (push! (mut names) name)
     `(do
        ~@forms
@@ -165,31 +141,32 @@
            (api/build o))))))
 
 (defn module-text [(context Code)] (-> (slice u8))
-  (let [(mut c) (dsl/cursor (dsl/source-of context) (dsl/path-of context) "=")
+  (let [src (dsl/source-of context)
+        path (dsl/path-of context)
+        (mut c) (dsl/cursor "" path "")
+        tree (match (g/parse-result src path 0)
+               (Ok [t] t)
+               (Err [e] (dsl/fail-at path (.line e) (.col e) (dsl/join2 "expected " (.want e)))))
         (mut passes) (ArrayList::new [Pass] (malloc-allocator))
         (mut targets) (primitive/code-list-new)
         (mut names) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut calls) (primitive/code-list-new)
         (mut imports) (primitive/code-list-new)]
-    (dsl/expect! (mut c) "bundler")
-    (while (dsl/accept! (mut c) "use")
-      (let [sort (dsl/name! (mut c) "rewrite or coil")
-            n (dsl/name! (mut c) "a step name")]
-        (dsl/expect! (mut c) "=")
-        (let [target (dsl/name! (mut c) "a module")
-              p (cond
-                  (= (.text sort) "rewrite")
-                    (Pass :name (.text n) :module (.text target) :function "run")
-                  (= (.text sort) "coil")
-                    (let [split (split-function (mut c) target)]
-                      (Pass :name (.text n) :module (.module split) :function (.function split)))
-                  :else (dsl/die (mut c) sort "expected rewrite or coil"))]
-          (push! (mut passes) p)
-          (push! (mut imports) `(import ~(.module p) :as ~(alias-sym p))))))
-    (while (dsl/accept! (mut c) "target")
-      (push! (mut targets) (read-target (mut c) passes (mut names))))
-    (unless (dsl/eof? (mut c))
-      (dsl/die (mut c) (dsl/peek (mut c)) "expected target"))
+    (for u (.kids (get (.kids tree) 0))
+      (let [sort (get (.kids u) 0)
+            n (get (.kids u) 1)
+            target (get (.kids u) 2)
+            p (cond
+                (= (.text sort) "rewrite")
+                  (Pass :name (.text n) :module (.text target) :function "run")
+                (= (.text sort) "coil")
+                  (let [split (split-function (mut c) (tok-of src target))]
+                    (Pass :name (.text n) :module (.module split) :function (.function split)))
+                :else (dsl/die (mut c) (tok-of src sort) "expected rewrite or coil"))]
+        (push! (mut passes) p)
+        (push! (mut imports) `(import ~(.module p) :as ~(alias-sym p)))))
+    (for t (.kids (get (.kids tree) 1))
+      (push! (mut targets) (compile-target (mut c) src t passes (mut names))))
     (for n names
       (push! (mut calls) `(~(primitive/code-symbol "build-" n))))
     (dsl/render
