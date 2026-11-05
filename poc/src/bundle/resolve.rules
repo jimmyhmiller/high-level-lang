@@ -12,26 +12,67 @@ record Options {
 
 record Resolved { path: Text, side-effects: Bool }
 
-# Everything the filesystem answered, so each question is asked once.
-state files: {Text:Bool} = {}
-state docs: {Text:pkg.Node} = {}
-state resolved: {Text:Text} = {}
-state effects: {Text:[Text]} = {}
-state type-module: {Text:Bool} = {}
+# Answers derived from the filesystem's, so each is worked out once per worker: they are caches,
+# and a new build's generation empties them. What the filesystem itself says is a memo, below,
+# asked once for all workers.
+task state files: {Text:Bool} = {}
+task state resolved: {Text:Text} = {}
+task state effects: {Text:[Text]} = {}
+task state type-module: {Text:Bool} = {}
+task state seen-generation: Int = -1
+state generation: Int = 0
+
+fn fresh-caches!() -> Void {
+  if seen-generation != generation {
+    files = {}
+    resolved = {}
+    effects = {}
+    type-module = {}
+    seen-generation = generation
+  }
+}
+
+# A new build: every worker's caches start over the next time it asks, and the memos now. The
+# number comes from a counter no reset of this module's state can rewind.
+fn new-generation!() -> Void {
+  generation = next-pass!()
+  forget-memos!()
+}
+
+# What a directory holds, by name: 'f' a file, 'd' a directory, 'l' a link. Read once, as esbuild does,
+# so each candidate a resolution tries costs a lookup and not a system call.
+memo fn listing-of(dir: Text) -> {Text:Int} {
+  let text = dir-listing(dir)
+  var out: {Text:Int} = {}
+  var start = 0
+  for i in 0..len(text) {
+    if text[i] == '\n' {
+      out[text[start + 1..i]] = text[start]
+      start = i + 1
+    }
+  }
+  out
+}
 
 fn file?(path: Text) -> Bool {
+  fresh-caches!()
   if let some(known) = files[path] { return known }
-  let there = readable-file?(path)
+  let kind = listing-of(dir-of(path))[base-of(path)] ?? 0
+  # A link is the one case the listing cannot answer.
+  let there = if kind == 'l' then readable-file?(path) else kind == 'f'
   files[path] = there
   there
 }
 
-fn doc-of(path: Text) -> pkg.Node {
-  if let some(d) = docs[path] { return d }
-  let d = pkg.parse(read-file(path), path)
-  docs[path] = d
-  d
+fn base-of(path: Text) -> Text {
+  var cut = -1
+  for i in 0..len(path) {
+    if path[i] == '/' { cut = i }
+  }
+  path[cut + 1..len(path)]
 }
+
+memo fn doc-of(path: Text) -> pkg.Node = pkg.parse(read-file(path), path)
 
 # Remove `.` and `..` segments.
 fn normalize(path: Text) -> Text {
@@ -154,6 +195,7 @@ fn package-json-for(start: Text) -> Text? {
 
 # Is the package.json governing a file `"type": "module"`?
 fn package-type-module?(path: Text) -> Bool {
+  fresh-caches!()
   let dir = dir-of(path)
   if let some(known) = type-module[dir] { return known }
   let answer = match package-json-for(dir) {
@@ -170,6 +212,7 @@ fn package-type-module?(path: Text) -> Bool {
 # `"sideEffects"` in the package.json governing a file: `false`, or the files that have them. No
 # list at all is every file, written as the empty pattern.
 fn effect-patterns(dir: Text) -> [Text] {
+  fresh-caches!()
   if let some(known) = effects[dir] { return known }
   let answer: [Text] = match package-json-for(dir) {
     none => [""]
@@ -282,17 +325,33 @@ fn external?(spec: Text, o: Options) -> Bool =
 fn relative?(spec: Text) -> Bool =
   starts-with(spec, "./") or starts-with(spec, "../") or spec == "." or spec == ".." or starts-with(spec, "/")
 
-fn resolve-uncached(spec: Text, importer: Text, from-dir: Text, o: Options) -> Text {
-  let target =
-    if relative?(spec) {
-      try-path(normalize(if starts-with(spec, "/") then spec else from-dir ++ "/" ++ spec), o)
-    } else {
-      resolve-bare(spec, from-dir, o)
+fn target-of(spec: Text, from-dir: Text, o: Options) -> Text? =
+  if relative?(spec) then try-path(normalize(if starts-with(spec, "/") then spec else from-dir ++ "/" ++ spec), o)
+  else resolve-bare(spec, from-dir, o)
+
+fn resolve-uncached(spec: Text, importer: Text, from-dir: Text, o: Options) -> Text =
+  target-of(spec, from-dir, o) ?? panic "{}: could not resolve {}", importer, spec
+
+# The same, or nothing: for looking ahead at imports that may never be needed.
+fn resolve-opt(spec: Text, importer: Text, o: Options) -> Resolved? {
+  fresh-caches!()
+  let from-dir = dir-of(importer)
+  let key = from-dir ++ "\n" ++ spec
+  let found: Text? = match resolved[key] {
+    some(p) => some(p)
+    none => target-of(spec, from-dir, o)
+  }
+  match found {
+    some(p) => {
+      resolved[key] = p
+      some(Resolved(path: p, side-effects: side-effects-of(p)))
     }
-  target ?? panic "{}: could not resolve {}", importer, spec
+    none => none
+  }
 }
 
 fn resolve(spec: Text, importer: Text, o: Options) -> Resolved {
+  fresh-caches!()
   let from-dir = dir-of(importer)
   let key = from-dir ++ "\n" ++ spec
   let path = match resolved[key] {

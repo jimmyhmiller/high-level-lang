@@ -23,6 +23,10 @@ state any-reexport: Bool = false
 state splitting: Bool = false
 # `--pure:NAME`: calls of these free names may go when nothing uses their value.
 state pure-names: [Text] = []
+# How many threads walk modules for their facts.
+state facts-threads: Int = 1
+# Each `import * as` binding's module, as `ns-import` holds it, for a walk that must not query.
+state ns-imports: {Int:Int} = {}
 state dynamic-roots: [Int] = []
 
 # The module the current analysis is looking at.
@@ -39,48 +43,159 @@ fn dep-of(mo: m.Module, spec: Text) -> Int {
   m.by-path[r.path] ?? panic "{}: {} was not loaded", mo.path, spec
 }
 
-fn dep-of-str(mo: m.Module, from: Node) -> Int = dep-of(mo, m.module-of-str(from))
+# Asked for every fact an import statement gives: so asked once per module and specifier.
+state deps-known: {Text:Int} = {}
+
+fn dep-of-str(mo: m.Module, from: Node) -> Int {
+  if let some(d) = mo.dep-ids[m.module-of-str(from)] { return d }
+  let key = int-text(mo.id) ++ "\n" ++ from.text
+  if let some(d) = deps-known[key] { return d }
+  let d = dep-of(mo, m.module-of-str(from))
+  deps-known[key] = d
+  d
+}
+
+# A specifier `dep-of-str` has answered already. The walk for facts runs on many threads and may
+# not resolve, so whatever it meets was resolved before it, by `on-demand-targets`.
+fn known-dep(mo: m.Module, from: Node) -> Int =
+  mo.dep-ids[m.module-of-str(from)] ?? deps-known[int-text(mo.id) ++ "\n" ++ from.text]
+    ?? panic "{}: {} was not resolved before its facts", mo.path, from.text
 
 # Imported as an opaque object at run time, rather than linked by name.
 fn opaque?(t: m.Module) -> Bool = t.kind == Cjs or t.kind == External
 
 fn bound?(n: Node) -> Bool = n.lo in here.bindings
 
+# ---------------------------------------------------------------- what statements say
+
+# What one statement says, found by walking it. The walk is most of what facts cost, and it reads
+# only its module and what is known already, so modules are walked at once; the facts are then
+# asserted from these, in the order the walk met them.
+enum Reach { Symbol, Member, Whole, Chunk }
+
+# A symbol named; `ns.x` of an `import * as ns` (the module, and `x`); a module named as a whole,
+# by `require` or `import()`; a chunk `import()` loads.
+record Mention { reach: Reach, id: Int, name: Text }
+
+record Summary { declares: [Int], mentions: [Mention] }
+
+fn no-summary() -> Summary = Summary(declares: [], mentions: [])
+
+task state walk-declares: [Int] = []
+task state walk-mentions: [Mention] = []
+
+fn summary-of(n: Node, declares: Bool) -> Summary {
+  walk-declares = []
+  walk-mentions = []
+  if declares { declared-under(n) }
+  mentions-under(n)
+  Summary(declares: walk-declares, mentions: walk-mentions)
+}
+
+# A module's summaries: CommonJS is one, of its whole tree; an ES module has one for each top-level
+# statement, empty for those whose facts come from what they import and export.
+fn summaries-of(id: Int) -> [Summary] {
+  var out: [Summary] = []
+  with here = m.modules[id] {
+    if here.kind == Cjs {
+      out += summary-of(here.tree, false)
+    } else {
+      for s in here.tree.kids[1].kids { out += if walked?(s) then summary-of(s, true) else no-summary() }
+    }
+  }
+  out
+}
+
+fn walked?(s: Node) -> Bool = match s {
+  Import(...) | ImportBare(_) | ExportAll(_) | ExportAllAs(...) | ExportFrom(...) | ExportNamed(_) => false
+  _ => true
+}
+
 # Every binding beneath `n`, by symbol. Does not enter nested functions: a top-level statement
 # declares only its own names.
-fn declared-under(part: Int, n: Node) -> Void = match n {
+fn declared-under(n: Node) -> Void = match n {
   BindName(x) => {
     let s = here.bindings[n.lo] ?? panic "{}: no symbol for binding {}", here.path, x
-    if sym.symbol-at(m.table, s).scope == here.root { assert m.db.declares(part, s) }
+    if sym.symbol-at(m.table, s).scope == here.root { walk-declares += s }
   }
   _ =>
     if sc.hoist-name?(n.kind) {
-      declared-under(part, n.kids[0])
+      declared-under(n.kids[0])
     } else if not sc.opens?(n.kind) {
-      for k in n.kids { declared-under(part, k) }
+      for k in n.kids { declared-under(k) }
     }
+}
+
+fn mentions-kids(n: Node) -> Void {
+  for k in n.kids { mentions-under(k) }
+}
+
+fn mention(reach: Reach, id: Int) -> Void { walk-mentions += Mention(reach: reach, id: id, name: "") }
+
+fn mentions-under(n: Node) -> Void = match n {
+  Ident(x) => match here.bindings[n.lo] {
+    some(s) => mention(Symbol, s)
+    none => if x in here.helpers { mention(Symbol, helper(x)) }
+  }
+  Member(object, property) => match namespace-of(here, object) {
+    some(target) => { walk-mentions += Mention(reach: Member, id: target, name: property.text) }
+    none => mentions-under(object)
+  }
+  ImportCall(...) => match imported-str(n) {
+    some(from) => mention(if splitting then Chunk else Whole, known-dep(here, from))
+    none => mentions-kids(n)
+  }
+  CallExpr(...) => match required-str(here, n) {
+    some(from) => mention(Whole, known-dep(here, from))
+    none => mentions-kids(n)
+  }
+  _ => mentions-kids(n)
+}
+
+# The facts a summary stands for, in `part`.
+fn assert-summary(part: Int, sm: Summary) -> Void {
+  for s in sm.declares { assert m.db.declares(part, s) }
+  for x in sm.mentions {
+    match x.reach {
+      Symbol => { assert m.db.mentions(part, x.id) }
+      Member => { assert m.db.ns-member(part, x.id, m.name-id(x.name)) }
+      Whole => mention-module(part, x.id)
+      Chunk => mention-chunk(part, x.id)
+    }
+  }
 }
 
 # The module an identifier names when it is `import * as` of an ES module.
 fn namespace-of(mo: m.Module, n: Node) -> Int? = match n {
   Ident(_) => match mo.bindings[n.lo] {
-    some(s) => first m.db.ns-import(s, ?target): some(target)
+    some(s) => ns-imports[s]
     none => none
   }
   _ => none
 }
 
-# `import("x")` with a literal path: the module it names.
-fn import-call-target(mo: m.Module, n: Node) -> Int? = match n {
-  ImportCall(Str(_) as from, ...) => some(dep-of-str(mo, from))
+# `import("x")` with a literal path: the path.
+fn imported-str(n: Node) -> Node? = match n {
+  ImportCall(Str(_) as from, ...) => some(from)
   _ => none
 }
 
-# `require("x")` with a literal path and a free `require`: the module it names.
-fn require-target(mo: m.Module, n: Node) -> Int? = match n {
+# `require("x")` with a literal path and a free `require`: the path.
+fn required-str(mo: m.Module, n: Node) -> Node? = match n {
   CallExpr(Ident("require") as callee, Args(List(Str(_) as from))) =>
-    if callee.lo in mo.bindings then none else some(dep-of-str(mo, from))
+    if callee.lo in mo.bindings then none else some(from)
   _ => none
+}
+
+# The modules those name.
+fn import-call-target(mo: m.Module, n: Node) -> Int? = match imported-str(n) {
+  some(from) => some(dep-of-str(mo, from))
+  none => none
+}
+
+fn require-target(mo: m.Module, n: Node) -> Int? = match required-str(mo, n) {
+  some(from) => some(dep-of-str(mo, from))
+  none => none
 }
 
 # What a run-time reference to a whole module needs: its wrapper, and the helpers.
@@ -104,29 +219,6 @@ fn mention-chunk(part: Int, t: Int) -> Void {
   if m.modules[t].kind == Cjs { assert m.db.mentions(part, helper("__toESM")) }
 }
 
-fn mentions-kids(part: Int, n: Node) -> Void {
-  for k in n.kids { mentions-under(part, k) }
-}
-
-fn mentions-under(part: Int, n: Node) -> Void = match n {
-  Ident(x) => match here.bindings[n.lo] {
-    some(s) => { assert m.db.mentions(part, s) }
-    none => if x in here.helpers { assert m.db.mentions(part, helper(x)) }
-  }
-  Member(object, property) => match namespace-of(here, object) {
-    some(target) => { assert m.db.ns-member(part, target, m.name-id(property.text)) }
-    none => mentions-under(part, object)
-  }
-  ImportCall(...) => match import-call-target(here, n) {
-    some(t) => if splitting then mention-chunk(part, t) else mention-module(part, t)
-    none => mentions-kids(part, n)
-  }
-  CallExpr(...) => match require-target(here, n) {
-    some(t) => mention-module(part, t)
-    none => mentions-kids(part, n)
-  }
-  _ => mentions-kids(part, n)
-}
 
 # ---------------------------------------------------------------- what can be removed
 
@@ -245,6 +337,7 @@ fn bind-import(target: Int, name: Text, bind: Node, namespace: Bool) -> Void {
     cjs-imports[s] = CjsImport(importer: here.id, import-var: import-var-of(here, target), name: name, namespace: namespace)
   } else if namespace {
     assert m.db.ns-import(s, target)
+    ns-imports[s] = target
   } else {
     assert m.db.import-of(s, target, m.name-id(name))
   }
@@ -308,7 +401,7 @@ fn export-spec-names(spec: Node) -> Text = match spec {
 }
 
 # One top-level statement of an ES module becomes one part.
-fn add-part(s: Node) -> Void {
+fn add-part(s: Node, sm: Summary) -> Void {
   let part = new-part(s)
   let mid = here.id
   match s {
@@ -379,8 +472,7 @@ fn add-part(s: Node) -> Void {
       }
     }
     _ => {
-      declared-under(part, s)
-      mentions-under(part, s)
+      assert-summary(part, sm)
       match s {
         ExportVar(...) => exports-under(s)
         ExportLexical(d) => exports-under(d)
@@ -419,18 +511,20 @@ fn synthetic-parts() -> Void {
 
 # Facts for one module. CommonJS is one opaque part with effects, whose only symbol is its
 # `require_x`; its dependencies are whatever it `require`s.
-fn module-facts() -> Void {
+fn module-facts(summaries: [Summary]) -> Void {
   if here.side-effects { assert m.db.module-effects(here.id) }
   if here.kind == Cjs {
     let part = new-part(here.tree)
     assert m.db.effect(part)
     assert m.db.declares(part, here.require-sym)
     assert m.db.mentions(part, helper("__commonJS"))
-    mentions-under(part, here.tree)
+    assert-summary(part, summaries[0])
   } else {
     synthetic-parts()
-    for s in here.tree.kids[1].kids {
-      add-part(s)
+    let stmts = here.tree.kids[1].kids
+    for i in 0..len(stmts) {
+      let s = stmts[i]
+      add-part(s, summaries[i])
       match s {
         Import(_, from) =>
           if opaque?(m.modules[dep-of-str(here, from)]) {
@@ -459,26 +553,44 @@ fn wrap(id: Int) -> Void {
   }
 }
 
-fn on-demand-targets(mo: m.Module, n: Node) -> Void {
+# Every `require("x")` and `import("x")` in a module, in the order a walk meets them. Finding
+# them is a walk of every tree, so modules are searched at once.
+fn on-demand-calls(id: Int) -> [Node] {
+  var out: [Node] = []
+  let mo = m.modules[id]
+  if mo.kind != Runtime { on-demand-calls-under(mo, mo.tree, out) }
+  out
+}
+
+fn on-demand-calls-under(mo: m.Module, n: Node, out: mut [Node]) -> Void {
   match n {
-    ImportCall(...) => if let some(t) = import-call-target(mo, n) {
-      if splitting {
-        if m.modules[t].kind != External and not (t in dynamic-roots) { dynamic-roots += t }
-      } else {
-        wrap(t)
-      }
-    }
-    CallExpr(...) => if let some(t) = require-target(mo, n) { wrap(t) }
+    ImportCall(...) => if imported-str(n) is some(_) { out += n }
+    CallExpr(...) => if required-str(mo, n) is some(_) { out += n }
     _ => {}
   }
-  for k in n.kids { on-demand-targets(mo, k) }
+  for k in n.kids { on-demand-calls-under(mo, k, out) }
+}
+
+# What those calls load runs on demand: wrapped, or with splitting, a root of its own.
+fn on-demand-targets(mo: m.Module, calls: [Node]) -> Void {
+  for n in calls {
+    match n {
+      ImportCall(...) => if let some(t) = import-call-target(mo, n) {
+        if splitting {
+          if m.modules[t].kind != External and not (t in dynamic-roots) { dynamic-roots += t }
+        } else {
+          wrap(t)
+        }
+      }
+      CallExpr(...) => if let some(t) = require-target(mo, n) { wrap(t) }
+      _ => {}
+    }
+  }
 }
 
 fn link() -> Void {
-  for id in m.order {
-    let mo = m.modules[id]
-    if mo.kind != Runtime { on-demand-targets(mo, mo.tree) }
-  }
+  let calls = parallel-map(m.order, on-demand-calls, facts-threads)
+  for i in 0..len(m.order) { on-demand-targets(m.modules[m.order[i]], calls[i]) }
   # A module's symbols exist before any module's facts mention them.
   for id in m.order {
     let mo = m.modules[id]
@@ -517,8 +629,9 @@ fn link() -> Void {
       }
     }
   }
-  for id in m.order {
-    with here = m.modules[id] { module-facts() }
+  let summaries = parallel-map(m.order, summaries-of, facts-threads)
+  for i in 0..len(m.order) {
+    with here = m.modules[m.order[i]] { module-facts(summaries[i]) }
   }
   link.solve!(m.db)
 }

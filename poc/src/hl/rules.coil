@@ -44,7 +44,7 @@
 (defstruct FieldDef [(name (slice u8)) (ty (slice u8))])
 (defstruct RecDef [(name (slice u8)) (fields (ArrayList FieldDef))])
 (defstruct EnumDef [(name (slice u8)) (variants (ArrayList (slice u8)))])
-(defstruct Global [(name (slice u8)) (ty (slice u8)) (assignable bool)])
+(defstruct Global [(name (slice u8)) (ty (slice u8)) (assignable bool) (task bool)])
 (defstruct RelDef [(name (slice u8)) (arity i64)])
 (defstruct QuoteDef [(name (slice u8)) (path (ArrayList i64))])
 (defstruct Alias [(name (slice u8)) (module (slice u8))])
@@ -80,7 +80,10 @@
    (counter i64)
    (in-with i64)
    (returned bool)
-   (ret (slice u8))])
+   (ret (slice u8))
+   (aux (ArrayList Code))
+   (in-fn bool)                   ; compiling a function body, which finds its task state once
+   (task-used bool)])       ; top-level forms expressions need, such as a parallel map's job
 
 ;;; A compiled expression.
 (defstruct TE [(code Code) (ty (slice u8))])
@@ -399,6 +402,27 @@
       (push! (mut (.funcs m)) f))
     m))
 
+;;; A `.pipeline` module: `plan(name)` answers the record its header says it fills.
+(defn pipeline-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
+  (let [(mut m) (mod-new module (SRewrite) "")
+        src (rt/read-all path)
+        start (let [(mut i) 0]
+                (while (and (< i (len src)) (not (rt/at? src i "fills "))) (set! i (+ i 1)))
+                (+ i 6))
+        (mut end) start]
+    (while (and (< end (len src)) (!= (get src end) #\newline) (!= (get src end) #\space)) (set! end (+ end 1)))
+    (let [fills (subslice src start end)
+          (mut slash) 0]
+      (for i (range 0 (len fills)) (when (= (get fills i) #\/) (set! slash i)))
+      (let [record-module (subslice fills 0 slash)
+            record (cat3 record-module "." (subslice fills (+ slash 1) (len fills)))]
+        (ensure-loaded! (mut k) record-module)
+        (let [(mut f) (func-of "plan" record)]
+          (param (mut f) "name" "Text" false)
+          (push! (mut (.funcs m)) f))
+        (push! (mut (.funcs m)) (func-of "plan-names" "[Text]"))))
+    m))
+
 (defn scopes-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
   (let [(mut m) (mod-new module (SScopes) "")
         src (rt/read-all path)
@@ -440,6 +464,8 @@
             (let [m (rewrite-mod (mut k) module path)] (push! (mut (.mods k)) m))
           (rt/ends-with path ".scopes")
             (let [m (scopes-mod (mut k) module path)] (push! (mut (.mods k)) m))
+          (rt/ends-with path ".pipeline")
+            (let [m (pipeline-mod (mut k) module path)] (push! (mut (.mods k)) m))
           :else (dsl/fail-at (.path k) 1 1 (cat "cannot read the signatures of " path)))))))
 
 (defn add-foreign! [(k (mut Comp)) (decl g/Node) (owner (slice u8))] (-> void)
@@ -545,27 +571,53 @@
                          (FieldDef :name (.text (kid f 0)) :ty ty))))
               (set! rec-index (+ rec-index 1)))
             (g/KState [] (add-global! (mut k) ix2 name d true))
+            (g/KTaskState [] (add-global! (mut k) ix2 name d true))
             (g/KContext [] (add-global! (mut k) ix2 name d true))
             (g/KConst [] (add-global! (mut k) ix2 name d false))
-            (g/KFn []
-              (let [(mut f) (Func :name (.text (kid d 0)) :coil (.text (kid d 0))
-                                  :params (ArrayList::new [Param] (malloc-allocator))
-                                  :ret (if (none? (kid d 2)) "Void" (resolve-type (mut k) name (kid d 2))))]
-                (for p (list-kids (kid d 1))
-                  (push! (mut (.params f))
-                         (Param :name (.text (kid p 0))
-                                :ty (resolve-type (mut k) name (kid p 1))
-                                :by-ref (= (.kind (kid p 1)) (g/KTMut)))))
-                (push! (mut (.funcs (elem (mut (.mods k)) ix2))) f)))
-            (_ 0)))))
+            (g/KMemoFn [] (collect-fn! (mut k) ix2 name d))
+            (g/KFn [] (collect-fn! (mut k) ix2 name d))
+            (_ 0)))
+        (when (any-memo? decls)
+          (push! (mut (.funcs (elem (mut (.mods k)) ix2)))
+                 (Func :name "forget-memos!" :coil "forget-memos!"
+                       :params (ArrayList::new [Param] (malloc-allocator)) :ret "Void")))))
     (set! (.src k) saved-src)
     (set! (.path k) saved-path)
     tree))
 
+(defn any-memo? [(decls (ArrayList g/Node))] (-> bool)
+  (let [(mut hit) false]
+    (for d decls (when (= (.kind d) (g/KMemoFn)) (set! hit true)))
+    hit))
+
+(defn collect-fn! [(k (mut Comp)) (ix2 i64) (name (slice u8)) (d g/Node)] (-> void)
+  (let [(mut f) (Func :name (.text (kid d 0)) :coil (.text (kid d 0))
+                      :params (ArrayList::new [Param] (malloc-allocator))
+                      :ret (if (none? (kid d 2)) "Void" (resolve-type (mut k) name (kid d 2))))]
+    (for p (list-kids (kid d 1))
+      (push! (mut (.params f))
+             (Param :name (.text (kid p 0))
+                    :ty (resolve-type (mut k) name (kid p 1))
+                    :by-ref (= (.kind (kid p 1)) (g/KTMut)))))
+    (push! (mut (.funcs (elem (mut (.mods k)) ix2))) f)))
+
 (defn add-global! [(k (mut Comp)) (ix i64) (module (slice u8)) (d g/Node) (assignable bool)] (-> void)
-  (let [ty (resolve-type (mut k) module (kid d 1))]
+  (let [ty (resolve-type (mut k) module (kid d 1))
+        ;; A context is rebound for a dynamic extent, which is one thread's.
+        task (or (= (.kind d) (g/KTaskState)) (= (.kind d) (g/KContext)))]
     (push! (mut (.globals (elem (mut (.mods k)) ix)))
-           (Global :name (.text (kid d 0)) :ty ty :assignable assignable))))
+           (Global :name (.text (kid d 0)) :ty ty :assignable assignable :task task))))
+
+;;; Where a global lives: once per program, or once per worker slot for `task state` and contexts.
+;;; A function runs on one thread from start to end, so inside one the slot is looked up once.
+(defn storage-call [(k (mut Comp)) (x Global)] (-> Code)
+  (cond
+    (not (.task x)) `(rules-state)
+    (.in-fn k) (do (set! (.task-used k) true) `rules-task-here)
+    :else `(rules-task)))
+
+(defn storage-of [(k (mut Comp)) (module (slice u8)) (x Global)] (-> Code)
+  `(~(sym (qualified (mut k) module (if (.task x) "rules-task" "rules-state")))))
 
 ;; ---------------------------------------------------------------- locals
 
@@ -620,9 +672,14 @@
   `(ArrayList::new [~(coil-type (mut k) elem)] (rt/tree-allocator)))
 
 (defn new-map [(k (mut Comp)) (t (slice u8))] (-> Code)
-  (if (= (map-key t) "Text")
+  (cond
+    (= (map-key t) "Text")
       `(HashMap::new [~(coil-type (mut k) (map-key t)) ~(coil-type (mut k) (map-val t))]
                      (malloc-allocator) (str/keyops))
+    ;; An Int is its own hash, near enough: one multiply, not eight bytes of FNV.
+    (= (map-key t) "Int")
+      `(HashMap::new [i64 ~(coil-type (mut k) (map-val t))] (malloc-allocator) (i64-keyops))
+    :else
       `(HashMap::new-scalar [~(coil-type (mut k) (map-key t)) ~(coil-type (mut k) (map-val t))]
                             (malloc-allocator))))
 
@@ -1000,7 +1057,7 @@
         (None []
           (let [m (self-mod (mut k))]
             (match (find-global m (.text e))
-              (Some [x] (te `(~(primitive/code-symbol "." (.name x)) (rules-state)) (.ty x)))
+              (Some [x] (te `(~(primitive/code-symbol "." (.name x)) ~(storage-call (mut k) x)) (.ty x)))
               (None [] (die (mut k) e (cat "nothing named " (.text e)))))))))
     (g/KGroup [] (place (mut k) (kid e 0)))
     (g/KFieldE []
@@ -1010,7 +1067,7 @@
           (Some [module]
             (match (find-global (mod-at (mut k) module) field)
               (Some [x]
-                (te `(~(primitive/code-symbol "." field) (~(sym (qualified (mut k) module "rules-state"))))
+                (te `(~(primitive/code-symbol "." field) ~(storage-of (mut k) module x))
                     (.ty x)))
               (None [] (die (mut k) e (cat4 module " has no state named " field "")))))
           (None []
@@ -1106,6 +1163,129 @@
                        (for ~(sym t) ~(.code e) (push! (mut ~(sym o)) ~(sym t)))
                        ~(sym o))
                     (cat3 "[" (map-key (.ty e)) "]"))))
+      ;; `parallel-map(xs, f, n)`: `f` of each element on `n` threads, results in the order of `xs`.
+      ;; Each thread takes the next index it finds free, so uneven work evens out.
+      (and (= name "parallel-map") (= count 3))
+        (let [xs (expr (mut k) (get args 0) "")
+              f (expr (mut k) (get args 1) "")
+              threads (expect (mut k) (get args 2) (expr (mut k) (get args 2) "Int") "Int")]
+          (unless (list? (.ty xs)) (die (mut k) n "parallel-map needs a list"))
+          (unless (fn? (.ty f)) (die (mut k) n "parallel-map needs a function"))
+          (let [t (elem-of (.ty xs))
+                ps (fn-params (.ty f))
+                r (fn-ret (.ty f))]
+            (unless (and (= (len ps) 1) (= (get ps 0) t))
+              (die (mut k) n (cat4 "parallel-map's function must take one " t ", not " (.ty f))))
+            (let [ct (coil-type (mut k) t)
+                  cr (coil-type (mut k) r)
+                  job (fresh (mut k) "PJob")
+                  body (fresh (mut k) "pjob-body")
+                  xs-v (fresh (mut k) "pxs")
+                  out-v (fresh (mut k) "pout")
+                  job-v (fresh (mut k) "pjob")
+                  res-v (fresh (mut k) "pres")
+                  o-v (fresh (mut k) "po")
+                  v-v (fresh (mut k) "pv")]
+              (push! (mut (.aux k))
+                     `(defstruct ~(sym job) [(next i64) (xs (ArrayList ~ct)) (out (ArrayList (Option ~cr)))
+                                             (f (fnptr (cc/C) [~ct] ~cr))]))
+              (push! (mut (.aux k))
+                     `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
+                        (let [j (cast (ptr ~(sym job)) arg)
+                              f (.f j)
+                              xs (.xs j)
+                              (mut out) (.out j)
+                              (mut go) true]
+                          (while go
+                            (let [i (atomic/add (cast (ptr i64) j) 1)]
+                              (if (< i (len xs))
+                                  (set! (mut out) i (Some (f (get xs i))))
+                                  (set! go false))))
+                          arg)))
+              (Some (te `(let [~(sym xs-v) ~(.code xs)
+                               (mut ~(sym out-v)) (ArrayList::new [(Option ~cr)] (malloc-allocator))]
+                           (for _ ~(sym xs-v) (push! (mut ~(sym out-v)) (None [~cr])))
+                           (let [(mut ~(sym job-v)) (~(sym job) :next 0 :xs ~(sym xs-v) :out ~(sym out-v) :f ~(.code f))]
+                             (rt/run-workers (fnptr-of ~(sym body)) (cast (ptr i8) (mut ~(sym job-v))) ~(.code threads))
+                             (let [(mut ~(sym res-v)) (ArrayList::new [~cr] (rt/tree-allocator))]
+                               (for ~(sym o-v) (.out ~(sym job-v))
+                                 (match ~(sym o-v)
+                                   (Some [~(sym v-v)] (push! (mut ~(sym res-v)) ~(sym v-v)))
+                                   (None [] (panic "a parallel task left no result"))))
+                               ~(sym res-v))))
+                        (cat3 "[" r "]"))))))
+      ;; `parallel-walk(roots, visit, next, n)`: a graph found as it is walked. Each name is visited
+      ;; once, on whichever of `n` threads takes it, and `next` of its result names more. A thread
+      ;; that finds work waiting never waits for a whole wave to finish. Results come in the order
+      ;; they finish.
+      (and (= name "parallel-walk") (= count 4))
+        (let [roots (expect (mut k) (get args 0) (expr (mut k) (get args 0) "[Text]") "[Text]")
+              visit (expr (mut k) (get args 1) "")
+              follow (expr (mut k) (get args 2) "")
+              threads (expect (mut k) (get args 3) (expr (mut k) (get args 3) "Int") "Int")]
+          (unless (fn? (.ty visit)) (die (mut k) n "parallel-walk needs a function to visit with"))
+          (let [ps (fn-params (.ty visit))
+                r (fn-ret (.ty visit))]
+            (unless (and (= (len ps) 1) (= (get ps 0) "Text"))
+              (die (mut k) n "parallel-walk visits names: its function takes one Text"))
+            (unless (= (.ty follow) (cat3 "Fn(" r ")->[Text]"))
+              (die (mut k) n (cat3 "parallel-walk's next must take a " r " and give [Text]")))
+            (let [cr (coil-type (mut k) r)
+                  job (fresh (mut k) "WJob")
+                  body (fresh (mut k) "wjob-body")
+                  job-v (fresh (mut k) "wjob")
+                  res-v (fresh (mut k) "wres")
+                  root-v (fresh (mut k) "wroot")]
+              (push! (mut (.aux k))
+                     `(defstruct ~(sym job)
+                        [(lock i64) (head i64) (busy i64)
+                         (queue (ArrayList (slice u8))) (seen (HashMap (slice u8) bool))
+                         (results (ArrayList ~cr))
+                         (visit (fnptr (cc/C) [(slice u8)] ~cr))
+                         (follow (fnptr (cc/C) [~cr] (ArrayList (slice u8))))]))
+              (push! (mut (.aux k))
+                     `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
+                        (let [j (cast (ptr ~(sym job)) arg)
+                              word (cast (ptr i64) j)
+                              visit (.visit j)
+                              follow (.follow j)
+                              (mut go) true]
+                          (while go
+                            (rt/spin-lock! word)
+                            (if (< (.head j) (len (.queue j)))
+                                (let [item (get (.queue j) (.head j))]
+                                  (set! (.head j) (+ (.head j) 1))
+                                  (set! (.busy j) (+ (.busy j) 1))
+                                  (rt/spin-unlock! word)
+                                  (let [r (visit item)
+                                        more (follow r)]
+                                    (rt/spin-lock! word)
+                                    (push! (mut (.results j)) r)
+                                    (for x more
+                                      (unless (match (get (.seen j) x) (Some [_] true) (None [] false))
+                                        (set! (mut (.seen j)) x true)
+                                        (push! (mut (.queue j)) x)))
+                                    (set! (.busy j) (- (.busy j) 1))
+                                    (rt/spin-unlock! word)))
+                                (if (= (.busy j) 0)
+                                    (do (rt/spin-unlock! word) (set! go false))
+                                    (do (rt/spin-unlock! word) (rt/pause!)))))
+                          arg)))
+              (Some (te `(let [(mut ~(sym job-v))
+                                 (~(sym job) :lock 0 :head 0 :busy 0
+                                            :queue (ArrayList::new [(slice u8)] (malloc-allocator))
+                                            :seen (HashMap::new [(slice u8) bool] (malloc-allocator) (str/keyops))
+                                            :results (ArrayList::new [~cr] (malloc-allocator))
+                                            :visit ~(.code visit) :follow ~(.code follow))]
+                           (for ~(sym root-v) ~(.code roots)
+                             (unless (match (get (.seen ~(sym job-v)) ~(sym root-v)) (Some [_] true) (None [] false))
+                               (set! (mut (.seen ~(sym job-v))) ~(sym root-v) true)
+                               (push! (mut (.queue ~(sym job-v))) ~(sym root-v))))
+                           (rt/run-workers (fnptr-of ~(sym body)) (cast (ptr i8) (mut ~(sym job-v))) ~(.code threads))
+                           (let [(mut ~(sym res-v)) (ArrayList::new [~cr] (rt/tree-allocator))]
+                             (for x (.results ~(sym job-v)) (push! (mut ~(sym res-v)) x))
+                             ~(sym res-v)))
+                        (cat3 "[" r "]"))))))
       (and (= name "include-text") (= count 1) (= (.kind (get args 0)) (g/KStr)))
         (Some (te `(~(sym "include-str") ~(str-literal (get args 0))) "Text"))
       :else (None [TE]))))
@@ -1130,7 +1310,7 @@
                       (match (find-global (self-mod (mut k)) name)
                         (Some [x]
                           (unless (fn? (.ty x)) (die (mut k) n (cat4 name " is a " (.ty x) ", not a function")))
-                          (fn-value-call (mut k) n `(~(primitive/code-symbol "." name) (rules-state)) (.ty x) args))
+                          (fn-value-call (mut k) n `(~(primitive/code-symbol "." name) ~(storage-call (mut k) x)) (.ty x) args))
                         (None []
                           (match (find-func (mod-at (mut k) "hl.rt") name)
                             (Some [f] (call-func (mut k) n "hl.rt" f args))
@@ -1492,7 +1672,7 @@
         (None []
           (let [m (self-mod (mut k))]
             (match (find-global m (.text n))
-              (Some [x] (te `(~(primitive/code-symbol "." (.name x)) (rules-state)) (.ty x)))
+              (Some [x] (te `(~(primitive/code-symbol "." (.name x)) ~(storage-call (mut k) x)) (.ty x)))
               (None []
                 (match (find-func m (.text n))
                   (Some [f] (te `(fnptr-of ~(sym (.coil f))) (func-type f)))
@@ -1820,7 +2000,7 @@
               (None [] (die (mut k) init (cat "no context named " name)))
               (Some [x]
                 (let [saved (fresh (mut k) "saved")
-                      field `(~(primitive/code-symbol "." name) (rules-state))
+                      field `(~(primitive/code-symbol "." name) ~(storage-call (mut k) x))
                       v (expect (mut k) (kid init 1) (expr (mut k) (kid init 1) (.ty x)) (.ty x))]
                   (push! (mut saves) (sym saved))
                   (push! (mut saves) field)
@@ -1942,6 +2122,9 @@
     hit))
 
 (defn compile-fn [(k (mut Comp)) (d g/Node)] (-> Code)
+  (compile-fn-as (mut k) d (.text (kid d 0))))
+
+(defn compile-fn-as [(k (mut Comp)) (d g/Node) (coil-name (slice u8))] (-> Code)
   (let [name (.text (kid d 0))
         f (match (find-func (self-mod (mut k)) name)
             (Some [x] x)
@@ -1959,11 +2142,122 @@
                (if (.by-ref p)
                    `(~(sym local) (mut ~(coil-type (mut k) (.ty p))))
                    `(~(sym local) ~(coil-type (mut k) (.ty p)))))))
+    (set! (.in-fn k) true)
+    (set! (.task-used k) false)
     (let [body (expect (mut k) body-node (expr (mut k) body-node (.ret f)) (.ret f))
-          code (if (.returned k) `(block :fn ~(.code body)) (.code body))]
+          inner (if (.returned k) `(block :fn ~(.code body)) (.code body))
+          code (if (.task-used k) `(let [rules-task-here (rules-task)] ~inner) inner)]
+      (set! (.in-fn k) false)
       (when (and (!= (.ret f) "Void") (= (.ty body) "Void"))
         (die (mut k) body-node (cat "this function must answer " (.ret f))))
-      `(defn ~(sym name) [~@params] (-> ~(coil-type (mut k) (.ret f))) ~code))))
+      `(defn ~(sym coil-name) [~@params] (-> ~(coil-type (mut k) (.ret f))) ~code))))
+
+;; ---------------------------------------------------------------- memo functions
+
+;;; `memo fn f(k: K) -> R`: each answer is computed once per build, by whichever worker asks
+;;; first, and every worker shares it. Each keeps a table of its own in front of the shared one,
+;;; so a question asked again costs no lock. The answer must not be changed by whoever gets it.
+(defn memo-check! [(k (mut Comp)) (d g/Node)] (-> Func)
+  (let [f (match (find-func (self-mod (mut k)) (.text (kid d 0)))
+            (Some [x] x)
+            (None [] (die (mut k) d "this function was not collected")))]
+    (unless (= (len (.params f)) 1)
+      (die (mut k) d "a memo function takes one argument, for now"))
+    (let [p (get (.params f) 0)]
+      (when (.by-ref p) (die (mut k) d "a memo function's argument cannot be mut"))
+      (unless (or (= (.ty p) "Text") (= (.ty p) "Int"))
+        (die (mut k) d "a memo function's argument is Text or Int, for now")))
+    (when (= (.ret f) "Void") (die (mut k) d "a memo function must answer something"))
+    f))
+
+(defn memo-map-type [(f Func)] (-> (slice u8))
+  (cat4 "{" (.ty (get (.params f) 0)) ":" (cat (.ret f) "}")))
+
+(defn memo-near [(name (slice u8))] (-> (slice u8)) (cat "memo-near--" name))
+(defn memo-near-gen [(name (slice u8))] (-> (slice u8)) (cat "memo-near-gen--" name))
+
+;;; The task struct's fields for a memo: its near table and the generation that table is of.
+(defn memo-new-map [(k (mut Comp)) (d g/Node)] (-> Code)
+  (new-map (mut k) (memo-map-type (memo-check! (mut k) d))))
+
+(defn memo-near-field [(k (mut Comp)) (d g/Node)] (-> Code)
+  `(~(sym (memo-near (.text (kid d 0)))) ~(coil-type (mut k) (memo-map-type (memo-check! (mut k) d)))))
+
+(defn memo-gen-field [(d g/Node)] (-> Code) `(~(sym (memo-near-gen (.text (kid d 0)))) i64))
+
+(defn memo-near-init [(k (mut Comp)) (d g/Node)] (-> Code)
+  `(set! (~(primitive/code-symbol "." (memo-near (.text (kid d 0)))) s) ~(memo-new-map (mut k) d)))
+
+(defn memo-gen-init [(d g/Node)] (-> Code)
+  `(set! (~(primitive/code-symbol "." (memo-near-gen (.text (kid d 0)))) s) -1))
+
+;;; The shared table, its lock and generation; the function; the computation under another name.
+(defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
+  (let [f (memo-check! (mut k) d)
+        name (.text (kid d 0))
+        mt (memo-map-type f)
+        store (sym (cat "MemoStore--" name))
+        store-fn (sym (cat "memo-store--" name))
+        compute (cat "memo-compute--" name)
+        near (primitive/code-symbol "." (memo-near name))
+        near-gen (primitive/code-symbol "." (memo-near-gen name))
+        p (get (.params f) 0)
+        kt (coil-type (mut k) (.ty p))
+        rt (coil-type (mut k) (.ret f))]
+    (emit! (mut out) (compile-fn-as (mut k) d compute))
+    ;; The lock word comes first, so the store's address is the word's.
+    (emit! (mut out) `(defstruct ~store [(lock i64) (ready bool) (gen i64) (table ~(coil-type (mut k) mt))]))
+    (emit! (mut out)
+           `(defn ~store-fn [] (-> (ptr ~store))
+              (let [s (primitive/alloc-static ~store)]
+                (unless (.ready s)
+                  (rt/init-lock!)
+                  (unless (.ready s)
+                    (set! (.table s) ~(new-map (mut k) mt))
+                    (set! (.gen s) (rt/next-pass!))
+                    (set! (.ready s) true))
+                  (rt/init-unlock!))
+                s)))
+    (emit! (mut out)
+           `(defn ~(sym name) [(key ~kt)] (-> ~rt)
+              (let [t (rules-task)
+                    s (~store-fn)
+                    word (cast (ptr i64) s)]
+                (when (!= (~near-gen t) (.gen s))
+                  (set! (~near t) ~(new-map (mut k) mt))
+                  (set! (~near-gen t) (.gen s)))
+                (match (get (~near t) key)
+                  (Some [v] v)
+                  (None []
+                    (rt/spin-lock! word)
+                    (let [shared (get (.table s) key)]
+                      (rt/spin-unlock! word)
+                      (let [v (match shared
+                                (Some [x] x)
+                                (None []
+                                  (let [made (~(sym compute) key)]
+                                    (rt/spin-lock! word)
+                                    ;; Another worker may have answered meanwhile: its answer stands.
+                                    (let [won (match (get (.table s) key)
+                                                (Some [w] w)
+                                                (None [] (do (set! (mut (.table s)) key made) made)))]
+                                      (rt/spin-unlock! word)
+                                      won))))]
+                        (set! (mut (~near t)) key v)
+                        v)))))))))
+
+;;; Every memo of the module starts over. Only while no other worker runs.
+(defn compile-forget! [(k (mut Comp)) (decls (ArrayList g/Node))] (-> Code)
+  (let [(mut body) (primitive/code-list-new)]
+    (for d decls
+      (when (= (.kind d) (g/KMemoFn))
+        (let [f (memo-check! (mut k) d)
+              name (.text (kid d 0))]
+          (push! (mut body)
+                 `(let [s (~(sym (cat "memo-store--" name)))]
+                    (set! (.table s) ~(new-map (mut k) (memo-map-type f)))
+                    (set! (.gen s) (rt/next-pass!)))))))
+    `(defn forget-memos! [] (-> void) ~@body 0)))
 
 (defn compile-record [(k (mut Comp)) (r RecDef)] (-> Code)
   (let [(mut fields) (primitive/code-list-new)]
@@ -1984,6 +2278,25 @@
 
 (defn prelude-text [] (-> (slice u8)) (include-str "rules_prelude.rules"))
 
+;;; Placeholder values for a fresh task struct's fields, before its own thread initialises them.
+(defn task-zeroes [(k (mut Comp)) (self Mod) (decls (ArrayList g/Node))] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for d decls
+      (when (or (= (.kind d) (g/KTaskState)) (= (.kind d) (g/KContext)))
+        (let [g-name (.text (kid d 0))
+              x (match (find-global self g-name)
+                  (Some [v] v)
+                  (None [] (die (mut k) d "this was not collected")))
+              v (expect (mut k) (kid d 2) (expr (mut k) (kid d 2) (.ty x)) (.ty x))]
+          (push! (mut out) (primitive/code-symbol ":" g-name))
+          (push! (mut out) (.code v))))
+      (when (= (.kind d) (g/KMemoFn))
+        (push! (mut out) (primitive/code-symbol ":" (memo-near (.text (kid d 0)))))
+        (push! (mut out) (memo-new-map (mut k) d))
+        (push! (mut out) (primitive/code-symbol ":" (memo-near-gen (.text (kid d 0)))))
+        (push! (mut out) `-1)))
+    `(~@out)))
+
 (defn compile-module [(context Code)] (-> (slice u8))
   (let [src (dsl/source-of context)
         path (dsl/path-of context)
@@ -1998,7 +2311,10 @@
                       :counter 0
                       :in-with 0
                       :returned false
-                      :ret "Void")
+                      :ret "Void"
+                      :aux (ArrayList::new [Code] (malloc-allocator))
+                      :in-fn false
+                      :task-used false)
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)
     (load-prelude! (mut k))
@@ -2015,7 +2331,7 @@
                 (import "coil.primitive" :as primitive)
                 (import "coil.alloc" :use [malloc-allocator])
                 (import "coil.arraylist" :use [ArrayList])
-                (import "coil.hashmap" :use [HashMap])
+                (import "coil.hashmap" :use [HashMap i64-keyops])
                 (import "coil.slice" :use [subslice])
                 (import "coil.str" :as str)
                 (import "coil.cc" :as cc)
@@ -2025,6 +2341,7 @@
           (emit! (mut out) `(import ~(.name m) :as ~(sym (alias-of (.name m)))))))
       (emit! (mut out) `(import "hl.rt" :as rt))
       (emit! (mut out) `(import "hl.rt" :as hl-rt))
+      (emit! (mut out) `(import "coil.atomic" :as atomic))
       (let [(mut deps) (primitive/code-list-new)]
         (for d (.depends k) (push! (mut deps) `~d))
         (when (> (len (.depends k)) 0)
@@ -2034,33 +2351,76 @@
             (mut state-inits) (primitive/code-list-new)]
         (for e (.enums self) (emit! (mut out) (compile-enum e)))
         (for r (.recs self) (emit! (mut out) (compile-record (mut k) r)))
-        (for d decls
-          (when (or (= (.kind d) (g/KState)) (= (.kind d) (g/KContext)) (= (.kind d) (g/KConst)))
-            (let [g-name (.text (kid d 0))
-                  x (match (find-global self g-name)
-                      (Some [v] v)
-                      (None [] (die (mut k) d "this was not collected")))
-                  v (expect (mut k) (kid d 2) (expr (mut k) (kid d 2) (.ty x)) (.ty x))]
-              (push! (mut state-fields) `(~(sym g-name) ~(coil-type (mut k) (.ty x))))
-              (push! (mut state-inits) `(set! (~(primitive/code-symbol "." g-name) s) ~(.code v))))))
-        (emit! (mut out)
-               `(defstruct RulesState [(rules-ready bool) ~@state-fields]))
-        (emit! (mut out)
-               `(defn rules-init! [(s (ptr RulesState))] (-> void)
-                  (set! (.rules-ready s) true)
-                  ~@state-inits
-                  0))
-        (emit! (mut out)
-               `(defn rules-state [] (-> (ptr RulesState))
-                  (let [s (primitive/alloc-static RulesState)]
-                    (unless (.rules-ready s) (rules-init! s))
-                    s)))
-        (emit! (mut out)
-               `(defn reset-state! [] (-> void)
-                  (rules-init! (rules-state)))))
+        (let [(mut task-fields) (primitive/code-list-new)
+              (mut task-inits) (primitive/code-list-new)]
+          (for d decls
+            (when (or (= (.kind d) (g/KState)) (= (.kind d) (g/KTaskState))
+                      (= (.kind d) (g/KContext)) (= (.kind d) (g/KConst)))
+              (let [g-name (.text (kid d 0))
+                    x (match (find-global self g-name)
+                        (Some [v] v)
+                        (None [] (die (mut k) d "this was not collected")))
+                    v (expect (mut k) (kid d 2) (expr (mut k) (kid d 2) (.ty x)) (.ty x))]
+                (if (.task x)
+                    (do
+                      (push! (mut task-fields) `(~(sym g-name) ~(coil-type (mut k) (.ty x))))
+                      (push! (mut task-inits) `(set! (~(primitive/code-symbol "." g-name) s) ~(.code v))))
+                    (do
+                      (push! (mut state-fields) `(~(sym g-name) ~(coil-type (mut k) (.ty x))))
+                      (push! (mut state-inits) `(set! (~(primitive/code-symbol "." g-name) s) ~(.code v)))))))
+            (when (= (.kind d) (g/KMemoFn))
+              (push! (mut task-fields) (memo-near-field (mut k) d))
+              (push! (mut task-fields) (memo-gen-field d))
+              (push! (mut task-inits) (memo-near-init (mut k) d))
+              (push! (mut task-inits) (memo-gen-init d))))
+          (emit! (mut out)
+                 `(defstruct RulesState [(rules-ready bool) ~@state-fields]))
+          (emit! (mut out)
+                 `(defn rules-init! [(s (ptr RulesState))] (-> void)
+                    (set! (.rules-ready s) true)
+                    ~@state-inits
+                    0))
+          (emit! (mut out)
+                 `(defn rules-state [] (-> (ptr RulesState))
+                    (let [s (primitive/alloc-static RulesState)]
+                      (unless (.rules-ready s) (rules-init! s))
+                      s)))
+          ;; Task state: one copy per worker slot, made the first time its own thread asks.
+          (emit! (mut out)
+                 `(defstruct RulesTask [(rules-ready bool) ~@task-fields]))
+          (emit! (mut out)
+                 `(defstruct RulesTasks [(ready bool) (slots (ArrayList RulesTask))]))
+          (emit! (mut out)
+                 `(defn rules-task-init! [(s (ptr RulesTask))] (-> void)
+                    (set! (.rules-ready s) true)
+                    ~@task-inits
+                    0))
+          (emit! (mut out)
+                 `(defn rules-task [] (-> (ptr RulesTask))
+                    (let [all (primitive/alloc-static RulesTasks)]
+                      (unless (.ready all)
+                        (rt/init-lock!)
+                        (unless (.ready all)
+                          (let [(mut slots) (ArrayList::new [RulesTask] (malloc-allocator))]
+                            (for _ (range 0 (rt/max-workers))
+                              (push! (mut slots) (RulesTask :rules-ready false ~@(task-zeroes (mut k) self decls))))
+                            (set! (.slots all) slots))
+                          (set! (.ready all) true))
+                        (rt/init-unlock!))
+                      (let [s (elem (mut (.slots all)) (rt/worker-slot))]
+                        (unless (.rules-ready s) (rules-task-init! s))
+                        s))))
+          (emit! (mut out)
+                 `(defn reset-state! [] (-> void)
+                    (rules-init! (rules-state))
+                    (rules-task-init! (rules-task))))))
       (for d decls
         (when (= (.kind d) (g/KFn))
-          (emit! (mut out) (compile-fn (mut k) d))))
+          (emit! (mut out) (compile-fn (mut k) d)))
+        (when (= (.kind d) (g/KMemoFn))
+          (compile-memo! (mut k) d (mut out))))
+      (when (any-memo? decls) (emit! (mut out) (compile-forget! (mut k) decls)))
+      (for a (.aux k) (emit! (mut out) a))
       (for d decls
         (when (= (.kind d) (g/KMainDecl))
           (emit! (mut out) (compile-main (mut k) d))))

@@ -6,6 +6,7 @@ other real libraries.
 
 ```
 build.bundler        targets, formats, defines, loaders, hooks      → the build program
+build.pipeline       stages, and plans of how many threads run them → plans, checked for shared state
 ├── js.syntax        JavaScript as a scannerless PEG                → parser, AST, printer, node table
 ├── literal.syntax   the inside of strings and templates            → a parser for escapes
 ├── comments.syntax  where annotations can be                       → a scanner for /* @__PURE__ */
@@ -28,16 +29,17 @@ tables, Datalog and rewriting in general, plus a runtime of buffers, files and U
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 8,118 | Resolution, modules, JSX, TypeScript, tsconfig, early errors, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
+| `.rules` | 8,654 | Resolution, modules, JSX, TypeScript, tsconfig, early errors, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
 | `.syntax` | 780 | JavaScript with JSX and TypeScript, CSS, literals, comments, package.json and tsconfig.json |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
 | `.facts` | 114 | Linking, tree shaking, and which root reaches what for code splitting |
 | `.js` | 171 | The bundle's runtime helpers, and those lowering adds |
 | `.bundler` | 70 | A demo build |
+| `.pipeline` | 44 | Which stages may run in parallel, and five plans for running them |
 | `.scopes` | 26 | Scoping |
-| `.coil` | 12 | Three `main` functions, because a package's entry must be plain Coil |
+| `.coil` | 15 | Four `main` functions, because a package's entry must be plain Coil |
 
-The compilers for those languages are about 6,700 lines of Coil and 260 of grammars.
+The compilers for those languages are about 7,800 lines of Coil and 300 of grammars.
 
 `.rules` is the least specific of these languages: a typed language over the grammar's nodes, with
 pattern matching, relations, dynamic scope and code templates written in JavaScript's own syntax:
@@ -51,7 +53,7 @@ It is closer to a small ML than to a one-purpose language. Some of it is still b
 number spelling, VLQ and path normalising. `early.rules` (968 lines) is the largest file and mostly
 a translation of the specification's rules, so it is the best candidate for a language of its own.
 
-Compile time is the real cost: building the tools peaks at about 6.5 GB, of which the reader image
+Compile time is the real cost: building the tools peaks at about 9 GB, of which the reader image
 is about 3.2 GB. Run builds through `corpus/tools/guard.py`, which kills a process tree over a limit.
 
 ## Running it
@@ -128,6 +130,73 @@ nothing:
 Against esbuild it is about 1 to 3 times slower per core, measured before this move: esbuild on one
 core took 76, 78, 24, 30, 42, 48 and 56 ms on those apps, and is faster still on all cores.
 
+## Parallelism
+
+How the build divides its work is a language of its own. `poc/src/app/build.pipeline` names the
+stages that work on one file, module or part at a time, the functions each runs, and plans:
+
+```
+stage load     per file   bundle.modules/visit-file bundle.modules/next-files ...
+stage facts    per module bundle.analysis/on-demand-calls bundle.analysis/summaries-of
+stage optimize per part   bundle.api/default-optimize
+stage print    per part   bundle.api/render-part
+stage link     whole      bundle.analysis/link
+
+plan full
+  threads auto
+  load parallel
+  facts parallel
+  optimize parallel 8 parts 8
+  print parallel 8 parts 8
+end
+```
+
+A plan that runs a stage in parallel compiles only if nothing those functions call, in any module,
+writes shared state. The checker infers each function's effects from the `.rules` sources and says
+what is in the way. Running `load-file` in parallel, for example:
+
+```
+plan unsafe runs graph in parallel, but bundle.modules/load-file
+  writes shared state bundle.modules.table, in bundle.modules/load-file
+  writes shared state bundle.modules.modules, in bundle.modules/load-file
+  writes shared state bundle.modules.by-path, in bundle.modules/load-file
+  writes shared state bundle.cssbundle.assets, in bundle.cssbundle/file-asset
+  bundle.modules/load-file calls transform, whose effects cannot be known here
+  ...
+```
+
+`.rules` has what the stages need for this:
+- `task state`: one copy per worker, for caches and scratch space.
+- `memo fn`: an answer computed once per build by whichever worker asks first, then shared.
+  Directory listings and `package.json` are memos, so twelve threads read a directory once, not twelve times.
+- `parallel-map` and `parallel-walk`: the second follows imports as workers find them.
+- A pool of parked worker threads in the runtime.
+
+The per-file stage now parses, lowers, analyses scopes in a table of the file's own, and resolves
+its imports. The serial pass grafts that table into the shared one.
+
+Every plan gives the same output, byte for byte, as the serial build. That holds for 12 apps,
+plain, minified, pretty and with source maps. Parts are cut by weight and only after declarations,
+which no minification rule merges across. `--pipeline=NAME` picks a plan, and `--threads=N` runs
+every stage on N threads.
+
+`--minify`, ms, best of three passes of best of 9, 12-core M-series laptop:
+
+| App | single | load-only | back-half | two | full | esbuild |
+|---|---|---|---|---|---|---|
+| tree-shaken lodash-es | 50.2 | 29.8 | 47.8 | 35.8 | **26.5** | 26.4 |
+| all of lodash-es | 61.1 | 41.5 | 55.5 | 44.3 | **33.9** | 28.0 |
+| rxjs | 29.0 | 18.0 | 29.4 | 21.0 | **16.5** | 15.9 |
+| date-fns | 32.1 | 18.9 | 31.9 | 23.2 | **17.5** | 20.2 |
+| d3 | 78.8 | 36.9 | 76.8 | 50.3 | **30.8** | 16.8 |
+| zod | 102.6 | 66.6 | 84.6 | 66.9 | **46.7** | 15.5 |
+
+On apps of many small files the full plan is as fast as esbuild on all its cores. Where one big
+file dominates, as in zod and d3, the parser is the limit: it is a general PEG parser, slower per
+file than esbuild's hand-written one, and a file is parsed by one thread. What is
+still serial: linking's fact replay and Datalog solve (about 5 ms on lodash-es), naming, and
+renaming identifiers in the emitted program (8 ms on zod).
+
 ## What it does
 
 Module graph, Node resolution (`exports`, `main` fields, conditions, `sideEffects: false`),
@@ -173,13 +242,13 @@ Being explicit, because "everything esbuild does" is a lot:
 
 ## Layout
 
-- `poc/src/hl/`: the languages. `syntax`, `rules`, `rewrite`, `facts`, `scopes` and `bundler` are
-  readers; `rt` and `symtab` are their domain-free runtime.
+- `poc/src/hl/`: the languages. `syntax`, `rules`, `rewrite`, `facts`, `scopes`, `bundler` and
+  `pipeline` are readers; `rt` and `symtab` are their domain-free runtime.
 - `poc/src/hl/grammars/`: the grammars of those languages.
 - `poc/src/bundle/`: the bundler, in those languages.
-- `poc/src/tools/`: the command-line `esb` and `jsparse`, in `.rules`.
-- `poc/src/app/`: a demo spec with four targets, a format, a loader and plugins.
-- `poc/src/boot/`: three `main` functions.
+- `poc/src/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map` gives the serial answer, in `.rules`.
+- `poc/src/app/`: a demo spec with four targets, a format, a loader and plugins, and the pipeline.
+- `poc/src/boot/`: four `main` functions.
 - `corpus/`: test apps and oracles. `node_modules` and `vendor` are not checked in.
 - `experiments/`: small programs that established how Coil readers behave, and repros of Coil issues.
 

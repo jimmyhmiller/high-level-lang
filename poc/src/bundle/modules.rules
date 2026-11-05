@@ -26,6 +26,8 @@ record Module {
   bindings: {Int:Int},
   side-effects: Bool,
   deps: [Int],
+  dep-ids: {Text:Int},  # the module each specifier it imports or requires led to
+  symbol-shift: Int,    # while loading: how far `bindings` must move to the shared table's numbering
   base: Text,
   require-sym: Int,
   source: [Node],
@@ -65,6 +67,12 @@ state hook-answers: {Text:Text} = {}
 state jsx-options: jsx.Options = jsx.options-new()
 # Where the output goes, for the paths the file loader writes into modules.
 state out-dir: Text = "."
+# Files parsed ahead of the walk that links them, by path, and how many threads may do it.
+state parsed-ahead: {Text:Parsed} = {}
+state load-threads: Int = 1
+# A spec's transform runs before scopes are analysed; it is a function value, so while there is one
+# the analysis stays on the thread that links.
+state has-transform: Bool = false
 state packages-external: Bool = false
 state public-path: Text = ""
 
@@ -345,7 +353,7 @@ fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-
 
 fn blank-module(id: Int, path: Text, kind: ModuleKind, tree: Node, root: Int) -> Module =
   Module(id: id, path: path, kind: kind, tree: tree, root: root, bindings: {}, side-effects: true,
-         deps: [], base: base-name(path), require-sym: -1, source: [], free: [], text: "",
+         deps: [], dep-ids: {}, symbol-shift: 0, base: base-name(path), require-sym: -1, source: [], free: [], text: "",
          ns-sym: -1, init-sym: -1, wrapped: false, pure-at: {}, pure-calls: {}, legal: [], helpers: [])
 
 # The stand-in module for an external import, one per specifier.
@@ -397,8 +405,12 @@ fn configured-path(spec: Text, importer: Text) -> Text? {
   none
 }
 
-# Where an import leads: resolve hooks first, then the project's paths, then the search.
+# Where an import leads: resolve hooks first, then the project's paths, then the search. A worker
+# that parsed the importer ahead may have found the answer already.
 fn resolve-import(spec: Text, importer: Text) -> res.Resolved {
+  if let some(ahead) = parsed-ahead[importer] {
+    if let some(t) = ahead.targets[spec] { return res.Resolved(path: t, side-effects: res.side-effects-of(t)) }
+  }
   let wanted = aliased(spec)
   match hook-path(wanted, importer) {
     some(p) => res.Resolved(path: p, side-effects: true)
@@ -437,16 +449,9 @@ fn default-loader(path: Text) -> Text =
 
 
 # A file's text as a module, by what its loader says it is.
-fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
-  "js" | "jsx" | "ts" | "tsx" => text
-  "json" => "module.exports = " ++ text
-  "text" => "export default " ++ host.js-string(text) ++ ";"
-  "base64" => "export default \"" ++ host.base64(text) ++ "\";"
-  "dataurl" => "export default \"" ++ host.data-url-of(text, host.mime-of(path)) ++ "\";"
-  "empty" | "css" => ""
-  "file" => "export default " ++ host.js-string(public-url(cssb.file-asset(path, out-dir, path))) ++ ";"
-  other => panic "{}: no loader named {}", path, other
-}
+fn as-module(text: Text, path: Text) -> Text =
+  if loader-of(path) == "file" then "export default " ++ host.js-string(public-url(cssb.file-asset(path, out-dir, path))) ++ ";"
+  else module-text(text, path)
 
 # A load hook may supply a file's text, or the file does.
 fn source-of(path: Text) -> Text = (first hook in on-load: hook(path)) ?? read-file(path)
@@ -460,32 +465,50 @@ fn import-spec-of(s: Node) -> Text? = match s {
 
 # Load a file and, first, everything it imports: `order` is post-order, so a module's dependencies
 # come before it, as they do in esbuild's output.
-fn load-file(path: Text, effects: Bool) -> Int {
-  if let some(id) = by-path[path] { return id }
-  let src = as-module(source-of(path), path)
-  let parsed = parse-file(src, path)
-  let loader = loader-of(path)
-  let config = tsc.for-file(path)
-  let file-jsx = configured-jsx(jsx-options, config)
-  let lowered = if loader == "jsx" or loader == "tsx" then jsx.lower(parsed, src, path, file-jsx)
-                else jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
-  let typed = if loader == "ts" or loader == "tsx" then ts.lower(lowered.tree, src, jsx.kept-names(src, path, file-jsx), tsc.define-fields?(config), config.verbatim, config.decorators)
-              else ts.Lowered(tree: lowered.tree, pure-calls: {}, helpers: [])
-  var pure-calls = lowered.pure-calls
-  for k in keys(typed.pure-calls) { pure-calls[k] = typed.pure-calls[k] ?? k }
-  let tree0 = transform(typed.tree)
-  let base = base-name(path)
-  let id = len(modules)
+# ---------------------------------------------------------------- the per-file stage
+
+# A file to parse: its text when that has been read already, which a load hook or the file loader
+# does on the thread that owns them.
+record Pending { path: Text, text: Text, ready: Bool }
+
+# Everything one file says by itself, before anything links it to another.
+record Parsed {
+  path: Text,
+  src: Text,
+  parsed: Node,
+  tree: Node,
+  pure-calls: {Int:Int},
+  helpers: [Text],
+  jsx-imports: Bool,
+  pure-at: {Int:Bool},
+  legal: [Text],
+  specs: [Text],
+  targets: {Text:Text}, # where each specifier led, when it was resolved ahead
+  analysed: Bool,       # whether `scopes` and `analysis` hold its scope analysis already
+  scopes: sym.Table,
+  analysis: Analysis
+}
+
+# A file's scope analysis: its tree once defines are applied, its root scope, which symbol each name
+# leaf is, the names it leaves free, and whether it is CommonJS.
+# `shift`: how far the symbols `bindings` names moved when the file's own table joined the shared
+# one, which the bindings themselves catch up with once loading is done.
+record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs: Bool, shift: Int }
+
+fn no-analysis() -> Analysis = Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, shift: 0)
+
+# Scopes for one file, in `t`, under `scope`: the shared table on the linking thread, or a file's own.
+fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool,
+               helpers: [Text], t: mut sym.Table, scope: Int) -> Analysis {
   let esm = early.program-has-module-syntax?(tree0)
   let tree = normalized-tree(tree0, base)
   var bindings: {Int:Int} = {}
   # Free names per module: this file's go to a fresh map for the moment.
-  sym.take-free!(table)
-  let first-root = sc.analyze(tree, table, bundle-scope, bindings)
-  let cjs = not esm and (sym.has-free?(table, "module") or sym.has-free?(table, "exports")
-                         or sym.has-free?(table, "require"))
-  if lowered.imports and not early.program-has-module-syntax?(parsed)
-     and (sym.has-free?(table, "module") or sym.has-free?(table, "exports")) {
+  sym.take-free!(t)
+  let first-root = sc.analyze(tree, t, scope, bindings)
+  let cjs = not esm and (sym.has-free?(t, "module") or sym.has-free?(t, "exports") or sym.has-free?(t, "require"))
+  if jsx-imports and not early.program-has-module-syntax?(parsed)
+     and (sym.has-free?(t, "module") or sym.has-free?(t, "exports")) {
     panic "{}: the automatic JSX runtime in a CommonJS module is not implemented yet", path
   }
   # Defines are substituted and the branches they decide removed, then the result is analysed
@@ -494,37 +517,213 @@ fn load-file(path: Text, effects: Bool) -> Int {
   let final-tree = if defined then dce.run(substitute(tree, bindings)) else tree
   var analysed-root = first-root
   if defined {
-    sym.drop-last-child!(table, bundle-scope)
+    sym.drop-last-child!(t, scope)
     clear(bindings)
-    analysed-root = sc.analyze(final-tree, table, bundle-scope, bindings)
+    analysed-root = sc.analyze(final-tree, t, scope, bindings)
   }
   # CommonJS is analysed again inside its (exports, module) wrapper. The first attempt's scope is
   # detached, so naming never sees it.
   var root = analysed-root
   if cjs {
-    sym.drop-last-child!(table, bundle-scope)
-    let wrapper = sym.new-scope!(table, bundle-scope, true)
-    sym.declare!(table, wrapper, "exports")
-    sym.declare!(table, wrapper, "module")
+    sym.drop-last-child!(t, scope)
+    let wrapper = sym.new-scope!(t, scope, true)
+    sym.declare!(t, wrapper, "exports")
+    sym.declare!(t, wrapper, "module")
     clear(bindings)
-    root = sc.analyze(final-tree, table, wrapper, bindings)
+    root = sc.analyze(final-tree, t, wrapper, bindings)
   }
-  let free-names = sym.free-names(table)
-  let real-free = [f for f in free-names if not ((cjs and (f == "exports" or f == "module")) or f in typed.helpers)]
-  modules += blank-module(id, path, if cjs then Cjs else Esm, final-tree, root) with {
-    bindings: bindings, side-effects: effects, base: base, source: tree0.kids[1].kids,
-    free: real-free, text: src, pure-at: pure-annotations(src), pure-calls: pure-calls,
-    legal: legal.of-file(src, parsed), helpers: typed.helpers
+  let free-names = sym.free-names(t)
+  let real-free = [f for f in free-names if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
+  Analysis(tree: final-tree, root: root, bindings: bindings, free: real-free, cjs: cjs, shift: 0)
+}
+
+# A file analysed on its own, moved into the shared table: its ids move by where it lands.
+fn grafted(p: Parsed) -> Analysis {
+  let symbol-shift = sym.symbol-count(table)
+  var own = p.scopes
+  let scope-shift = sym.graft!(table, own, bundle-scope)
+  p.analysis with { root: p.analysis.root + scope-shift, shift: symbol-shift }
+}
+
+# A module's bindings in the shared table's numbering. Every module is moved at once, when all
+# are loaded.
+fn rebased-bindings(id: Int) -> {Int:Int} {
+  let mo = modules[id]
+  if mo.symbol-shift == 0 { return mo.bindings }
+  var out: {Int:Int} = {}
+  for k in keys(mo.bindings) { out[k] = (mo.bindings[k] ?? 0) + mo.symbol-shift }
+  out
+}
+
+fn rebase-all!() -> Void {
+  let moved = parallel-map(order, rebased-bindings, load-threads)
+  for i in 0..len(order) {
+    let id = order[i]
+    modules[id].bindings = moved[i]
+    modules[id].symbol-shift = 0
+  }
+}
+
+# The text a module of this loader stands for. Not the file loader's: that writes an asset, so it
+# is made by `as-module`, on the thread that links.
+fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
+  "js" | "jsx" | "ts" | "tsx" => text
+  "json" => "module.exports = " ++ text
+  "text" => "export default " ++ host.js-string(text) ++ ";"
+  "base64" => "export default \"" ++ host.base64(text) ++ "\";"
+  "dataurl" => "export default \"" ++ host.data-url-of(text, host.mime-of(path)) ++ "\";"
+  "empty" | "css" => ""
+  "file" => panic "{}: the file loader's text is made by the linking stage", path
+  other => panic "{}: no loader named {}", path, other
+}
+
+# What one file's own text says: parsed, checked, its JSX and TypeScript lowered, its comments read,
+# and every specifier it might import. Touches only task state, so any number can run at once.
+fn parsed-file(item: Pending) -> Parsed {
+  let path = item.path
+  let src = if item.ready then item.text else module-text(read-file(path), path)
+  let parsed = parse-file(src, path)
+  let loader = loader-of(path)
+  let config = tsc.for-file(path)
+  let file-jsx = configured-jsx(jsx-options, config)
+  let lowered = if loader == "jsx" or loader == "tsx" then jsx.lower(parsed, src, path, file-jsx)
+                else jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
+  let typed = if loader == "ts" or loader == "tsx"
+              then ts.lower(lowered.tree, src, jsx.kept-names(src, path, file-jsx), tsc.define-fields?(config), config.verbatim, config.decorators)
+              else ts.Lowered(tree: lowered.tree, pure-calls: {}, helpers: [])
+  var pure-calls = lowered.pure-calls
+  for k in keys(typed.pure-calls) { pure-calls[k] = typed.pure-calls[k] ?? k }
+  var specs: [Text] = []
+  for s in typed.tree.kids[1].kids {
+    if let some(spec) = import-spec-of(s) { specs += spec }
+  }
+  # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
+  # file the build never uses, but never misses one it does.
+  require-calls!(typed.tree, specs)
+  import-calls!(typed.tree, specs)
+  Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
+         helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
+         legal: legal.of-file(src, parsed), specs: specs, targets: {},
+         analysed: false, scopes: sym.table-new(), analysis: no-analysis())
+}
+
+# The same, with scopes analysed too, in a table of the file's own. Not while a spec's transform
+# has to see the tree first.
+fn analysed-file(p: Parsed) -> Parsed {
+  if has-transform { return p }
+  var own = sym.table-new()
+  let top = sym.new-scope!(own, -1, true)
+  let a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers, own, top)
+  p with { analysed: true, scopes: own, analysis: a }
+}
+
+# A file found by walking: parsed, and its imports resolved, all on one worker.
+fn visit-file(path: Text) -> Parsed {
+  let p = analysed-file(parsed-file(Pending(path: path, text: "", ready: false)))
+  var targets: {Text:Text} = {}
+  for spec in p.specs {
+    if let some(t) = unhooked-target(spec, path) { targets[spec] = t }
+  }
+  p with { targets: targets }
+}
+
+fn next-files(p: Parsed) -> [Text] = [t for t in values-of(p.targets) if ahead?(t)]
+
+fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
+
+# `ahead-target` without hooks, which only the thread that owns them may call.
+fn unhooked-target(spec: Text, importer: Text) -> Text? {
+  if res.external?(aliased(spec), options) or (packages-external and package-spec?(aliased(spec), importer)) { return none }
+  let wanted = aliased(spec)
+  if let some(p) = configured-path(wanted, importer) { return some(p) }
+  let from = if wanted != spec and res.relative?(wanted) then "alias" else importer
+  match res.resolve-opt(wanted, from, options) {
+    some(r) => some(r.path)
+    none => none
+  }
+}
+
+fn ahead?(path: Text) -> Bool = loader-of(path) != "file"
+
+# Where an import would lead, or nothing if it leads nowhere or stays outside the bundle.
+fn ahead-target(spec: Text, importer: Text) -> Text? {
+  if stays-external?(spec, importer) { return none }
+  let wanted = aliased(spec)
+  if let some(p) = hook-path(wanted, importer) { return some(p) }
+  if let some(p) = configured-path(wanted, importer) { return some(p) }
+  let from = if wanted != spec and res.relative?(wanted) then "alias" else importer
+  match res.resolve-opt(wanted, from, options) {
+    some(r) => some(r.path)
+    none => none
+  }
+}
+
+# Parse every file the entries can reach, a wave at a time: each wave's files are parsed at once,
+# and their imports are the next wave.
+fn parse-ahead!(paths: [Text]) -> Void {
+  if load-threads <= 1 { return }
+  # Without hooks, a worker can resolve what it parsed: a walk that never waits for a wave.
+  if len(on-load) == 0 and len(on-resolve) == 0 {
+    let roots = [p for p in paths if ahead?(p)]
+    for d in parallel-walk(roots, visit-file, next-files, load-threads) { parsed-ahead[d.path] = d }
+    return
+  }
+  var seen: {Text:Bool} = {}
+  var wave: [Text] = []
+  for p in paths {
+    if not (p in seen) and ahead?(p) {
+      seen[p] = true
+      wave += p
+    }
+  }
+  while len(wave) > 0 {
+    let hooked = len(on-load) > 0
+    let items = [Pending(path: p, text: if hooked then module-text(source-of(p), p) else "", ready: hooked) for p in wave]
+    let done = parallel-map(items, parsed-file, load-threads)
+    var next: [Text] = []
+    for d in done {
+      parsed-ahead[d.path] = d
+      for spec in d.specs {
+        if let some(target) = ahead-target(spec, d.path) {
+          if not (target in seen) and ahead?(target) {
+            seen[target] = true
+            next += target
+          }
+        }
+      }
+    }
+    wave = next
+  }
+}
+
+fn load-file(path: Text, effects: Bool) -> Int {
+  if let some(id) = by-path[path] { return id }
+  let ahead = parsed-ahead[path] ?? parsed-file(Pending(path: path, text: as-module(source-of(path), path), ready: true))
+  let src = ahead.src
+  let parsed = ahead.parsed
+  let tree0 = if ahead.analysed then ahead.tree else transform(ahead.tree)
+  let base = base-name(path)
+  let id = len(modules)
+  let a = if ahead.analysed then grafted(ahead)
+          else analysis-of(tree0, parsed, src, path, base, ahead.jsx-imports, ahead.helpers, table, bundle-scope)
+  let final-tree = a.tree
+  let cjs = a.cjs
+  modules += blank-module(id, path, if cjs then Cjs else Esm, final-tree, a.root) with {
+    bindings: a.bindings, symbol-shift: a.shift, side-effects: effects, base: base, source: tree0.kids[1].kids,
+    free: a.free, text: src, pure-at: ahead.pure-at, pure-calls: ahead.pure-calls,
+    legal: ahead.legal, helpers: ahead.helpers
   }
   by-path[path] = id
   # Imports in source order. Statements `define` removed import nothing.
+  var ids: {Text:Int} = {}
   for s in tree0.kids[1].kids {
-    if let some(spec) = import-spec-of(s) { dep-add(id, spec, path) }
+    if let some(spec) = import-spec-of(s) { ids[spec] = dep-add(id, spec, path) }
   }
   var reqs: [Text] = []
   for s in final-tree.kids[1].kids { require-calls!(s, reqs) }
   for s in final-tree.kids[1].kids { import-calls!(s, reqs) }
-  for spec in reqs { dep-add(id, spec, path) }
+  for spec in reqs { ids[spec] = dep-add(id, spec, path) }
+  modules[id].dep-ids = ids
   order += id
   id
 }
@@ -553,10 +752,13 @@ fn css-imports() -> [Text] = [modules[id].path for id in order if loader-of(modu
 fn load-tree(entry-path: Text) -> Void {
   entry = load-file(entry-path, true)
   entries = [entry]
+  rebase-all!()
 }
 
 # Several entries, for code splitting. `entry` stays the first, for what only one of them can be.
 fn load-trees(paths: [Text]) -> Void {
+  parse-ahead!(paths)
   entries = [load-file(p, true) for p in paths]
   entry = entries[0]
+  rebase-all!()
 }

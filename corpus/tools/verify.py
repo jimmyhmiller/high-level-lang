@@ -8,7 +8,10 @@ E = "node_modules/.bin/esbuild"
 failures = []
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guard
+# `ESB_FLAGS` adds options to every build of ours, to run the whole suite under another plan.
+EXTRA = os.environ.get("ESB_FLAGS", "").split()
 def sh(cmd, timeout=120):
+    if EXTRA and cmd and cmd[0] == ESB: cmd = cmd + EXTRA
     # Everything runs under a memory cap as well as a clock: a runaway fails one check.
     code, out, err, peak, reason = guard.run(cmd, 4000, timeout, quiet=True)
     if reason: return 124, "STOPPED: " + reason
