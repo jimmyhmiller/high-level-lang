@@ -1,0 +1,99 @@
+;;; The escape hatch: a pass with no language of its own is ordinary Coil over the
+;;; node types the grammar generated.
+;;;
+;;; Follows relative imports, then concatenates modules in dependency order. It
+;;; does no renaming, so a top-level name defined twice is an error rather than a
+;;; silent collision. Only the entry module's exports stay `export`.
+(module demo.link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.slice" :use [subslice])
+(import "demo.js" :as js)
+(import "hl.rt" :as rt)
+
+(defstruct Module [(path (slice u8)) (exports (ArrayList (slice u8)))])
+
+(defstruct Linker
+  [(done (ArrayList Module))
+   (active (ArrayList (slice u8)))
+   (names (ArrayList (slice u8)))
+   (out (ArrayList js/Node))])
+
+(defn contains? [(xs (ArrayList (slice u8))) (s (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for x xs (when (= x s) (set! hit true)))
+    hit))
+
+(defn find-module [(l (mut Linker)) (path (slice u8))] (-> (Option Module))
+  (let [(mut out) (None [Module])]
+    (for m (.done l) (when (= (.path m) path) (set! out (Some m))))
+    out))
+
+;;; The name a top-level statement declares, if it declares one.
+(defn declared [(n js/Node)] (-> (Option (slice u8)))
+  (match (.kind n)
+    (js/KConst [] (Some (.text (get (.kids n) 0))))
+    (js/KFunc [] (Some (.text (get (.kids n) 0))))
+    (_ (None [(slice u8)]))))
+
+(defn resolve [(from (slice u8)) (spec (slice u8))] (-> (slice u8))
+  (unless (and (> (len spec) 2) (= (subslice spec 0 2) "./"))
+    (panic "{}: the PoC resolves only ./relative imports, not {}" from spec))
+  (rt/join (rt/join (rt/dir-of from) "/") (subslice spec 2 (len spec))))
+
+(defn claim-name! [(l (mut Linker)) (path (slice u8)) (name (slice u8))] (-> void)
+  (when (contains? (.names l) name)
+    (panic "{}: {} is already defined at top level; the PoC linker does not rename" path name))
+  (push! (mut (.names l)) name))
+
+(defn visit! [(l (mut Linker)) (path (slice u8)) (entry bool)] (-> void)
+  (when (contains? (.active l) path)
+    (panic "{}: import cycle; the PoC linker does not handle cycles" path))
+  (match (find-module (mut l) path)
+    (Some [_] 0)
+    (None []
+      (push! (mut (.active l)) path)
+      (let [tree (js/parse (rt/read-all path) path)
+            stmts (.kids (get (.kids tree) 0))
+            (mut exports) (ArrayList::new [(slice u8)] (malloc-allocator))]
+        (for s stmts
+          (when (= (.kind s) (js/KImport))
+            (let [target (resolve path (.text (get (.kids s) 1)))]
+              (visit! (mut l) target false)
+              (match (find-module (mut l) target)
+                (Some [m]
+                  (for wanted (.kids (get (.kids s) 0))
+                    (unless (contains? (.exports m) (.text wanted))
+                      (panic "{}: {} does not export {}" path target (.text wanted)))))
+                (None [] (panic "{}: {} did not load" path target))))))
+        (for s stmts
+          (match (.kind s)
+            (js/KImport [] 0)
+            (js/KExport []
+              (let [inner (get (.kids s) 0)]
+                (match (declared inner)
+                  (Some [name]
+                    (claim-name! (mut l) path name)
+                    (push! (mut exports) name))
+                  (None [] (panic "{}: the PoC exports only const and function" path)))
+                (push! (mut (.out l)) (if entry s inner))))
+            (_
+              (match (declared s)
+                (Some [name] (claim-name! (mut l) path name))
+                (None [] 0))
+              (push! (mut (.out l)) s))))
+        (push! (mut (.done l)) (Module :path path :exports exports))
+        (pop! (mut (.active l)))
+        0))))
+
+;;; Everything reachable from `entry`, as one Program.
+(defn load-entry [(entry (slice u8))] (-> js/Node)
+  (let [(mut l) (Linker
+                  :done (ArrayList::new [Module] (malloc-allocator))
+                  :active (ArrayList::new [(slice u8)] (malloc-allocator))
+                  :names (ArrayList::new [(slice u8)] (malloc-allocator))
+                  :out (js/new-kids))]
+    (visit! (mut l) entry true)
+    (let [(mut top) (js/new-kids)]
+      (push! (mut top) (js/Node :kind (js/KList) :text "" :kids (.out l)))
+      (js/Node :kind (js/KProgram) :text "" :kids top))))

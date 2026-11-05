@@ -1,0 +1,322 @@
+;;; `.rewrite`: the transformation language. Rules over a grammar's nodes compile
+;;; to pattern tests grouped by head node, plus a bottom-up driver.
+;;;
+;;;   rewrite demo.js
+;;;   rule fold-add : Add(Num(a), Num(b)) => Num(a + b) ;
+;;;   rule if-true  : If(True(), t, e)    => t ;
+;;;
+;;; In a pattern, a name binds a child and `_` ignores one. Inside the leaf nodes
+;;; Num, Ident and Str, a name binds the value and a string must match exactly.
+;;; Arithmetic is exact: outside [0, 2^53) a rule simply does not fire.
+(module hl.rewrite)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "hl.rt" :as rt)
+(import "hl.dsl" :as dsl)
+
+(reader-provider "hl.rewrite" read-rewrite)
+
+(defsum VarSort (VNode) (VNum) (VText))
+(derive Eq VarSort)
+(defstruct Var [(name (slice u8)) (sort VarSort)])
+
+;;; A pattern, flattened to the tests and bindings it performs, in order.
+(defsum Step
+  (STest [(subject i64) (kind (slice u8)) (arity i64)])
+  (SKid [(subject i64) (index i64) (out i64)])
+  (SVar [(subject i64) (name (slice u8))])
+  (SNum [(subject i64) (name (slice u8))])
+  (SText [(subject i64) (name (slice u8))])
+  (STextEq [(subject i64) (text (slice u8))]))
+
+(defstruct Use [(where (slice u8)) (name (slice u8)) (arity i64)])
+
+(defstruct Rule [(name (slice u8)) (head (slice u8))])
+
+(defstruct Comp
+  [(prefix (slice u8))
+   (uses (ArrayList Use))
+   (rules (ArrayList Rule))
+   (steps (ArrayList Step))
+   (vars (ArrayList Var))
+   (next-subject i64)])
+
+(defn kind-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "syn/K" n))
+(defn subj-sym [(i i64)] (-> Code) (primitive/code-symbol "s" i))
+(defn var-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "v-" n))
+(defn pfx-sym [(k (mut Comp)) (n (slice u8))] (-> Code)
+  (primitive/code-symbol (dsl/join2 (.prefix k) n)))
+(defn rule-sym [(k (mut Comp)) (i i64)] (-> Code)
+  (primitive/code-symbol (dsl/join2 (.prefix k) "rule") i))
+
+(defn where-of [(c (mut dsl/Cur)) (t rt/Tok)] (-> (slice u8))
+  (let [(mut b) (dsl/join3 (.path c) ":" (primitive/int->str (.line t)))]
+    (dsl/join3 b ":" (primitive/int->str (.col t)))))
+
+(defn leaf? [(n (slice u8))] (-> bool) (or (= n "Num") (= n "Ident") (= n "Str")))
+
+(defn bind-var! [(k (mut Comp)) (c (mut dsl/Cur)) (t rt/Tok) (sort VarSort)] (-> void)
+  (for v (.vars k)
+    (when (= (.name v) (.text t))
+      (dsl/die (mut c) t (dsl/join3 "the variable " (.text t) " is bound twice in this pattern"))))
+  (push! (mut (.vars k)) (Var :name (.text t) :sort sort)))
+
+(defn fresh-subject! [(k (mut Comp))] (-> i64)
+  (let [i (.next-subject k)]
+    (set! (.next-subject k) (+ i 1))
+    i))
+
+(defn read-leaf-pat! [(k (mut Comp)) (c (mut dsl/Cur)) (kind (slice u8)) (subject i64)] (-> void)
+  (let [t (dsl/peek (mut c))]
+    (cond
+      (= (.kind t) (rt/TStr))
+        (do
+          (when (= kind "Num") (dsl/die (mut c) t "Num matches a name, not a string"))
+          (dsl/advance! (mut c))
+          (push! (mut (.steps k)) (STextEq :subject subject :text (.text t))))
+      (= (.text t) "_") (dsl/advance! (mut c))
+      :else
+        (let [n (dsl/name! (mut c) "a name, _ or a string")]
+          (if (= kind "Num")
+              (do
+                (bind-var! (mut k) (mut c) n (VNum))
+                (push! (mut (.steps k)) (SNum :subject subject :name (.text n))))
+              (do
+                (bind-var! (mut k) (mut c) n (VText))
+                (push! (mut (.steps k)) (SText :subject subject :name (.text n)))))))
+    (dsl/expect! (mut c) ")")))
+
+;;; Parse one pattern into steps testing `subject`. Answers the head node's name,
+;;; or "" for a pattern that is a plain variable or wildcard.
+(defn read-pat! [(k (mut Comp)) (c (mut dsl/Cur)) (subject i64)] (-> (slice u8))
+  (let [t (dsl/name! (mut c) "a pattern")]
+    (cond
+      (= (.text t) "_") ""
+      (not (dsl/accept! (mut c) "("))
+        (do
+          (bind-var! (mut k) (mut c) t (VNode))
+          (push! (mut (.steps k)) (SVar :subject subject :name (.text t)))
+          "")
+      (leaf? (.text t))
+        (do
+          (push! (mut (.steps k)) (STest :subject subject :kind (.text t) :arity 0))
+          (push! (mut (.uses k)) (Use :where (where-of (mut c) t) :name (.text t) :arity 0))
+          (read-leaf-pat! (mut k) (mut c) (.text t) subject)
+          (.text t))
+      :else
+        (let [test-at (len (.steps k))
+              (mut count) 0]
+          ;; Placeholder arity, fixed below once the children have been counted.
+          (push! (mut (.steps k)) (STest :subject subject :kind (.text t) :arity 0))
+          (while (not (dsl/accept! (mut c) ")"))
+            (when (> count 0) (dsl/expect! (mut c) ","))
+            (let [kid (fresh-subject! (mut k))]
+              (push! (mut (.steps k)) (SKid :subject subject :index count :out kid))
+              (read-pat! (mut k) (mut c) kid))
+            (set! count (+ count 1)))
+          (set! (mut (.steps k)) test-at (STest :subject subject :kind (.text t) :arity count))
+          (push! (mut (.uses k)) (Use :where (where-of (mut c) t) :name (.text t) :arity count))
+          (.text t)))))
+
+(defn var-sort [(k (mut Comp)) (c (mut dsl/Cur)) (t rt/Tok)] (-> VarSort)
+  (let [(mut out) (None [VarSort])]
+    (for v (.vars k) (when (= (.name v) (.text t)) (set! out (Some (.sort v)))))
+    (match out
+      (Some [s] s)
+      (None [] (dsl/die (mut c) t (dsl/join3 "the variable " (.text t) " is not bound by the pattern"))))))
+
+;;; Arithmetic in a right-hand side, as a chain over (Option i64).
+(defn read-num-atom [(k (mut Comp)) (c (mut dsl/Cur))] (-> Code)
+  (let [t (dsl/peek (mut c))]
+    (cond
+      (= (.kind t) (rt/TNum))
+        (do
+          (dsl/advance! (mut c))
+          `(rt/parse-num ~(.text t)))
+      (dsl/accept! (mut c) "(")
+        (let [e (read-num-sum (mut k) (mut c))]
+          (dsl/expect! (mut c) ")")
+          e)
+      :else
+        (let [n (dsl/name! (mut c) "a number or a variable")]
+          (unless (= (var-sort (mut k) (mut c) n) (VNum))
+            (dsl/die (mut c) n (dsl/join3 "the variable " (.text n) " is not a number")))
+          `(Some ~(var-sym (.text n)))))))
+
+(defn read-num-product [(k (mut Comp)) (c (mut dsl/Cur))] (-> Code)
+  (let [(mut acc) (read-num-atom (mut k) (mut c))]
+    (while (dsl/accept! (mut c) "*")
+      (set! acc `(rt/num-mul ~acc ~(read-num-atom (mut k) (mut c)))))
+    acc))
+
+(defn read-num-sum [(k (mut Comp)) (c (mut dsl/Cur))] (-> Code)
+  (let [(mut acc) (read-num-product (mut k) (mut c)) (mut go) true]
+    (while go
+      (cond
+        (dsl/accept! (mut c) "+")
+          (set! acc `(rt/num-add ~acc ~(read-num-product (mut k) (mut c))))
+        (dsl/accept! (mut c) "-")
+          (set! acc `(rt/num-sub ~acc ~(read-num-product (mut k) (mut c))))
+        :else (set! go false)))
+    acc))
+
+;;; A right-hand side, compiled as it is read: a Node expression that can leave
+;;; the rule through :r when arithmetic is out of range.
+(defn read-rhs [(k (mut Comp)) (c (mut dsl/Cur))] (-> Code)
+  (let [t (dsl/name! (mut c) "a node or a variable")]
+    (cond
+      (not (dsl/accept! (mut c) "("))
+        (do
+          (unless (= (var-sort (mut k) (mut c) t) (VNode))
+            (dsl/die (mut c) t (dsl/join3 "the variable " (.text t) " is not a node")))
+          (var-sym (.text t)))
+      (= (.text t) "Num")
+        (let [e (read-num-sum (mut k) (mut c))]
+          (dsl/expect! (mut c) ")")
+          (push! (mut (.uses k)) (Use :where (where-of (mut c) t) :name "Num" :arity 0))
+          `(match ~e
+             (Some [v] (syn/leaf (syn/KNum) (rt/num-text v)))
+             (None [] (return-from :r (None [syn/Node])))))
+      (leaf? (.text t))
+        (let [a (dsl/peek (mut c))]
+          (push! (mut (.uses k)) (Use :where (where-of (mut c) t) :name (.text t) :arity 0))
+          (let [value (if (= (.kind a) (rt/TStr))
+                          (do (dsl/advance! (mut c)) `~(.text a))
+                          (let [n (dsl/name! (mut c) "a string or a variable")]
+                            (unless (= (var-sort (mut k) (mut c) n) (VText))
+                              (dsl/die (mut c) n (dsl/join3 "the variable " (.text n) " is not text")))
+                            (var-sym (.text n))))]
+            (dsl/expect! (mut c) ")")
+            `(syn/leaf (~(kind-sym (.text t))) ~value)))
+      :else
+        (let [(mut pushes) (primitive/code-list-new)
+              (mut count) 0]
+          (while (not (dsl/accept! (mut c) ")"))
+            (when (> count 0) (dsl/expect! (mut c) ","))
+            (push! (mut pushes) `(push! (mut kids) ~(read-rhs (mut k) (mut c))))
+            (set! count (+ count 1)))
+          (push! (mut (.uses k)) (Use :where (where-of (mut c) t) :name (.text t) :arity count))
+          `(let [(mut kids) (syn/new-kids)]
+             ~@pushes
+             (syn/Node :kind (~(kind-sym (.text t))) :text "" :kids kids))))))
+
+(defn no-match [] (-> Code) `(None [syn/Node]))
+
+;;; Wrap `inner` in steps from index i on: the pattern's tests, outermost first.
+(defn wrap-steps [(steps (ArrayList Step)) (i i64) (inner Code)] (-> Code)
+  (if (>= i (len steps))
+      inner
+      (let [rest (wrap-steps steps (+ i 1) inner)]
+        (match (get steps i)
+          (STest [s kind arity]
+            `(if (and (= (.kind ~(subj-sym s)) (~(kind-sym kind)))
+                      (= (len (.kids ~(subj-sym s))) ~arity))
+                 ~rest
+                 ~(no-match)))
+          (SKid [s index out]
+            `(let [~(subj-sym out) (get (.kids ~(subj-sym s)) ~index)] ~rest))
+          (SVar [s name] `(let [~(var-sym name) ~(subj-sym s)] ~rest))
+          (SNum [s name]
+            `(match (rt/parse-num (.text ~(subj-sym s)))
+               (Some [~(var-sym name)] ~rest)
+               (None [] ~(no-match))))
+          (SText [s name] `(let [~(var-sym name) (.text ~(subj-sym s))] ~rest))
+          (STextEq [s text]
+            `(if (= (.text ~(subj-sym s)) ~text) ~rest ~(no-match)))))))
+
+(defn read-rule [(k (mut Comp)) (c (mut dsl/Cur)) (index i64)] (-> Code)
+  (dsl/expect! (mut c) "rule")
+  (let [name (dsl/name! (mut c) "a rule name")]
+    (dsl/expect! (mut c) ":")
+    (clear! (mut (.steps k)))
+    (clear! (mut (.vars k)))
+    (set! (.next-subject k) 1)
+    (let [head (read-pat! (mut k) (mut c) 0)]
+      (when (= (len head) 0)
+        (dsl/die (mut c) name "a rule's pattern must start with a node"))
+      (dsl/expect! (mut c) "=>")
+      (let [rhs (read-rhs (mut k) (mut c))]
+        (dsl/expect! (mut c) ";")
+        (push! (mut (.rules k)) (Rule :name (.text name) :head head))
+        `(defn ~(rule-sym (mut k) index) [(s0 syn/Node)] (-> (Option syn/Node))
+           (block :r ~(wrap-steps (.steps k) 0 `(Some ~rhs))))))))
+
+;;; Try each rule with this head in order.
+(defn try-rules [(k (mut Comp)) (head (slice u8)) (i i64)] (-> Code)
+  (cond
+    (>= i (len (.rules k))) (no-match)
+    (!= (.head (get (.rules k) i)) head) (try-rules (mut k) head (+ i 1))
+    :else
+      `(match (~(rule-sym (mut k) i) n)
+         (Some [r] (Some r))
+         (None [] ~(try-rules (mut k) head (+ i 1))))))
+
+;;; The rules' definitions, a step function dispatching on the head node, a driver,
+;;; and the check against the grammar's table. The caller supplies `syn`.
+(defn compile-rules [(c (mut dsl/Cur)) (prefix (slice u8))] (-> Code)
+  (let [(mut k) (Comp
+                  :prefix prefix
+                  :uses (ArrayList::new [Use] (malloc-allocator))
+                  :rules (ArrayList::new [Rule] (malloc-allocator))
+                  :steps (ArrayList::new [Step] (malloc-allocator))
+                  :vars (ArrayList::new [Var] (malloc-allocator))
+                  :next-subject 1)
+        (mut forms) (primitive/code-list-new)
+        (mut arms) (primitive/code-list-new)
+        (mut uses) (primitive/code-list-new)
+        (mut index) 0]
+    (while (not (dsl/eof? (mut c)))
+      (push! (mut forms) (read-rule (mut k) (mut c) index))
+      (set! index (+ index 1)))
+    (for i (range 0 (len (.rules k)))
+      (let [head (.head (get (.rules k) i)) (mut first) true]
+        (for j (range 0 i)
+          (when (= (.head (get (.rules k) j)) head) (set! first false)))
+        (when first
+          (push! (mut arms) `(~(kind-sym head) [] ~(try-rules (mut k) head 0))))))
+    (for u (.uses k)
+      (push! (mut uses) `(~(.where u) ~(.name u) ~(.arity u))))
+    (let [step (pfx-sym (mut k) "step")
+          go (pfx-sym (mut k) "go")
+          run (pfx-sym (mut k) "run")
+          check (pfx-sym (mut k) "check")]
+      `(do
+         ~@forms
+         (defn ~step [(n syn/Node)] (-> (Option syn/Node))
+           (match (.kind n) ~@arms (_ ~(no-match))))
+         ;;; Bottom up: normal children first, then rules here until none applies.
+         (defn ~go [(n syn/Node) (fuel (mut i64))] (-> syn/Node)
+           (let [(mut kids) (syn/new-kids)]
+             (for child (.kids n) (push! (mut kids) (~go child (mut fuel))))
+             (let [rebuilt (syn/Node :kind (.kind n) :text (.text n) :kids kids)]
+               (match (~step rebuilt)
+                 (None [] rebuilt)
+                 (Some [r]
+                   (set! fuel (- fuel 1))
+                   (when (< fuel 0)
+                     (panic "rewrite rules did not terminate within 1000000 firings"))
+                   (~go r (mut fuel)))))))
+         (defn ~run [(n syn/Node)] (-> syn/Node)
+           (let [(mut fuel) 1000000] (~go n (mut fuel))))
+         (defn ~check [] (-> Code)
+           (check/against (syn/node-table) (quasiquote (~@uses))))
+         (meta (~check))))))
+
+(defn imports-for [(syntax (slice u8))] (-> Code)
+  `(do
+     (import "coil.control" :use [return-from])
+     (import "hl.rt" :as rt)
+     (import "hl.check" :as check)
+     (import ~syntax :as syn)))
+
+(const PUNCTS "=> ( ) , : ; + - *")
+
+(defn module-text [(context Code)] (-> (slice u8))
+  (let [(mut c) (dsl/cursor (dsl/source-of context) (dsl/path-of context) PUNCTS)]
+    (dsl/expect! (mut c) "rewrite")
+    (let [syntax (.text (dsl/name! (mut c) "a syntax module"))]
+      (dsl/render `(do ~(imports-for syntax) ~(compile-rules (mut c) ""))))))
+
+(defn read-rewrite [(context Code)] (-> Code)
+  (primitive/code-read (module-text context) `(reader-config)))

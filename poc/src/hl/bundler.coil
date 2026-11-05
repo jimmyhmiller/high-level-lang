@@ -1,0 +1,186 @@
+;;; `.bundler`: the top of the tower. A build is targets, each a pipeline of steps
+;;; drawn from the lower languages, or from plain Coil where no language fits.
+;;;
+;;;   bundler
+;;;   syntax demo.js
+;;;   load demo.link/load-entry
+;;;   use rewrite minify = demo.minify
+;;;   use coil shake = demo.treeshake/shake
+;;;   target client
+;;;     entry "app/main.js"
+;;;     define SERVER = false
+;;;     run define minify shake
+;;;     emit "dist/client.js" compact
+;;;   end
+;;;
+;;; `define` is not a runtime feature. Each define lowers to a rule of the rewrite
+;;; language, and that text goes through the rewrite language's own compiler, so a
+;;; target gets a function specialised to its constants.
+(module hl.bundler)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.slice" :use [subslice])
+(import "hl.rt" :as rt)
+(import "hl.dsl" :as dsl)
+(import "hl.rewrite" :as rewrite)
+
+(reader-provider "hl.bundler" read-bundler)
+
+;;; What a step name can mean. `module` and `function` are what the generated call
+;;; goes through: the rewrite module's `run`, or the named Coil function.
+(defstruct Pass [(name (slice u8)) (module (slice u8)) (function (slice u8))])
+
+(defstruct Spec
+  [(syntax (slice u8))
+   (load-module (slice u8))
+   (load-function (slice u8))
+   (passes (ArrayList Pass))])
+
+(defn split-function [(c (mut dsl/Cur)) (t rt/Tok)] (-> Pass)
+  (let [s (.text t) (mut cut) -1]
+    (for i (range 0 (len s)) (when (= (get s i) #\/) (set! cut i)))
+    (when (< cut 0)
+      (dsl/die (mut c) t "expected module/function"))
+    (Pass :name "" :module (subslice s 0 cut) :function (subslice s (+ cut 1) (len s)))))
+
+(defn alias-for [(p Pass)] (-> Code) (primitive/code-symbol "pass-" (.name p)))
+
+(defn call-of [(alias (slice u8)) (function (slice u8))] (-> Code)
+  (primitive/code-symbol (dsl/join3 alias "/" function)))
+
+(defn find-pass [(s Spec) (n (slice u8))] (-> (Option Pass))
+  (let [(mut out) (None [Pass])]
+    (for p (.passes s) (when (= (.name p) n) (set! out (Some p))))
+    out))
+
+;;; `define NAME = value` as one rule of the rewrite language.
+(defn define-rule [(c (mut dsl/Cur)) (index i64) (name (slice u8)) (value rt/Tok)] (-> (slice u8))
+  (let [rhs (cond
+              (= (.kind value) (rt/TStr)) (dsl/join3 "Str(\"" (.text value) "\")")
+              (= (.kind value) (rt/TNum)) (dsl/join3 "Num(" (.text value) ")")
+              (= (.text value) "true") "True()"
+              (= (.text value) "false") "False()"
+              :else (dsl/die (mut c) value "a define's value is true, false, a number or a string"))
+        head (dsl/join3 "rule define-" (primitive/int->str index) " : Ident(\"")]
+    (dsl/join3 (dsl/join3 head name "\") => ") rhs " ;\n")))
+
+;;; One `target … end`. Answers the forms it needs, last of them its build function.
+(defn read-target [(c (mut dsl/Cur)) (s Spec) (out-names (mut (ArrayList (slice u8))))] (-> Code)
+  (let [name (.text (dsl/name! (mut c) "a target name"))
+        (mut entry) ""
+        (mut output) ""
+        (mut pretty) false
+        (mut rules) ""
+        (mut rule-count) 0
+        (mut steps) (ArrayList::new [rt/Tok] (malloc-allocator))
+        (mut go) true]
+    (while go
+      (let [t (dsl/peek (mut c))]
+        (cond
+          (dsl/accept! (mut c) "end") (set! go false)
+          (dsl/accept! (mut c) "entry")
+            (set! entry (.text (dsl/string! (mut c) "an entry path")))
+          (dsl/accept! (mut c) "define")
+            (let [n (dsl/name! (mut c) "a name to define")]
+              (dsl/expect! (mut c) "=")
+              (let [value (dsl/advance! (mut c))]
+                (set! rules (dsl/join2 rules (define-rule (mut c) rule-count (.text n) value)))
+                (set! rule-count (+ rule-count 1))))
+          (dsl/accept! (mut c) "run")
+            ;; Steps run up to the next keyword of a target. `define` is both a
+            ;; keyword and a step, and only the step form follows `run`.
+            (while (and (= (.kind (dsl/peek (mut c))) (rt/TIdent))
+                        (not (dsl/at? (mut c) "emit"))
+                        (not (dsl/at? (mut c) "end"))
+                        (not (dsl/at? (mut c) "entry"))
+                        (not (dsl/at? (mut c) "run")))
+              (push! (mut steps) (dsl/advance! (mut c))))
+          (dsl/accept! (mut c) "emit")
+            (do
+              (set! output (.text (dsl/string! (mut c) "an output path")))
+              (cond
+                (dsl/accept! (mut c) "compact") (set! pretty false)
+                (dsl/accept! (mut c) "pretty") (set! pretty true)
+                :else (dsl/die (mut c) (dsl/peek (mut c)) "expected compact or pretty")))
+          :else (dsl/die (mut c) t "expected entry, define, run, emit or end"))))
+    (when (= (len entry) 0) (dsl/die (mut c) (dsl/peek (mut c)) (dsl/join3 "target " name " has no entry")))
+    (when (= (len output) 0) (dsl/die (mut c) (dsl/peek (mut c)) (dsl/join3 "target " name " has no emit")))
+    (push! (mut out-names) name)
+    (let [prefix (dsl/join2 name "-define-")
+          define-forms
+            (if (> rule-count 0)
+                (let [(mut lowered)
+                        (dsl/cursor rules (dsl/join3 (.path c) " define of " name) rewrite/PUNCTS)]
+                  (rewrite/compile-rules (mut lowered) prefix))
+                `(do))
+          (mut sets) (primitive/code-list-new)]
+      (for t steps
+        (if (= (.text t) "define")
+            (do
+              (when (= rule-count 0)
+                (dsl/die (mut c) t "the pipeline runs define, but this target defines nothing"))
+              (push! (mut sets) `(set! n (~(primitive/code-symbol prefix "run") n))))
+            (match (find-pass s (.text t))
+              (Some [p]
+                (push! (mut sets)
+                       `(set! n (~(call-of (dsl/join2 "pass-" (.name p)) (.function p)) n))))
+              (None []
+                (dsl/die (mut c) t (dsl/join3 "no step named " (.text t) "; declare it with `use`"))))))
+      `(do
+         ~define-forms
+         (defn ~(primitive/code-symbol "build-" name) [] (-> void)
+           (let [(mut n) (~(call-of "loader" (.load-function s)) ~entry)]
+             ~@sets
+             (let [text (syn/render n ~pretty)]
+               (rt/write-output ~output text)
+               (println "{:<8} {} bytes  {}" ~name (len text) ~output))))))))
+
+(defn module-text [(context Code)] (-> (slice u8))
+  (let [(mut c) (dsl/cursor (dsl/source-of context) (dsl/path-of context) "=")
+        (mut spec) (Spec :syntax "" :load-module "" :load-function ""
+                         :passes (ArrayList::new [Pass] (malloc-allocator)))
+        (mut targets) (primitive/code-list-new)
+        (mut names) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut calls) (primitive/code-list-new)
+        (mut imports) (primitive/code-list-new)]
+    (dsl/expect! (mut c) "bundler")
+    (dsl/expect! (mut c) "syntax")
+    (set! (.syntax spec) (.text (dsl/name! (mut c) "a syntax module")))
+    (dsl/expect! (mut c) "load")
+    (let [t (dsl/name! (mut c) "module/function")
+          p (split-function (mut c) t)]
+      (set! (.load-module spec) (.module p))
+      (set! (.load-function spec) (.function p)))
+    (while (dsl/accept! (mut c) "use")
+      (let [sort (dsl/name! (mut c) "rewrite or coil")
+            n (dsl/name! (mut c) "a step name")]
+        (dsl/expect! (mut c) "=")
+        (let [target (dsl/name! (mut c) "a module")
+              p (cond
+                  (= (.text sort) "rewrite")
+                    (Pass :name (.text n) :module (.text target) :function "run")
+                  (= (.text sort) "coil")
+                    (let [split (split-function (mut c) target)]
+                      (Pass :name (.text n) :module (.module split) :function (.function split)))
+                  :else (dsl/die (mut c) sort "expected rewrite or coil"))]
+          (push! (mut (.passes spec)) p)
+          (push! (mut imports) `(import ~(.module p) :as ~(alias-for p))))))
+    (while (dsl/accept! (mut c) "target")
+      (push! (mut targets) (read-target (mut c) spec (mut names))))
+    (unless (dsl/eof? (mut c))
+      (dsl/die (mut c) (dsl/peek (mut c)) "expected target"))
+    (for n names
+      (push! (mut calls) `(~(primitive/code-symbol "build-" n))))
+    (dsl/render
+      `(do
+         ~(rewrite/imports-for (.syntax spec))
+         (import ~(.load-module spec) :as loader)
+         ~@imports
+         ~@targets
+         (defn main [] (-> i64)
+           ~@calls
+           0)))))
+
+(defn read-bundler [(context Code)] (-> Code)
+  (primitive/code-read (module-text context) `(reader-config)))

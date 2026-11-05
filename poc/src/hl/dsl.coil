@@ -1,0 +1,118 @@
+;;; What every reader in the tower shares: a token cursor over a DSL file and
+;;; errors that name the guest file's line and column. Compile-time only.
+;;;
+;;; Each helper that builds Code takes a non-Code argument. A helper whose
+;;; arguments are all Code is staged as a macro inside a reader entry (filed with
+;;; Coil; see experiments/repros/g-code-read-in-helper).
+(module hl.dsl)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.slice" :use [subslice])
+(import "coil.str" :as str)
+(import "hl.rt" :as rt)
+
+(defn source-of [(context Code)] (-> (slice u8))
+  (primitive/code-str (get context 2)))
+
+(defn path-of [(context Code)] (-> (slice u8))
+  (primitive/code-str (get context 1)))
+
+;;; Stop the build with a located message.
+(defn fail-at [(path (slice u8)) (line i64) (col i64) (msg (slice u8))]
+  (-> never)
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) path)
+    (push-str! (mut b) ":")
+    (push-i64! (mut b) line)
+    (push-str! (mut b) ":")
+    (push-i64! (mut b) col)
+    (push-str! (mut b) ": ")
+    (push-str! (mut b) msg)
+    (primitive/error (finish! (mut b)))
+    (unreachable)))
+
+(defn join2 [(a (slice u8)) (b (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut sb) a)
+    (push-str! (mut sb) b)
+    (finish! (mut sb))))
+
+(defn join3 [(a (slice u8)) (b (slice u8)) (c (slice u8))] (-> (slice u8))
+  (join2 (join2 a b) c))
+
+;;; Split on single spaces: how readers spell their punctuation tables.
+(defn words [(s (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut start) 0]
+    (for i (range 0 (+ (len s) 1))
+      (when (or (= i (len s)) (= (get s i) #\space))
+        (when (> i start) (push! (mut out) (subslice s start i)))
+        (set! start (+ i 1))))
+    out))
+
+;; ---------------------------------------------------------------- cursor
+
+(defstruct Cur [(toks (ArrayList rt/Tok)) (pos i64) (path (slice u8))])
+
+(defn cursor [(src (slice u8)) (path (slice u8)) (puncts (slice u8))] (-> Cur)
+  (match (rt/lex src
+                 (rt/LexConfig
+                   :comment "#"
+                   :puncts (words puncts)
+                   :dsl-names true))
+    (Ok [toks]
+        (Cur
+          :toks toks
+          :pos 0
+          :path path))
+    (Err [e] (fail-at path (.line e) (.col e) (.msg e)))))
+
+(defn peek [(c (mut Cur))] (-> rt/Tok)
+  (get (.toks c) (.pos c)))
+
+(defn advance! [(c (mut Cur))] (-> rt/Tok)
+  (let [t (peek (mut c))]
+    (set! (.pos c) (+ (.pos c) 1))
+    t))
+
+(defn die [(c (mut Cur)) (t rt/Tok) (msg (slice u8))] (-> never)
+  (fail-at (.path c) (.line t) (.col t) msg))
+
+(defn eof? [(c (mut Cur))] (-> bool)
+  (= (.kind (peek (mut c))) (rt/TEof)))
+
+;;; The current token is this word or punctuation.
+(defn at? [(c (mut Cur)) (s (slice u8))] (-> bool)
+  (let [t (peek (mut c))]
+    (and (or (= (.kind t) (rt/TIdent)) (= (.kind t) (rt/TPunct)))
+         (= (.text t) s))))
+
+(defn accept! [(c (mut Cur)) (s (slice u8))] (-> bool)
+  (if (at? (mut c) s)
+      (do (advance! (mut c)) true)
+      false))
+
+(defn expect! [(c (mut Cur)) (s (slice u8))] (-> rt/Tok)
+  (if (at? (mut c) s)
+      (advance! (mut c))
+      (let [t (peek (mut c))]
+        (die (mut c) t (join3 (join3 "expected " s ", found ") (.text t) "")))))
+
+(defn name! [(c (mut Cur)) (what (slice u8))] (-> rt/Tok)
+  (let [t (peek (mut c))]
+    (if (= (.kind t) (rt/TIdent))
+        (advance! (mut c))
+        (die (mut c) t (join3 (join2 "expected " what) ", found " (.text t))))))
+
+(defn string! [(c (mut Cur)) (what (slice u8))] (-> rt/Tok)
+  (let [t (peek (mut c))]
+    (if (= (.kind t) (rt/TStr))
+        (advance! (mut c))
+        (die (mut c) t (join3 (join2 "expected " what) ", found " (.text t))))))
+
+;;; A template's value as source text. The reader entry reads it back with
+;;; (code-read text `(reader-config)), so nothing of the template's hygiene
+;;; survives and the module means exactly what this text says.
+(defn render [(f Code)] (-> (slice u8))
+  (primitive/code-source f))

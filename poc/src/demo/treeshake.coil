@@ -1,0 +1,59 @@
+;;; Tree shaking in two halves. Hand-written Coil turns the tree into facts, which
+;;; a fact-extraction language could later replace. The question of what is live
+;;; is answered by liveness.facts.
+;;;
+;;; The facts are deliberately conservative: every identifier under a declaration
+;;; counts as a reference, whatever it is bound to, and anything that may have an
+;;; effect is a root. That can keep too much and never removes too much.
+(module demo.treeshake)
+(import "demo.js" :as js)
+(import "demo.liveness" :as live)
+(import "demo.link" :as link)
+(import "hl.rt" :as rt)
+
+;;; Could evaluating this run code? A call can, and so can a property read,
+;;; through a getter.
+(defn may-have-effect? [(n js/Node)] (-> bool)
+  (let [(mut hit) (or (= (.kind n) (js/KCall)) (= (.kind n) (js/KMember)))]
+    (for k (.kids n) (when (may-have-effect? k) (set! hit true)))
+    hit))
+
+(defn add-refs! [(db (mut live/Db)) (names (mut rt/Names)) (from i64) (n js/Node)] (-> void)
+  (when (= (.kind n) (js/KIdent))
+    (live/add-refs! (mut db) from (rt/intern! (mut names) (.text n)))
+    0)
+  (for k (.kids n) (add-refs! (mut db) (mut names) from k)))
+
+;;; The id a top-level statement answers to in the facts.
+(defn id-of [(names (mut rt/Names)) (s js/Node) (index i64)] (-> i64)
+  (let [inner (if (= (.kind s) (js/KExport)) (get (.kids s) 0) s)]
+    (match (link/declared inner)
+      (Some [name] (rt/intern! (mut names) name))
+      (None [] (rt/intern! (mut names) (rt/join "statement#" (rt/num-text index)))))))
+
+(defn root? [(s js/Node)] (-> bool)
+  (match (.kind s)
+    (js/KExport [] true)
+    (js/KFunc [] false)
+    (js/KConst [] (may-have-effect? (get (.kids s) 1)))
+    (_ true)))
+
+(defn shake [(program js/Node)] (-> js/Node)
+  (let [stmts (.kids (get (.kids program) 0))
+        (mut db) (live/new-db)
+        (mut names) (rt/names-new)]
+    (for i (range 0 (len stmts))
+      (let [s (get stmts i)
+            id (id-of (mut names) s i)]
+        (when (root? s)
+          (live/add-root! (mut db) id)
+          0)
+        (add-refs! (mut db) (mut names) id s)))
+    (live/solve! (mut db))
+    (let [(mut kept) (js/new-kids)
+          (mut top) (js/new-kids)]
+      (for i (range 0 (len stmts))
+        (when (live/has-live? db (id-of (mut names) (get stmts i) i))
+          (push! (mut kept) (get stmts i))))
+      (push! (mut top) (js/Node :kind (js/KList) :text "" :kids kept))
+      (js/Node :kind (js/KProgram) :text "" :kids top))))
