@@ -296,7 +296,10 @@
           (js/node2 (js/KMember) (rw (mut gr) m (get (.kids n) 0) depth) (get (.kids n) 1)))))
     (js/KImportCall []
       (match (g/import-call-target (mut gr) m n)
-        (Some [t] (import-call (mut gr) (g/module-at (mut gr) t)))
+        (Some [t]
+          (if (= (.kind (g/module-at (mut gr) t)) (g/External))
+              n
+              (import-call (mut gr) (g/module-at (mut gr) t))))
         (None [] (rw-kids (mut gr) m n depth))))
     (js/KImportMeta []
       (let [(mut kids) (js/new-kids)]
@@ -335,9 +338,10 @@
         arg-list (.kids (get (.kids args) 0))]
     (if (match (g/require-target (mut gr) m n) (Some [_] true) (None [] false))
         (let [t (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get arg-list 0)))))]
-          (if (= (.kind t) (g/Cjs))
-              (require-of (mut gr) t)
-              (expression-of (require-esm-text (mut gr) t))))
+          (cond
+            (= (.kind t) (g/Cjs)) (require-of (mut gr) t)
+            (= (.kind t) (g/External)) (rw-kids (mut gr) m n depth)
+            :else (expression-of (require-esm-text (mut gr) t))))
         (let [new-callee (rw (mut gr) m callee depth)
               new-args (rw (mut gr) m args depth)
               wrapped
@@ -359,16 +363,19 @@
   (match (.kind s)
     (js/KImportBare []
       (let [t (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 0)))))]
-        (if (= (.kind t) (g/Cjs))
+        (cond
+          (= (.kind t) (g/Cjs))
             (Some (first-stmt (rt/join (final-of (mut gr) (.require-sym t)) "();")))
-            (init-call (mut gr) t))))
+          (= (.kind t) (g/External))
+            (Some (first-stmt (rt/join (external-object (mut gr) t) ";")))
+          :else (init-call (mut gr) t))))
     (js/KExportAll [] (init-call (mut gr) (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 0)))))))
     (js/KExportAllAs [] (init-call (mut gr) (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 1)))))))
     (js/KExportFrom [] (init-call (mut gr) (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 1)))))))
     (js/KExportNamed [] (None [js/Node]))
     (js/KImport []
       (let [t (g/module-at (mut gr) (g/dep-of (mut gr) m (g/strip-quotes (.text (get (.kids s) 1)))))]
-        (if (= (.kind t) (g/Cjs))
+        (if (g/opaque-module? t)
             (Some (import-cjs-stmt (mut gr) m t))
             (init-call (mut gr) t))))
     (js/KExportVar []
@@ -385,8 +392,33 @@
       (Some (first-stmt (rt/join (final-of (mut gr) (.init-sym t)) "();")))
       (None [js/Node])))
 
+;;; Offsets in generated text are nobody's source position.
+(defn unlocated [(n js/Node)] (-> js/Node)
+  (let [(mut out) n (mut kids) (js/new-kids)]
+    (for k (.kids n) (push! (mut kids) (unlocated k)))
+    (set! (.kids out) kids)
+    (set! (.lo out) 0)
+    out))
+
 (defn first-stmt [(text (slice u8))] (-> js/Node)
-  (get (.kids (get (.kids (js/parse text "<generated>")) 1)) 0))
+  (unlocated (get (.kids (get (.kids (js/parse text "<generated>")) 1)) 0)))
+
+;;; An external module, as an expression: `require("x")`, or in ES module output the
+;;; namespace of an `import * as` hoisted to the top of the file.
+(defn external-object [(gr (mut g/Graph)) (t g/Module)] (-> (slice u8))
+  (if (.esm-output gr)
+      (let [name (rt/join (rt/join "__external_" (.base t)) "")
+            (mut b) (str/StrBuf::new (malloc-allocator))]
+        (push-str! (mut b) "import * as ")
+        (push-str! (mut b) name)
+        (push-str! (mut b) " from \"")
+        (push-str! (mut b) (.path t))
+        (push-str! (mut b) "\";")
+        (let [line (finish! (mut b)) (mut seen) false]
+          (for l (.external-imports gr) (when (= l line) (set! seen true)))
+          (unless seen (push! (mut (.external-imports gr)) line)))
+        name)
+      (rt/join (rt/join "require(\"" (.path t)) "\")")))
 
 ;;; `var import_x = __toESM(require_x(), 1);` Files in node mode (.mjs, or a package
 ;;; with "type": "module") get the second argument, so `default` is module.exports.
@@ -399,8 +431,13 @@
     (push-str! (mut b) "=")
     (push-str! (mut b) to-esm)
     (push-str! (mut b) "(")
-    (push-str! (mut b) (final-of (mut gr) (.require-sym t)))
-    (push-str! (mut b) (if (g/node-mode? (.path m) (.options gr)) "(),1);" "());"))
+    (if (= (.kind t) (g/External))
+        (do
+          (push-str! (mut b) (external-object (mut gr) t))
+          (push-str! (mut b) (if (g/node-mode? (.path m) (.options gr)) ",1);" ");")))
+        (do
+          (push-str! (mut b) (final-of (mut gr) (.require-sym t)))
+          (push-str! (mut b) (if (g/node-mode? (.path m) (.options gr)) "(),1);" "());"))))
     (first-stmt (finish! (mut b)))))
 
 ;;; For a source map: each leaf's offset gains its module, as (module+1)<<32 | offset.
