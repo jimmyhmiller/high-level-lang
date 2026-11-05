@@ -14,7 +14,7 @@
 
 ;; ---------------------------------------------------------------- tokens
 
-(defsum TokKind (TIdent) (TNum) (TStr) (TPunct) (TEof))
+(defsum TokKind (TIdent) (TNum) (TStr) (TClass) (TPunct) (TEof))
 
 (derive Eq Debug TokKind)
 
@@ -23,8 +23,9 @@
 (defstruct LexFail [(msg (slice u8)) (line i64) (col i64)])
 
 ;;; `dsl-names` lets a name also contain `- . /`, for names like `fold-add`.
+;;; `classes` reads `[a-z]` as one token, for grammars.
 (defstruct LexConfig
-  [(comment (slice u8)) (puncts (ArrayList (slice u8))) (dsl-names bool)])
+  [(comment (slice u8)) (puncts (ArrayList (slice u8))) (dsl-names bool) (classes bool)])
 
 (defn digit? [(c u8)] (-> bool)
   (and (>= c #\0) (<= c #\9)))
@@ -98,7 +99,21 @@
                                :text (subslice src start i)
                                :line line
                                :col col)))
-                  (= c #\")
+                  (and (.classes cfg) (= c #\[))
+              (let [start (+ i 1)]
+                (set! i start)
+                (while (and (< i n) (!= (get src i) #\]))
+                  (when (= (get src i) #\newline)
+                    (return-from :out
+                      (Err (LexFail :msg "unterminated character class" :line line :col col))))
+                  (set! i (+ i (if (= (get src i) #\\) 2 1))))
+                (when (>= i n)
+                  (return-from :out
+                    (Err (LexFail :msg "unterminated character class" :line line :col col))))
+                (push! (mut toks)
+                       (Tok :kind (TClass) :text (subslice src start i) :line line :col col))
+                (set! i (+ i 1)))
+            (= c #\")
                     (let [start (+ i 1)]
                       (set! i start)
                       (while (and (< i n) (!= (get src i) #\"))
@@ -154,110 +169,193 @@
 
 ;; ---------------------------------------------------------------- parser state
 
-;;; Generated parsers run over this. `far` and `want` keep the farthest failure,
-;;; which is the one worth reporting from a backtracking parser.
+;;; One memo table entry: did the rule match here, where did it end, and its node
+;;; as an address, because this module does not know the grammar's node type.
+(defstruct MemoHit [(ok bool) (end i64) (node i64)])
+
+;;; Generated parsers work directly on bytes. `pos` is always just past the last
+;;; token with whitespace unskipped, so `@nl` can see what lies before the next
+;;; token. `ws-*` caches the most recent skip, and `far`/`want` keep the farthest
+;;; failure, the one worth reporting from a backtracking parser.
 (defstruct P
-  [(toks (ArrayList Tok))
-   (keywords (ArrayList (slice u8)))
+  [(src (slice u8))
    (path (slice u8))
    (pos i64)
+   (flags i64)
+   (ws-from i64)
+   (ws-to i64)
+   (ws-nl bool)
    (far i64)
-   (want (slice u8))])
+   (want (slice u8))
+   (memos (ArrayList (HashMap i64 MemoHit)))])
+
+(defstruct ParseError [(path (slice u8)) (line i64) (col i64) (want (slice u8)) (found (slice u8))])
+
+(defn p-new [(src (slice u8)) (path (slice u8)) (flags i64) (memo-count i64)] (-> P)
+  (let [(mut memos) (ArrayList::new [(HashMap i64 MemoHit)] (malloc-allocator))]
+    (for _ (range 0 memo-count)
+      (push! (mut memos) (HashMap::new-scalar [i64 MemoHit] (malloc-allocator))))
+    (P :src src :path path :pos 0 :flags flags :ws-from -1 :ws-to 0 :ws-nl false
+       :far 0 :want "a program" :memos memos)))
+
+(defn peek [(p (mut P))] (-> i64)
+  (if (< (.pos p) (len (.src p))) (cast i64 (get (.src p) (.pos p))) -1))
+
+(defn advance! [(p (mut P)) (n i64)] (-> void)
+  (set! (.pos p) (+ (.pos p) n)))
+
+(defn at-bytes? [(p (mut P)) (s (slice u8))] (-> bool)
+  (at? (.src p) (.pos p) s))
+
+(defn eof? [(p (mut P))] (-> bool) (>= (.pos p) (len (.src p))))
+
+(defn span [(p (mut P)) (lo i64) (hi i64)] (-> (slice u8)) (subslice (.src p) lo hi))
 
 (defn note-fail! [(p (mut P)) (want (slice u8))] (-> void)
-  (when (>= (.pos p) (.far p))
+  (when (> (.pos p) (.far p))
     (set! (.far p) (.pos p))
     (set! (.want p) want)))
 
-(defn lit! [(p (mut P)) (s (slice u8))] (-> bool)
-  (let [t (get (.toks p) (.pos p))]
-    (if (and (or (= (.kind t) (TPunct)) (= (.kind t) (TIdent))) (= (.text t) s))
-        (do (set! (.pos p) (+ (.pos p) 1)) true)
-        (do (note-fail! (mut p) s) false))))
-
-(defn keyword? [(p (mut P)) (s (slice u8))] (-> bool)
-  (let [(mut hit) false]
-    (for k (.keywords p) (when (= k s) (set! hit true)))
+;;; Does this span cross an ECMAScript line terminator?
+(defn has-newline? [(src (slice u8)) (from i64) (to i64)] (-> bool)
+  (let [(mut hit) false (mut i) from]
+    (while (and (< i to) (not hit))
+      (let [c (get src i)]
+        (when (or (= c #\newline) (= c #\return)
+                  (and (= c (: 226 u8)) (< (+ i 2) to)
+                       (= (get src (+ i 1)) (: 128 u8))
+                       (or (= (get src (+ i 2)) (: 168 u8)) (= (get src (+ i 2)) (: 169 u8)))))
+          (set! hit true)))
+      (set! i (+ i 1)))
     hit))
 
-;;; A token of class K. Keywords do not count as identifiers.
-(defn take! [(p (mut P)) (k TokKind) (want (slice u8))] (-> (Option (slice u8)))
-  (let [t (get (.toks p) (.pos p))]
-    (if (and (= (.kind t) k)
-             (not (and (= k (TIdent)) (keyword? (mut p) (.text t)))))
-        (do (set! (.pos p) (+ (.pos p) 1)) (Some (.text t)))
-        (do (note-fail! (mut p) want) (None [(slice u8)])))))
+(defn apply-flags [(flags i64) (on i64) (off i64)] (-> i64)
+  (| (& flags (- -1 off)) on))
 
-(defn at-eof? [(p (mut P))] (-> bool)
-  (let [t (get (.toks p) (.pos p))]
-    (if (= (.kind t) (TEof))
-        true
-        (do (note-fail! (mut p) "end of input") false))))
+(defn flag? [(p (mut P)) (bit i64)] (-> bool) (!= (& (.flags p) bit) 0))
 
-(defn parse-failed [(p (mut P))] (-> never)
-  (let [t (get (.toks p) (.far p))]
-    (panic "{}:{}:{}: expected {}, found {}"
-           (.path p)
-           (.line t)
-           (.col t)
-           (.want p)
-           (.text t))))
+(defn memo-key [(p (mut P))] (-> i64) (+ (* (.pos p) 16) (.flags p)))
 
-(defn parser-for [(src (slice u8))
-                  (path (slice u8))
-                  (comment (slice u8))
-                  (puncts (ArrayList (slice u8)))
-                  (keywords (ArrayList (slice u8)))] (-> P)
-  (match (lex src
-              (LexConfig
-                :comment comment
-                :puncts puncts
-                :dsl-names false))
-    (Ok [toks]
-        (P
-          :toks toks
-          :keywords keywords
-          :path path
-          :pos 0
-          :far 0
-          :want "a program"))
-    (Err [e] (panic "{}:{}:{}: {}" path (.line e) (.col e) (.msg e)))))
+(defn memo-get [(p (mut P)) (id i64) (key i64)] (-> (Option MemoHit))
+  (get (get (.memos p) id) key))
+
+(defn memo-put! [(p (mut P)) (id i64) (key i64) (hit MemoHit)] (-> void)
+  (set! (mut (elem (mut (.memos p)) id)) key hit))
+
+;;; Where a byte offset falls, for messages.
+(defn line-col [(src (slice u8)) (at i64)] (-> Pos)
+  (let [(mut line) 1 (mut col) 1]
+    (for i (range 0 (if (< at (len src)) at (len src)))
+      (if (= (get src i) #\newline)
+          (do (set! line (+ line 1)) (set! col 1))
+          (set! col (+ col 1))))
+    (Pos :line line :col col)))
+
+(defstruct Pos [(line i64) (col i64)])
+
+(defn parse-error [(p (mut P))] (-> ParseError)
+  (let [at (line-col (.src p) (.far p))
+        n (len (.src p))
+        end (if (< (+ (.far p) 20) n) (+ (.far p) 20) n)]
+    (ParseError :path (.path p) :line (.line at) :col (.col at) :want (.want p)
+                :found (if (>= (.far p) n) "end of input" (subslice (.src p) (.far p) end)))))
+
+(defn parse-failed [(e ParseError)] (-> never)
+  (panic "{}:{}:{}: expected {}, found: {}" (.path e) (.line e) (.col e) (.want e) (.found e)))
 
 ;; ---------------------------------------------------------------- printer
 
-(defstruct W [(buf (ArrayList u8)) (pretty bool)])
+;;; `keep` counts enclosing positions where parentheses must stay as written, and
+;;; `pending` holds a `;` that a following `}` makes unnecessary.
+(defstruct W [(buf (ArrayList u8)) (pretty bool) (pending bool) (keep i64) (after-int bool)])
 
 (defn w-new [(pretty bool)] (-> W)
-  (W :buf (ArrayList::new [u8] (malloc-allocator)) :pretty pretty))
+  (W :buf (ArrayList::new [u8] (malloc-allocator)) :pretty pretty :pending false :keep 0
+     :after-int false))
 
-;;; Two tokens that would fuse into a different token get a space between them.
-(defn must-separate? [(a u8) (b u8)] (-> bool)
-  (or (and (name-char? a) (name-char? b))
-      (and (= a #\+) (= b #\+))
-      (and (= a #\-) (= b #\-))
-      (and (= a #\/) (= b #\/))))
+(defn printed-name-char? [(c u8)] (-> bool)
+  (or (name-char? c) (>= c (: 128 u8)) (= c #\\)))
+
+;;; Two tokens that would read differently run together get a space between them.
+(defn must-separate? [(a u8) (next (slice u8))] (-> bool)
+  (let [b (get next 0)]
+    (or (and (printed-name-char? a) (printed-name-char? b))
+        (and (= a #\+) (= b #\+))
+        (and (= a #\-) (= b #\-))
+        (and (= a #\/) (= b #\/))
+        (and (= a #\<) (= b #\!)))))
+
+(defn all-digits? [(s (slice u8))] (-> bool)
+  (let [(mut ok) (> (len s) 0)]
+    (for c s (unless (digit? c) (set! ok false)))
+    ok))
 
 (defn w-bytes! [(w (mut W)) (s (slice u8))] (-> void)
   (for c s (push! (mut (.buf w)) c)))
 
+(defn flush-semi! [(w (mut W))] (-> void)
+  (when (.pending w)
+    (set! (.pending w) false)
+    (push! (mut (.buf w)) #\;)
+    (when (.pretty w) (push! (mut (.buf w)) #\newline))))
+
 ;;; Write one token. Pretty output breaks lines after `; { }`; compact never does.
 (defn tok! [(w (mut W)) (s (slice u8))] (-> void)
-  (let [n (len (.buf w))]
-    (when (and (> n 0)
-               (> (len s) 0)
-               (must-separate? (get (.buf w) (- n 1)) (get s 0)))
-      (push! (mut (.buf w)) #\space)))
-  (w-bytes! (mut w) s)
-  (when (and (.pretty w) (or (= s ";") (= s "{") (= s "}")))
-    (push! (mut (.buf w)) #\newline)))
+  (when (> (len s) 0)
+    (if (and (.pending w) (= s "}"))
+        (set! (.pending w) false)
+        (flush-semi! (mut w)))
+    (let [n (len (.buf w))]
+      (when (and (> n 0)
+                 (or (must-separate? (get (.buf w) (- n 1)) s)
+                     (and (.after-int w) (= (get s 0) #\.))))
+        (push! (mut (.buf w)) #\space)))
+    (w-bytes! (mut w) s)
+    (set! (.after-int w) (all-digits? s))
+    (when (and (.pretty w) (or (= s ";") (= s "{") (= s "}")))
+      (push! (mut (.buf w)) #\newline))))
 
-(defn str-tok! [(w (mut W)) (s (slice u8))] (-> void)
-  (push! (mut (.buf w)) #\")
-  (w-bytes! (mut w) s)
-  (push! (mut (.buf w)) #\"))
+;;; A `;` the language allows us to drop before `}`.
+(defn soft-semi! [(w (mut W))] (-> void)
+  (flush-semi! (mut w))
+  (set! (.pending w) true))
 
-(defn w-finish [(w W)] (-> (slice u8))
-  (slice (.buf w)))
+;;; Remember where the next token will land, for a later `w-wrap!`.
+(defn w-mark! [(w (mut W))] (-> i64)
+  (flush-semi! (mut w))
+  (len (.buf w)))
+
+(defn skip-printed-space [(w (mut W)) (from i64)] (-> i64)
+  (let [(mut i) from]
+    (while (and (< i (len (.buf w))) (= (get (.buf w) i) #\space)) (set! i (+ i 1)))
+    i))
+
+;;; Did what was printed since `mark` begin with this punctuation?
+(defn w-starts? [(w (mut W)) (mark i64) (s (slice u8))] (-> bool)
+  (at? (slice (.buf w)) (skip-printed-space (mut w) mark) s))
+
+;;; Did it begin with this word?
+(defn w-starts-word? [(w (mut W)) (mark i64) (s (slice u8))] (-> bool)
+  (let [i (skip-printed-space (mut w) mark)
+        end (+ i (len s))]
+    (and (at? (slice (.buf w)) i s)
+         (or (>= end (len (.buf w)))
+             (not (printed-name-char? (get (.buf w) end)))))))
+
+;;; Parenthesise everything printed since `mark`.
+(defn w-wrap! [(w (mut W)) (mark i64) (open (slice u8)) (close (slice u8))] (-> void)
+  (flush-semi! (mut w))
+  (let [at (skip-printed-space (mut w) mark)
+        tail (ArrayList::new [u8] (malloc-allocator))
+        (mut saved) tail]
+    (for i (range at (len (.buf w))) (push! (mut saved) (get (.buf w) i)))
+    (while (> (len (.buf w)) at) (pop! (mut (.buf w))))
+    (w-bytes! (mut w) open)
+    (w-bytes! (mut w) (slice saved))
+    (w-bytes! (mut w) close)
+    (set! (.after-int w) false)))
+
+(defn w-finish [(w W)] (-> (slice u8)) (slice (.buf w)))
 
 ;; ---------------------------------------------------------------- integers
 

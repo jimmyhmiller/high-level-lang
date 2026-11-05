@@ -1,88 +1,314 @@
 ;;; `.syntax`: the parsing language. One grammar is the source of truth for the
-;;; parser, the AST type, the printer, and a compile-time table of node shapes
-;;; that other languages check themselves against.
+;;; parser, the AST type, the printer, and a compile-time table of node shapes that
+;;; other languages check themselves against.
+;;;
+;;; It is a scannerless PEG, because context decides what JavaScript's tokens are:
+;;; a regex can only start where an expression can, so it needs no lexer mode.
 ;;;
 ;;;   syntax
-;;;   comment "//"
 ;;;   start Program
-;;;   rule Block = "{" Stmt* "}" -> Block ;
-;;;   infix Expr over Unary  left "+" Add "-" Sub  left "*" Mul ;
-;;;   postfix Postfix over Primary "(" Expr,* ")" -> Call | "." Ident -> Member ;
+;;;   space Space                   # skipped before every token in a `rule`
+;;;   word IdPart                   # what may not follow a word literal
+;;;   flags noin gen await          # parser state, set with `with(...)`
+;;;   keep noin ;                   # parentheses stay as written under this flag
+;;;   group "(" ")" Paren           # how the printer parenthesises
+;;;   opaque OptMember Coalesce ;   # kinds whose parentheses are never removed
+;;;   precedence Seq Assign Cond ;  # lowest first
 ;;;
-;;; Ident, Num and Str are the built-in token classes, and each is a leaf node.
-;;; `X*` and `X,*` each capture one List node. An alternative with no `-> Label`
-;;; has exactly one capture and passes it through.
+;;;   fragment Space = [ \n]* ;     # bytes, no node
+;;;   token Ident = [a-z]+ ;        # bytes, a leaf node of that name
+;;;   rule Block = "{" Stmt* "}" -> Block | Other ;
+;;;   memo rule Assign = … ;        # packrat this rule
+;;;   hidden rule Semi prints soft ";" = ";" | &"}" | @eof | @nl ;
+;;;   infix Binary over Unary  left "+" Add "-" Sub  left "*" Mul ;
+;;;   postfix Call over New  "." PropName -> Member | Args -> Call ;  # loops
+;;;   suffix Cond over Binary  "?" Assign ":" Assign -> Cond ;        # at most once
+;;;
+;;; Items in a rule: "lit", Name, X*, X+, X,* (optional trailing comma), X,+,
+;;; X?, ( … )?, !X, &X, ~X (keep this child's parentheses), with(a -b) X, if(a),
+;;; unless(a), @eof, @nl, @nonl. In a token or fragment: also [class] and `.`.
+;;;
+;;; An alternative with no `-> Label` has exactly one capture and passes it on.
+;;; `X*` captures one List node, and `X?` captures its one capture or a None.
 (module hl.syntax)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :as str)
 (import "hl.rt" :as rt)
 (import "hl.dsl" :as dsl)
 
 (reader-provider "hl.syntax" read-syntax)
 
-(defsum Shape
-  (ILit [(text (slice u8))])
-  (IRef [(name (slice u8))])
-  (IRep [(name (slice u8))])
-  (ISep [(name (slice u8))]))
+;; ---------------------------------------------------------------- the grammar
 
-(defstruct Item [(shape Shape) (tok rt/Tok)])
-(defstruct Alt [(items (ArrayList Item)) (label (slice u8)) (tok rt/Tok)])
-(defstruct Op [(lit (slice u8)) (kind (slice u8)) (level i64) (tok rt/Tok)])
+(defsum PEOp
+  (OLit) (OClass) (OAny) (ORef)
+  (OSeq) (OChoice)
+  (OStar) (OPlus) (OOpt) (OSepStar) (OSepPlus)
+  (ONot) (OAnd) (OKeep)
+  (OWith) (OIf) (OUnless)
+  (OEof) (OBof) (ONl) (ONoNl))
+(derive Eq PEOp)
 
-(defsum Decl
-  (DRule [(name (slice u8)) (alts (ArrayList Alt))])
-  (DInfix [(name (slice u8)) (over (slice u8)) (ops (ArrayList Op))])
-  (DPostfix [(name (slice u8)) (over (slice u8)) (alts (ArrayList Alt))]))
+(defstruct Range [(lo i64) (hi i64)])
 
+;;; One parsing expression. `text` is a literal's bytes, a reference's name, or a
+;;; flag's name; `on`/`off` are a `with`'s flag names.
+(defstruct PE
+  [(op PEOp)
+   (text (slice u8))
+   (kids (ArrayList PE))
+   (ranges (ArrayList Range))
+   (neg bool)
+   (on (ArrayList (slice u8)))
+   (off (ArrayList (slice u8)))
+   (tok rt/Tok)])
+
+(defstruct Alt [(seq PE) (label (slice u8))])
+(defstruct Op [(lit (slice u8)) (kind (slice u8)) (level i64) (unless-flag (slice u8)) (tok rt/Tok)])
+
+(defsum DeclKind (DFragment) (DToken) (DRule) (DHidden) (DInfix) (DPostfix) (DSuffix))
+(derive Eq DeclKind)
+
+(defstruct Decl
+  [(kind DeclKind)
+   (name (slice u8))
+   (over (slice u8))
+   (alts (ArrayList Alt))
+   (ops (ArrayList Op))
+   (body PE)
+   (memo bool)
+   (print-soft bool)
+   (print-text (slice u8))
+   (tok rt/Tok)])
+
+;;; What a kind prints as: an alternative, an operator, or a token's own bytes.
 (defsum Print
-  (PAlt [(alt Alt) (has-base bool)])
-  (POp [(op Op)]))
+  (PAlt [(alt Alt) (base-min i64)])
+  (POp [(op Op)])
+  (PLeaf []))
 
 (defstruct Kind [(name (slice u8)) (arity i64) (level i64) (print Print)])
-(defstruct RuleLevel [(name (slice u8)) (level i64)])
+(defstruct Named [(name (slice u8)) (value i64)])
+(defstruct Lit [(text (slice u8)) (id i64)])
 
 (defstruct Grammar
-  [(comment (slice u8))
-   (start (slice u8))
+  [(start (slice u8))
+   (space (slice u8))
+   (word (slice u8))
+   (flags (ArrayList (slice u8)))
+   (keep-under (ArrayList (slice u8)))
+   (group-open (slice u8))
+   (group-close (slice u8))
+   (group-kind (slice u8))
+   (opaque (ArrayList (slice u8)))
+   (precedence (ArrayList (slice u8)))
    (decls (ArrayList Decl))
    (kinds (ArrayList Kind))
-   (levels (ArrayList RuleLevel))
-   (group-open (slice u8))
-   (group-close (slice u8))])
+   (lits (ArrayList Lit))
+   (reps (ArrayList (slice u8)))
+   (memo-count i64)
+   (next-aux i64)
+   (aux (ArrayList (slice u8)))
+   (path (slice u8))])
 
-(const NO-LEVEL 1000000)
+(const NO-LEVEL-VALUE 1000000)
+(defn no-level [] (-> i64) NO-LEVEL-VALUE)
 
 ;; ---------------------------------------------------------------- reading
 
-(defn read-item [(c (mut dsl/Cur))] (-> Item)
+(defn empty-pes [] (-> (ArrayList PE)) (ArrayList::new [PE] (malloc-allocator)))
+(defn empty-strs [] (-> (ArrayList (slice u8))) (ArrayList::new [(slice u8)] (malloc-allocator)))
+
+(defn pe-new [(op PEOp) (text (slice u8)) (tok rt/Tok)] (-> PE)
+  (PE :op op :text text :kids (empty-pes)
+      :ranges (ArrayList::new [Range] (malloc-allocator))
+      :neg false :on (empty-strs) :off (empty-strs) :tok tok))
+
+(defn pe-wrap [(op PEOp) (inner PE) (tok rt/Tok)] (-> PE)
+  (let [(mut out) (pe-new op "" tok)]
+    (push! (mut (.kids out)) inner)
+    out))
+
+(defn hex-value [(c u8)] (-> i64)
+  (cond (and (>= c #\0) (<= c #\9)) (- (cast i64 c) 48)
+        (and (>= c #\a) (<= c #\f)) (+ (- (cast i64 c) 97) 10)
+        (and (>= c #\A) (<= c #\F)) (+ (- (cast i64 c) 65) 10)
+        :else -1))
+
+(defn push-utf8! [(out (mut (ArrayList u8))) (cp i64)] (-> void)
+  (cond
+    (< cp 128) (push! (mut out) (cast u8 cp))
+    (< cp 2048)
+      (do (push! (mut out) (cast u8 (+ 192 (/ cp 64))))
+          (push! (mut out) (cast u8 (+ 128 (% cp 64)))))
+    :else
+      (do (push! (mut out) (cast u8 (+ 224 (/ cp 4096))))
+          (push! (mut out) (cast u8 (+ 128 (% (/ cp 64) 64))))
+          (push! (mut out) (cast u8 (+ 128 (% cp 64)))))))
+
+(defn hex-at [(c (mut dsl/Cur)) (t rt/Tok) (s (slice u8)) (at i64) (count i64)] (-> i64)
+  (let [(mut v) 0]
+    (for k (range 0 count)
+      (let [d (if (< (+ at k) (len s)) (hex-value (get s (+ at k))) -1)]
+        (when (< d 0) (dsl/die (mut c) t "bad hex escape"))
+        (set! v (+ (* v 16) d))))
+    v))
+
+;;; How many source bytes the escape at `i` takes, and its value.
+(defstruct Esc [(value i64) (size i64)])
+
+(defn read-escape [(c (mut dsl/Cur)) (t rt/Tok) (s (slice u8)) (i i64)] (-> Esc)
+  (when (>= (+ i 1) (len s)) (dsl/die (mut c) t "dangling backslash"))
+  (let [e (get s (+ i 1))]
+    (cond
+      (= e #\n) (Esc :value 10 :size 2)
+      (= e #\r) (Esc :value 13 :size 2)
+      (= e #\t) (Esc :value 9 :size 2)
+      (= e #\0) (Esc :value 0 :size 2)
+      (= e #\x) (Esc :value (hex-at (mut c) t s (+ i 2) 2) :size 4)
+      (= e #\u) (Esc :value (hex-at (mut c) t s (+ i 2) 4) :size 6)
+      :else (Esc :value (cast i64 e) :size 2))))
+
+;;; A string token's bytes with its escapes resolved; \u is UTF-8 encoded.
+(defn decode-string [(c (mut dsl/Cur)) (t rt/Tok)] (-> (slice u8))
+  (let [s (.text t)
+        (mut out) (ArrayList::new [u8] (malloc-allocator))
+        (mut i) 0]
+    (while (< i (len s))
+      (if (= (get s i) #\\)
+          (let [e (read-escape (mut c) t s i)]
+            (push-utf8! (mut out) (.value e))
+            (set! i (+ i (.size e))))
+          (do (push! (mut out) (get s i)) (set! i (+ i 1)))))
+    (slice out)))
+
+;;; `[a-z_\n]` or `[^…]`. Values are bytes: \xHH names one directly.
+(defn read-class [(c (mut dsl/Cur)) (t rt/Tok)] (-> PE)
+  (let [s (.text t)
+        (mut out) (pe-new (OClass) "" t)
+        (mut i) 0
+        (mut vals) (ArrayList::new [i64] (malloc-allocator))]
+    (when (and (> (len s) 0) (= (get s 0) #\^))
+      (set! (.neg out) true)
+      (set! i 1))
+    (while (< i (len s))
+      (let [lo (if (= (get s i) #\\)
+                   (let [e (read-escape (mut c) t s i)]
+                     (set! i (+ i (.size e)))
+                     (.value e))
+                   (let [v (cast i64 (get s i))]
+                     (set! i (+ i 1))
+                     v))]
+        (if (and (< (+ i 1) (len s)) (= (get s i) #\-))
+            (let [hi (if (= (get s (+ i 1)) #\\)
+                         (let [e (read-escape (mut c) t s (+ i 1))]
+                           (set! i (+ i 1 (.size e)))
+                           (.value e))
+                         (let [v (cast i64 (get s (+ i 1)))]
+                           (set! i (+ i 2))
+                           v))]
+              (push! (mut (.ranges out)) (Range :lo lo :hi hi)))
+            (push! (mut (.ranges out)) (Range :lo lo :hi lo)))))
+    out))
+
+(defn read-with [(c (mut dsl/Cur)) (t rt/Tok)] (-> PE)
+  (let [(mut out) (pe-new (OWith) "" t)]
+    (dsl/expect! (mut c) "(")
+    (while (not (dsl/accept! (mut c) ")"))
+      (if (dsl/accept! (mut c) "-")
+          (push! (mut (.off out)) (.text (dsl/name! (mut c) "a flag")))
+          (push! (mut (.on out)) (.text (dsl/name! (mut c) "a flag")))))
+    (push! (mut (.kids out)) (read-prefixed (mut c)))
+    out))
+
+(defn read-flag-test [(c (mut dsl/Cur)) (t rt/Tok) (op PEOp)] (-> PE)
+  (dsl/expect! (mut c) "(")
+  (let [n (dsl/name! (mut c) "a flag")]
+    (dsl/expect! (mut c) ")")
+    (pe-new op (.text n) t)))
+
+(defn read-atom [(c (mut dsl/Cur))] (-> PE)
   (let [t (dsl/peek (mut c))]
-    (if (= (.kind t) (rt/TStr))
-        (do (dsl/advance! (mut c)) (Item :shape (ILit (.text t)) :tok t))
-        (let [n (dsl/name! (mut c) "a rule name or a literal")]
-          (cond (dsl/accept! (mut c) "*") (Item :shape (IRep (.text n)) :tok n)
-                (dsl/accept! (mut c) ",*") (Item :shape (ISep (.text n)) :tok n)
-                :else (Item :shape (IRef (.text n)) :tok n))))))
+    (cond
+      (= (.kind t) (rt/TStr))
+        (do (dsl/advance! (mut c)) (pe-new (OLit) (decode-string (mut c) t) t))
+      (= (.kind t) (rt/TClass))
+        (do (dsl/advance! (mut c)) (read-class (mut c) t))
+      (dsl/accept! (mut c) ".") (pe-new (OAny) "" t)
+      (dsl/accept! (mut c) "(")
+        (let [inner (read-choice (mut c))]
+          (dsl/expect! (mut c) ")")
+          inner)
+      (= (.kind t) (rt/TIdent))
+        (do (dsl/advance! (mut c)) (pe-new (ORef) (.text t) t))
+      :else (dsl/die (mut c) t (dsl/join2 "expected a grammar item, found " (.text t))))))
 
-(defn read-alt [(c (mut dsl/Cur))] (-> Alt)
-  (let [start (dsl/peek (mut c))
-        (mut items) (ArrayList::new [Item] (malloc-allocator))
-        (mut label) ""]
-    (while (not (or (dsl/at? (mut c) "|") (dsl/at? (mut c) ";") (dsl/at? (mut c) "->")))
-      (push! (mut items) (read-item (mut c))))
-    (when (= (len items) 0)
-      (dsl/die (mut c) start "an alternative needs at least one item"))
-    (when (dsl/accept! (mut c) "->")
-      (set! label (.text (dsl/name! (mut c) "a node label"))))
-    (Alt :items items :label label :tok start)))
+(defn read-suffixed [(c (mut dsl/Cur))] (-> PE)
+  (let [t (dsl/peek (mut c))
+        a (read-atom (mut c))]
+    (cond
+      (dsl/accept! (mut c) "*") (pe-wrap (OStar) a t)
+      (dsl/accept! (mut c) "+") (pe-wrap (OPlus) a t)
+      (dsl/accept! (mut c) "?") (pe-wrap (OOpt) a t)
+      (dsl/accept! (mut c) ",*") (pe-wrap (OSepStar) a t)
+      (dsl/accept! (mut c) ",+") (pe-wrap (OSepPlus) a t)
+      :else a)))
 
+(defn read-prefixed [(c (mut dsl/Cur))] (-> PE)
+  (let [t (dsl/peek (mut c))]
+    (cond
+      (dsl/accept! (mut c) "!") (pe-wrap (ONot) (read-prefixed (mut c)) t)
+      (dsl/accept! (mut c) "&") (pe-wrap (OAnd) (read-prefixed (mut c)) t)
+      (dsl/accept! (mut c) "~") (pe-wrap (OKeep) (read-prefixed (mut c)) t)
+      (dsl/accept! (mut c) "@")
+        (let [n (dsl/name! (mut c) "eof, nl or nonl")]
+          (cond (= (.text n) "eof") (pe-new (OEof) "" t)
+                (= (.text n) "bof") (pe-new (OBof) "" t)
+                (= (.text n) "nl") (pe-new (ONl) "" t)
+                (= (.text n) "nonl") (pe-new (ONoNl) "" t)
+                :else (dsl/die (mut c) n "expected @eof, @nl or @nonl")))
+      (dsl/accept! (mut c) "with") (read-with (mut c) t)
+      (dsl/accept! (mut c) "if") (read-flag-test (mut c) t (OIf))
+      (dsl/accept! (mut c) "unless") (read-flag-test (mut c) t (OUnless))
+      :else (read-suffixed (mut c)))))
+
+(defn seq-end? [(c (mut dsl/Cur))] (-> bool)
+  (or (dsl/at? (mut c) "|") (dsl/at? (mut c) ";") (dsl/at? (mut c) "->") (dsl/at? (mut c) ")")))
+
+(defn read-seq [(c (mut dsl/Cur))] (-> PE)
+  (let [t (dsl/peek (mut c))
+        (mut out) (pe-new (OSeq) "" t)]
+    (while (not (seq-end? (mut c)))
+      (push! (mut (.kids out)) (read-prefixed (mut c))))
+    (when (= (len (.kids out)) 0)
+      (dsl/die (mut c) t "an empty sequence"))
+    (if (= (len (.kids out)) 1) (get (.kids out) 0) out)))
+
+(defn read-choice [(c (mut dsl/Cur))] (-> PE)
+  (let [t (dsl/peek (mut c))
+        first (read-seq (mut c))]
+    (if (dsl/at? (mut c) "|")
+        (let [(mut out) (pe-new (OChoice) "" t)]
+          (push! (mut (.kids out)) first)
+          (while (dsl/accept! (mut c) "|")
+            (push! (mut (.kids out)) (read-seq (mut c))))
+          out)
+        first)))
+
+;;; `seq -> Label`, with a `|` between alternatives and a `;` after the last.
 (defn read-alts [(c (mut dsl/Cur))] (-> (ArrayList Alt))
-  (let [(mut alts) (ArrayList::new [Alt] (malloc-allocator))]
+  (let [(mut alts) (ArrayList::new [Alt] (malloc-allocator))
+        (mut go) true]
     (dsl/accept! (mut c) "|")
-    (push! (mut alts) (read-alt (mut c)))
-    (while (dsl/accept! (mut c) "|")
-      (push! (mut alts) (read-alt (mut c))))
+    (while go
+      (let [s (read-seq (mut c))
+            label (if (dsl/accept! (mut c) "->")
+                      (.text (dsl/name! (mut c) "a node label"))
+                      "")]
+        (push! (mut alts) (Alt :seq s :label label))
+        (unless (dsl/accept! (mut c) "|") (set! go false))))
     (dsl/expect! (mut c) ";")
     alts))
 
@@ -91,61 +317,197 @@
         (mut level) -1]
     (while (not (dsl/accept! (mut c) ";"))
       (when (dsl/accept! (mut c) "left") (set! level (+ level 1)))
-      (let [lit (dsl/string! (mut c) "an operator literal")
+      (let [flag (if (dsl/accept! (mut c) "unless")
+                     (.text (read-flag-test (mut c) (dsl/peek (mut c)) (OUnless)))
+                     "")
+            lit (dsl/string! (mut c) "an operator literal")
             kind (dsl/name! (mut c) "a node label")]
         (when (< level 0)
           (dsl/die (mut c) lit "an operator needs a `left` level before it"))
-        (push! (mut ops) (Op :lit (.text lit) :kind (.text kind) :level level :tok lit))))
+        (push! (mut ops)
+               (Op :lit (decode-string (mut c) lit) :kind (.text kind) :level level
+                   :unless-flag flag :tok lit))))
     ops))
 
+(defn decl-new [(kind DeclKind) (name (slice u8)) (t rt/Tok)] (-> Decl)
+  (Decl :kind kind :name name :over ""
+        :alts (ArrayList::new [Alt] (malloc-allocator))
+        :ops (ArrayList::new [Op] (malloc-allocator))
+        :body (pe-new (OSeq) "" t)
+        :memo false :print-soft false :print-text "" :tok t))
+
 (defn read-decl [(c (mut dsl/Cur))] (-> Decl)
-  (let [t (dsl/peek (mut c))]
+  (let [t (dsl/peek (mut c))
+        memo (dsl/accept! (mut c) "memo")]
     (cond
-      (dsl/accept! (mut c) "rule")
-        (let [n (dsl/name! (mut c) "a rule name")]
+      (dsl/accept! (mut c) "fragment")
+        (let [n (dsl/name! (mut c) "a name")
+              (mut d) (decl-new (DFragment) (.text n) n)]
           (dsl/expect! (mut c) "=")
-          (DRule (.text n) (read-alts (mut c))))
+          (set! (.body d) (read-choice (mut c)))
+          (dsl/expect! (mut c) ";")
+          d)
+      (dsl/accept! (mut c) "token")
+        (let [n (dsl/name! (mut c) "a name")
+              (mut d) (decl-new (DToken) (.text n) n)]
+          (dsl/expect! (mut c) "=")
+          (set! (.body d) (read-choice (mut c)))
+          (dsl/expect! (mut c) ";")
+          d)
+      (dsl/accept! (mut c) "hidden")
+        (let [_ (dsl/expect! (mut c) "rule")
+              n (dsl/name! (mut c) "a name")
+              (mut d) (decl-new (DHidden) (.text n) n)]
+          (when (dsl/accept! (mut c) "prints")
+            (set! (.print-soft d) (dsl/accept! (mut c) "soft"))
+            (let [s (dsl/string! (mut c) "the printed text")]
+              (set! (.print-text d) (decode-string (mut c) s))))
+          (dsl/expect! (mut c) "=")
+          (set! (.body d) (read-choice (mut c)))
+          (dsl/expect! (mut c) ";")
+          d)
+      (dsl/accept! (mut c) "rule")
+        (let [n (dsl/name! (mut c) "a name")
+              (mut d) (decl-new (DRule) (.text n) n)]
+          (dsl/expect! (mut c) "=")
+          (set! (.alts d) (read-alts (mut c)))
+          (set! (.memo d) memo)
+          d)
       (dsl/accept! (mut c) "infix")
-        (let [n (dsl/name! (mut c) "a rule name")]
+        (let [n (dsl/name! (mut c) "a name")
+              (mut d) (decl-new (DInfix) (.text n) n)]
           (dsl/expect! (mut c) "over")
-          (let [over (dsl/name! (mut c) "a rule name")]
-            (DInfix :name (.text n) :over (.text over) :ops (read-ops (mut c)))))
-      (dsl/accept! (mut c) "postfix")
-        (let [n (dsl/name! (mut c) "a rule name")]
+          (set! (.over d) (.text (dsl/name! (mut c) "a rule")))
+          (set! (.ops d) (read-ops (mut c)))
+          d)
+      (or (dsl/at? (mut c) "postfix") (dsl/at? (mut c) "suffix"))
+        (let [kind (if (dsl/accept! (mut c) "postfix")
+                       (DPostfix)
+                       (do (dsl/expect! (mut c) "suffix") (DSuffix)))
+              n (dsl/name! (mut c) "a name")
+              (mut d) (decl-new kind (.text n) n)]
           (dsl/expect! (mut c) "over")
-          (let [over (dsl/name! (mut c) "a rule name")]
-            (DPostfix :name (.text n) :over (.text over) :alts (read-alts (mut c)))))
-      :else (dsl/die (mut c) t "expected rule, infix or postfix"))))
+          (set! (.over d) (.text (dsl/name! (mut c) "a rule")))
+          (set! (.alts d) (read-alts (mut c)))
+          (set! (.memo d) memo)
+          d)
+      :else (dsl/die (mut c) t "expected fragment, token, rule, hidden, infix, postfix or suffix"))))
 
 ;; ---------------------------------------------------------------- analysis
 
-(defn token-class? [(n (slice u8))] (-> bool)
-  (or (= n "Ident") (= n "Num") (= n "Str")))
+(defn find-decl [(g Grammar) (n (slice u8))] (-> (Option Decl))
+  (let [(mut out) (None [Decl])]
+    (for d (.decls g) (when (= (.name d) n) (set! out (Some d))))
+    out))
 
-(defn decl-name [(d Decl)] (-> (slice u8))
-  (match d
-    (DRule [n _] n)
-    (DInfix [n _ _] n)
-    (DPostfix [n _ _] n)))
-
-(defn known-rule? [(g Grammar) (n (slice u8))] (-> bool)
-  (let [(mut hit) (token-class? n)]
-    (for d (.decls g) (when (= (decl-name d) n) (set! hit true)))
+(defn contains? [(xs (ArrayList (slice u8))) (s (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for x xs (when (= x s) (set! hit true)))
     hit))
 
-(defn captures [(a Alt)] (-> i64)
+(defn add-unique! [(xs (mut (ArrayList (slice u8)))) (s (slice u8))] (-> void)
+  (unless (contains? xs s) (push! (mut xs) s)))
+
+(defn decl-kind-of [(g Grammar) (c (mut dsl/Cur)) (t rt/Tok) (n (slice u8))] (-> DeclKind)
+  (match (find-decl g n)
+    (Some [d] (.kind d))
+    (None [] (dsl/die (mut c) t (dsl/join2 "no rule named " n)))))
+
+;;; Does this item capture a child in a rule?
+(defn captures? [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> bool)
+  (match (.op e)
+    (OLit []  false)
+    (ORef []
+      (let [k (decl-kind-of g (mut c) (.tok e) (.text e))]
+        (cond
+          (= k (DHidden)) false
+          (= k (DFragment)) false
+          :else true)))
+    (OStar [] true) (OPlus [] true) (OOpt [] true) (OSepStar [] true) (OSepPlus [] true)
+    (OKeep [] (captures? g (mut c) (get (.kids e) 0)))
+    (OWith [] (captures? g (mut c) (get (.kids e) 0)))
+    (_ false)))
+
+(defn seq-items [(e PE)] (-> (ArrayList PE))
+  (if (= (.op e) (OSeq))
+      (.kids e)
+      (let [(mut out) (empty-pes)]
+        (push! (mut out) e)
+        out)))
+
+(defn count-captures [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> i64)
   (let [(mut n) 0]
-    (for it (.items a)
-      (match (.shape it)
-        (ILit [_] 0)
-        (_ (set! n (+ n 1)))))
+    (for it (seq-items e) (when (captures? g (mut c) it) (set! n (+ n 1))))
     n))
 
+;;; What must not begin a capture that a `!` guard protects: its literals.
+(defn guard-lits! [(e PE) (out (mut (ArrayList (slice u8))))] (-> void)
+  (match (.op e)
+    (OLit [] (add-unique! (mut out) (.text e)))
+    (OChoice [] (for k (.kids e) (guard-lits! k (mut out))))
+    (OSeq [] (guard-lits! (get (.kids e) 0) (mut out)))
+    (_ 0)))
+
+(defn word-literal? [(s (slice u8))] (-> bool)
+  (and (> (len s) 0) (rt/name-start? (get s 0))))
+
+(defn collect-lits! [(g (mut Grammar)) (c (mut dsl/Cur)) (e PE)] (-> void)
+  (match (.op e)
+    (OLit []
+      (let [(mut hit) false]
+        (for l (.lits g) (when (= (.text l) (.text e)) (set! hit true)))
+        (unless hit
+          (push! (mut (.lits g)) (Lit :text (.text e) :id (len (.lits g)))))))
+    (_ (for k (.kids e) (collect-lits! (mut g) (mut c) k)))))
+
+(defn add-lit! [(g (mut Grammar)) (text (slice u8))] (-> void)
+  (let [(mut hit) false]
+    (for l (.lits g) (when (= (.text l) text) (set! hit true)))
+    (unless hit (push! (mut (.lits g)) (Lit :text text :id (len (.lits g)))))))
+
+(defn lit-id [(g (mut Grammar)) (text (slice u8))] (-> i64)
+  (let [(mut out) -1]
+    (for l (.lits g) (when (= (.text l) text) (set! out (.id l))))
+    (when (< out 0) (panic "literal {} was not collected" text))
+    out))
+
+;;; A printable signature of an alternative: a label may repeat across rules only
+;;; if every use prints the same way.
+(defn sig [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> (slice u8))
+  (let [(mut out) ""]
+    (for it (seq-items e)
+      (set! out (dsl/join3 out " " (sig-item g (mut c) it))))
+    out))
+
+(defn sig-item [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> (slice u8))
+  (match (.op e)
+    (OLit [] (.text e))
+    (ORef [] (.text e))
+    (OStar [] (dsl/join2 "*" (sig g (mut c) (get (.kids e) 0))))
+    (OPlus [] (dsl/join2 "+" (sig g (mut c) (get (.kids e) 0))))
+    (OSepStar [] (dsl/join2 ",*" (sig g (mut c) (get (.kids e) 0))))
+    (OSepPlus [] (dsl/join2 ",+" (sig g (mut c) (get (.kids e) 0))))
+    (OOpt [] (dsl/join2 "?" (sig g (mut c) (get (.kids e) 0))))
+    (OKeep [] (sig-item g (mut c) (get (.kids e) 0)))
+    (OWith [] (sig-item g (mut c) (get (.kids e) 0)))
+    (_ "")))
+
 (defn add-kind! [(g (mut Grammar)) (c (mut dsl/Cur)) (t rt/Tok) (k Kind)] (-> void)
-  (for old (.kinds g)
-    (when (= (.name old) (.name k))
-      (dsl/die (mut c) t (dsl/join3 "the label " (.name k) " is used twice; a printer needs one form per label"))))
-  (push! (mut (.kinds g)) k))
+  (let [(mut dup) false]
+    (for old (.kinds g)
+      (when (= (.name old) (.name k))
+        (set! dup true)
+        (let [same
+                (match (.print old)
+                  (PAlt [a _]
+                    (match (.print k)
+                      (PAlt [b _] (= (sig g (mut c) (.seq a)) (sig g (mut c) (.seq b))))
+                      (_ false)))
+                  (_ false))]
+          (unless same
+            (dsl/die (mut c) t (dsl/join3 "the label " (.name k)
+                                          " is used with two different forms; a printer needs one form per label"))))))
+    (unless dup (push! (mut (.kinds g)) k))))
 
 (defn set-kind-level! [(g (mut Grammar)) (name (slice u8)) (level i64)] (-> void)
   (for i (range 0 (len (.kinds g)))
@@ -154,163 +516,337 @@
         (set! (mut (.kinds g)) i
               (Kind :name (.name k) :arity (.arity k) :level level :print (.print k)))))))
 
-(defn check-items! [(g Grammar) (c (mut dsl/Cur)) (a Alt)] (-> void)
-  (for it (.items a)
-    (let [name (match (.shape it)
-                 (ILit [_] "")
-                 (IRef [n] n)
-                 (IRep [n] n)
-                 (ISep [n] n))]
-      (when (and (> (len name) 0) (not (known-rule? g name)))
-        (dsl/die (mut c) (.tok it) (dsl/join3 "no rule named " name ""))))))
+(defn set-kind-base! [(g (mut Grammar)) (name (slice u8)) (base-min i64)] (-> void)
+  (for i (range 0 (len (.kinds g)))
+    (let [k (get (.kinds g) i)]
+      (when (= (.name k) name)
+        (match (.print k)
+          ;; A label shared across rules keeps the strictest requirement.
+          (PAlt [a old]
+            (when (> base-min old)
+              (set! (mut (.kinds g)) i
+                    (Kind :name (.name k) :arity (.arity k) :level (.level k)
+                          :print (PAlt a base-min)))))
+          (_ 0))))))
 
-;;; Every label becomes a kind, and every reference must name something.
-(defn analyse-alts! [(g (mut Grammar)) (c (mut dsl/Cur)) (alts (ArrayList Alt)) (base bool)] (-> void)
-  (for a alts
-    (check-items! g (mut c) a)
-    (cond
-      (> (len (.label a)) 0)
-        (add-kind! (mut g) (mut c) (.tok a)
-                   (Kind :name (.label a)
-                         :arity (+ (captures a) (if base 1 0))
-                         :level NO-LEVEL
-                         :print (PAlt a base)))
-      (!= (captures a) 1)
-        (dsl/die (mut c) (.tok a) "an alternative with no label must capture exactly one thing")
-      :else 0)))
+(defn check-refs! [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> void)
+  (when (= (.op e) (ORef))
+    (decl-kind-of g (mut c) (.tok e) (.text e))
+    0)
+  (for k (.kids e) (check-refs! g (mut c) k)))
 
-(defn analyse-decls! [(g (mut Grammar)) (c (mut dsl/Cur))] (-> void)
+(defn analyse-alts! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl) (extra i64)] (-> void)
+  (for a (.alts d)
+    (check-refs! g (mut c) (.seq a))
+    (collect-lits! (mut g) (mut c) (.seq a))
+    (let [n (count-captures g (mut c) (.seq a))]
+      (cond
+        (> (len (.label a)) 0)
+          (add-kind! (mut g) (mut c) (.tok (.seq a))
+                     (Kind :name (.label a) :arity (+ n extra) :level (no-level)
+                           :print (PAlt a 0)))
+        (and (= extra 0) (!= n 1))
+          (dsl/die (mut c) (.tok (.seq a))
+                   "an alternative with no label must capture exactly one thing")
+        (> extra 0)
+          (dsl/die (mut c) (.tok (.seq a)) "a postfix or suffix alternative needs a label")
+        :else 0))))
+
+(defn analyse! [(g (mut Grammar)) (c (mut dsl/Cur))] (-> void)
   (for d (.decls g)
-    (match d
-      (DRule [_ alts] (analyse-alts! (mut g) (mut c) alts false))
-      (DPostfix [_ over alts]
-        (unless (known-rule? g over)
-          (dsl/die (mut c) (dsl/peek (mut c)) (dsl/join2 "no rule named " over)))
-        (analyse-alts! (mut g) (mut c) alts true))
-      (DInfix [_ over ops]
-        (unless (known-rule? g over)
-          (dsl/die (mut c) (dsl/peek (mut c)) (dsl/join2 "no rule named " over)))
-        (for op ops
-          (add-kind! (mut g) (mut c) (.tok op)
-                     (Kind :name (.kind op) :arity 2 :level NO-LEVEL :print (POp op))))))))
+    (let [k (.kind d)]
+      (cond
+        (= k (DRule)) (analyse-alts! (mut g) (mut c) d 0)
+        (or (= k (DPostfix)) (= k (DSuffix)))
+          (do (decl-kind-of g (mut c) (.tok d) (.over d))
+              (analyse-alts! (mut g) (mut c) d 1))
+        (= k (DInfix))
+          (do
+            (decl-kind-of g (mut c) (.tok d) (.over d))
+            (for op (.ops d)
+              (add-lit! (mut g) (.lit op))
+              (add-kind! (mut g) (mut c) (.tok op)
+                         (Kind :name (.kind op) :arity 2 :level (no-level) :print (POp op)))))
+        (= k (DToken))
+          (do
+            (check-refs! g (mut c) (.body d))
+            (add-kind! (mut g) (mut c) (.tok d)
+                       (Kind :name (.name d) :arity 0 :level (no-level) :print (PLeaf))))
+        (= k (DHidden))
+          (do (check-refs! g (mut c) (.body d))
+              (collect-lits! (mut g) (mut c) (.body d)))
+        :else (check-refs! g (mut c) (.body d)))))
+  ;; Everything a lexical body or guard mentions by literal is matched as bytes,
+  ;; except lookaheads in rules, which go through the same literal functions.
+  (unless (> (len (.lits g)) 0)
+    (dsl/die (mut c) (dsl/peek (mut c)) "a grammar with no literals")))
 
-(defn find-decl [(g Grammar) (n (slice u8))] (-> (Option Decl))
-  (let [(mut out) (None [Decl])]
-    (for d (.decls g) (when (= (decl-name d) n) (set! out (Some d))))
-    out))
-
-;;; The next rule down a pass-through chain, or "" at the bottom. Also finds the
-;;; grouping alternative `"(" Expr ")"`, which the printer needs for parentheses.
-(defn chain-next! [(g (mut Grammar)) (alts (ArrayList Alt))] (-> (slice u8))
-  (let [(mut next) ""]
-    (for a alts
-      (when (= (len (.label a)) 0)
-        (let [n (len (.items a))]
-          (cond
-            (= n 1)
-              (match (.shape (get (.items a) 0))
-                (IRef [r] (when (= (len next) 0) (set! next r)))
-                (_ 0))
-            (= n 3)
-              (match (.shape (get (.items a) 0))
-                (ILit [o]
-                  (match (.shape (get (.items a) 2))
-                    (ILit [cl] (set! (.group-open g) o) (set! (.group-close g) cl))
-                    (_ 0)))
-                (_ 0))
-            :else 0))))
-    next))
-
-;;; Walk the expression chain top down and number it, so the printer can decide
-;;; parentheses: a child below the level its position requires gets wrapped.
-(defn assign-levels! [(g (mut Grammar)) (c (mut dsl/Cur))] (-> void)
-  (let [(mut next) "" (mut level) 1]
-    (for d (.decls g)
-      (match d
-        (DInfix [name over ops]
-          (when (> (len next) 0)
-            (dsl/die (mut c) (dsl/peek (mut c)) "the PoC supports one infix chain per grammar"))
-          (push! (mut (.levels g)) (RuleLevel :name name :level 1))
-          (let [(mut top) 0]
-            (for op ops
-              (set-kind-level! (mut g) (.kind op) (+ 1 (.level op)))
-              (when (> (.level op) top) (set! top (.level op))))
-            (set! level (+ 2 top)))
-          (set! next over))
-        (_ 0)))
-    (while (> (len next) 0)
-      (let [here next]
-        (set! next "")
-        (match (find-decl g here)
-          (None [] 0)
-          (Some [d]
-            (match d
-              (DRule [_ alts]
-                (push! (mut (.levels g)) (RuleLevel :name here :level level))
-                (for a alts
+;;; Number the precedence chain, lowest first, and give kinds their rule's level.
+;;; Infix operators take one level each, so a rule's level is its lowest kind.
+(defn assign-levels! [(g (mut Grammar)) (c (mut dsl/Cur)) (levels (mut (ArrayList Named)))] (-> void)
+  (let [(mut level) 1]
+    (for name (.precedence g)
+      (match (find-decl g name)
+        (None [] (dsl/die (mut c) (dsl/peek (mut c)) (dsl/join2 "precedence names no rule called " name)))
+        (Some [d]
+          (push! (mut levels) (Named :name name :value level))
+          (if (= (.kind d) (DInfix))
+              (let [(mut top) 0]
+                (for op (.ops d)
+                  (set-kind-level! (mut g) (.kind op) (+ level (.level op)))
+                  (when (> (.level op) top) (set! top (.level op))))
+                (set! level (+ level top 1)))
+              (do
+                (for a (.alts d)
                   (when (> (len (.label a)) 0) (set-kind-level! (mut g) (.label a) level)))
-                (set! next (chain-next! (mut g) alts)))
-              (DPostfix [_ over alts]
-                (push! (mut (.levels g)) (RuleLevel :name here :level level))
-                (for a alts (set-kind-level! (mut g) (.label a) level))
-                (set! next over))
-              (DInfix [n _ _] (dsl/die (mut c) (dsl/peek (mut c)) (dsl/join2 "cycle through infix rule " n))))))
-        (set! level (+ level 1))))
-    (when (and (> (len (.levels g)) 0) (= (len (.group-open g)) 0))
-      (dsl/die (mut c) (dsl/peek (mut c))
-               "a grammar with an infix rule needs a grouping alternative such as \"(\" Expr \")\" so it can print parentheses"))))
+                (set! level (+ level 1)))))))
+    ;; A postfix chain may nest in itself; a suffix's base must sit above it.
+    (for d (.decls g)
+      (when (or (= (.kind d) (DPostfix)) (= (.kind d) (DSuffix)))
+        (let [self (named-value levels (.name d))
+              over (named-value levels (.over d))]
+          (for a (.alts d)
+            (set-kind-base! (mut g) (.label a)
+                            (if (= (.kind d) (DPostfix)) self over))))))))
 
-(defn level-of-rule [(g Grammar) (n (slice u8))] (-> i64)
+(defn named-value [(xs (ArrayList Named)) (n (slice u8))] (-> i64)
   (let [(mut out) 0]
-    (for r (.levels g) (when (= (.name r) n) (set! out (.level r))))
+    (for x xs (when (= (.name x) n) (set! out (.value x))))
     out))
 
-;; ---------------------------------------------------------------- generating
+;; ---------------------------------------------------------------- symbols
 
 (defn kind-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "K" n))
 (defn rule-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "p-" n))
+(defn impl-sym [(n (slice u8))] (-> Code) (primitive/code-symbol (dsl/join3 "p-" n "-impl")))
+(defn lex-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "lex-" n))
+(defn hidden-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "h-" n))
 (defn rep-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "rep-" n))
+(defn rep1-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "rep1-" n))
 (defn sep-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "sep-" n))
+(defn sep1-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "sep1-" n))
 (defn cap-sym [(i i64)] (-> Code) (primitive/code-symbol "c" i))
+(defn lit-sym [(i i64)] (-> Code) (primitive/code-symbol "lit-" i))
+(defn aux-sym [(i i64)] (-> Code) (primitive/code-symbol "opt-" i))
+(defn flag-sym [(n (slice u8))] (-> Code) (primitive/code-symbol "FLAG-" n))
 
 (defn alt-sym [(n (slice u8)) (i i64)] (-> Code)
   (primitive/code-symbol (dsl/join3 "p-" n "-alt") i))
 
-;;; The tail of an alternative: all items matched, so build the result.
-(defn alt-result [(a Alt) (base bool)] (-> Code)
+(defn fresh-aux! [(g (mut Grammar))] (-> i64)
+  (let [i (.next-aux g)]
+    (set! (.next-aux g) (+ i 1))
+    i))
+
+(defn add-aux! [(g (mut Grammar)) (form Code)] (-> void)
+  (push! (mut (.aux g)) (dsl/render form)))
+
+;; ---------------------------------------------------------------- lexical code
+
+;;; A bool expression over bytes that advances on success and restores on failure.
+(defn class-test [(e PE)] (-> Code)
+  (let [(mut tests) (primitive/code-list-new)]
+    (for r (.ranges e)
+      (if (= (.lo r) (.hi r))
+          (push! (mut tests) `(= c ~(.lo r)))
+          (push! (mut tests) `(and (>= c ~(.lo r)) (<= c ~(.hi r))))))
+    (if (.neg e)
+        `(and (>= c 0) (not (or ~@tests)))
+        `(or ~@tests))))
+
+(defn lex-code [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> Code)
+  (match (.op e)
+    (OLit []
+      `(if (rt/at-bytes? (mut p) ~(.text e))
+           (do (rt/advance! (mut p) ~(len (.text e))) true)
+           false))
+    (OClass []
+      `(let [c (rt/peek (mut p))]
+         (if ~(class-test e)
+             (do (rt/advance! (mut p) 1) true)
+             false)))
+    (OAny []
+      `(if (rt/eof? (mut p)) false (do (rt/advance! (mut p) 1) true)))
+    (ORef []
+      (let [k (decl-kind-of g (mut c) (.tok e) (.text e))]
+        (unless (or (= k (DFragment)) (= k (DToken)))
+          (dsl/die (mut c) (.tok e) "a token can only use fragments and tokens"))
+        `(~(lex-sym (.text e)) (mut p))))
+    (OSeq []
+      (let [(mut parts) (primitive/code-list-new)]
+        (for k (.kids e) (push! (mut parts) (lex-code g (mut c) k)))
+        `(let [s (.pos p)]
+           (if (and ~@parts true) true (do (set! (.pos p) s) false)))))
+    (OChoice []
+      (let [(mut parts) (primitive/code-list-new)]
+        (for k (.kids e) (push! (mut parts) (lex-code g (mut c) k)))
+        `(or ~@parts)))
+    (OStar []
+      `(let [(mut go) true]
+         (while go
+           (let [s (.pos p)]
+             (unless (and ~(lex-code g (mut c) (get (.kids e) 0)) (> (.pos p) s))
+               (set! go false))))
+         true))
+    (OPlus []
+      `(if ~(lex-code g (mut c) (get (.kids e) 0))
+           (let [(mut go) true]
+             (while go
+               (let [s (.pos p)]
+                 (unless (and ~(lex-code g (mut c) (get (.kids e) 0)) (> (.pos p) s))
+                   (set! go false))))
+             true)
+           false))
+    (OOpt []
+      `(do ~(lex-code g (mut c) (get (.kids e) 0)) true))
+    (ONot []
+      `(let [s (.pos p) hit ~(lex-code g (mut c) (get (.kids e) 0))]
+         (set! (.pos p) s)
+         (not hit)))
+    (OAnd []
+      `(let [s (.pos p) hit ~(lex-code g (mut c) (get (.kids e) 0))]
+         (set! (.pos p) s)
+         hit))
+    (OEof [] `(rt/eof? (mut p)))
+    (OBof [] `(= (.pos p) 0))
+    (_ (dsl/die (mut c) (.tok e) "this item is not allowed in a token or fragment"))))
+
+;; ---------------------------------------------------------------- recognisers
+
+;;; A bool expression over rules, for lookaheads and hidden rules: nothing captured.
+(defn rec-code [(g (mut Grammar)) (c (mut dsl/Cur)) (e PE)] (-> Code)
+  (match (.op e)
+    (OLit [] `(~(lit-sym (lit-id (mut g) (.text e))) (mut p)))
+    (ORef []
+      (let [k (decl-kind-of g (mut c) (.tok e) (.text e))]
+        (cond
+          (= k (DHidden)) `(~(hidden-sym (.text e)) (mut p))
+          (= k (DFragment))
+            `(do (skip! (mut p)) (~(lex-sym (.text e)) (mut p)))
+          :else
+            `(match (~(rule-sym (.text e)) (mut p))
+               (Some [_] true)
+               (None [] false)))))
+    (OSeq []
+      (let [(mut parts) (primitive/code-list-new)]
+        (for k (.kids e) (push! (mut parts) (rec-code (mut g) (mut c) k)))
+        `(let [s (.pos p)]
+           (if (and ~@parts true) true (do (set! (.pos p) s) false)))))
+    (OChoice []
+      (let [(mut parts) (primitive/code-list-new)]
+        (for k (.kids e) (push! (mut parts) (rec-code (mut g) (mut c) k)))
+        `(or ~@parts)))
+    (OOpt [] `(do ~(rec-code (mut g) (mut c) (get (.kids e) 0)) true))
+    (ONot []
+      `(let [s (.pos p) hit ~(rec-code (mut g) (mut c) (get (.kids e) 0))]
+         (set! (.pos p) s)
+         (not hit)))
+    (OAnd []
+      `(let [s (.pos p) hit ~(rec-code (mut g) (mut c) (get (.kids e) 0))]
+         (set! (.pos p) s)
+         hit))
+    (OEof [] `(skip-peek? (mut p)))
+    (ONl [] `(newline-ahead? (mut p)))
+    (ONoNl [] `(not (newline-ahead? (mut p))))
+    (OIf [] `(rt/flag? (mut p) ~(flag-sym (.text e))))
+    (OUnless [] `(not (rt/flag? (mut p) ~(flag-sym (.text e)))))
+    (_ (dsl/die (mut c) (.tok e) "this item is not allowed in a lookahead or hidden rule"))))
+
+;; ---------------------------------------------------------------- parsing code
+
+(defn flag-mask [(names (ArrayList (slice u8)))] (-> Code)
+  (let [(mut parts) (primitive/code-list-new)]
+    (for n names (push! (mut parts) (flag-sym n)))
+    `(| 0 0 ~@parts)))
+
+(defn none-fail [] (-> Code) `(None [Node]))
+
+;;; A generated function for `X?`: at most one capture, and never fails.
+(defn emit-opt! [(g (mut Grammar)) (c (mut dsl/Cur)) (inner PE)] (-> Code)
+  (let [id (fresh-aux! (mut g))
+        n (count-captures g (mut c) inner)
+        name (aux-sym id)]
+    (when (> n 1)
+      (dsl/die (mut c) (.tok inner) "an optional group may capture at most one thing"))
+    (let [tail (if (= n 1) `(Some c0) `(Some (flag-node)))
+          body (seq-code (mut g) (mut c) (seq-items inner) 0 0 tail)]
+      (add-aux! (mut g)
+                `(defn ~name [(p (mut rt/P))] (-> (Option Node))
+                   (let [s (.pos p)]
+                     (match ~body
+                       (Some [v] (Some v))
+                       (None []
+                         (set! (.pos p) s)
+                         (Some (none-node)))))))
+      `(~name (mut p)))))
+
+;;; The call producing a capture, always (Option Node). Repetitions need a helper
+;;; for what they repeat, so their inner item must be a plain reference.
+(defn capture-call [(g (mut Grammar)) (c (mut dsl/Cur)) (e PE)] (-> Code)
+  (match (.op e)
+    (ORef [] `(~(rule-sym (.text e)) (mut p)))
+    (OKeep [] (capture-call (mut g) (mut c) (get (.kids e) 0)))
+    (OWith []
+      `(let [old (.flags p)]
+         (set! (.flags p) (rt/apply-flags old ~(flag-mask (.on e)) ~(flag-mask (.off e))))
+         (let [r ~(capture-call (mut g) (mut c) (get (.kids e) 0))]
+           (set! (.flags p) old)
+           r)))
+    (OOpt [] (emit-opt! (mut g) (mut c) (get (.kids e) 0)))
+    (OStar [] `(~(rep-sym (rep-name! (mut g) (mut c) e)) (mut p)))
+    (OPlus [] `(~(rep1-sym (rep-name! (mut g) (mut c) e)) (mut p)))
+    (OSepStar [] `(~(sep-sym (rep-name! (mut g) (mut c) e)) (mut p)))
+    (OSepPlus [] `(~(sep1-sym (rep-name! (mut g) (mut c) e)) (mut p)))
+    (_ (dsl/die (mut c) (.tok e) "this item cannot capture"))))
+
+(defn rep-name! [(g (mut Grammar)) (c (mut dsl/Cur)) (e PE)] (-> (slice u8))
+  (let [inner (get (.kids e) 0)]
+    (unless (= (.op inner) (ORef))
+      (dsl/die (mut c) (.tok e) "a repetition needs a plain rule name; give the group a rule"))
+    (add-unique! (mut (.reps g)) (.text inner))
+    (.text inner)))
+
+;;; Items i.. of a sequence, nested, ending in `tail`.
+(defn seq-code [(g (mut Grammar)) (c (mut dsl/Cur)) (items (ArrayList PE)) (i i64) (cap i64) (tail Code)] (-> Code)
+  (if (>= i (len items))
+      tail
+      (let [e (get items i)]
+        (if (captures? g (mut c) e)
+            (let [call (capture-call (mut g) (mut c) e)]
+              `(match ~call
+                 (Some [~(cap-sym cap)]
+                   ~(seq-code (mut g) (mut c) items (+ i 1) (+ cap 1) tail))
+                 (None [] ~(none-fail))))
+            `(if ~(rec-code (mut g) (mut c) e)
+                 ~(seq-code (mut g) (mut c) items (+ i 1) cap tail)
+                 ~(none-fail))))))
+
+;;; All items matched: build the node, or pass the one capture through.
+(defn alt-tail [(g Grammar) (c (mut dsl/Cur)) (a Alt) (extra i64)] (-> Code)
   (if (= (len (.label a)) 0)
       `(Some c0)
       (let [(mut pushes) (primitive/code-list-new)
-            total (+ (captures a) (if base 1 0))]
+            total (+ (count-captures g (mut c) (.seq a)) extra)]
         (for i (range 0 total)
           (push! (mut pushes) `(push! (mut kids) ~(cap-sym i))))
         `(let [(mut kids) (new-kids)]
            ~@pushes
-           (Some (Node :kind (~(kind-sym (.label a))) :text "" :kids kids))))))
+           (Some (mk (~(kind-sym (.label a))) kids lo (.pos p)))))))
 
-(defn alt-body [(a Alt) (i i64) (cap i64) (base bool)] (-> Code)
-  (if (>= i (len (.items a)))
-      (alt-result a base)
-      (match (.shape (get (.items a) i))
-        (ILit [text]
-          `(if (rt/lit! (mut p) ~text)
-               ~(alt-body a (+ i 1) cap base)
-               (None [Node])))
-        (IRef [n]
-          `(match (~(rule-sym n) (mut p))
-             (Some [~(cap-sym cap)] ~(alt-body a (+ i 1) (+ cap 1) base))
-             (None [] (None [Node]))))
-        (IRep [n]
-          `(let [~(cap-sym cap) (~(rep-sym n) (mut p))]
-             ~(alt-body a (+ i 1) (+ cap 1) base)))
-        (ISep [n]
-          `(let [~(cap-sym cap) (~(sep-sym n) (mut p))]
-             ~(alt-body a (+ i 1) (+ cap 1) base))))))
+(defn emit-alt-fn! [(g (mut Grammar)) (c (mut dsl/Cur)) (name (slice u8)) (i i64) (a Alt) (extra i64)] (-> void)
+  (let [tail (alt-tail g (mut c) a extra)
+        body (seq-code (mut g) (mut c) (seq-items (.seq a)) 0 extra tail)]
+    (add-aux! (mut g)
+              (if (> extra 0)
+                  `(defn ~(alt-sym name i) [(c0 Node) (p (mut rt/P))] (-> (Option Node))
+                     (let [lo (.lo c0)] ~body))
+                  `(defn ~(alt-sym name i) [(p (mut rt/P))] (-> (Option Node))
+                     (let [lo (.pos p)] ~body))))))
 
 ;;; Try alternatives in order, restoring the position after each failure.
 (defn try-alts [(name (slice u8)) (i i64) (total i64) (base bool)] (-> Code)
   (if (>= i total)
-      `(None [Node])
+      (none-fail)
       `(match ~(if base
                    `(~(alt-sym name i) acc (mut p))
                    `(~(alt-sym name i) (mut p)))
@@ -319,234 +855,505 @@
            (set! (.pos p) save)
            ~(try-alts name (+ i 1) total base)))))
 
-(defn emit-alt-fn [(name (slice u8)) (i i64) (a Alt) (base bool)] (-> Code)
-  (if base
-      `(defn ~(alt-sym name i) [(c0 Node) (p (mut rt/P))] (-> (Option Node))
-         ~(alt-body a 0 1 true))
-      `(defn ~(alt-sym name i) [(p (mut rt/P))] (-> (Option Node))
-         ~(alt-body a 0 0 false))))
+(defn emit-rule-fn! [(g (mut Grammar)) (d Decl) (body Code)] (-> void)
+  (if (.memo d)
+      (let [id (.memo-count g)]
+        (set! (.memo-count g) (+ id 1))
+        (add-aux! (mut g)
+                  `(defn ~(impl-sym (.name d)) [(p (mut rt/P))] (-> (Option Node)) ~body))
+        (add-aux! (mut g)
+                  `(defn ~(rule-sym (.name d)) [(p (mut rt/P))] (-> (Option Node))
+                     (let [key (rt/memo-key (mut p))]
+                       (match (rt/memo-get (mut p) ~id key)
+                         (Some [hit]
+                           (set! (.pos p) (.end hit))
+                           (if (.ok hit) (Some (load (cast (ptr Node) (.node hit)))) (None [Node])))
+                         (None []
+                           (let [r (~(impl-sym (.name d)) (mut p))]
+                             (match r
+                               (Some [n]
+                                 (rt/memo-put! (mut p) ~id key
+                                               (rt/MemoHit :ok true :end (.pos p) :node (box-node n))))
+                               (None []
+                                 (rt/memo-put! (mut p) ~id key
+                                               (rt/MemoHit :ok false :end (.pos p) :node 0))))
+                             r)))))))
+      (add-aux! (mut g)
+                `(defn ~(rule-sym (.name d)) [(p (mut rt/P))] (-> (Option Node)) ~body))))
 
-;;; `acc op next` while operators at this level keep matching.
-(defn infix-arms [(ops (ArrayList Op)) (i i64) (level i64) (next Code)] (-> Code)
-  (cond
-    (>= i (len ops)) `(set! go false)
-    (!= (.level (get ops i)) level) (infix-arms ops (+ i 1) level next)
-    :else
-      (let [op (get ops i)]
-        `(if (rt/lit! (mut p) ~(.lit op))
-             (match (~next (mut p))
-               (Some [r] (set! acc (node2 (~(kind-sym (.kind op))) acc r)))
-               (None [] (set! (.pos p) save) (set! go false)))
-             ~(infix-arms ops (+ i 1) level next)))))
+(defn emit-rule! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl)] (-> void)
+  (for i (range 0 (len (.alts d)))
+    (emit-alt-fn! (mut g) (mut c) (.name d) i (get (.alts d) i) 0))
+  (emit-rule-fn! (mut g) d
+                 `(let [save (.pos p)]
+                    ~(try-alts (.name d) 0 (len (.alts d)) false))))
+
+;;; A base, then alternatives that extend it: repeatedly, or at most once.
+(defn emit-chain! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl) (repeat bool)] (-> void)
+  (for i (range 0 (len (.alts d)))
+    (emit-alt-fn! (mut g) (mut c) (.name d) i (get (.alts d) i) 1))
+  (let [step (try-alts (.name d) 0 (len (.alts d)) true)]
+    (emit-rule-fn!
+      (mut g) d
+      (if repeat
+          `(match (~(rule-sym (.over d)) (mut p))
+             (None [] (None [Node]))
+             (Some [first]
+               (let [(mut acc) first (mut go) true]
+                 (while go
+                   (let [save (.pos p)]
+                     (match ~step
+                       (Some [r] (set! acc r))
+                       (None [] (set! (.pos p) save) (set! go false)))))
+                 (Some acc))))
+          `(match (~(rule-sym (.over d)) (mut p))
+             (None [] (None [Node]))
+             (Some [acc]
+               (let [save (.pos p)]
+                 (match ~step
+                   (Some [r] (Some r))
+                   (None [] (set! (.pos p) save) (Some acc))))))))))
 
 (defn infix-level-sym [(name (slice u8)) (level i64)] (-> Code)
   (primitive/code-symbol (dsl/join3 "p-" name "-level") level))
 
-(defn emit-infix-level [(name (slice u8)) (over (slice u8)) (ops (ArrayList Op)) (level i64) (top i64)] (-> Code)
-  (let [next (if (= level top) (rule-sym over) (infix-level-sym name (+ level 1)))]
-    `(defn ~(infix-level-sym name level) [(p (mut rt/P))] (-> (Option Node))
-       (match (~next (mut p))
-         (None [] (None [Node]))
-         (Some [first]
-           (let [(mut acc) first (mut go) true]
-             (while go
-               (let [save (.pos p)]
-                 ~(infix-arms ops 0 level next)))
-             (Some acc)))))))
+(defn next-level-sym [(d Decl) (level i64) (top i64)] (-> Code)
+  (if (= level top) (rule-sym (.over d)) (infix-level-sym (.name d) (+ level 1))))
 
-(defn emit-rep [(n (slice u8))] (-> Code)
-  `(defn ~(rep-sym n) [(p (mut rt/P))] (-> Node)
-     (let [(mut kids) (new-kids) (mut go) true]
-       (while go
-         (let [save (.pos p)]
-           (match (~(rule-sym n) (mut p))
-             (Some [v] (push! (mut kids) v))
-             (None [] (set! (.pos p) save) (set! go false)))))
-       (Node :kind (KList) :text "" :kids kids))))
+;;; `acc op next` while operators at this level keep matching.
+(defn infix-arms [(g (mut Grammar)) (d Decl) (i i64) (level i64) (top i64)] (-> Code)
+  (cond
+    (>= i (len (.ops d))) `(set! go false)
+    (!= (.level (get (.ops d) i)) level) (infix-arms (mut g) d (+ i 1) level top)
+    :else
+      (let [op (get (.ops d) i)
+            test `(~(lit-sym (lit-id (mut g) (.lit op))) (mut p))
+            guarded (if (> (len (.unless-flag op)) 0)
+                        `(and (not (rt/flag? (mut p) ~(flag-sym (.unless-flag op)))) ~test)
+                        test)]
+        `(if ~guarded
+             (match (~(next-level-sym d level top) (mut p))
+               (Some [r] (set! acc (node2 (~(kind-sym (.kind op))) acc r)))
+               (None [] (set! (.pos p) save) (set! go false)))
+             ~(infix-arms (mut g) d (+ i 1) level top)))))
 
-(defn emit-sep [(n (slice u8))] (-> Code)
-  `(defn ~(sep-sym n) [(p (mut rt/P))] (-> Node)
-     (let [(mut kids) (new-kids) (mut go) true (mut start) (.pos p)]
-       (while go
-         (match (~(rule-sym n) (mut p))
-           (Some [v]
-             (push! (mut kids) v)
-             (set! start (.pos p))
-             (unless (rt/lit! (mut p) ",") (set! go false)))
-           (None [] (set! (.pos p) start) (set! go false))))
-       (Node :kind (KList) :text "" :kids kids))))
+(defn emit-infix! [(g (mut Grammar)) (d Decl)] (-> void)
+  (let [(mut top) 0]
+    (for op (.ops d) (when (> (.level op) top) (set! top (.level op))))
+    (for level (range 0 (+ top 1))
+      (add-aux! (mut g)
+                `(defn ~(infix-level-sym (.name d) level) [(p (mut rt/P))] (-> (Option Node))
+                   (match (~(next-level-sym d level top) (mut p))
+                     (None [] (None [Node]))
+                     (Some [first]
+                       (let [(mut acc) first (mut go) true]
+                         (while go
+                           (let [save (.pos p)]
+                             ~(infix-arms (mut g) d 0 level top)))
+                         (Some acc)))))))
+    (add-aux! (mut g)
+              `(defn ~(rule-sym (.name d)) [(p (mut rt/P))] (-> (Option Node))
+                 (~(infix-level-sym (.name d) 0) (mut p))))))
 
-(defn emit-token-rule [(name (slice u8)) (tok-kind Code) (want (slice u8))] (-> Code)
-  `(defn ~(rule-sym name) [(p (mut rt/P))] (-> (Option Node))
-     (match (rt/take! (mut p) (~tok-kind) ~want)
-       (Some [text] (Some (leaf (~(kind-sym name)) text)))
-       (None [] (None [Node])))))
+(defn emit-reps! [(g (mut Grammar))] (-> void)
+  (for n (.reps g)
+    (add-aux! (mut g)
+              `(defn ~(rep-sym n) [(p (mut rt/P))] (-> (Option Node))
+                 (let [(mut kids) (new-kids) (mut go) true lo (.pos p)]
+                   (while go
+                     (let [save (.pos p)]
+                       (match (~(rule-sym n) (mut p))
+                         (Some [v] (push! (mut kids) v))
+                         (None [] (set! (.pos p) save) (set! go false)))))
+                   (Some (mk (KList) kids lo (.pos p))))))
+    (add-aux! (mut g)
+              `(defn ~(rep1-sym n) [(p (mut rt/P))] (-> (Option Node))
+                 (match (~(rep-sym n) (mut p))
+                   (Some [l] (if (> (len (.kids l)) 0) (Some l) (None [Node])))
+                   (None [] (None [Node])))))
+    ;; X,* : zero or more, trailing comma allowed.
+    (add-aux! (mut g)
+              `(defn ~(sep-sym n) [(p (mut rt/P))] (-> (Option Node))
+                 (let [(mut kids) (new-kids) (mut go) true lo (.pos p)]
+                   (while go
+                     (let [save (.pos p)]
+                       (match (~(rule-sym n) (mut p))
+                         (Some [v]
+                           (push! (mut kids) v)
+                           (unless (comma! (mut p)) (set! go false)))
+                         (None [] (set! (.pos p) save) (set! go false)))))
+                   (Some (mk (KList) kids lo (.pos p))))))
+    ;; X,+ : one or more, no trailing comma.
+    (add-aux! (mut g)
+              `(defn ~(sep1-sym n) [(p (mut rt/P))] (-> (Option Node))
+                 (let [lo (.pos p)]
+                   (match (~(rule-sym n) (mut p))
+                     (None [] (None [Node]))
+                     (Some [v]
+                       (let [(mut kids) (new-kids) (mut go) true]
+                         (push! (mut kids) v)
+                         (while go
+                           (let [save (.pos p)]
+                             (if (comma! (mut p))
+                                 (match (~(rule-sym n) (mut p))
+                                   (Some [w] (push! (mut kids) w))
+                                   (None [] (set! (.pos p) save) (set! go false)))
+                                 (set! go false))))
+                         (Some (mk (KList) kids lo (.pos p)))))))))))
 
-;;; One printed item. `k` is its child index when it captures.
-(defn print-item [(g Grammar) (it Item) (k i64)] (-> Code)
-  (match (.shape it)
-    (ILit [text] `(rt/tok! (mut w) ~text))
-    (IRef [n] `(print-at (get (.kids n) ~k) ~(level-of-rule g n) (mut w)))
-    (IRep [n]
-      `(for each (.kids (get (.kids n) ~k))
-         (print-at each ~(level-of-rule g n) (mut w))))
-    (ISep [n]
-      `(let [items (.kids (get (.kids n) ~k))]
-         (for i (range 0 (len items))
-           (when (> i 0) (rt/tok! (mut w) ","))
-           (print-at (get items i) ~(level-of-rule g n) (mut w)))))))
+(defn emit-token! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl)] (-> void)
+  (add-aux! (mut g)
+            `(defn ~(lex-sym (.name d)) [(p (mut rt/P))] (-> bool)
+               ~(lex-code g (mut c) (.body d))))
+  (when (= (.kind d) (DToken))
+    (add-aux! (mut g)
+              `(defn ~(rule-sym (.name d)) [(p (mut rt/P))] (-> (Option Node))
+                 (let [before (.pos p)]
+                   (skip! (mut p))
+                   (let [start (.pos p)]
+                     (if (~(lex-sym (.name d)) (mut p))
+                         (Some (leaf (~(kind-sym (.name d))) (rt/span (mut p) start (.pos p)) start (.pos p)))
+                         (do
+                           (rt/note-fail! (mut p) ~(.name d))
+                           (set! (.pos p) before)
+                           (None [Node])))))))))
 
-(defn print-arm [(g Grammar) (k Kind)] (-> Code)
-  (let [(mut body) (primitive/code-list-new)]
-    (match (.print k)
-      (POp [op]
-        (push! (mut body) `(print-at (get (.kids n) 0) ~(.level k) (mut w)))
-        (push! (mut body) `(rt/tok! (mut w) ~(.lit op)))
-        (push! (mut body) `(print-at (get (.kids n) 1) ~(+ (.level k) 1) (mut w))))
-      (PAlt [a base]
-        (let [(mut cap) 0]
-          (when base
-            (push! (mut body) `(print-at (get (.kids n) 0) ~(.level k) (mut w)))
-            (set! cap 1))
-          (for it (.items a)
-            (push! (mut body) (print-item g it cap))
-            (match (.shape it)
-              (ILit [_] 0)
-              (_ (set! cap (+ cap 1))))))))
-    `(~(kind-sym (.name k)) [] (do ~@body))))
+(defn emit-hidden! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl)] (-> void)
+  (add-aux! (mut g)
+            `(defn ~(hidden-sym (.name d)) [(p (mut rt/P))] (-> bool)
+               (let [s (.pos p)]
+                 (if ~(rec-code (mut g) (mut c) (.body d))
+                     true
+                     (do (set! (.pos p) s) false))))))
 
-(defn table-entry [(k Kind)] (-> Code)
-  `(~(.name k) ~(.arity k)))
+;;; A word literal may not run into the next character; punctuation may not be a
+;;; prefix of a longer literal that also matches here.
+(defn emit-lit! [(g (mut Grammar)) (l Lit)] (-> void)
+  (let [(mut guards) (primitive/code-list-new)]
+    (if (word-literal? (.text l))
+        (push! (mut guards)
+               `(let [e (.pos p)
+                      more (do (rt/advance! (mut p) ~(len (.text l)))
+                               (~(lex-sym (.word g)) (mut p)))]
+                  (set! (.pos p) e)
+                  (not more)))
+        (for other (.lits g)
+          (when (and (> (len (.text other)) (len (.text l)))
+                     (not (word-literal? (.text other)))
+                     (rt/at? (.text other) 0 (.text l)))
+            (push! (mut guards) `(not (rt/at-bytes? (mut p) ~(.text other)))))))
+    (add-aux! (mut g)
+              `(defn ~(lit-sym (.id l)) [(p (mut rt/P))] (-> bool)
+                 (let [s (.pos p)]
+                   (skip! (mut p))
+                   (if (and (rt/at-bytes? (mut p) ~(.text l)) ~@guards true)
+                       (do (rt/advance! (mut p) ~(len (.text l))) true)
+                       (do
+                         (rt/note-fail! (mut p) ~(.text l))
+                         (set! (.pos p) s)
+                         false)))))))
 
-;;; The whole generated module.
-(defn emit-module [(g Grammar)] (-> Code)
+;; ---------------------------------------------------------------- printing code
+
+;;; The rule a capture refers to, through `with` and `~`.
+(defn captured-ref [(e PE)] (-> (slice u8))
+  (match (.op e)
+    (ORef [] (.text e))
+    (OWith [] (captured-ref (get (.kids e) 0)))
+    (OKeep [] (captured-ref (get (.kids e) 0)))
+    (_ "")))
+
+;;; The precedence a position naming this rule requires. A rule outside the chain
+;;; that only passes something through, like `Arg = … | Assign`, requires what it
+;;; passes through, or `f((a, b))` would lose its parentheses.
+(defn rule-level [(g Grammar) (levels (ArrayList Named)) (name (slice u8)) (depth i64)] (-> i64)
+  (let [(mut out) (named-value levels name)]
+    (when (and (= out 0) (< depth 16))
+      (match (find-decl g name)
+        (Some [d]
+          (when (= (.kind d) (DRule))
+            (for a (.alts d)
+              (when (= (len (.label a)) 0)
+                (for it (seq-items (.seq a))
+                  (let [r (captured-ref it)]
+                    (when (> (len r) 0)
+                      (let [l (rule-level g levels r (+ depth 1))]
+                        (when (> l out) (set! out l))))))))))
+        (None [] 0)))
+    out))
+
+(defn level-of-item [(g Grammar) (levels (ArrayList Named)) (name (slice u8))] (-> i64)
+  (rule-level g levels name 0))
+
+;;; The literal the hidden rule prints, if any.
+(defn print-ref [(g Grammar) (levels (ArrayList Named)) (name (slice u8)) (source Code) (keep bool)] (-> Code)
+  (if keep
+      `(print-keep ~source (mut w))
+      `(print-at ~source ~(level-of-item g levels name) (mut w))))
+
+;;; Print `items`, drawing captures from `(get (.kids n) k)` from index `cap` on.
+;;; A `!` guard just before a capture parenthesises output that would start that way.
+(defn print-items [(g Grammar) (c (mut dsl/Cur)) (levels (ArrayList Named))
+                   (items (ArrayList PE)) (cap i64) (single bool)] (-> Code)
+  (let [(mut body) (primitive/code-list-new)
+        (mut k) cap
+        (mut guard) (None [PE])]
+    (for e items
+      (let [source (if single `o `(get (.kids n) ~k))
+            printed (print-item g (mut c) levels e source)]
+        (match (.op e)
+          (ONot [] (set! guard (Some e)))
+          (_
+            (if (captures? g (mut c) e)
+                (do
+                  (match guard
+                    (Some [ge]
+                      (push! (mut body) (guarded g (mut c) ge printed))
+                      (set! guard (None [PE])))
+                    (None [] (push! (mut body) printed)))
+                  (set! k (+ k 1)))
+                (push! (mut body) printed))))))
+    `(do ~@body)))
+
+(defn guarded [(g Grammar) (c (mut dsl/Cur)) (ge PE) (printed Code)] (-> Code)
+  (let [(mut lits) (empty-strs)
+        (mut tests) (primitive/code-list-new)]
+    (guard-lits! (get (.kids ge) 0) (mut lits))
+    (for l lits
+      (push! (mut tests)
+             (if (word-literal? l)
+                 `(rt/w-starts-word? (mut w) mark ~l)
+                 `(rt/w-starts? (mut w) mark ~l))))
+    (if (= (len lits) 0)
+        printed
+        `(let [mark (rt/w-mark! (mut w))]
+           ~printed
+           (when (or ~@tests)
+             (rt/w-wrap! (mut w) mark ~(.group-open g) ~(.group-close g)))))))
+
+(defn print-item [(g Grammar) (c (mut dsl/Cur)) (levels (ArrayList Named)) (e PE) (source Code)] (-> Code)
+  (match (.op e)
+    (OLit [] `(rt/tok! (mut w) ~(.text e)))
+    (ORef []
+      (match (find-decl g (.text e))
+        (Some [d]
+          (cond
+            (= (.kind d) (DHidden))
+              (cond
+                (.print-soft d) `(rt/soft-semi! (mut w))
+                (> (len (.print-text d)) 0) `(rt/tok! (mut w) ~(.print-text d))
+                :else `0)
+            (= (.kind d) (DFragment)) `0
+            :else (print-ref g levels (.text e) source false)))
+        (None [] `0)))
+    (OKeep []
+      (let [inner (get (.kids e) 0)]
+        (print-ref g levels (.text inner) source true)))
+    (OWith []
+      (let [inner (print-item g (mut c) levels (get (.kids e) 0) source)
+            (mut on) false
+            (mut off) false]
+        (for f (.keep-under g)
+          (when (contains? (.on e) f) (set! on true))
+          (when (contains? (.off e) f) (set! off true)))
+        (cond
+          on `(let [old (.keep w)]
+                (set! (.keep w) (+ old 1))
+                ~inner
+                (set! (.keep w) old))
+          off `(let [old (.keep w)]
+                 (set! (.keep w) 0)
+                 ~inner
+                 (set! (.keep w) old))
+          :else inner)))
+    (OStar [] (print-rep g levels e source false))
+    (OPlus [] (print-rep g levels e source false))
+    (OSepStar [] (print-rep g levels e source true))
+    (OSepPlus [] (print-rep g levels e source true))
+    (OOpt []
+      (let [inner (get (.kids e) 0)]
+        `(let [o ~source]
+           (unless (= (.kind o) (KNone))
+             ~(print-items g (mut c) levels (seq-items inner) 0 true)))))
+    (_ `0)))
+
+(defn print-rep [(g Grammar) (levels (ArrayList Named)) (e PE) (source Code) (commas bool)] (-> Code)
+  (let [name (.text (get (.kids e) 0))
+        min (level-of-item g levels name)]
+    (if commas
+        `(let [items (.kids ~source)]
+           (for i (range 0 (len items))
+             (when (> i 0) (rt/tok! (mut w) ","))
+             (print-at (get items i) ~min (mut w))))
+        `(for each (.kids ~source)
+           (print-at each ~min (mut w))))))
+
+(defn print-arm [(g Grammar) (c (mut dsl/Cur)) (levels (ArrayList Named)) (k Kind)] (-> Code)
+  (match (.print k)
+    (PLeaf []
+      `(~(kind-sym (.name k)) [] (rt/tok! (mut w) (.text n))))
+    (POp [op]
+      `(~(kind-sym (.name k)) []
+         (do
+           (print-at (get (.kids n) 0) ~(.level k) (mut w))
+           (rt/tok! (mut w) ~(.lit op))
+           (print-at (get (.kids n) 1) ~(+ (.level k) 1) (mut w)))))
+    (PAlt [a base-min]
+      (let [items (seq-items (.seq a))
+            is-chain (> (.arity k) (count-captures g (mut c) (.seq a)))]
+        (if is-chain
+            `(~(kind-sym (.name k)) []
+               (do
+                 (print-at (get (.kids n) 0) ~base-min (mut w))
+                 ~(print-items g (mut c) levels items 1 false)))
+            `(~(kind-sym (.name k)) []
+               ~(print-items g (mut c) levels items 0 false)))))))
+
+;; ---------------------------------------------------------------- the module
+
+(defn opaque-test [(g Grammar)] (-> Code)
+  (let [(mut arms) (primitive/code-list-new)]
+    (for name (.opaque g)
+      (push! (mut arms) `(~(kind-sym name) [] true)))
+    `(match (.kind n) ~@arms (_ false))))
+
+(defn emit-module! [(g (mut Grammar)) (c (mut dsl/Cur)) (levels (ArrayList Named))] (-> Code)
   (let [(mut variants) (primitive/code-list-new)
-        (mut forms) (primitive/code-list-new)
         (mut table) (primitive/code-list-new)
         (mut arms) (primitive/code-list-new)
         (mut level-arms) (primitive/code-list-new)
-        (mut puncts) (primitive/code-list-new)
-        (mut keywords) (primitive/code-list-new)
-        (mut lits) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut reps) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut seps) (ArrayList::new [(slice u8)] (malloc-allocator))]
+        (mut flag-consts) (primitive/code-list-new)
+        (mut bit) 1]
+    (for f (.flags g)
+      (push! (mut flag-consts) `(const ~(flag-sym f) ~bit))
+      (set! bit (* bit 2)))
     (for k (.kinds g)
       (push! (mut variants) `(~(kind-sym (.name k)) []))
-      (push! (mut table) (table-entry k))
-      (push! (mut arms) (print-arm g k))
-      (when (< (.level k) NO-LEVEL)
+      (push! (mut table) `(~(.name k) ~(.arity k)))
+      (push! (mut arms) (print-arm g (mut c) levels k))
+      (when (< (.level k) (no-level))
         (push! (mut level-arms) `(~(kind-sym (.name k)) [] ~(.level k)))))
-    ;; Parser functions, and the literals and repetitions they use.
-    (for d (.decls g)
-      (match d
-        (DRule [name alts]
-          (for i (range 0 (len alts))
-            (push! (mut forms) (emit-alt-fn name i (get alts i) false))
-            (collect-items! (get alts i) (mut lits) (mut reps) (mut seps)))
-          (push! (mut forms)
-                 `(defn ~(rule-sym name) [(p (mut rt/P))] (-> (Option Node))
-                    (let [save (.pos p)]
-                      ~(try-alts name 0 (len alts) false)))))
-        (DPostfix [name over alts]
-          (for i (range 0 (len alts))
-            (push! (mut forms) (emit-alt-fn name i (get alts i) true))
-            (collect-items! (get alts i) (mut lits) (mut reps) (mut seps)))
-          (push! (mut forms)
-                 `(defn ~(rule-sym name) [(p (mut rt/P))] (-> (Option Node))
-                    (match (~(rule-sym over) (mut p))
-                      (None [] (None [Node]))
-                      (Some [first]
-                        (let [(mut acc) first (mut go) true]
-                          (while go
-                            (let [save (.pos p)]
-                              (match ~(try-alts name 0 (len alts) true)
-                                (Some [r] (set! acc r))
-                                (None [] (set! (.pos p) save) (set! go false)))))
-                          (Some acc)))))))
-        (DInfix [name over ops]
-          (let [(mut top) 0]
-            (for op ops
-              (add-unique! (mut lits) (.lit op))
-              (when (> (.level op) top) (set! top (.level op))))
-            (for level (range 0 (+ top 1))
-              (push! (mut forms) (emit-infix-level name over ops level top)))
-            (push! (mut forms)
-                   `(defn ~(rule-sym name) [(p (mut rt/P))] (-> (Option Node))
-                      (~(infix-level-sym name 0) (mut p))))))))
-    (for n reps (push! (mut forms) (emit-rep n)))
-    (for n seps (push! (mut forms) (emit-sep n)))
-    (when (> (len seps) 0) (add-unique! (mut lits) ","))
-    ;; Lexer tables: words are keywords, the rest is punctuation, longest first.
-    (let [(mut longest) 0]
-      (for l lits (when (> (len l) longest) (set! longest (len l))))
-      (for size (range 0 longest)
-        (for l lits
-          (when (and (= (len l) (- longest size)) (not (rt/name-start? (get l 0))))
-            (push! (mut puncts) `(push! (mut out) ~l))))))
-    (for l lits
-      (when (rt/name-start? (get l 0))
-        (push! (mut keywords) `(push! (mut out) ~l))))
     `(do
-       (import "coil.alloc" :use [malloc-allocator])
+       (import "coil.alloc" :use [malloc-allocator box!])
        (import "coil.arraylist" :use [ArrayList])
        (import "hl.rt" :as rt)
 
-       (defsum Kind ~@variants (KList []) (KIdent []) (KNum []) (KStr []))
+       ~@flag-consts
+
+       (defsum Kind ~@variants (KList []) (KNone []) (KFlag []))
        (derive Eq Debug Kind)
-       (defstruct Node [(kind Kind) (text (slice u8)) (kids (ArrayList Node))])
+       (defstruct Node [(kind Kind) (text (slice u8)) (kids (ArrayList Node)) (lo i64) (hi i64)])
 
        (defn node-table [] (-> Code)
-         (quasiquote (~@table ("List" -1) ("Ident" 0) ("Num" 0) ("Str" 0))))
+         (quasiquote (~@table ("List" -1) ("None" 0) ("Flag" 0))))
 
        (defn new-kids [] (-> (ArrayList Node))
          (ArrayList::new [Node] (malloc-allocator)))
-       (defn leaf [(k Kind) (text (slice u8))] (-> Node)
-         (Node :kind k :text text :kids (new-kids)))
+       (defn mk [(k Kind) (kids (ArrayList Node)) (lo i64) (hi i64)] (-> Node)
+         (Node :kind k :text "" :kids kids :lo lo :hi hi))
+       (defn leaf [(k Kind) (text (slice u8)) (lo i64) (hi i64)] (-> Node)
+         (Node :kind k :text text :kids (new-kids) :lo lo :hi hi))
+       (defn none-node [] (-> Node) (leaf (KNone) "" 0 0))
+       (defn flag-node [] (-> Node) (leaf (KFlag) "" 0 0))
        (defn node2 [(k Kind) (a Node) (b Node)] (-> Node)
          (let [(mut kids) (new-kids)]
            (push! (mut kids) a)
            (push! (mut kids) b)
-           (Node :kind k :text "" :kids kids)))
+           (mk k kids (.lo a) (.hi b))))
+       (defn box-node [(n Node)] (-> i64)
+         (cast i64 (box! (malloc-allocator) Node n)))
 
-       ~(emit-token-rule "Ident" `rt/TIdent "an identifier")
-       ~(emit-token-rule "Num" `rt/TNum "a number")
-       ~(emit-token-rule "Str" `rt/TStr "a string")
-       ~@forms
+       (defn skip! [(p (mut rt/P))] (-> void)
+         (if (= (.ws-from p) (.pos p))
+             (set! (.pos p) (.ws-to p))
+             (let [from (.pos p)]
+               (~(lex-sym (.space g)) (mut p))
+               (set! (.ws-from p) from)
+               (set! (.ws-to p) (.pos p))
+               (set! (.ws-nl p) (rt/has-newline? (.src p) from (.pos p))))))
 
-       (defn puncts [] (-> (ArrayList (slice u8)))
-         (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
-           ~@puncts
-           out))
-       (defn keywords [] (-> (ArrayList (slice u8)))
-         (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
-           ~@keywords
-           out))
+       ;;; Is there a line terminator between here and the next token?
+       (defn newline-ahead? [(p (mut rt/P))] (-> bool)
+         (let [s (.pos p)]
+           (skip! (mut p))
+           (set! (.pos p) s)
+           (.ws-nl p)))
+
+       (defn skip-peek? [(p (mut rt/P))] (-> bool)
+         (let [s (.pos p)]
+           (skip! (mut p))
+           (let [at-end (rt/eof? (mut p))]
+             (set! (.pos p) s)
+             at-end)))
+
+       (defn comma! [(p (mut rt/P))] (-> bool)
+         (~(lit-sym (lit-id (mut g) ",")) (mut p)))
+
+       ~(primitive/code-symbol "@@AUX@@")
+
+       (defn parse-result [(src (slice u8)) (path (slice u8)) (flags i64)] (-> (Result Node rt/ParseError))
+         (let [(mut p) (rt/p-new src path flags ~(.memo-count g))]
+           (match (~(rule-sym (.start g)) (mut p))
+             (Some [n]
+               (skip! (mut p))
+               (if (rt/eof? (mut p))
+                   (Ok n)
+                   (do
+                     (rt/note-fail! (mut p) "end of input")
+                     (Err (rt/parse-error (mut p))))))
+             (None [] (Err (rt/parse-error (mut p)))))))
 
        ;;; Parse a whole file. Syntax errors stop the program with file:line:col.
        (defn parse [(src (slice u8)) (path (slice u8))] (-> Node)
-         (let [(mut p) (rt/parser-for src path ~(.comment g) (puncts) (keywords))]
-           (match (~(rule-sym (.start g)) (mut p))
-             (Some [n] (if (rt/at-eof? (mut p)) n (rt/parse-failed (mut p))))
-             (None [] (rt/parse-failed (mut p))))))
+         (match (parse-result src path 0)
+           (Ok [n] n)
+           (Err [e] (rt/parse-failed e))))
 
        (defn kind-level [(k Kind)] (-> i64)
-         (match k ~@level-arms (_ ~NO-LEVEL)))
+         (match k ~@level-arms (_ ~(no-level))))
 
+       (defn opaque-kind? [(n Node)] (-> bool) ~(opaque-test g))
+
+       ;;; Parentheses around this must stay: an opaque kind, at or under its base.
+       (defn opaque-spine? [(n Node)] (-> bool)
+         (cond
+           (opaque-kind? n) true
+           (and (> (len (.kids n)) 0) (< (kind-level (.kind n)) ~(no-level)))
+             (opaque-spine? (get (.kids n) 0))
+           :else false))
+
+       ;;; Print with this much precedence required: redundant written parentheses
+       ;;; go, missing ones appear.
        (defn print-at [(n Node) (min i64) (w (mut rt/W))] (-> void)
-         (if (< (kind-level (.kind n)) min)
-             (do
-               (rt/tok! (mut w) ~(.group-open g))
-               (print-node n (mut w))
-               (rt/tok! (mut w) ~(.group-close g)))
-             (print-node n (mut w))))
+         (match (.kind n)
+           (~(kind-sym (.group-kind g)) []
+             (let [inner (get (.kids n) 0)]
+               (if (and (= (.keep w) 0)
+                        (>= (kind-level (.kind inner)) min)
+                        (not (opaque-spine? inner)))
+                   (print-at inner min (mut w))
+                   (print-node n (mut w)))))
+           (_
+             (if (< (kind-level (.kind n)) min)
+                 (do
+                   (rt/tok! (mut w) ~(.group-open g))
+                   (print-node n (mut w))
+                   (rt/tok! (mut w) ~(.group-close g)))
+                 (print-node n (mut w))))))
+
+       ;;; Print a child exactly as written.
+       (defn print-keep [(n Node) (w (mut rt/W))] (-> void)
+         (let [old (.keep w)]
+           (set! (.keep w) (+ old 1))
+           (print-node n (mut w))
+           (set! (.keep w) old)))
 
        (defn print-node [(n Node) (w (mut rt/W))] (-> void)
          (match (.kind n)
            ~@arms
            (KList [] (panic "a List node has no printed form outside a repetition"))
-           (KIdent [] (rt/tok! (mut w) (.text n)))
-           (KNum [] (rt/tok! (mut w) (.text n)))
-           (KStr [] (rt/str-tok! (mut w) (.text n)))))
+           (KNone [] 0)
+           (KFlag [] 0)))
 
        ;;; The grammar printed back: `pretty` breaks lines, otherwise it is minimal.
        (defn render [(n Node) (pretty bool)] (-> (slice u8))
@@ -554,46 +1361,91 @@
            (print-at n 0 (mut w))
            (rt/w-finish w))))))
 
-(defn add-unique! [(xs (mut (ArrayList (slice u8)))) (s (slice u8))] (-> void)
-  (let [(mut hit) false]
-    (for x xs (when (= x s) (set! hit true)))
-    (unless hit (push! (mut xs) s))))
-
-(defn collect-items! [(a Alt)
-                      (lits (mut (ArrayList (slice u8))))
-                      (reps (mut (ArrayList (slice u8))))
-                      (seps (mut (ArrayList (slice u8))))] (-> void)
-  (for it (.items a)
-    (match (.shape it)
-      (ILit [t] (add-unique! (mut lits) t))
-      (IRef [_] 0)
-      (IRep [n] (add-unique! (mut reps) n))
-      (ISep [n] (add-unique! (mut seps) n)))))
-
 ;; ---------------------------------------------------------------- entry
 
-(defn module-text [(context Code)] (-> (slice u8))
-  (let [(mut c) (dsl/cursor (dsl/source-of context) (dsl/path-of context) "-> ,* = | ; *")
+(defn read-grammar [(source (slice u8)) (path (slice u8))] (-> (slice u8))
+  (let [(mut c) (dsl/grammar-cursor source path "-> ,* ,+ = | ; * + ? ! & ~ ( ) . @ -")
         (mut g) (Grammar
-                  :comment "//"
-                  :start ""
+                  :start "" :space "" :word ""
+                  :flags (empty-strs) :keep-under (empty-strs)
+                  :group-open "(" :group-close ")" :group-kind ""
+                  :opaque (empty-strs) :precedence (empty-strs)
                   :decls (ArrayList::new [Decl] (malloc-allocator))
                   :kinds (ArrayList::new [Kind] (malloc-allocator))
-                  :levels (ArrayList::new [RuleLevel] (malloc-allocator))
-                  :group-open ""
-                  :group-close "")]
+                  :lits (ArrayList::new [Lit] (malloc-allocator))
+                  :reps (empty-strs)
+                  :memo-count 0 :next-aux 0
+                  :aux (empty-strs)
+                  :path path)
+        (mut levels) (ArrayList::new [Named] (malloc-allocator))
+        (mut go) true]
     (dsl/expect! (mut c) "syntax")
-    (when (dsl/accept! (mut c) "comment")
-      (set! (.comment g) (.text (dsl/string! (mut c) "a comment leader"))))
-    (let [t (dsl/expect! (mut c) "start")]
-      (set! (.start g) (.text (dsl/name! (mut c) "the start rule")))
-      (while (not (dsl/eof? (mut c)))
-        (push! (mut (.decls g)) (read-decl (mut c))))
-      (unless (known-rule? g (.start g))
-        (dsl/die (mut c) t (dsl/join2 "no rule named " (.start g)))))
-    (analyse-decls! (mut g) (mut c))
-    (assign-levels! (mut g) (mut c))
-    (dsl/render (emit-module g))))
+    (while go
+      (cond
+        (dsl/accept! (mut c) "start") (set! (.start g) (.text (dsl/name! (mut c) "a rule")))
+        (dsl/accept! (mut c) "space") (set! (.space g) (.text (dsl/name! (mut c) "a fragment")))
+        (dsl/accept! (mut c) "word") (set! (.word g) (.text (dsl/name! (mut c) "a fragment")))
+        (dsl/accept! (mut c) "flags")
+          (while (not (dsl/accept! (mut c) ";"))
+            (push! (mut (.flags g)) (.text (dsl/name! (mut c) "a flag"))))
+        (dsl/accept! (mut c) "keep")
+          (while (not (dsl/accept! (mut c) ";"))
+            (push! (mut (.keep-under g)) (.text (dsl/name! (mut c) "a flag"))))
+        (dsl/accept! (mut c) "group")
+          (let [o (dsl/string! (mut c) "an opening literal")
+                e (dsl/string! (mut c) "a closing literal")]
+            (set! (.group-open g) (.text o))
+            (set! (.group-close g) (.text e))
+            (set! (.group-kind g) (.text (dsl/name! (mut c) "the parenthesis node"))))
+        (dsl/accept! (mut c) "opaque")
+          (while (not (dsl/accept! (mut c) ";"))
+            (push! (mut (.opaque g)) (.text (dsl/name! (mut c) "a kind"))))
+        (dsl/accept! (mut c) "precedence")
+          (while (not (dsl/accept! (mut c) ";"))
+            (push! (mut (.precedence g)) (.text (dsl/name! (mut c) "a rule"))))
+        :else (set! go false)))
+    (while (not (dsl/eof? (mut c)))
+      (push! (mut (.decls g)) (read-decl (mut c))))
+    (analyse! (mut g) (mut c))
+    (add-lit! (mut g) ",")
+    (assign-levels! (mut g) (mut c) (mut levels))
+    ;; Code generation order: bodies first, so literals and reps are all known.
+    (for d (.decls g)
+      (let [k (.kind d)]
+        (cond
+          (or (= k (DFragment)) (= k (DToken))) (emit-token! (mut g) (mut c) d)
+          (= k (DHidden)) (emit-hidden! (mut g) (mut c) d)
+          (= k (DRule)) (emit-rule! (mut g) (mut c) d)
+          (= k (DPostfix)) (emit-chain! (mut g) (mut c) d true)
+          (= k (DSuffix)) (emit-chain! (mut g) (mut c) d false)
+          (= k (DInfix)) (emit-infix! (mut g) d)
+          :else 0)))
+    (emit-reps! (mut g))
+    (for l (.lits g) (emit-lit! (mut g) l))
+    (let [shell (dsl/render (emit-module! (mut g) (mut c) levels))]
+      (splice-aux shell (.aux g)))))
+
+;;; The module's text with every generated function where the marker stands.
+(defn splice-aux [(shell (slice u8)) (aux (ArrayList (slice u8)))] (-> (slice u8))
+  (let [marker "@@AUX@@"
+        (mut b) (str/StrBuf::new (malloc-allocator))
+        (mut at) -1]
+    (for i (range 0 (- (len shell) (len marker)))
+      (when (and (< at 0) (rt/at? shell i marker)) (set! at i)))
+    (when (< at 0) (panic "generated module is missing its marker"))
+    (for i (range 0 at) (push! (mut (.bytes b)) (get shell i)))
+    (for form aux
+      (push-str! (mut b) form)
+      (push-str! (mut b) "\n"))
+    (for i (range (+ at (len marker)) (len shell)) (push! (mut (.bytes b)) (get shell i)))
+    (finish! (mut b))))
 
 (defn read-syntax [(context Code)] (-> Code)
-  (primitive/code-read (module-text context) `(reader-config)))
+  (primitive/code-read (read-grammar (dsl/source-of context) (dsl/path-of context))
+                       `(reader-config)))
+
+;;; The same compiler as a generator, for grammars a reader must call at compile
+;;; time: a provider image is built with no readers active, so it cannot import a
+;;; .syntax module. An ordinary module says (meta (syntax/define-from TEXT PATH)).
+(defn define-from [(source (slice u8)) (path (slice u8))] (-> Code)
+  (primitive/code-read (read-grammar source path) `(reader-config)))

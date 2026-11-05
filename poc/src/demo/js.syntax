@@ -1,44 +1,385 @@
-# The fragment of JavaScript the demo bundler handles.
+# JavaScript: ES2023 scripts and modules, as a scannerless PEG.
+# A bundler needs the program's structure and tolerates leniency about programs that
+# are already invalid, so early errors that depend on semantics are not modelled.
 syntax
-comment "//"
 start Program
+space Space
+word IdPart
+flags noin gen await ;
+keep noin ;
+group "(" ")" Paren
+opaque OptMember OptIndex OptCall Coalesce NewNoArgs ;
+precedence Seq AssignExpr AssignBase Cond Binary Unary Exp Update Call New Primary ;
 
-rule Program = Stmt* -> Program ;
+# ---------------------------------------------------------------- bytes
+
+fragment LineEnd = [\n\r] | " " | " " ;
+fragment LineComment = "//" (!LineEnd .)* ;
+fragment PlainBlock = "/*" (!"*/" .)* "*/" ;
+fragment HtmlOpen = "<!--" (!LineEnd .)* ;
+# Annex B: `-->` opens a comment when only space and comments precede it on its line.
+fragment InlineSpace = [ \t\x0b\x0c] | " " | "﻿" | " " | " " | " "
+                     | " " | " " | " " | " " | " " | " " | " "
+                     | " " | " " | " " | " " | "　" ;
+fragment HtmlClose = (InlineSpace | PlainBlock)* "-->" (!LineEnd .)* ;
+fragment MultiLineBlock = "/*" (!"*/" !LineEnd .)* LineEnd (!"*/" .)* "*/" HtmlClose? ;
+fragment NewLine = LineEnd HtmlClose? ;
+fragment Space = (@bof HtmlClose)? (NewLine | InlineSpace | LineComment | MultiLineBlock | PlainBlock | HtmlOpen)* ;
+
+fragment Hex = [0-9a-fA-F] ;
+fragment UnicodeEsc = "\\u" (Hex Hex Hex Hex | "{" Hex+ "}") ;
+fragment IdStart = [a-zA-Z_$] | UnicodeEsc | !InlineSpace !LineEnd [\x80-\xff] ;
+fragment IdPart = [a-zA-Z0-9_$] | UnicodeEsc | !InlineSpace !LineEnd [\x80-\xff] ;
+fragment Reserved = ("break" | "case" | "catch" | "class" | "const" | "continue" | "debugger"
+                   | "default" | "delete" | "do" | "else" | "enum" | "export" | "extends" | "false"
+                   | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof" | "new"
+                   | "null" | "return" | "super" | "switch" | "this" | "throw" | "true" | "try"
+                   | "typeof" | "var" | "void" | "while" | "with") !IdPart ;
+
+# Each identifier role is its own node kind, so later languages never confuse a
+# binding, a reference, a property name and a label.
+token Ident = !Reserved IdStart IdPart* ;
+token BindName = !Reserved IdStart IdPart* ;
+token LabelName = !Reserved IdStart IdPart* ;
+token PropName = IdStart IdPart* ;
+token PrivateName = "#" IdStart IdPart* ;
+
+fragment Digits = [0-9]+ ("_" [0-9]+)* ;
+fragment Exponent = [eE] [+\-]? Digits ;
+token Num = ( ("0x" | "0X") Hex (Hex | "_")* "n"?
+            | ("0b" | "0B") [01_]+ "n"?
+            | ("0o" | "0O") [0-7_]+ "n"?
+            | "0" [0-7]+ ![0-9eE_n]
+            | Digits "n"
+            | Digits "." Digits? Exponent?
+            | "." Digits Exponent?
+            | Digits Exponent?
+            ) !IdStart ;
+
+fragment StrEsc = "\\" ("\r\n" | .) ;
+token Str = "\"" (StrEsc | [^"\\\n\r])* "\"" | "'" (StrEsc | [^'\\\n\r])* "'" ;
+
+fragment TplChars = (StrEsc | "$" !"{" | [^`$\\])* ;
+token TemplateFull = "`" TplChars "`" ;
+token TemplateHead = "`" TplChars "${" ;
+token TemplateMiddle = "}" TplChars "${" ;
+token TemplateTail = "}" TplChars "`" ;
+
+fragment RegexClass = "[" ("\\" !LineEnd . | [^\]\\\n\r])* "]" ;
+fragment RegexChar = "\\" !LineEnd . | RegexClass | [^/\[\\\n\r] ;
+token Regex = "/" !"*" !"/" RegexChar+ "/" IdPart* ;
+
+token AssignOp = ">>>=" | "<<=" | ">>=" | "**=" | "&&=" | "||=" | "??=" | "+=" | "-=" | "*=" | "/="
+               | "%=" | "&=" | "|=" | "^=" | "=" !("=" | ">") ;
+
+token Hashbang = "#!" (!LineEnd .)* ;
+
+hidden rule Semi prints soft ";" = ";" | &"}" | @eof | @nl ;
+
+# ---------------------------------------------------------------- program
+
+rule Program = Hashbang? Stmt* -> Program ;
 
 rule Stmt
-  = "import" "{" Ident,* "}" "from" Str ";" -> Import
-  | "export" Stmt -> Export
-  | "const" Ident "=" Expr ";" -> Const
-  | "function" Ident "(" Ident,* ")" Block -> Func
-  | "return" Expr ";" -> Return
-  | "if" "(" Expr ")" Block "else" Block -> If
-  | "if" "(" Expr ")" Block -> IfOnly
-  | Expr ";" -> ExprStmt
-  | Block
+  = Block
+  | "var" with(-noin) Declarator,+ Semi -> VarDecl
+  | LexicalDecl
+  | FunctionDecl
+  | ClassDecl
+  | ";" -> Empty
+  | "if" "(" with(-noin) Seq ")" Stmt ("else" Stmt)? -> If
+  | "do" Stmt "while" "(" with(-noin) Seq ")" ";"? -> DoWhile
+  | "while" "(" with(-noin) Seq ")" Stmt -> While
+  | ForStmt
+  | "continue" (@nonl LabelName)? Semi -> Continue
+  | "break" (@nonl LabelName)? Semi -> Break
+  | "return" (@nonl with(-noin) Seq)? Semi -> Return
+  | "with" "(" with(-noin) Seq ")" Stmt -> With
+  | "switch" "(" with(-noin) Seq ")" "{" with(-noin) SwitchCase* "}" -> Switch
+  | "throw" @nonl with(-noin) Seq Semi -> Throw
+  | "try" Block CatchClause? ("finally" Block)? -> Try
+  | "debugger" Semi -> Debugger
+  | ImportDecl
+  | ExportDecl
+  | LabelName ":" Stmt -> Labeled
+  | !("{" | "function" | "class" | "let" "[" | "async" @nonl "function") with(-noin) Seq Semi -> ExprStmt
   ;
 
-rule Block = "{" Stmt* "}" -> Block ;
+rule Block = "{" with(-noin) Stmt* "}" -> Block ;
 
-infix Expr over Unary
+rule LexicalDecl
+  = "let" with(-noin) Declarator,+ Semi -> LetDecl
+  | "const" with(-noin) Declarator,+ Semi -> ConstDecl
+  ;
+
+rule Declarator = BindTarget ("=" Assign)? -> Declarator ;
+
+rule SwitchCase
+  = "case" Seq ":" Stmt* -> Case
+  | "default" ":" Stmt* -> Default
+  ;
+
+rule CatchClause = "catch" CatchHead? Block -> Catch ;
+rule CatchHead = "(" BindTarget ")" -> CatchHead ;
+
+rule ForStmt
+  = "for" "(" ForInit? ";" with(-noin) Seq? ";" with(-noin) Seq? ")" Stmt -> For
+  | "for" "(" ForLeft "in" with(-noin) Seq ")" Stmt -> ForIn
+  | "for" "await"? "(" ForLeft "of" with(-noin) Assign ")" Stmt -> ForOf
+  ;
+
+rule ForInit
+  = "var" with(noin) Declarator,+ -> VarInit
+  | "let" with(noin) Declarator,+ -> LetInit
+  | "const" with(noin) Declarator,+ -> ConstInit
+  | with(noin) Seq
+  ;
+
+rule ForLeft
+  = "var" BindTarget "=" with(noin) Assign -> VarLeftInit
+  | "var" BindTarget -> VarLeft
+  | "let" BindTarget -> LetLeft
+  | "const" BindTarget -> ConstLeft
+  | Call
+  ;
+
+# ---------------------------------------------------------------- bindings
+
+rule BindTarget = BindName | ArrayPattern | ObjectPattern ;
+rule BindElement = BindTarget ("=" with(-noin) Assign)? -> BindElement ;
+
+rule ArrayPattern = "[" PatternSlot* "]" -> ArrayPattern ;
+rule PatternSlot
+  = "," -> PatHole
+  | "..." BindTarget -> PatRest
+  | BindElement "," -> PatItem
+  | BindElement &"]" -> PatLast
+  ;
+
+rule ObjectPattern = "{" PatternProp,* "}" -> ObjectPattern ;
+rule PatternProp
+  = "..." BindTarget -> PatPropRest
+  | PropKey ":" BindElement -> PatProp
+  | BindName ("=" with(-noin) Assign)? -> PatShort
+  ;
+
+# ---------------------------------------------------------------- functions
+
+rule Params = "(" Param,* ")" -> Params ;
+rule Param
+  = "..." BindTarget -> RestParam
+  | BindTarget ("=" with(-noin) Assign)? -> Param
+  ;
+
+rule FuncBody = "{" with(-noin) Stmt* "}" -> FuncBody ;
+
+rule FunctionDecl
+  = "async" @nonl "function" "*" BindName with(gen await -noin) Params with(gen await -noin) FuncBody -> AsyncGenDecl
+  | "async" @nonl "function" BindName with(await -gen -noin) Params with(await -gen -noin) FuncBody -> AsyncFuncDecl
+  | "function" "*" BindName with(gen -await -noin) Params with(gen -await -noin) FuncBody -> GenDecl
+  | "function" BindName with(-gen -await -noin) Params with(-gen -await -noin) FuncBody -> FuncDecl
+  ;
+
+rule FunctionExpr
+  = "async" @nonl "function" "*" BindName? with(gen await -noin) Params with(gen await -noin) FuncBody -> AsyncGenExpr
+  | "async" @nonl "function" BindName? with(await -gen -noin) Params with(await -gen -noin) FuncBody -> AsyncFuncExpr
+  | "function" "*" BindName? with(gen -await -noin) Params with(gen -await -noin) FuncBody -> GenExpr
+  | "function" BindName? with(-gen -await -noin) Params with(-gen -await -noin) FuncBody -> FuncExpr
+  ;
+
+rule ArrowParams = Params | BindName ;
+rule ArrowBody = with(-gen -await) FuncBody | !"{" Assign -> ExprBody ;
+rule AsyncArrowBody = with(await -gen) FuncBody | !"{" with(await) Assign -> ExprBody ;
+
+rule PropKey
+  = PropName | Str | Num | PrivateName
+  | "[" with(-noin) Assign "]" -> Computed
+  ;
+
+rule MethodDef
+  = "async" @nonl "*" PropKey with(gen await -noin) Params with(gen await -noin) FuncBody -> AsyncGenMethod
+  | "async" @nonl PropKey with(await -gen -noin) Params with(await -gen -noin) FuncBody -> AsyncMethod
+  | "*" PropKey with(gen -await -noin) Params with(gen -await -noin) FuncBody -> GenMethod
+  | "get" PropKey with(-gen -await -noin) Params with(-gen -await -noin) FuncBody -> Getter
+  | "set" PropKey with(-gen -await -noin) Params with(-gen -await -noin) FuncBody -> Setter
+  | PropKey with(-gen -await -noin) Params with(-gen -await -noin) FuncBody -> Method
+  ;
+
+# ---------------------------------------------------------------- classes
+
+rule ClassHeritage = "extends" Call -> ClassHeritage ;
+rule ClassBody = "{" ClassMember* "}" -> ClassBody ;
+
+rule ClassDecl = "class" BindName ClassHeritage? ClassBody -> ClassDecl ;
+rule ClassExpr = "class" BindName? ClassHeritage? ClassBody -> ClassExpr ;
+
+rule ClassMember
+  = ";" -> ClassEmpty
+  | "static" with(-gen -await -noin) FuncBody -> StaticBlock
+  | "static" MethodDef -> StaticMethod
+  | MethodDef
+  | "static" PropKey ("=" with(-gen -await -noin) Assign)? Semi -> StaticField
+  | PropKey ("=" with(-gen -await -noin) Assign)? Semi -> Field
+  ;
+
+# ---------------------------------------------------------------- modules
+
+rule ModuleName = PropName | Str ;
+
+rule ImportDecl
+  = "import" Str Semi -> ImportBare
+  | "import" ImportClause "from" Str Semi -> Import
+  ;
+rule ImportClause
+  = BindName "," ImportRest -> ImportDefaultAnd
+  | BindName -> ImportDefault
+  | ImportRest
+  ;
+rule ImportRest
+  = "*" "as" BindName -> ImportNamespace
+  | "{" ImportSpec,* "}" -> ImportNamed
+  ;
+rule ImportSpec
+  = ModuleName "as" BindName -> ImportAs
+  | BindName -> ImportName
+  ;
+
+rule ExportDecl
+  = "export" "*" "from" Str Semi -> ExportAll
+  | "export" "*" "as" ModuleName "from" Str Semi -> ExportAllAs
+  | "export" "{" ExportSpec,* "}" "from" Str Semi -> ExportFrom
+  | "export" "{" ExportSpec,* "}" Semi -> ExportNamed
+  | "export" "default" FunctionDefault -> ExportDefaultDecl
+  | "export" "default" !("function" | "class" | "async" @nonl "function") Assign Semi -> ExportDefault
+  | "export" "var" with(-noin) Declarator,+ Semi -> ExportVar
+  | "export" LexicalDecl -> ExportLexical
+  | "export" FunctionDecl -> ExportFunction
+  | "export" ClassDecl -> ExportClass
+  ;
+rule FunctionDefault = FunctionExpr | ClassExpr ;
+rule ExportSpec
+  = ModuleName "as" ModuleName -> ExportAs
+  | ModuleName -> ExportName
+  ;
+
+# ---------------------------------------------------------------- expressions
+
+postfix Seq over Assign  "," Assign -> Seq ;
+
+memo rule Assign = AssignExpr ;
+rule AssignExpr
+  = "async" @nonl ArrowParams @nonl "=>" AsyncArrowBody -> AsyncArrow
+  | ArrowParams @nonl "=>" ArrowBody -> Arrow
+  | if(gen) "yield" @nonl "*" Assign -> YieldStar
+  | if(gen) "yield" (@nonl Assign)? -> Yield
+  | AssignBase
+  ;
+suffix AssignBase over Cond  AssignOp Assign -> Assignment ;
+suffix Cond over Binary  "?" with(-noin) Assign ":" Assign -> Cond ;
+
+infix Binary over Unary
   left "||" Or
   left "&&" And
-  left "===" StrictEq "!==" StrictNeq
+  left "??" Coalesce
+  left "|" BitOr
+  left "^" BitXor
+  left "&" BitAnd
+  left "==" Eq "!=" Ne "===" StrictEq "!==" StrictNe
+  left "<" Lt ">" Gt "<=" Le ">=" Ge "instanceof" InstanceOf unless(noin) "in" In
+  left "<<" Shl ">>>" Ushr ">>" Shr
   left "+" Add "-" Sub
-  left "*" Mul "/" Div
+  left "*" Mul "/" Div "%" Mod
   ;
 
-rule Unary = "!" Unary -> Not | "-" Unary -> Neg | Postfix ;
+rule Unary
+  = "!" Unary -> Not
+  | "~" Unary -> BitNot
+  | "+" Unary -> Pos
+  | "-" Unary -> Neg
+  | "typeof" Unary -> TypeOf
+  | "void" Unary -> Void
+  | "delete" Unary -> Delete
+  | if(await) "await" Unary -> Await
+  | Exp
+  ;
 
-postfix Postfix over Primary
-  "(" Expr,* ")" -> Call
-  | "." Ident -> Member
+suffix Exp over Update  "**" Unary -> Pow ;
+
+rule Update
+  = "++" Unary -> PreInc
+  | "--" Unary -> PreDec
+  | PostUpdate
+  ;
+suffix PostUpdate over Call
+  @nonl "++" -> PostInc
+  | @nonl "--" -> PostDec
+  ;
+
+postfix Call over New
+  "." PropMember -> Member
+  | "[" with(-noin) Seq "]" -> Index
+  | Args -> CallExpr
+  | Template -> Tagged
+  | "?." "(" with(-noin) Arg,* ")" -> OptCall
+  | "?." "[" with(-noin) Seq "]" -> OptIndex
+  | "?." !Digit PropMember -> OptMember
+  ;
+fragment Digit = [0-9] ;
+rule PropMember = PropName | PrivateName ;
+
+rule Args = "(" with(-noin) Arg,* ")" -> Args ;
+rule Arg = "..." with(-noin) Assign -> Spread | with(-noin) Assign ;
+
+memo postfix NewCallee over NewBase
+  "." PropMember -> Member
+  | "[" with(-noin) Seq "]" -> Index
+  | Template -> Tagged
+  ;
+rule NewBase = New | Primary ;
+
+rule New
+  = "new" "." "target" -> NewTarget
+  | "new" ~NewCallee Args -> NewExpr
+  | "new" ~NewCallee -> NewNoArgs
+  | Primary
   ;
 
 rule Primary
-  = Num
-  | Str
+  = "this" -> This
+  | "null" -> Null
   | "true" -> True
   | "false" -> False
+  | "super" -> Super
+  | "import" "." "meta" -> ImportMeta
+  | "import" "(" with(-noin) Assign ("," with(-noin) Assign)? ","? ")" -> ImportCall
+  | Num
+  | Str
+  | Template
+  | Regex
+  | ArrayLit
+  | ObjectLit
+  | FunctionExpr
+  | ClassExpr
+  | "(" with(-noin) Seq ")" -> Paren
+  | PrivateName
   | Ident
-  | "(" Expr ")"
+  ;
+
+rule Template = TemplateFull | TemplateHead with(-noin) Seq TemplateRest* TemplateTail -> Template ;
+rule TemplateRest = TemplateMiddle with(-noin) Seq -> TemplatePart ;
+
+rule ArrayLit = "[" ArraySlot* "]" -> ArrayLit ;
+rule ArraySlot
+  = "," -> Hole
+  | Arg "," -> Elem
+  | Arg &"]" -> ElemLast
+  ;
+
+rule ObjectLit = "{" ObjectProp,* "}" -> ObjectLit ;
+rule ObjectProp
+  = "..." with(-noin) Assign -> SpreadProp
+  | MethodDef
+  | PropKey ":" with(-noin) Assign -> Prop
+  | Ident "=" with(-noin) Assign -> CoverInit
+  | Ident -> Shorthand
   ;
