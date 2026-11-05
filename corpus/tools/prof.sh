@@ -6,7 +6,7 @@ n=${B:t}
 sample $n 3 1 -wait -mayDie -file $S/prof.txt >/dev/null 2>&1 &
 pid=$!
 sleep 0.3
-for i in 1 2 3 4 5 6 7 8; do $B "$@" >/dev/null 2>&1; done
+for i in {1..40}; do $B "$@" >/dev/null 2>&1; done
 wait $pid
 python3 - <<PY
 import re
