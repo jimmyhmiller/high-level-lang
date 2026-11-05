@@ -1,0 +1,228 @@
+# Legal comments: `/*!`, `//!`, or anything saying @license or @preserve. They leave the code and go
+# to the end of the output, or to a file of their own, each once.
+rules bundle.legal over bundle.js
+use bundle.js as js
+use bundle.gaps as gaps
+
+fn legal?(comment: Text) -> Bool =
+  starts-with(comment, "/*!") or starts-with(comment, "//!")
+  or contains-text?(comment, "@license") or contains-text?(comment, "@preserve")
+
+fn worth-looking?(src: Text) -> Bool =
+  contains-text?(src, "/*!") or contains-text?(src, "//!") or contains-text?(src, "@license")
+  or contains-text?(src, "@preserve")
+
+fn comments-in!(src: Text, from: Int, to: Int, out: mut [Text]) -> Void {
+  if to <= from { return }
+  let gap = src[from..to]
+  if not worth-looking?(gap) { return }
+  match gaps.parse(gap, "<gap>") {
+    gaps.Gap(List(pieces...)) => for p in pieces {
+      if p is gaps.BlockNote(_) | gaps.LineNote(_) {
+        if legal?(p.text) { out += p.text }
+      }
+    }
+    _ => panic "a gap scans to pieces"
+  }
+}
+
+# Where a comment might start being legal: every place a marker appears.
+fn markers(src: Text) -> [Int] {
+  var out: [Int] = []
+  for i in 0..len(src) {
+    let c = src[i]
+    if (c == '/' and (at?(src, i, "/*!") or at?(src, i, "//!")))
+       or (c == '@' and (at?(src, i, "@license") or at?(src, i, "@preserve"))) {
+      out += i
+    }
+  }
+  out
+}
+
+# Where the last token ending at or before `at` ends, and the first starting after it starts, found
+# by walking down the tree: a node spans its tokens. -1 for the end means `at` is inside a token.
+fn end-before(n: Node, at: Int) -> Int {
+  var best = 0
+  for k in n.kids {
+    if k.hi > k.lo {
+      if k.hi <= at {
+        if k.hi > best { best = k.hi }
+      } else if k.lo <= at {
+        if len(k.kids) == 0 { return -1 }
+        let inner = end-before(k, at)
+        if inner < 0 { return -1 }
+        if inner > best { best = inner }
+      }
+    }
+  }
+  best
+}
+
+fn start-after(n: Node, at: Int, size: Int) -> Int {
+  var best = size
+  for k in n.kids {
+    if k.hi > k.lo {
+      if k.lo > at {
+        if k.lo < best { best = k.lo }
+      } else if k.hi > at and len(k.kids) > 0 {
+        let inner = start-after(k, at, size)
+        if inner < best { best = inner }
+      }
+    }
+  }
+  best
+}
+
+# A file's legal comments, in order. Only the gaps between tokens that hold a marker are looked at.
+fn of-file(src: Text, tree: Node) -> [Text] {
+  let found = markers(src)
+  if len(found) == 0 { return [] }
+  var out: [Text] = []
+  var done: [Int] = []
+  for m in found {
+    let start = end-before(tree, m)
+    if start >= 0 and not (start in done) {
+      done += start
+      comments-in!(src, start, start-after(tree, m, len(src)), out)
+    }
+  }
+  out
+}
+
+# Each comment once, the first time it appears.
+fn once(xs: [Text]) -> [Text] {
+  var out: [Text] = []
+  for x in xs {
+    if not (x in out) { out += x }
+  }
+  out
+}
+
+# The same, keeping each where it last appears, as esbuild does for a minified stylesheet.
+fn once-last(xs: [Text]) -> [Text] {
+  var out: [Text] = []
+  for i in 0..len(xs) {
+    let later = any j in i + 1..len(xs): xs[j] == xs[i]
+    if not later { out += xs[i] }
+  }
+  out
+}
+
+fn lines(xs: [Text]) -> Text {
+  var b = buf-new()
+  for x in xs {
+    buf-add!(b, x)
+    buf-add!(b, "\n")
+  }
+  buf-text(b)
+}
+
+record Placement { tail: Text, file: Text }
+
+# A legal comment and the file it came from.
+record Note { path: Text, text: Text }
+
+fn package-file(path: Text) -> Text? {
+  var at = -1
+  let marker = "node_modules/"
+  for i in 0..len(path) {
+    if at?(path, i, marker) { at = i + len(marker) }
+  }
+  if at < 0 then none else some(path[at..len(path)])
+}
+
+fn indented(text: Text) -> Text {
+  var b = buf-new()
+  buf-add!(b, "  ")
+  for c in text {
+    buf-byte!(b, c)
+    if c == '\n' { buf-add!(b, "  ") }
+  }
+  buf-text(b)
+}
+
+# Inside one `/*! … */`, a comment's own `/*` and `*/` become `(*` and `*)`.
+fn quoted(text: Text) -> Text =
+  if starts-with(text, "//") then "(*" ++ text[2..len(text)] ++ " *)"
+  else "(*" ++ text[2..len(text) - 2] ++ "*)"
+
+record Split { local: [Text], files: [Text], by-file: [[Text]] }
+
+# Comments from packages are grouped by file; the program's own are kept apart, each once.
+fn split(notes: [Note]) -> Split {
+  var local: [Text] = []
+  var files: [Text] = []
+  var by-file: [[Text]] = []
+  for n in notes {
+    match package-file(n.path) {
+      none => if not (n.text in local) { local += n.text }
+      some(f) => {
+        var at = -1
+        for i in 0..len(files) {
+          if files[i] == f { at = i }
+        }
+        if at < 0 {
+          files += f
+          by-file += []
+          at = len(files) - 1
+        }
+        if not (n.text in by-file[at]) { by-file[at] += n.text }
+      }
+    }
+  }
+  Split(local: local, files: files, by-file: by-file)
+}
+
+fn same-texts?(a: [Text], b: [Text]) -> Bool = len(a) == len(b) and (all i in 0..len(a): a[i] == b[i])
+
+# Files in a row with the same comments share them: their names, then the comments once.
+fn bundled-block(sp: Split, quote: Bool) -> Text {
+  var b = buf-new()
+  for i in 0..len(sp.files) {
+    let same-as-next = i + 1 < len(sp.files) and same-texts?(sp.by-file[i + 1], sp.by-file[i])
+    let same-as-last = i > 0 and same-texts?(sp.by-file[i - 1], sp.by-file[i])
+    if i > 0 and not same-as-last { buf-add!(b, "\n") }
+    buf-add!(b, sp.files[i])
+    buf-add!(b, ":\n")
+    if not same-as-next {
+      for c in sp.by-file[i] {
+        buf-add!(b, indented(if quote then quoted(c) else c))
+        buf-add!(b, "\n")
+      }
+    }
+  }
+  buf-text(b)
+}
+
+fn eof-text(sp: Split) -> Text {
+  let packages = if len(sp.files) == 0 then "" else "/*! Bundled license information:\n\n" ++ bundled-block(sp, true) ++ "*/\n"
+  lines(sp.local) ++ packages
+}
+
+fn file-text(sp: Split) -> Text {
+  let packages = if len(sp.files) == 0 then "" else "\nBundled license information:\n\n" ++ bundled-block(sp, false)
+  lines(sp.local) ++ packages
+}
+
+# What goes at the end of `outfile`, and what goes in a file of its own, for `--legal-comments`.
+fn placed(mode: Text, notes: [Note], outfile: Text) -> Placement {
+  if len(notes) == 0 { return Placement(tail: "", file: "") }
+  let sp = split(notes)
+  match mode {
+    "eof" => Placement(tail: eof-text(sp), file: "")
+    "none" => Placement(tail: "", file: "")
+    "external" => Placement(tail: "", file: file-text(sp))
+    "linked" => {
+      var base = outfile
+      for i in 0..len(outfile) {
+        if outfile[i] == '/' { base = outfile[i + 1..len(outfile)] }
+      }
+      Placement(tail: "/*! For license information please see " ++ base ++ ".LEGAL.txt */\n", file: file-text(sp))
+    }
+    "inline" => panic "--legal-comments=inline is not implemented yet; use eof, linked, external or none"
+    other => panic "--legal-comments is eof, linked, external or none, not {}", other
+  }
+}
+
+# For a stylesheet: its comments as notes of one file outside any package.
+fn notes-of(texts: [Text]) -> [Note] = [Note(path: "", text: t) for t in texts]

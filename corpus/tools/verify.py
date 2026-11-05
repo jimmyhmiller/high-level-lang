@@ -215,6 +215,51 @@ lowered_check("app/react.js", 2017, ["--platform=node"], "react")
 for app in ["rx", "zod4", "immer", "main"]:
     lowered_check(f"app/ts/{app}.ts", 2018, [], f"{app}.ts")
 
+print("== stylesheets against esbuild")
+def css_normal(path):
+    text = re.sub(r"-[A-Z0-9]{8}\.", "-HASH.", open(path).read())
+    return subprocess.run([E, "--minify", "--loader=css", "--log-level=error"], input=text, capture_output=True, text=True, timeout=60).stdout
+FILE_LOADERS = ["--loader:.png=file", "--loader:.woff2=file"]
+for entry, flags in [("app/css/main.css", []), ("app/css/main.css", ["--minify"]), ("app/css/edge.css", []), ("app/css/edge.css", ["--minify"])]:
+    for d in [f"{SCRATCH}/css-o", f"{SCRATCH}/css-e"]:
+        os.makedirs(d, exist_ok=True)
+        for f in glob.glob(d + "/*"): os.unlink(f)
+    code, _ = sh([ESB, entry, f"--outfile={SCRATCH}/css-o/out.css"] + FILE_LOADERS + flags)
+    sh([E, entry, "--bundle", f"--outfile={SCRATCH}/css-e/out.css", "--log-level=error"] + FILE_LOADERS + flags)
+    names = lambda d: sorted(re.sub(r"-[A-Z0-9]{8}\.", "-HASH.", os.path.basename(f)) for f in glob.glob(d + "/*"))
+    same = code == 0 and css_normal(f"{SCRATCH}/css-o/out.css") == css_normal(f"{SCRATCH}/css-e/out.css")
+    check(same and names(f"{SCRATCH}/css-o") == names(f"{SCRATCH}/css-e"),
+          f"{entry} {' '.join(flags)}: the same stylesheet as esbuild's, once both are normalised; {os.path.getsize(f'{SCRATCH}/css-o/out.css')} vs {os.path.getsize(f'{SCRATCH}/css-e/out.css')} bytes")
+for flags in [[], ["--minify"]]:
+    for d in [f"{SCRATCH}/css-o", f"{SCRATCH}/css-e"]:
+        for f in glob.glob(d + "/*"): os.unlink(f)
+    sh([ESB, "app/css/entry.js", f"--outfile={SCRATCH}/css-o/app.js"] + FILE_LOADERS + flags)
+    sh([E, "app/css/entry.js", "--bundle", f"--outfile={SCRATCH}/css-e/app.js", "--log-level=error"] + FILE_LOADERS + flags)
+    ran = [re.sub(r"-[A-Z0-9]{8}\.", "-HASH.", sh(["node", f"{SCRATCH}/css-{w}/app.js"], 15)[1]) for w in "oe"]
+    check(ran[0] and ran[0] == ran[1] and css_normal(f"{SCRATCH}/css-o/app.css") == css_normal(f"{SCRATCH}/css-e/app.css"),
+          f"stylesheets imported from JavaScript, and the file loader {' '.join(flags)}: same as esbuild's")
+
+print("== legal comments against esbuild")
+def legal_tail(path):
+    t = open(path).read()
+    return re.findall(r"^(/\*.*?\*/|//.*)$", t[t.rfind("})();") if path.endswith(".js") else t.rfind("}"):], re.M | re.S)
+for entry, ext, flags in [("app/legal/a.js", "js", []), ("app/legal/a.js", "js", ["--minify"]), ("app/legal/a.js", "js", ["--legal-comments=external"]),
+                          ("app/legal/a.js", "js", ["--legal-comments=none"]), ("app/legal/c.css", "css", []), ("app/legal/c.css", "css", ["--minify"])]:
+    outs = [f"{SCRATCH}/lg-{w}.{ext}" for w in "oe"]
+    for o in outs:
+        if os.path.exists(o + ".LEGAL.txt"): os.unlink(o + ".LEGAL.txt")
+    sh([ESB, entry, f"--outfile={outs[0]}"] + flags)
+    sh([E, entry, "--bundle", f"--outfile={outs[1]}", "--log-level=error"] + flags)
+    files = [open(o + ".LEGAL.txt").read() if os.path.exists(o + ".LEGAL.txt") else "" for o in outs]
+    check(legal_tail(outs[0]) == legal_tail(outs[1]) and files[0] == files[1], f"{entry} {' '.join(flags)}: legal comments where esbuild puts them")
+
+for app in ["react", "named", "three", "all", "cjs"]:
+    outs = [f"{SCRATCH}/lgapp-{w}.js" for w in "oe"]
+    sh([ESB, f"app/{app}.js", f"--outfile={outs[0]}"])
+    sh([E, f"app/{app}.js", "--bundle", f"--outfile={outs[1]}", "--log-level=error"])
+    tails = [open(o).read()[open(o).read().rindex("})();") + 5:] for o in outs]
+    check(tails[0] == tails[1] and len(tails[0]) > 1, f"{app}: the same license block as esbuild's, byte for byte ({len(tails[0])} bytes)")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)

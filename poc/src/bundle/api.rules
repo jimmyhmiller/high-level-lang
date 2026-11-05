@@ -15,6 +15,8 @@ use bundle.sourcemap as map
 use bundle.jsx as jsx
 use bundle.chunks as chunks
 use bundle.lower as lower
+use bundle.cssbundle as cssb
+use bundle.legal as legal
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -65,6 +67,7 @@ record Options {
   banner: Text,
   footer: Text,
   tree-shaking: Bool,
+  legal-comments: Text,
   jsx: jsx.Options,
   target: Int,
   on-resolve: [Fn(Text,Text)->Text?],
@@ -84,8 +87,8 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
-          extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
-          aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, jsx: jsx.options-new(), target: lower.no-lowering,
+          extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
+          aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, legal-comments: "eof", jsx: jsx.options-new(), target: lower.no-lowering,
           on-resolve: [], on-load: [],
           transform: keep-as-is, optimize: default-optimize)
 
@@ -321,9 +324,42 @@ fn build(options: Options) -> Void {
   }
 }
 
+fn loader-map(o: Options) -> {Text:Text} {
+  var out: {Text:Text} = {}
+  for l in o.loaders { out[l.key] = l.value }
+  out
+}
+
+fn resolve-options(o: Options) -> res.Options =
+  res.Options(main-fields: o.main-fields, conditions: o.conditions, extensions: o.extensions,
+              external: o.external, node-builtins: o.platform-node)
+
+fn with-extension(path: Text, ext: Text) -> Text {
+  let base = base-of-path(path)
+  var dot = len(base)
+  for i in 0..len(base) {
+    if base[i] == '.' { dot = i }
+  }
+  let dir = dir-of(path)
+  (if dir == "." and not starts-with(path, "./") then "" else dir ++ "/") ++ base[0..dot] ++ ext
+}
+
+# A stylesheet entry: its imports and the files it names, and nothing for JavaScript to do.
+fn build-css(o: Options) -> Void {
+  reset-all()
+  cssb.reset(resolve-options(o), loader-map(o))
+  let text = cssb.bundle([o.entry], o.outfile, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
+  write-file(o.outfile, text)
+  cssb.write-assets()
+  print "{} bytes -> {}", len(text), o.outfile
+}
+
 fn build-one(options: Options) -> Void {
+  if ends-with(options.entry, ".css") { return build-css(options) }
   var o = options
   reset-all()
+  cssb.reset(resolve-options(o), loader-map(o))
+  m.out-dir = dir-of(o.outfile)
   if o.pretty and o.jsx.runtime == jsx.Preserve {
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
   }
@@ -369,14 +405,25 @@ fn build-one(options: Options) -> Void {
   for line in e.external-imports { buf-add!(hoisted, line) }
   let head = buf-text(hoisted)
   let footer = if len(o.footer) > 0 then o.footer ++ "\n" else ""
-  let full = head ++ out0.text ++ footer
+  let notes = legal.placed(o.legal-comments, legal-of-modules(none), o.outfile)
+  let full = head ++ out0.text ++ footer ++ notes.tail
   let base = len(head) + out0.base
   let text = if o.sourcemap then full ++ "//# sourceMappingURL=" ++ base-of-path(o.outfile) ++ ".map\n" else full
+  if len(notes.file) > 0 { write-file(o.outfile ++ ".LEGAL.txt", notes.file) }
   lap(o, "print")
   write-file(o.outfile, text)
   if o.sourcemap { write-file(o.outfile ++ ".map", map.build-map(full, base, out0.marks, o.outfile)) }
-  lap(o, "write")
   print "{} bytes -> {}", len(text), o.outfile
+  # Stylesheets the program imports go beside it, under its name.
+  let sheets = m.css-imports()
+  if len(sheets) > 0 {
+    let css-out = with-extension(o.outfile, ".css")
+    let css-text = cssb.bundle(sheets, css-out, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
+    write-file(css-out, css-text)
+    print "{} bytes -> {}", len(css-text), css-out
+  }
+  cssb.write-assets()
+  lap(o, "write")
 }
 
 # ---------------------------------------------------------------- code splitting
@@ -386,6 +433,21 @@ state chunk-of-root: {Int:Int} = {}
 fn path-of-root(root: Int) -> Text {
   let c = chunk-of-root[root] ?? panic "{} has no chunk", m.modules[root].path
   chunks.placeholder(c)
+}
+
+# The legal comments of the modules in the output, or in one chunk of it, in module order.
+fn legal-of-modules(chunk: chunks.Chunk?) -> [legal.Note] {
+  var out: [legal.Note] = []
+  for id in m.order {
+    let wanted = match chunk {
+      some(c) => any p in e.parts-of(id): p in c.parts
+      none => e.included?(id)
+    }
+    if wanted {
+      for t in m.modules[id].legal { out += legal.Note(path: m.modules[id].path, text: t) }
+    }
+  }
+  out
 }
 
 # What running this chunk's entry looks like at its end.
@@ -452,8 +514,11 @@ fn build-split(options: Options) -> Void {
   an.keep-entry-exports = true
   e.esm-output = true
   an.splitting = true
+  cssb.reset(resolve-options(o), loader-map(o))
+  m.out-dir = o.outdir
   m.load-runtime(include-text("runtime.js"))
   m.load-trees(o.entries)
+  if len(m.css-imports()) > 0 { panic "stylesheets with --splitting are not implemented yet" }
   an.link()
   if o.minify-identifiers then mangle.assign-minified() else e.assign-names()
   let roots = m.entries ++ an.dynamic-roots
@@ -472,7 +537,10 @@ fn build-split(options: Options) -> Void {
   for i in 0..len(texts) {
     let pr = printed-chunks[i]
     let done = chunks.filled(pr.text, pr.base, pr.marks, holes[i], paths[i], paths)
-    let text = if o.sourcemap then done.text ++ "//# sourceMappingURL=" ++ base-of-path(paths[i]) ++ ".map\n" else done.text
+    let notes = legal.placed(o.legal-comments, legal-of-modules(some(chunks.chunks[i])), paths[i])
+    let body = done.text ++ notes.tail
+    if len(notes.file) > 0 { write-file(paths[i] ++ ".LEGAL.txt", notes.file) }
+    let text = if o.sourcemap then body ++ "//# sourceMappingURL=" ++ base-of-path(paths[i]) ++ ".map\n" else body
     write-file(paths[i], text)
     if o.sourcemap { write-file(paths[i] ++ ".map", map.build-map(done.text, pr.base, done.marks, paths[i])) }
     print "{} bytes -> {}", len(text), paths[i]

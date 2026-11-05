@@ -132,8 +132,10 @@ core took 76, 78, 24, 30, 42, 48 and 56 ms on those apps, and is faster still on
 Module graph, Node resolution (`exports`, `main` fields, conditions, `sideEffects: false`),
 scope hoisting, esbuild-compatible renaming, tree shaking with `/* @__PURE__ */` and class
 purity, CommonJS wrapping, re-exports from CommonJS, `__esm` wrapping for `require` and `import()`
-of ES modules, namespace objects, `define`, aliases, loaders (js, json, text, base64, dataurl,
-empty), TypeScript (types erased by the grammar, enums, namespaces, parameter properties, unused
+of ES modules, namespace objects, `define`, aliases, loaders (js, json, text, base64, dataurl with
+MIME types, file, css, empty), CSS bundling (`@import` in place with media queries, `url()` through the
+loaders, whitespace minified, stylesheets imported from JavaScript), legal comments (eof, linked,
+external, none, with esbuild's grouping for packages), TypeScript (types erased by the grammar, enums, namespaces, parameter properties, unused
 imports, `import x = …`, `export =`, `./x.js` meaning `./x.ts`), JSX (classic, automatic and dev runtimes, preserve, pragmas in block comments), banner and
 footer, tree shaking off, iife/esm/cjs and spec-defined output formats, `--target=es2015` and later (`??`, `?.`, logical
 assignment, `**`, numeric separators, optional catch binding, object spread and rest, async
@@ -147,17 +149,19 @@ load, transform and optimize hooks.
 
 Being explicit, because "everything esbuild does" is a lot:
 
-- **Not built:** the CSS loader, watch and serve,
-  legal comments in output, `tsconfig.json`, TypeScript decorators, `accessor` fields, inlining enum
+- **Not built:** watch and serve, CSS modules, CSS nesting and other CSS lowering, `tsconfig.json`, TypeScript decorators, `accessor` fields, inlining enum
   values across files.
 - **Hard errors for now:** `export *` from a CommonJS or external module in the entry point of ES
   module output.
-- **Hard errors for now:** the automatic JSX runtime in a CommonJS module, and `--jsx=preserve` with
+- **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside
+  another, stylesheets with `--splitting`, `--legal-comments=inline`, the automatic JSX runtime in a CommonJS module, and `--jsx=preserve` with
   `--pretty`.
 - **Hard errors when lowering:** `super` inside an async function, object rest nested inside another
   pattern or in an assignment, a computed key in an object rest, and calling a parenthesized optional
   chain, all below the version that has them; browser names in `--target`.
-- **Simplifications:** a computed class field name is evaluated before the class's computed method
+- **Simplifications:** CSS minification is whitespace and number spelling only, so minified
+  stylesheets are a few percent larger than esbuild's. Content hashes in file names differ from
+  esbuild's. A computed class field name is evaluated before the class's computed method
   names when lowered, not in source order. Data URLs are spelled out or base64, without esbuild's percent escaping. Source maps have no
   `names`. Regex patterns are not validated. Labels are not renamed. Single-use `const` inlining is
   missing.
