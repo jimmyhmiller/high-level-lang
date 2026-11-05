@@ -104,6 +104,8 @@
    (group-kind (slice u8))
    (opaque (ArrayList (slice u8)))
    (precedence (ArrayList (slice u8)))
+   (keep-min (slice u8))
+   (keep-forbid (ArrayList (slice u8)))
    (decls (ArrayList Decl))
    (kinds (ArrayList Kind))
    (lits (ArrayList Lit))
@@ -1224,6 +1226,22 @@
                 (print-at inner min (mut w))
                 (print-node n (mut w))))))))
 
+(defn forbid-test [(g Grammar)] (-> Code)
+  (let [(mut arms) (primitive/code-list-new)]
+    (for name (.keep-forbid g)
+      (push! (mut arms) `(~(kind-sym name) [] true)))
+    `(match (.kind n) ~@arms (_ false))))
+
+;;; Under a kept flag, an operator that flag disables needs parentheses:
+;;; `for (x = ("a" in b);;)`.
+(defn flagged-op-test [(g Grammar)] (-> Code)
+  (let [(mut arms) (primitive/code-list-new)]
+    (for d (.decls g)
+      (for op (.ops d)
+        (when (contains? (.keep-under g) (.unless-flag op))
+          (push! (mut arms) `(~(kind-sym (.kind op)) [] true)))))
+    `(match (.kind n) ~@arms (_ false))))
+
 (defn opaque-test [(g Grammar)] (-> Code)
   (let [(mut arms) (primitive/code-list-new)]
     (for name (.opaque g)
@@ -1255,7 +1273,7 @@
 
        (defsum Kind ~@variants (KList []) (KNone []) (KFlag []))
        (derive Eq Debug Kind)
-       (defstruct Node [(kind Kind) (text (slice u8)) (kids (ArrayList Node)) (lo i64) (hi i64)])
+       (defstruct Node [(kind Kind) (text (slice u8)) (kids (ArrayList Node)) (lo i64) (hi i64) (gen i64)])
 
        (defn node-table [] (-> Code)
          (quasiquote (~@table ("List" -1) ("None" 0) ("Flag" 0))))
@@ -1263,9 +1281,14 @@
        (defn new-kids [] (-> (ArrayList Node))
          (ArrayList::new [Node] (malloc-allocator)))
        (defn mk [(k Kind) (kids (ArrayList Node)) (lo i64) (hi i64)] (-> Node)
-         (Node :kind k :text "" :kids kids :lo lo :hi hi))
+         (Node :kind k :text "" :kids kids :lo lo :hi hi :gen 0))
        (defn leaf [(k Kind) (text (slice u8)) (lo i64) (hi i64)] (-> Node)
-         (Node :kind k :text text :kids (new-kids) :lo lo :hi hi))
+         (Node :kind k :text text :kids (new-kids) :lo lo :hi hi :gen 0))
+       ;;; The nodes of a list from `from` up to `to`.
+       (defn sublist [(items (ArrayList Node)) (from i64) (to i64)] (-> (ArrayList Node))
+         (let [(mut out) (new-kids)]
+           (for i (range from to) (push! (mut out) (get items i)))
+           out))
        (defn none-node [] (-> Node) (leaf (KNone) "" 0 0))
        (defn flag-node [] (-> Node) (leaf (KFlag) "" 0 0))
        (defn node2 [(k Kind) (a Node) (b Node)] (-> Node)
@@ -1341,18 +1364,33 @@
          (match (.kind n)
            ~@(group-arm g)
            (_
-             (if (< (kind-level (.kind n)) min)
+             (if (or (< (kind-level (.kind n)) min)
+                     (and (> (.keep w) 0) ~(flagged-op-test g)))
                  (do
                    (rt/tok! (mut w) ~(.group-open g))
                    (print-node n (mut w))
                    (rt/tok! (mut w) ~(.group-close g)))
                  (print-node n (mut w))))))
 
-       ;;; Print a child exactly as written.
+       ;;; A forbidden kind on the left spine: `new (a())` needs its parentheses even
+       ;;; when a rewrite removed them.
+       (defn forbidden-spine? [(n Node)] (-> bool)
+         (cond
+           ~(forbid-test g) true
+           (and (> (len (.kids n)) 0) (< (kind-level (.kind n)) ~(no-level)))
+             (forbidden-spine? (get (.kids n) 0))
+           :else false))
+
+       ;;; A `~X` child: written parentheses stay, and any it now needs appear.
        (defn print-keep [(n Node) (w (mut rt/W))] (-> void)
          (let [old (.keep w)]
            (set! (.keep w) (+ old 1))
-           (print-node n (mut w))
+           (if (or (forbidden-spine? n) (< (kind-level (.kind n)) ~(named-value levels (.keep-min g))))
+               (do
+                 (rt/tok! (mut w) ~(.group-open g))
+                 (print-node n (mut w))
+                 (rt/tok! (mut w) ~(.group-close g)))
+               (print-node n (mut w)))
            (set! (.keep w) old)))
 
        (defn print-node [(n Node) (w (mut rt/W))] (-> void)
@@ -1377,6 +1415,7 @@
                   :flags (empty-strs) :keep-under (empty-strs)
                   :group-open "(" :group-close ")" :group-kind ""
                   :opaque (empty-strs) :precedence (empty-strs)
+                  :keep-min "" :keep-forbid (empty-strs)
                   :decls (ArrayList::new [Decl] (malloc-allocator))
                   :kinds (ArrayList::new [Kind] (malloc-allocator))
                   :lits (ArrayList::new [Lit] (malloc-allocator))
@@ -1404,6 +1443,12 @@
             (set! (.group-open g) (.text o))
             (set! (.group-close g) (.text e))
             (set! (.group-kind g) (.text (dsl/name! (mut c) "the parenthesis node"))))
+        ;; `~X` positions: what they require, and kinds that may not be on their spine.
+        (dsl/accept! (mut c) "keeplevel")
+          (set! (.keep-min g) (.text (dsl/name! (mut c) "a rule")))
+        (dsl/accept! (mut c) "keepforbid")
+          (while (not (dsl/accept! (mut c) ";"))
+            (push! (mut (.keep-forbid g)) (.text (dsl/name! (mut c) "a kind"))))
         (dsl/accept! (mut c) "opaque")
           (while (not (dsl/accept! (mut c) ";"))
             (push! (mut (.opaque g)) (.text (dsl/name! (mut c) "a kind"))))
