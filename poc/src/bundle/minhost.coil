@@ -212,3 +212,79 @@
 
 (defn different-text [(a (slice u8)) (b (slice u8))] (-> bool)
   (and (escape-free? a) (escape-free? b) (!= (rt/str-content a) (rt/str-content b))))
+
+;;; Two reads of the same plain variable: safe to merge, reading one has no effect.
+(defn same-ref [(a js/Node) (b js/Node)] (-> bool)
+  (and (= (.kind a) (js/KIdent)) (= (.kind b) (js/KIdent)) (= (.text a) (.text b))))
+
+;; ---------------------------------------------------------------- template literals
+
+;;; A string with raw newlines is shorter as a template: `\n` is two bytes, a line break
+;;; one. The first count is what a template costs over the double-quoted form.
+(defn template-gain [(raw (slice u8))] (-> i64)
+  (let [content (rt/str-content raw)
+        (mut gain) 0
+        (mut i) 0]
+    (while (< i (len content))
+      (let [c (get content i)]
+        (cond
+          (and (= c #\\) (< (+ i 1) (len content)))
+            (let [e (get content (+ i 1))]
+              (cond
+                (= e #\n) (set! gain (+ gain 1))
+                (or (= e #\") (= e #\')) (set! gain (+ gain 1))
+                :else 0)
+              (set! i (+ i 2)))
+          (or (= c #\`) (and (= c #\$) (< (+ i 1) (len content)) (= (get content (+ i 1)) #\{)))
+            (do (set! gain (- gain 1)) (set! i (+ i 1)))
+          :else (set! i (+ i 1)))))
+    gain))
+
+;;; A string's content as a template token.
+(defn as-template [(raw (slice u8))] (-> (slice u8))
+  (let [content (rt/str-content raw)
+        (mut b) (ArrayList::new [u8] (malloc-allocator))
+        (mut i) 0]
+    (push! (mut b) #\`)
+    (while (< i (len content))
+      (let [c (get content i)]
+        (cond
+          (and (= c #\\) (< (+ i 1) (len content)))
+            (let [e (get content (+ i 1))]
+              (cond
+                (= e #\n) (push! (mut b) #\newline)
+                (or (= e #\") (= e #\')) (push! (mut b) e)
+                :else (do (push! (mut b) c) (push! (mut b) e)))
+              (set! i (+ i 2)))
+          (= c #\`)
+            (do (push! (mut b) #\\) (push! (mut b) c) (set! i (+ i 1)))
+          (and (= c #\$) (< (+ i 1) (len content)) (= (get content (+ i 1)) #\{))
+            (do (push! (mut b) #\\) (push! (mut b) c) (set! i (+ i 1)))
+          :else (do (push! (mut b) c) (set! i (+ i 1))))))
+    (push! (mut b) #\`)
+    (slice b)))
+
+;;; A key or a directive cannot be a template, so this is a walk that knows positions,
+;;; not a rule.
+(defn key-first? [(k js/Kind)] (-> bool)
+  (or (= k (js/KProp)) (= k (js/KMethod)) (= k (js/KGenMethod)) (= k (js/KAsyncMethod))
+      (= k (js/KAsyncGenMethod)) (= k (js/KGetter)) (= k (js/KSetter)) (= k (js/KField))
+      (= k (js/KStaticField)) (= k (js/KPatProp))))
+
+(defn templates [(n js/Node)] (-> js/Node)
+  (cond
+    (= (.kind n) (js/KStr))
+      (if (> (template-gain (.text n)) 0)
+          (js/leaf (js/KTemplateFull) (as-template (.text n)) (.lo n) (.hi n))
+          n)
+    (and (= (.kind n) (js/KExprStmt)) (= (.kind (get (.kids n) 0)) (js/KStr))) n
+    (= (len (.kids n)) 0) n
+    :else
+      (let [(mut out) n
+            (mut kids) (js/new-kids)
+            skip (key-first? (.kind n))]
+        (for i (range 0 (len (.kids n)))
+          (let [k (get (.kids n) i)]
+            (push! (mut kids) (if (and skip (= i 0)) k (templates k)))))
+        (set! (.kids out) kids)
+        out)))
