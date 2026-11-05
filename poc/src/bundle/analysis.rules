@@ -17,6 +17,8 @@ state part-module: [Int] = []
 state entry-namespace: Bool = false
 state keep-entry-exports: Bool = false
 state tree-shaking: Bool = true
+state any-dynamic: Bool = false
+state any-reexport: Bool = false
 
 # The module the current analysis is looking at.
 context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
@@ -258,8 +260,21 @@ fn new-part(marker: Node) -> Int {
   part
 }
 
-fn no-reexport-from-cjs(t: m.Module, what: Text) -> Void {
-  if t.kind == Cjs { panic "{}: {} the CommonJS module {} is not implemented yet", here.path, what, t.path }
+# A statement that re-exports from CommonJS holds the import itself.
+fn reexport-import(part: Int, target: Int) -> Void {
+  assert m.db.declares(part, import-var-of(here, target))
+  if m.modules[target].kind == Cjs { assert m.db.mentions(part, m.modules[target].require-sym) }
+  assert m.db.mentions(part, helper("__toESM"))
+  assert m.db.effect(part)
+}
+
+# A name this module exports that is really a property of the import variable.
+fn reexport-symbol(part: Int, target: Int, name: Text, namespace: Bool, exported: Text) -> Void {
+  let s = sym.generated-symbol!(m.table, here.root, "reexport_" ++ exported)
+  cjs-imports[s] = CjsImport(importer: here.id, import-var: import-var-of(here, target), name: name, namespace: namespace)
+  assert m.db.local-export(here.id, m.name-id(exported), s)
+  assert m.db.cjs-binding(s, part)
+  any-reexport = true
 }
 
 fn export-spec-names(spec: Node) -> Text = match spec {
@@ -293,25 +308,42 @@ fn add-part(s: Node) -> Void {
     }
     ExportAll(from) => {
       let target = dep-of-str(here, from)
-      no-reexport-from-cjs(m.modules[target], "`export *` from")
       assert m.db.imports(mid, target)
-      assert m.db.star(mid, target)
       needs-init(part, target)
+      if opaque?(m.modules[target]) {
+        reexport-import(part, target)
+        assert m.db.dyn-star(mid, target)
+        assert m.db.mentions(part, helper("__reExport"))
+        assert m.db.mentions(part, here.ns-sym)
+        any-dynamic = true
+      } else {
+        assert m.db.star(mid, target)
+      }
     }
     ExportAllAs(name, from) => {
       let target = dep-of-str(here, from)
-      no-reexport-from-cjs(m.modules[target], "`export * as` of")
       assert m.db.imports(mid, target)
-      assert m.db.local-export(mid, m.name-id(m.module-name(name)), m.modules[target].ns-sym)
       needs-init(part, target)
+      if opaque?(m.modules[target]) {
+        reexport-import(part, target)
+        reexport-symbol(part, target, "*", true, m.module-name(name))
+      } else {
+        assert m.db.local-export(mid, m.name-id(m.module-name(name)), m.modules[target].ns-sym)
+      }
     }
     ExportFrom(List(specs...), from) => {
       let target = dep-of-str(here, from)
-      no-reexport-from-cjs(m.modules[target], "re-exporting from")
       assert m.db.imports(mid, target)
       needs-init(part, target)
-      for spec in specs {
-        assert m.db.reexport(mid, m.name-id(export-spec-names(spec)), target, m.name-id(m.module-name(spec.kids[0])))
+      if opaque?(m.modules[target]) {
+        reexport-import(part, target)
+        for spec in specs {
+          reexport-symbol(part, target, m.module-name(spec.kids[0]), false, export-spec-names(spec))
+        }
+      } else {
+        for spec in specs {
+          assert m.db.reexport(mid, m.name-id(export-spec-names(spec)), target, m.name-id(m.module-name(spec.kids[0])))
+        }
       }
     }
     ExportNamed(List(specs...)) => {
@@ -363,7 +395,7 @@ fn synthetic-parts() -> Void {
 # Facts for one module. CommonJS is one opaque part with effects, whose only symbol is its
 # `require_x`; its dependencies are whatever it `require`s.
 fn module-facts() -> Void {
-  if here.side-effects or not tree-shaking { assert m.db.module-effects(here.id) }
+  if here.side-effects { assert m.db.module-effects(here.id) }
   if here.kind == Cjs {
     let part = new-part(here.tree)
     assert m.db.effect(part)

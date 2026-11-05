@@ -1,6 +1,7 @@
 # From a solved graph to one program: name every symbol, rewrite identifiers to their final names,
 # wrap CommonJS modules and pick the live statements.
 rules bundle.emit over bundle.js
+use bundle.js as js
 use bundle.scopes as sc
 use bundle.modules as m
 use bundle.analysis as an
@@ -58,6 +59,7 @@ fn target-of(s: Int) -> Int {
     for m.db.resolved(d, n, ?candidate) {
       if out < 0 or not import-symbol?(candidate) { out = candidate }
     }
+    if out < 0 and m.db.dynamic(d) { return s }
     if out < 0 {
       panic "No matching export in {} for import {}", m.modules[d].path, name-of(m.names, n)
     }
@@ -148,8 +150,12 @@ fn helper-name(name: Text) -> Text = final-of(an.helper(name))
 
 fn void-zero() -> Node = exp`void 0`
 
+# The CommonJS property this name reads, whether imported here or re-exported to here.
 fn cjs-import-of(leaf: Node) -> an.CjsImport? = match here.bindings[leaf.lo] {
-  some(s) => an.cjs-imports[s]
+  some(s) => match an.cjs-imports[s] {
+    some(ci) => some(ci)
+    none => if an.any-reexport then an.cjs-imports[target-of(s)] else none
+  }
   none => none
 }
 
@@ -167,13 +173,35 @@ fn resolved-export(module: Int, name: Int) -> Int? {
   out
 }
 
+# What reading a symbol looks like in the output.
+fn symbol-read(s: Int) -> Node {
+  let t = target-of(s)
+  match an.cjs-imports[t] {
+    some(ci) => cjs-read(ci)
+    none => Ident(final-of(t))
+  }
+}
+
+fn namespace-property(target: Int, name: Text) -> Node = Member(Ident(final-of(m.modules[target].ns-sym)), PropName(name))
+
 # `ns.name` when `ns` is `import * as` of an ES module: the export itself.
 fn namespace-read(n: Node) -> Node? = match an.namespace-of(here, n.kids[0]) {
   none => none
   some(target) => match resolved-export(target, intern!(m.names, n.kids[1].text)) {
-    some(s) => some(Ident(final-of(target-of(s))))
-    none => some(void-zero())
+    some(s) => some(symbol-read(s))
+    none => some(if m.db.dynamic(target) then namespace-property(target, n.kids[1].text) else void-zero())
   }
+}
+
+# An import of a name only `export *` from CommonJS can supply, known at run time.
+fn dynamic-read(s: Int) -> Node? {
+  if not an.any-dynamic { return none }
+  for m.db.import-of(s, ?d, ?n) {
+    if not m.db.resolved(d, n, _) and m.db.dynamic(d) {
+      return some(namespace-property(d, name-of(m.names, n)))
+    }
+  }
+  none
 }
 
 fn require-of(t: m.Module) -> Node {
@@ -217,7 +245,7 @@ fn rw(n: Node, depth: Int) -> Node = match n {
   Ident(x) => match cjs-import-of(n) {
     some(ci) => cjs-read(ci)
     none => match here.bindings[n.lo] {
-      some(s) => Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
+      some(s) => dynamic-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
       # A free `undefined` is the shorter `void 0` under --minify-syntax.
       none => if void-undefined and x == "undefined" then void-zero() else n
     }
@@ -307,10 +335,25 @@ fn external-object(t: m.Module) -> Node {
 # "type": "module") get the second argument, so `default` is module.exports.
 fn import-cjs-stmt(t: m.Module) -> Node {
   let v = final-of(an.import-var-of(here, t.id))
+  let value = to-esm-call(t)
+  stmt`var $v = $value;`
+}
+
+fn to-esm-call(t: m.Module) -> Node {
   let to-esm = helper-name("__toESM")
   let object = if t.kind == External then external-object(t) else require-of(t)
-  if m.node-mode?(here.path) then stmt`var $v = $to_esm($object, 1);` else stmt`var $v = $to_esm($object);`
+  if m.node-mode?(here.path) then exp`$to_esm($object, 1)` else exp`$to_esm($object)`
 }
+
+# `export * from` CommonJS: `__reExport(x_exports, __toESM(require_y()));`
+fn reexport-all(t: m.Module) -> Node {
+  let re = helper-name("__reExport")
+  let ns = final-of(here.ns-sym)
+  let value = to-esm-call(t)
+  stmt`$re($ns, $value);`
+}
+
+fn import-or-init(t: m.Module) -> Node? = if an.opaque?(t) then some(import-cjs-stmt(t)) else init-call(t)
 
 # The body statements of a part, ready to print. None for a part with no code.
 fn part-output(s: Node) -> Node? = match s {
@@ -328,12 +371,13 @@ fn part-output(s: Node) -> Node? = match s {
       _ => init-call(t)
     }
   }
-  ExportAll(from) | ExportAllAs(_, from) | ExportFrom(_, from) => init-call(m.modules[an.dep-of-str(here, from)])
-  ExportNamed(...) => none
-  Import(_, from) => {
+  ExportAll(from) => {
     let t = m.modules[an.dep-of-str(here, from)]
-    if an.opaque?(t) then some(import-cjs-stmt(t)) else init-call(t)
+    if an.opaque?(t) then some(reexport-all(t)) else init-call(t)
   }
+  ExportAllAs(_, from) | ExportFrom(_, from) => import-or-init(m.modules[an.dep-of-str(here, from)])
+  ExportNamed(...) => none
+  Import(_, from) => import-or-init(m.modules[an.dep-of-str(here, from)])
   ExportVar(list) => some(rw(VarDecl(list) with { lo: s.lo, hi: s.hi }, 0))
   ExportLexical(d) | ExportFunction(d) | ExportClass(d) => some(rw(d, 0))
   _ => some(rw(s, 0))
@@ -372,7 +416,7 @@ fn plain-key?(s: Text) -> Bool = len(s) > 0 and host.name-start-byte?(s[0]) and 
 fn export-getter(name-id: Int) -> Node {
   let name = name-of(m.names, name-id)
   let s = resolved-export(here.id, name-id) ?? panic "{}: lost export {}", here.path, name
-  let target = final-of(target-of(s))
+  let target = symbol-read(s)
   let getter = exp`() => $target`
   Prop(if plain-key?(name) then PropName(name) else Str(quote-text(name)), getter)
 }
@@ -396,6 +440,68 @@ fn namespace-stmts!(out: mut [Node]) -> Void {
   out += stmt`$export_all($ns, { $$getters });`
 }
 
+# A binding pattern says the same thing as an assignment target, in other nodes.
+fn pattern-expr(t: Node) -> Node = match t {
+  BindName(x) => Ident(x)
+  ArrayPattern(List(slots...)) => {
+    let items = [slot-expr(s) for s in slots]
+    ArrayLit(List(items...))
+  }
+  ObjectPattern(List(props...)) => {
+    let items = [prop-expr(p) for p in props]
+    ObjectLit(List(items...))
+  }
+  _ => panic "unexpected binding pattern: {}", js.kind-name(t.kind)
+}
+
+fn element-expr(e: Node) -> Node = match e {
+  BindElement(t, None()) => pattern-expr(t)
+  BindElement(t, init) => Assignment(pattern-expr(t), AssignOp("="), init)
+  _ => panic "unexpected pattern element: {}", js.kind-name(e.kind)
+}
+
+fn slot-expr(s: Node) -> Node = match s {
+  PatHole() => Hole()
+  PatRest(t) => ElemLast(Spread(pattern-expr(t)))
+  PatItem(e) => Elem(element-expr(e))
+  PatLast(e) => ElemLast(element-expr(e))
+  _ => panic "unexpected array pattern slot: {}", js.kind-name(s.kind)
+}
+
+fn prop-expr(p: Node) -> Node = match p {
+  PatPropRest(t) => SpreadProp(pattern-expr(t))
+  PatProp(key, e) => Prop(key, element-expr(e))
+  PatShort(BindName(x), None()) => Shorthand(Ident(x))
+  PatShort(BindName(x), init) => CoverInit(Ident(x), init)
+  _ => panic "unexpected object pattern property: {}", js.kind-name(p.kind)
+}
+
+# The names a pattern binds, as declarators, without entering its default values.
+fn pattern-names!(t: Node, out: mut [Node]) -> Void = match t {
+  BindName(x) => { out += Declarator(BindName(x), None()) }
+  ArrayPattern(List(slots...)) => {
+    for s in slots {
+      match s {
+        PatHole() => {}
+        PatRest(x) => pattern-names!(x, out)
+        PatItem(e) | PatLast(e) => pattern-names!(e.kids[0], out)
+        _ => panic "unexpected array pattern slot: {}", js.kind-name(s.kind)
+      }
+    }
+  }
+  ObjectPattern(List(props...)) => {
+    for p in props {
+      match p {
+        PatPropRest(x) => pattern-names!(x, out)
+        PatProp(_, e) => pattern-names!(e.kids[0], out)
+        PatShort(name, _) => pattern-names!(name, out)
+        _ => panic "unexpected object pattern property: {}", js.kind-name(p.kind)
+      }
+    }
+  }
+  _ => panic "unexpected binding pattern: {}", js.kind-name(t.kind)
+}
+
 fn function-decl?(n: Node) -> Bool = n is FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...)
 
 # `var a, b; function f() {} var init_x = __esm({ "path"() { a = 1; } });` A `var` statement inside
@@ -416,7 +522,12 @@ fn wrapped-module!(outputs: [Node], out: mut [Node]) -> Void {
                 hoisted += Declarator(BindName(x), None())
                 if not (init is None()) { body += stmt`$x = $init;` }
               }
-              _ => panic "{}: destructuring at the top level of a module that is required or imported dynamically is not implemented yet", here.path
+              # `({ a, b } = init);` with the names hoisted, as esbuild does.
+              Declarator(target, init) => {
+                pattern-names!(target, hoisted)
+                body += ExprStmt(Assignment(pattern-expr(target), AssignOp("="), init))
+              }
+              _ => panic "a declaration list holds declarators"
             }
           }
         }

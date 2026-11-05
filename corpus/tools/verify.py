@@ -48,7 +48,7 @@ for name in ["fail", "early"]:
     print(f"  info test262 {name}/: rejected {m.group(2)} of {int(m.group(1)) + int(m.group(2))}")
 
 print("== bundles against esbuild")
-for a in "named all cjs features three zod rx datefns preact immer react d3".split():
+for a in "named all cjs features three zod rx datefns preact immer react d3 reexport".split():
     theirs, ours = f"{SCRATCH}/{a}.esb.min.js", f"{SCRATCH}/{a}.min.js"
     sh([E, f"app/{a}.js", "--bundle", "--minify", "--format=iife", f"--outfile={theirs}", "--log-level=silent"])
     expected = sh(["node", theirs], 15)[1]
@@ -70,8 +70,11 @@ for a in "exes excjs exdate exd3 eximmer".split():
     plain, mini = f"{SCRATCH}/{a}.esb.js", f"{SCRATCH}/{a}.esb.min.js"
     sh([E, f"app/{a}.js", "--bundle", "--format=iife", f"--outfile={plain}", "--log-level=silent"])
     sh([E, f"app/{a}.js", "--bundle", "--minify", "--format=iife", f"--outfile={mini}", "--log-level=silent"])
-    l1, l2 = sh(["node", plain])[1].split("\n"), sh(["node", mini])[1].split("\n")
-    stable = [i for i in range(min(len(l1), len(l2))) if l1[i] == l2[i]]
+    # A line counts only if esbuild's own builds agree on it across several runs: one pair could
+    # agree on a clock's value by chance.
+    runs = [sh(["node", f])[1].split("\n") for f in (plain, mini, plain, mini, plain)]
+    l1 = runs[0]
+    stable = [i for i in range(min(len(r) for r in runs)) if all(r[i] == l1[i] for r in runs)]
     for mode, flags in [("plain", []), ("minified", ["--minify"])]:
         out = f"{SCRATCH}/{a}.{mode}.js"
         sh([ESB, f"app/{a}.js", f"--outfile={out}"] + flags, 60)
@@ -79,6 +82,10 @@ for a in "exes excjs exdate exd3 eximmer".split():
         bad = [i for i in stable if i >= len(lx) or lx[i] != l1[i]]
         total = next((x for x in l1 if x.startswith("TOTAL")), "")
         check(not bad, f"{a} {mode}: {len(stable)} stable lines all agree {total}")
+        if bad:
+            at = bad[0]
+            print(f"       line {at}: esbuild {l1[at][:150]!r}")
+            print(f"       line {at}: ours    {(lx[at] if at < len(lx) else '<missing>')[:150]!r}")
 
 print("== formats")
 for fmt, ext, use in [("esm", "mjs", "import('{}').then(m=>console.log(Object.keys(m).sort().join(),m.answer,m.hello('x'),new m.default().hi()))"),
@@ -89,6 +96,30 @@ for fmt, ext, use in [("esm", "mjs", "import('{}').then(m=>console.log(Object.ke
         sh([E, "app/lib.js", "--bundle", f"--format={fmt}", f"--outfile={e}", "--log-level=silent"] + flags)
         a, b = sh(["node", "-e", use.format(o)])[1], sh(["node", "-e", use.format(e)])[1]
         check(a == b and "42" in a, f"{fmt}{' '.join(flags)}: {a.strip()}")
+
+print("== build options against esbuild")
+OPT = ["--alias:fake-math/sum=./app/opt/real/sum.js", "--loader:.txt=text", "--loader:.b64=base64", "--loader:.url=dataurl"]
+for name, entry, flags in [("alias and loaders", "app/opt/main.js", OPT),
+                           ("banner and footer", "app/opt/main.js", OPT + ["--banner:js=/* top */", "--footer:js=/* end */"]),
+                           ("minified", "app/opt/main.js", OPT + ["--minify"]),
+                           ("tree shaking off", "app/opt2/main.js", ["--tree-shaking=false"])]:
+    tag = name.replace(" ", "_")
+    ours, theirs = f"{SCRATCH}/opt-{tag}.js", f"{SCRATCH}/opt-{tag}.esb.js"
+    sh([E, entry, "--bundle", f"--outfile={theirs}", "--log-level=silent"] + flags)
+    code, out = sh([ESB, entry, f"--outfile={ours}"] + flags, 60)
+    check(code == 0 and sh(["node", ours], 15)[1] == sh(["node", theirs], 15)[1], f"{name}: same output as esbuild's")
+top = open(f"{SCRATCH}/opt-banner_and_footer.js").read()
+check(top.startswith("/* top */\n") and top.endswith("/* end */\n"), "banner and footer: where esbuild puts them")
+kept = open(f"{SCRATCH}/opt-tree_shaking_off.js").read()
+check("UNUSED_MARKER" in kept and "OTHER_MARKER" in kept, "tree shaking off: unused statements stay")
+
+print("== the spec language")
+SPEC = os.path.join(os.path.dirname(ESB), "spec")
+code, out = sh([SPEC], 60)
+check(code == 0, "the spec builds all its targets")
+got = sh(["node", "-e", "require('./out/spec/plugged.js');console.log(globalThis.bundled.summary)"], 15)[1].strip()
+check(got == '1.2.3 greetings, "friend"', f"plugins, a spec-defined format, a loader: {got}")
+check(open("out/spec/plugged.js").read().startswith("/* built by the spec */\n"), "a spec's banner")
 
 print("== source maps")
 for a in ["named", "cjs", "features"]:
