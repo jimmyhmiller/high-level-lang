@@ -17,6 +17,7 @@
 (import "bundle.minify" :as minify)
 (import "bundle.final" :as final)
 (import "bundle.minhost" :as host)
+(import "bundle.sourcemap" :as map)
 (import "hl.rt" :as rt)
 
 (defsum Format (Iife) (Esm) (Cjs))
@@ -33,6 +34,7 @@
    (minify-syntax bool)
    (pretty bool)
    (timing bool)
+   (sourcemap bool)
    (defines (ArrayList DefineText))
    (main-fields (ArrayList (slice u8)))
    (conditions (ArrayList (slice u8)))
@@ -52,7 +54,7 @@
     (push! (mut exts) ".cjs")
     (push! (mut exts) ".json")
     (Options :entry entry :outfile outfile :format (Iife) :global-name ""
-             :minify-identifiers false :minify-syntax false :pretty false :timing false
+             :minify-identifiers false :minify-syntax false :pretty false :timing false :sourcemap false
              :defines (ArrayList::new [DefineText] (malloc-allocator))
              :main-fields (words "module" "main")
              :conditions (words "import" "browser")
@@ -138,28 +140,38 @@
     (push-str! (mut b) "};")
     (if any (finish! (mut b)) "")))
 
-(defn wrap-format [(o (mut Options)) (gr (mut g/Graph)) (p js/Node)] (-> (slice u8))
+;;; The output text: `prefix`, the printed program, `suffix`. `base` is where the program
+;;; starts, for source map positions.
+(defstruct Printed [(text (slice u8)) (base i64) (marks (ArrayList rt/Mark))])
+
+(defn printed [(o (mut Options)) (p js/Node) (prefix (slice u8)) (suffix (slice u8))] (-> Printed)
+  (let [(mut w) (rt/w-new (.pretty o))]
+    (set! (.tracking w) (.sourcemap o))
+    (js/render-into p (mut w))
+    (Printed :text (rt/join (rt/join prefix (rt/w-finish w)) suffix)
+             :base (len prefix)
+             :marks (.marks w))))
+
+(defn wrap-format [(o (mut Options)) (gr (mut g/Graph)) (p js/Node)] (-> Printed)
   (match (.format o)
     (Iife []
       (if (> (len (.global-name o)) 0)
-          (let [(mut b) (str/StrBuf::new (malloc-allocator))
-                body (js/render (push-stmt! p (e/first-stmt (rt/join (rt/join "return " (to-common-js (mut gr))) ";")))
-                                (.pretty o))]
-            (push-str! (mut b) "var ")
-            (push-str! (mut b) (.global-name o))
-            (push-str! (mut b) "=(()=>{")
-            (push-str! (mut b) body)
-            (push-str! (mut b) "})();\n")
-            (finish! (mut b)))
-          (rt/join (rt/join "(()=>{" (js/render p (.pretty o))) "})();\n")))
+          (printed (mut o)
+                   (push-stmt! p (e/first-stmt (rt/join (rt/join "return " (to-common-js (mut gr))) ";")))
+                   (rt/join (rt/join "var " (.global-name o)) "=(()=>{")
+                   "})();\n")
+          (printed (mut o) p "(()=>{" "})();\n")))
     (Cjs []
-      (let [text (rt/join (rt/join "module.exports=" (to-common-js (mut gr))) ";")
-            body (js/render (push-stmt! p (e/first-stmt text)) (.pretty o))]
-        (rt/join body "\n")))
+      (let [text (rt/join (rt/join "module.exports=" (to-common-js (mut gr))) ";")]
+        (printed (mut o) (push-stmt! p (e/first-stmt text)) "" "\n")))
     (Esm []
-      (let [exports (esm-exports (mut gr))
-            body (js/render (if (> (len exports) 0) (push-stmt! p (e/first-stmt exports)) p) (.pretty o))]
-        (rt/join body "\n")))))
+      (let [exports (esm-exports (mut gr))]
+        (printed (mut o) (if (> (len exports) 0) (push-stmt! p (e/first-stmt exports)) p) "" "\n")))))
+
+(defn base-of-path [(path (slice u8))] (-> (slice u8))
+  (let [(mut cut) -1]
+    (for i (range 0 (len path)) (when (= (get path i) #\/) (set! cut i)))
+    (rt/subtext path (+ cut 1) (len path))))
 
 (defn build [(options Options)] (-> void)
   (let [(mut o) options
@@ -173,6 +185,7 @@
     (for d (.defines o)
       (push! (mut (.defines gr)) (g/Define :key (.key d) :value (define-value (.value d)))))
     (set! (.void-undefined gr) (.minify-syntax o))
+    (set! (.sourcemap gr) (.sourcemap o))
     (set! (.transform gr) (.transform o))
     (set! (.keep-entry-exports gr) (= (.format o) (Esm)))
     (set! (.entry-namespace gr)
@@ -196,9 +209,16 @@
                         out))
                     (None [] (host/templates (final/run (minify/run emitted)))))
                   (fold/run emitted)))
-          text (do (lap! (mut o) "minify rules") (wrap-format (mut o) (mut gr) p))]
+          out (do (lap! (mut o) "minify rules") (wrap-format (mut o) (mut gr) p))
+          text (if (.sourcemap o)
+                   (rt/join (rt/join (.text out) "//# sourceMappingURL=")
+                            (rt/join (base-of-path (.outfile o)) ".map\n"))
+                   (.text out))]
       (lap! (mut o) "print")
       (rt/write-output (.outfile o) text)
+      (when (.sourcemap o)
+        (rt/write-output (rt/join (.outfile o) ".map")
+                         (map/build (mut gr) (.text out) (.base out) (.marks out) (.outfile o))))
       (lap! (mut o) "write")
       (println "{} bytes -> {}" (len text) (.outfile o)))))
 

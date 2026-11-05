@@ -280,11 +280,15 @@
 
 ;;; `keep` counts enclosing positions where parentheses must stay as written, and
 ;;; `pending` holds a `;` that a following `}` makes unnecessary.
-(defstruct W [(buf (ArrayList u8)) (pretty bool) (pending bool) (keep i64) (after-int bool)])
+;;; `marks`, when `tracking`, records where each leaf token landed, for source maps.
+(defstruct Mark [(out i64) (src i64)])
+(defstruct W [(buf (ArrayList u8)) (pretty bool) (pending bool) (keep i64) (after-int bool)
+              (tracking bool) (marks (ArrayList Mark)) (next-src i64)])
 
 (defn w-new [(pretty bool)] (-> W)
   (W :buf (ArrayList::new [u8] (malloc-allocator)) :pretty pretty :pending false :keep 0
-     :after-int false))
+     :after-int false :tracking false :marks (ArrayList::new [Mark] (malloc-allocator))
+     :next-src 0))
 
 (defn printed-name-char? [(c u8)] (-> bool)
   (or (name-char? c) (>= c (: 128 u8)) (= c #\\)))
@@ -324,9 +328,22 @@
                      (and (.after-int w) (= (get s 0) #\.))))
         (push! (mut (.buf w)) #\space)))
     (w-bytes! (mut w) s)
+    (when (> (.next-src w) 0)
+      (push! (mut (.marks w)) (Mark :out (- (len (.buf w)) (len s)) :src (.next-src w)))
+      (set! (.next-src w) 0))
     (set! (.after-int w) (all-digits? s))
     (when (and (.pretty w) (or (= s ";") (= s "{") (= s "}")))
       (push! (mut (.buf w)) #\newline))))
+
+;;; A leaf: its text, and where it came from.
+(defn leaf-tok! [(w (mut W)) (s (slice u8)) (src i64)] (-> void)
+  (note-source! (mut w) src)
+  (tok! (mut w) s))
+
+;;; The next token printed starts the node that came from `src`.
+(defn note-source! [(w (mut W)) (src i64)] (-> void)
+  (when (and (.tracking w) (>= src 4294967296))
+    (set! (.next-src w) src)))
 
 ;;; A `;` the language allows us to drop before `}`.
 (defn soft-semi! [(w (mut W))] (-> void)
@@ -366,6 +383,11 @@
     (w-bytes! (mut w) open)
     (w-bytes! (mut w) (slice saved))
     (w-bytes! (mut w) close)
+    ;; What was printed since `at` moved along by the new opening.
+    (for i (range 0 (len (.marks w)))
+      (let [m (get (.marks w) i)]
+        (when (>= (.out m) at)
+          (set! (mut (.marks w)) i (Mark :out (+ (.out m) (len open)) :src (.src m))))))
     (set! (.after-int w) false)))
 
 (defn w-finish [(w W)] (-> (slice u8)) (slice (.buf w)))
@@ -373,6 +395,8 @@
 ;; ---------------------------------------------------------------- strings
 
 ;;; The content of a quoted string token.
+(defn subtext [(s (slice u8)) (from i64) (to i64)] (-> (slice u8)) (subslice s from to))
+
 (defn str-content [(raw (slice u8))] (-> (slice u8))
   (subslice raw 1 (- (len raw) 1)))
 
