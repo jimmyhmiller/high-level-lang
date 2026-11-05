@@ -135,7 +135,8 @@ purity, CommonJS wrapping, re-exports from CommonJS, `__esm` wrapping for `requi
 of ES modules, namespace objects, `define`, aliases, loaders (js, json, text, base64, dataurl,
 empty), TypeScript (types erased by the grammar, enums, namespaces, parameter properties, unused
 imports, `import x = …`, `export =`, `./x.js` meaning `./x.ts`), JSX (classic, automatic and dev runtimes, preserve, pragmas in block comments), banner and
-footer, tree shaking off, iife/esm/cjs and spec-defined output formats, global
+footer, tree shaking off, iife/esm/cjs and spec-defined output formats, several entries with `--outdir`, code splitting with
+shared chunks and `import()` (`--splitting`, `--entry-names`, `--chunk-names`, `--outbase`), global
 names, `--external`, `--platform=node`, identifier and syntax minification, source maps, and resolve,
 load, transform and optimize hooks.
 
@@ -143,7 +144,7 @@ load, transform and optimize hooks.
 
 Being explicit, because "everything esbuild does" is a lot:
 
-- **Not built:** code splitting, the CSS loader, syntax lowering for older targets, watch and serve,
+- **Not built:** the CSS loader, syntax lowering for older targets, watch and serve,
   legal comments in output, `tsconfig.json`, TypeScript decorators, `accessor` fields, inlining enum
   values across files.
 - **Hard errors for now:** `export *` from a CommonJS or external module in the entry point of ES

@@ -1,0 +1,303 @@
+# Code splitting: which chunk each file is in, what chunks import from each other, and the
+# file each one ends up as. The statements each root reaches come from link.facts.
+rules bundle.chunks over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.analysis as an
+use bundle.emit as e
+
+record Chunk {
+  id: Int,
+  key: Text,
+  root: Int,          # the module this chunk is the entry for, or -1 for a shared chunk
+  roots: [Int],       # every root that needs it
+  parts: {Int:Bool},
+  needs: {Int:[Text]} # from which other chunk, which names
+}
+
+state chunks: [Chunk] = []
+state by-key: {Text:Int} = {}
+state part-chunk: {Int:Int} = {}
+
+fn chunk-new(key: Text, root: Int, roots: [Int]) -> Int {
+  let id = len(chunks)
+  chunks += Chunk(id: id, key: key, root: root, roots: roots, parts: {}, needs: {})
+  by-key[key] = id
+  id
+}
+
+fn key-of(roots: [Int]) -> Text {
+  var b = buf-new()
+  for r in roots {
+    buf-add!(b, int-text(r))
+    buf-add!(b, ",")
+  }
+  buf-text(b)
+}
+
+# A file stays whole, as in esbuild: its live statements go where any of its roots can load them.
+fn roots-of(module: Int) -> [Int] {
+  let found = [r for m.db.entered(?r, module)]
+  sort r in found by r
+}
+
+# Every root's own chunk first, even an empty one: it is still a file someone asked for.
+fn assign!(roots: [Int]) -> Void {
+  chunks = []
+  by-key = {}
+  part-chunk = {}
+  for r in roots { chunk-new(key-of([r]), r, [r]) }
+  for id in m.order {
+    if e.included?(id) {
+      for p in e.parts-of(id) {
+        if e.live?(p) {
+          let reached = roots-of(id)
+          if len(reached) == 0 { panic "{}: a live statement no entry reaches", m.modules[id].path }
+          let key = key-of(reached)
+          let c = by-key[key] ?? chunk-new(key, -1, reached)
+          chunks[c].parts[p] = true
+          part-chunk[p] = c
+        }
+      }
+    }
+  }
+}
+
+# The live statement declaring a symbol, and so the chunk it is in.
+fn home-of(s: Int) -> Int? {
+  for m.db.declares(?p, s) {
+    if let some(c) = part-chunk[p] { return some(c) }
+  }
+  none
+}
+
+fn need!(c: Int, s: Int) -> Void {
+  if let some(home) = home-of(s) {
+    if home != c {
+      let name = e.final-of(s)
+      var names = chunks[c].needs[home] ?? []
+      if not (name in names) {
+        names += name
+        chunks[c].needs[home] = names
+      }
+    }
+  }
+}
+
+# A symbol as this chunk reads it: what an import resolves to, and the variable of a CommonJS import.
+fn need-symbol!(c: Int, s: Int) -> Void {
+  let t = e.target-of(s)
+  match an.cjs-imports[t] {
+    some(ci) => need!(c, ci.import-var)
+    none => need!(c, t)
+  }
+}
+
+fn link-chunks!() -> Void {
+  for ch in chunks {
+    for p in keys(ch.parts) {
+      for m.db.uses(p, ?s) { need-symbol!(ch.id, s) }
+    }
+    if ch.root >= 0 {
+      for m.db.resolved(ch.root, ?n, ?s) {
+        if let some(best) = e.resolved-export(ch.root, n) { need-symbol!(ch.id, best) }
+      }
+    }
+  }
+}
+
+fn import-names(names: [Text], from: Text) -> Node {
+  let sorted = sort n in names by n
+  let specs = [ImportName(BindName(n)) for n in sorted]
+  Import(ImportNamed(List(specs...)), Str(quote-text(from)))
+}
+
+# What this chunk says at its top. A root imports every chunk it needs, for its effects if nothing
+# else; a shared chunk imports only what it reads.
+fn imports-of(ch: Chunk) -> [Node] {
+  var out: [Node] = []
+  for other in chunks {
+    if other.id != ch.id {
+      let path = placeholder(other.id)
+      if let some(names) = ch.needs[other.id] {
+        out += import-names(names, path)
+      } else if ch.root >= 0 and ch.root in other.roots {
+        out += ImportBare(Str(quote-text(path)))
+      }
+    }
+  }
+  out
+}
+
+# Names other chunks read from this one.
+fn exports-of(ch: Chunk) -> [Node] {
+  var names: [Text] = []
+  for other in chunks {
+    if let some(ns) = other.needs[ch.id] {
+      for n in ns {
+        if not (n in names) { names += n }
+      }
+    }
+  }
+  if len(names) == 0 { return [] }
+  let sorted = sort n in names by n
+  let specs = [ExportName(PropName(n)) for n in sorted]
+  [ExportNamed(List(specs...))]
+}
+
+# ---------------------------------------------------------------- file names
+
+# A chunk's name is not known until its text is, and its text mentions other chunks' names. So the
+# text holds these until the end.
+const mark: Text = "__ESB_CHUNK_"
+
+fn placeholder(id: Int) -> Text = "./" ++ mark ++ int-text(id) ++ "__"
+
+# Each occurrence: where it starts, how long it is, and which chunk it names.
+record Hole { at: Int, size: Int, chunk: Int }
+
+fn holes-in(text: Text) -> [Hole] {
+  var out: [Hole] = []
+  var i = 0
+  while i < len(text) {
+    if text[i] == '.' and at?(text, i, "./" ++ mark) {
+      var j = i + 2 + len(mark)
+      var v = 0
+      while digit-byte?(text[j]) {
+        v = v * 10 + (text[j] - '0')
+        j += 1
+      }
+      out += Hole(at: i, size: j + 2 - i, chunk: v)
+      i = j + 2
+    } else {
+      i += 1
+    }
+  }
+  out
+}
+
+# Not for security, only for telling versions of a file apart.
+fn hash-text!(state-word: mut [Int], text: Text) -> Void {
+  var a = state-word[0]
+  var b = state-word[1]
+  for c in text {
+    a = (a * 131 + c + 7) % 2147483647
+    b = (b * 65599 + c + 11) % 2147483629
+  }
+  state-word[0] = a
+  state-word[1] = b
+}
+
+const hash-letters: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+fn hash-name(a: Int, b: Int) -> Text {
+  var x = a
+  var y = b
+  var out = buf-new()
+  for i in 0..4 {
+    buf-byte!(out, hash-letters[x % 32])
+    x = x / 32
+    buf-byte!(out, hash-letters[y % 32])
+    y = y / 32
+  }
+  buf-text(out)
+}
+
+# A file's hash covers everything it loads, so that a change anywhere renames all who depend on it.
+fn closure!(id: Int, holes: [[Hole]], seen: mut {Int:Bool}) -> Void {
+  if id in seen { return }
+  seen[id] = true
+  for h in holes[id] { closure!(h.chunk, holes, seen) }
+}
+
+fn content-hash(id: Int, texts: [Text], holes: [[Hole]]) -> Text {
+  var seen: {Int:Bool} = {}
+  closure!(id, holes, seen)
+  var word = [17, 31]
+  for other in 0..len(texts) {
+    if other in seen { hash-text!(word, texts[other]) }
+  }
+  hash-name(word[0], word[1])
+}
+
+fn replace-all(text: Text, what: Text, with-text: Text) -> Text {
+  var b = buf-new()
+  var i = 0
+  while i < len(text) {
+    if at?(text, i, what) {
+      buf-add!(b, with-text)
+      i += len(what)
+    } else {
+      buf-byte!(b, text[i])
+      i += 1
+    }
+  }
+  buf-text(b)
+}
+
+# `[dir]/[name]-[hash]`, with an empty directory and the slash after it gone.
+fn pattern-path(pattern: Text, dir: Text, name: Text, hash: Text) -> Text {
+  let filled = replace-all(replace-all(replace-all(pattern, "[name]", name), "[hash]", hash), "[dir]", dir)
+  var out = filled
+  while starts-with(out, "./") or starts-with(out, "/") {
+    out = out[if out[0] == '.' then 2 else 1..len(out)]
+  }
+  out
+}
+
+fn split-parts(path: Text) -> [Text] {
+  var out: [Text] = []
+  var start = 0
+  for i in 0..len(path) {
+    if path[i] == '/' {
+      if i > start and path[start..i] != "." { out += path[start..i] }
+      start = i + 1
+    }
+  }
+  if start < len(path) { out += path[start..len(path)] }
+  out
+}
+
+# `to` as an import written in the file `from`.
+fn relative-import(from: Text, to: Text) -> Text {
+  let a = split-parts(dir-of(from))
+  let b = split-parts(to)
+  var common = 0
+  while common < len(a) and common < len(b) - 1 and a[common] == b[common] { common += 1 }
+  var out = buf-new()
+  if common == len(a) { buf-add!(out, "./") }
+  for i in common..len(a) { buf-add!(out, "../") }
+  for i in common..len(b) {
+    buf-add!(out, b[i])
+    if i < len(b) - 1 { buf-add!(out, "/") }
+  }
+  buf-text(out)
+}
+
+# The text with every placeholder replaced, and where it put what used to follow each one.
+record Filled { text: Text, marks: [Mark] }
+
+fn filled(text: Text, base: Int, marks: [Mark], holes: [Hole], self-path: Text, paths: [Text]) -> Filled {
+  var b = buf-new()
+  var out: [Mark] = []
+  var from = 0
+  var shift = 0
+  var next-mark = 0
+  for h in holes {
+    while next-mark < len(marks) and marks[next-mark].out + base <= h.at {
+      out += Mark(out: marks[next-mark].out + shift, src: marks[next-mark].src)
+      next-mark += 1
+    }
+    buf-add!(b, text[from..h.at])
+    let replacement = relative-import(self-path, paths[h.chunk])
+    buf-add!(b, replacement)
+    shift = shift + len(replacement) - h.size
+    from = h.at + h.size
+  }
+  buf-add!(b, text[from..len(text)])
+  while next-mark < len(marks) {
+    out += Mark(out: marks[next-mark].out + shift, src: marks[next-mark].src)
+    next-mark += 1
+  }
+  Filled(text: buf-text(b), marks: out)
+}

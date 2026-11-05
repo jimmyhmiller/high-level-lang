@@ -19,6 +19,9 @@ state keep-entry-exports: Bool = false
 state tree-shaking: Bool = true
 state any-dynamic: Bool = false
 state any-reexport: Bool = false
+# Code splitting: `import()` loads a chunk, so what it names runs when loaded, and needs no wrapper.
+state splitting: Bool = false
+state dynamic-roots: [Int] = []
 
 # The module the current analysis is looking at.
 context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
@@ -94,6 +97,11 @@ fn mention-module(part: Int, t: Int) -> Void {
   }
 }
 
+# What `import()` of a chunk needs here: only the helper that makes CommonJS look like a module.
+fn mention-chunk(part: Int, t: Int) -> Void {
+  if m.modules[t].kind == Cjs { assert m.db.mentions(part, helper("__toESM")) }
+}
+
 fn mentions-kids(part: Int, n: Node) -> Void {
   for k in n.kids { mentions-under(part, k) }
 }
@@ -105,7 +113,7 @@ fn mentions-under(part: Int, n: Node) -> Void = match n {
     none => mentions-under(part, object)
   }
   ImportCall(...) => match import-call-target(here, n) {
-    some(t) => mention-module(part, t)
+    some(t) => if splitting then mention-chunk(part, t) else mention-module(part, t)
     none => mentions-kids(part, n)
   }
   CallExpr(...) => match require-target(here, n) {
@@ -440,7 +448,13 @@ fn wrap(id: Int) -> Void {
 
 fn on-demand-targets(mo: m.Module, n: Node) -> Void {
   match n {
-    ImportCall(...) => if let some(t) = import-call-target(mo, n) { wrap(t) }
+    ImportCall(...) => if let some(t) = import-call-target(mo, n) {
+      if splitting {
+        if m.modules[t].kind != External and not (t in dynamic-roots) { dynamic-roots += t }
+      } else {
+        wrap(t)
+      }
+    }
     CallExpr(...) => if let some(t) = require-target(mo, n) { wrap(t) }
     _ => {}
   }
@@ -466,8 +480,16 @@ fn link() -> Void {
       _ => {}
     }
   }
-  assert m.db.entry(m.entry)
-  if entry-namespace or keep-entry-exports { assert m.db.keep-exports(m.entry) }
+  if splitting {
+    for r in m.entries ++ dynamic-roots {
+      assert m.db.entry(r)
+      assert m.db.chunk-root(r)
+      if m.modules[r].kind == Esm { assert m.db.keep-exports(r) }
+    }
+  } else {
+    assert m.db.entry(m.entry)
+    if entry-namespace or keep-entry-exports { assert m.db.keep-exports(m.entry) }
+  }
   # Import bindings first, so a statement can tell `ns.x` from `obj.x` in any order.
   for id in m.order {
     let mo = m.modules[id]

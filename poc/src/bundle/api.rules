@@ -13,6 +13,7 @@ use bundle.final as final
 use bundle.minhost as host
 use bundle.sourcemap as map
 use bundle.jsx as jsx
+use bundle.chunks as chunks
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -38,7 +39,13 @@ record DefineText { key: Text, value: Text }
 
 record Options {
   entry: Text,
+  entries: [Text],
   outfile: Text,
+  outdir: Text,
+  outbase: Text,
+  splitting: Bool,
+  entry-names: Text,
+  chunk-names: Text,
   format: Format,
   global-name: Text,
   minify-identifiers: Bool,
@@ -70,7 +77,9 @@ fn keep-as-is(n: Node) -> Node = n
 fn default-optimize(n: Node) -> Node = host.templates(final.run(minify.run(n)))
 
 fn options-new(entry: Text, outfile: Text) -> Options =
-  Options(entry: entry, outfile: outfile, format: iife-format(), global-name: "",
+  Options(entry: entry, entries: [entry], outfile: outfile, outdir: "", outbase: "", splitting: false,
+          entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]",
+          format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
@@ -157,14 +166,16 @@ fn to-common-js() -> Node {
 
 # `export { a, b as c };` for the entry's names, and `var` statements for those a local name can't
 # hold, which come first.
-fn esm-exports() -> [Node] {
-  if m.db.dynamic(m.entry) {
-    panic "{}: `export *` from a CommonJS or external module in the entry point of ES module output is not implemented yet", m.modules[m.entry].path
+fn esm-exports() -> [Node] = exports-of-root(m.entry)
+
+fn exports-of-root(root: Int) -> [Node] {
+  if m.db.dynamic(root) {
+    panic "{}: `export *` from a CommonJS or external module in the entry point of ES module output is not implemented yet", m.modules[root].path
   }
   var out: [Node] = []
   var specs: [Node] = []
-  for n in e.unique-names([n for m.db.resolved(m.entry, ?n, _)]) {
-    if let some(s) = e.resolved-export(m.entry, n) {
+  for n in e.unique-names([n for m.db.resolved(root, ?n, _)]) {
+    if let some(s) = e.resolved-export(root, n) {
       let name = name-of(m.names, n)
       match e.symbol-read(s) {
         Ident(local) => { specs += ExportAs(PropName(local), PropName(name)) }
@@ -231,11 +242,58 @@ fn reset-all() -> Void {
   m.reset-state!()
   an.reset-state!()
   e.reset-state!()
+  chunks.reset-state!()
   mangle.reset-state!()
   res.reset-state!()
 }
 
+# The names esbuild gives output files: the entry's path below the entries' common directory.
+fn stem-of(path: Text) -> Text {
+  let base = base-of-path(path)
+  var dot = len(base)
+  for i in 0..len(base) {
+    if base[i] == '.' { dot = i }
+  }
+  base[0..dot]
+}
+
+fn common-dir(paths: [Text]) -> Text {
+  var dir = dir-of(paths[0])
+  for p in paths {
+    while not (dir == "." or starts-with(p, dir ++ "/")) { dir = dir-of(dir) }
+  }
+  dir
+}
+
+fn below(dir: Text, path: Text) -> Text =
+  if dir == "." then path else path[len(dir) + 1..len(path)]
+
+fn entry-output(o: Options, entry: Text, base: Text) -> Text {
+  let rel = below(base, entry)
+  let dir = dir-of(rel)
+  let name = chunks.pattern-path(o.entry-names, if dir == "." then "" else dir, stem-of(rel), "")
+  o.outdir ++ "/" ++ name ++ ".js"
+}
+
+fn base-dir(o: Options) -> Text = if len(o.outbase) > 0 then o.outbase else common-dir(o.entries)
+
+# One bundle, or one per entry, or one split into chunks.
 fn build(options: Options) -> Void {
+  if options.splitting {
+    build-split(options)
+  } else if len(options.outdir) > 0 {
+    let base = base-dir(options)
+    for entry in options.entries {
+      build-one(options with { entry: entry, entries: [entry], outfile: entry-output(options, entry, base) })
+    }
+  } else if len(options.entries) > 1 {
+    panic "several entry points need --outdir"
+  } else {
+    build-one(options)
+  }
+}
+
+fn build-one(options: Options) -> Void {
   var o = options
   reset-all()
   if o.pretty and o.jsx.runtime == jsx.Preserve {
@@ -291,4 +349,104 @@ fn build(options: Options) -> Void {
   if o.sourcemap { write-file(o.outfile ++ ".map", map.build-map(full, base, out0.marks, o.outfile)) }
   lap(o, "write")
   print "{} bytes -> {}", len(text), o.outfile
+}
+
+# ---------------------------------------------------------------- code splitting
+
+state chunk-of-root: {Int:Int} = {}
+
+fn path-of-root(root: Int) -> Text {
+  let c = chunk-of-root[root] ?? panic "{} has no chunk", m.modules[root].path
+  chunks.placeholder(c)
+}
+
+# What running this chunk's entry looks like at its end.
+fn root-statements(root: Int) -> [Node] {
+  let mo = m.modules[root]
+  if mo.kind == m.Cjs {
+    let call-me = e.final-of(mo.require-sym)
+    return [stmt`export default $call_me();`]
+  }
+  var out: [Node] = []
+  if mo.wrapped {
+    let call-me = e.final-of(mo.init-sym)
+    out += stmt`$call_me();`
+  }
+  out ++ exports-of-root(root)
+}
+
+# The body of one chunk, as text with placeholders in it.
+fn chunk-program(o: Options, c: chunks.Chunk) -> Printed {
+  e.in-chunk = true
+  e.chunk-parts = c.parts
+  e.external-imports = []
+  let body = e.program()
+  let p = if o.minify-syntax then o.optimize(body) else fold.run(body)
+  var stmts = chunks.imports-of(c) ++ p.kids[1].kids
+  if c.root >= 0 { stmts ++= root-statements(c.root) }
+  stmts ++= chunks.exports-of(c)
+  let r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
+  var hoisted = buf-new()
+  for line in e.external-imports { buf-add!(hoisted, line) }
+  let head = buf-text(hoisted)
+  Printed(text: head ++ r.text ++ "\n", base: len(head), marks: r.marks)
+}
+
+fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text {
+  if c.root < 0 {
+    return o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"
+  }
+  let path = m.modules[c.root].path
+  if c.root in static-roots { return entry-output(o, path, base) }
+  o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", stem-of(path), hash) ++ ".js"
+}
+
+fn build-split(options: Options) -> Void {
+  var o = options
+  if len(o.outdir) == 0 { panic "code splitting needs --outdir" }
+  if not o.format.export-names { panic "code splitting needs --format=esm" }
+  reset-all()
+  m.options = res.Options(main-fields: o.main-fields, conditions: o.conditions, extensions: o.extensions,
+                          external: o.external, node-builtins: o.platform-node)
+  if not has-define?(o, "process.env.NODE_ENV") and not o.platform-node {
+    define!(o, "process.env.NODE_ENV", if o.minify-syntax then "\"production\"" else "\"development\"")
+  }
+  m.defines = [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines]
+  m.aliases = o.aliases
+  m.loaders = o.loaders
+  m.jsx-options = o.jsx
+  m.on-resolve = o.on-resolve
+  m.on-load = o.on-load
+  an.tree-shaking = o.tree-shaking
+  e.void-undefined = o.minify-syntax
+  e.sourcemap = o.sourcemap
+  m.transform = o.transform
+  an.keep-entry-exports = true
+  e.esm-output = true
+  an.splitting = true
+  m.load-runtime(include-text("runtime.js"))
+  m.load-trees(o.entries)
+  an.link()
+  if o.minify-identifiers then mangle.assign-minified() else e.assign-names()
+  let roots = m.entries ++ an.dynamic-roots
+  chunks.assign!(roots)
+  chunks.link-chunks!()
+  chunk-of-root = {}
+  for c in chunks.chunks {
+    if c.root >= 0 { chunk-of-root[c.root] = c.id }
+  }
+  e.chunk-path = path-of-root
+  let printed-chunks = [chunk-program(o, c) for c in chunks.chunks]
+  let texts = [p.text for p in printed-chunks]
+  let holes = [chunks.holes-in(t) for t in texts]
+  let base = base-dir(o)
+  let paths = [chunk-path-of(o, c, chunks.content-hash(c.id, texts, holes), base, m.entries) for c in chunks.chunks]
+  for i in 0..len(texts) {
+    let pr = printed-chunks[i]
+    let done = chunks.filled(pr.text, pr.base, pr.marks, holes[i], paths[i], paths)
+    let text = if o.sourcemap then done.text ++ "//# sourceMappingURL=" ++ base-of-path(paths[i]) ++ ".map\n" else done.text
+    write-file(paths[i], text)
+    if o.sourcemap { write-file(paths[i] ++ ".map", map.build-map(done.text, pr.base, done.marks, paths[i])) }
+    print "{} bytes -> {}", len(text), paths[i]
+  }
 }

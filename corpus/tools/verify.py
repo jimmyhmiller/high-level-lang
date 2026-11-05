@@ -173,6 +173,30 @@ for a in "globs via-named via-star via-local via-ns via-whole via-none".split():
     x, y = sh(["node", ours], 15)[1], sh(["node", theirs], 15)[1]
     check(x and x == y, f"{a}: runs the same module effects")
 
+print("== code splitting against esbuild")
+def split_outputs(entries, flags):
+    for d in [f"{SCRATCH}/split-o", f"{SCRATCH}/split-e"]:
+        os.makedirs(d, exist_ok=True)
+        for f in glob.glob(d + "/**/*.*", recursive=True):
+            if os.path.isfile(f): os.unlink(f)
+    sh([ESB] + entries + ["--splitting", "--format=esm", f"--outdir={SCRATCH}/split-o"] + flags)
+    sh([E] + entries + ["--bundle", "--splitting", "--format=esm", f"--outdir={SCRATCH}/split-e", "--log-level=error"] + flags)
+    listing = lambda d: sorted(re.sub(r"-[A-Z0-9]{8}\.js$", ".js", os.path.relpath(f, d)) for f in glob.glob(d + "/**/*.js", recursive=True))
+    return listing(f"{SCRATCH}/split-o"), listing(f"{SCRATCH}/split-e")
+for label, entries, flags in [("fixture", ["app/split/a.js", "app/split/b.js"], []),
+                              ("fixture minified", ["app/split/a.js", "app/split/b.js"], ["--minify"]),
+                              ("nested directories", ["app/split/a.js", "app/split/sub/nested.js"], []),
+                              ("lodash-es, rxjs, d3 and import()", ["app/split/real1.js", "app/split/real2.js"], []),
+                              ("the same, minified", ["app/split/real1.js", "app/split/real2.js"], ["--minify"]),
+                              ("TypeScript", ["app/split/ts-entry.ts"], [])]:
+    ours, theirs = split_outputs(entries, flags)
+    same = True
+    for en in entries:
+        name = re.sub(r"\.[a-z]+$", ".js", en.replace("app/split/", ""))
+        x, y = sh(["node", f"{SCRATCH}/split-o/{name}"], 30), sh(["node", f"{SCRATCH}/split-e/{name}"], 30)
+        same = same and x[0] == 0 and x[1] and x[1] == y[1]
+    check(same and ours == theirs, f"{label}: same output as esbuild's, in the same {len(ours)} files")
+
 print("== the spec language")
 SPEC = os.path.join(os.path.dirname(ESB), "spec")
 code, out = sh([SPEC], 60)

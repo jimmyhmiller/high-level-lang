@@ -14,6 +14,12 @@ state void-undefined: Bool = false
 state esm-output: Bool = false
 state sourcemap: Bool = false
 state external-imports: [Text] = []
+# Code splitting: the statements of the chunk being printed, and how to write another chunk's path.
+state in-chunk: Bool = false
+state chunk-parts: {Int:Bool} = {}
+state chunk-path: Fn(Int)->Text = no-chunks
+
+fn no-chunks(root: Int) -> Text = panic "no chunks in this build"
 
 # Name-collision state: every name taken at the bundle's top level or reserved, plus a stack of
 # names taken in the nested scopes around the current one.
@@ -230,6 +236,18 @@ fn import-call(t: m.Module) -> Node {
   }
 }
 
+# `import("x")` of a chunk: its file, and a CommonJS module's value comes out as its default export.
+fn import-chunk(t: m.Module) -> Node {
+  let path = Str(quote-text(chunk-path(t.id)))
+  if t.kind == Cjs {
+    let to-esm = helper-name("__toESM")
+    let param = if to-esm == "m" then "n" else "m"
+    exp`import($path).then(($param) => $to_esm($param.default))`
+  } else {
+    exp`import($path)`
+  }
+}
+
 # Function-like kinds rebind `this`; arrows do not.
 fn rebinds-this?(n: Node) -> Bool = sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...))
 
@@ -277,7 +295,9 @@ fn rw(n: Node, depth: Int) -> Node = match n {
     }
   }
   ImportCall(...) => match an.import-call-target(here, n) {
-    some(t) => if m.modules[t].kind == External then n else import-call(m.modules[t])
+    some(t) => if m.modules[t].kind == External then n
+               else if an.splitting then import-chunk(m.modules[t])
+               else import-call(m.modules[t])
     none => rw-kids(n, depth)
   }
   ImportMeta() => exp`({})`.kids[0]
@@ -545,19 +565,23 @@ fn wrapped-module!(outputs: [Node], out: mut [Node]) -> Void {
 
 # Every live statement, in module order. Namespace objects go right after the runtime: their
 # getters are all functions, so this makes them safe to read from any module's top level.
+fn in-this-chunk?(p: Int) -> Bool = not in-chunk or p in chunk-parts
+
+fn any-part-here?(id: Int) -> Bool = any p in parts-of(id): in-this-chunk?(p)
+
 fn program() -> Node {
   var out: [Node] = []
   var namespaces: [Node] = []
   var runtime-count = 0
   for id in m.order {
-    if included?(id) {
+    if included?(id) and any-part-here?(id) {
       with here = m.modules[id] {
         if here.kind == Cjs {
           out += cjs-part()
         } else {
           var outputs: [Node] = []
           for p in parts-of(id) {
-            if live?(p) {
+            if live?(p) and in-this-chunk?(p) {
               match an.part-stmt[p] {
                 None() => namespace-stmts!(namespaces)
                 Flag() => {}
@@ -570,8 +594,8 @@ fn program() -> Node {
           if here.wrapped { wrapped-module!(outputs, out) }
         }
       }
-      if id == 0 { runtime-count = len(out) }
     }
+    if id == 0 { runtime-count = len(out) }
   }
   let all-stmts = out[0..runtime-count] ++ namespaces ++ out[runtime-count..len(out)]
   Program(None(), List(all-stmts...))
