@@ -28,16 +28,16 @@ tables, Datalog and rewriting in general, plus a runtime of buffers, files and U
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 3,820 | Resolution, modules, early errors, analysis, emit, naming, source maps, the build, the tools |
-| `.syntax` | 449 | JavaScript, its literals and comments, package.json |
+| `.rules` | 8,118 | Resolution, modules, JSX, TypeScript, tsconfig, early errors, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
+| `.syntax` | 780 | JavaScript with JSX and TypeScript, CSS, literals, comments, package.json and tsconfig.json |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
-| `.facts` | 77 | Linking and tree shaking |
-| `.js` | 58 | The bundle's runtime helpers |
-| `.bundler` | 56 | A demo build |
+| `.facts` | 114 | Linking, tree shaking, and which root reaches what for code splitting |
+| `.js` | 171 | The bundle's runtime helpers, and those lowering adds |
+| `.bundler` | 70 | A demo build |
 | `.scopes` | 26 | Scoping |
 | `.coil` | 12 | Three `main` functions, because a package's entry must be plain Coil |
 
-The compilers for those languages are about 6,400 lines of Coil and 260 of grammars.
+The compilers for those languages are about 6,700 lines of Coil and 260 of grammars.
 
 `.rules` is the least specific of these languages: a typed language over the grammar's nodes, with
 pattern matching, relations, dynamic scope and code templates written in JavaScript's own syntax:
@@ -152,13 +152,15 @@ load, transform and optimize hooks.
 
 Being explicit, because "everything esbuild does" is a lot:
 
-- **Not built:** watch and serve, CSS modules, CSS nesting and other CSS lowering, `tsconfig.json`, TypeScript decorators, `accessor` fields, inlining enum
-  values across files.
+- **Not built:** watch and serve, CSS modules, CSS nesting and other CSS lowering, JavaScript
+  (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
+  and inlining enum values across files.
 - **Hard errors for now:** `export *` from a CommonJS or external module in the entry point of ES
   module output.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside
-  another, stylesheets with `--splitting`, `--legal-comments=inline`, the automatic JSX runtime in a CommonJS module, and `--jsx=preserve` with
-  `--pretty`.
+  another, stylesheets with `--splitting`, `--legal-comments=inline`, the automatic JSX runtime in a
+  CommonJS module, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`
+  class, and decorators on members with computed names.
 - **Hard errors when lowering:** `super` inside an async function, object rest nested inside another
   pattern or in an assignment, a computed key in an object rest, and calling a parenthesized optional
   chain, all below the version that has them; browser names in `--target`.
