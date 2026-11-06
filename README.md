@@ -18,13 +18,13 @@ build.pipeline       stages, and plans of how many threads run them → plans, c
                      analysis, emit, renaming, source maps, the build
 ```
 
-Every language except `.syntax` is defined by a `.syntax` grammar in `poc/lang/languages/`.
+Every language except `.syntax` is defined by a `.syntax` grammar in `src/languages/`.
 `.syntax` keeps a hand-written parser, because it is the bootstrap.
 
 ## The split
 
-There is no bundler logic in Coil. Everything written in the languages is under `poc/lang/`, which
-holds no `.coil` file at all, and the Coil under `poc/compiler/` knows nothing about JavaScript or
+There is no bundler logic in Coil. Everything written in the languages is under `src/`, which
+holds no `.coil` file at all, and the Coil under `compiler/` knows nothing about JavaScript or
 bundling: it is grammars, types,
 tables, Datalog and rewriting in general, plus a runtime of buffers, files and Unicode.
 
@@ -97,7 +97,7 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 ```
 
 It is closer to a small ML than to a one-purpose language, and some of it is still written at a low
-level: `corpus/tools/altitude.py` counts 32% of the lines of `.rules` and `.attrs` in functions with
+level: `tools/altitude.py` counts 32% of the lines of `.rules` and `.attrs` in functions with
 loops over indices, variables updated in place, global or context state written to, or byte
 scanning (67% on 2026-11-05). What is left is mostly the build's own sequencing, symbol tables
 passed by reference, naming, and printing.
@@ -139,21 +139,21 @@ rewrite Member(object, property) as n =>
 ```
 
 The languages' readers are one provider, `hl.readers`, compiled once as a native reader artifact
-(`corpus/tools/readers.sh`, rebuilt only when the readers or the compiler change). Built from
+(`tools/readers.sh`, rebuilt only when the readers or the compiler change). Built from
 source instead, Coil compiles each reader into every build and keeps what each reading allocates
 until the build ends: the bundler took about 30 s and 8–9.8 GB. With the artifact it takes about
-7 s and 1.6 GB. Run builds through `corpus/tools/guard.py`, which kills a process tree over a limit.
+7 s and 1.6 GB. Run builds through `tools/guard.py`, which kills a process tree over a limit.
 
 ## Running it
 
 ```sh
-cd corpus && npm install --ignore-scripts && node node_modules/esbuild/install.js
-mkdir -p vendor && git clone --depth 1 https://github.com/tc39/test262-parser-tests vendor/test262-parser-tests
+(cd tests && npm install --ignore-scripts && node node_modules/esbuild/install.js)
+git clone --depth 1 https://github.com/tc39/test262-parser-tests tests/test262
 
-python3 tools/guard.py 9500 500 tools/build-tools.sh -O3  # corpus/out/bin/{esb,jsparse,spec}
-out/bin/esb app/named.js --minify --outfile=out/app.js    # command line, esbuild style
-python3 tools/verify.py out/bin/esb out/bin/jsparse       # every claim below
-out/bin/spec                                              # the build build.bundler describes
+python3 tools/guard.py 9500 500 tools/build-tools.sh -O3      # out/bin/{esb,jsparse,spec}
+out/bin/esb tests/apps/named.js --minify --outfile=out/app.js  # command line, esbuild style
+python3 tools/verify.py out/bin/esb out/bin/jsparse           # every claim below
+(cd tests && ../out/bin/spec)                                 # the build build.bundler describes
 ```
 
 `tools/same.py` compares a new build with a frozen one, byte for byte, across 189 outputs. That is
@@ -223,7 +223,7 @@ core took 76, 78, 24, 30, 42, 48 and 56 ms on those apps, and is faster still on
 
 ## Parallelism
 
-How the build divides its work is a language of its own. `poc/lang/app/build.pipeline` names the
+How the build divides its work is a language of its own. `src/app/build.pipeline` names the
 stages that work on one file, module or part at a time, the functions each runs, and plans:
 
 ```
@@ -362,18 +362,23 @@ Being explicit, because "everything esbuild does" is a lot:
 
 ## Layout
 
-Everything written in the languages is under `poc/lang/`; everything in Coil under `poc/compiler/`.
+Everything written in the languages is under `src/`; everything in Coil under `compiler/`.
 
-- `poc/lang/languages/`: the grammars of the languages themselves, and the `.rules` prelude.
-- `poc/lang/bundle/`: the bundler, in those languages.
-- `poc/lang/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map` gives the serial answer, in `.rules`.
-- `poc/lang/app/`: a demo spec with four targets, a format, a loader and plugins, and the pipeline.
-- `poc/compiler/hl/`: the languages' compilers. `syntax`, `rules`, `rewrite`, `facts`, `scopes`,
+- `src/languages/`: the grammars of the languages themselves, and the `.rules` prelude.
+- `src/bundle/`: the bundler, in those languages.
+- `src/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map` gives the serial answer, in `.rules`.
+- `src/app/`: a demo spec with four targets, a format, a loader and plugins, and the pipeline.
+- `compiler/hl/`: the languages' compilers. `syntax`, `rules`, `rewrite`, `facts`, `scopes`,
   `bundler` and `pipeline` are readers; `rt` and `symtab` are their domain-free runtime;
-  `grammars/` turns each grammar in `lang/languages/` into its parser.
-- `poc/compiler/boot/`: four `main` functions, because a package's entry must be plain Coil.
-- `corpus/`: test apps and oracles. `node_modules` and `vendor` are not checked in.
-- `experiments/`: small programs that established how Coil readers behave, and repros of Coil issues.
+  `grammars/` turns each grammar in `src/languages/` into its parser.
+- `compiler/boot/`: four `main` functions, because a package's entry must be plain Coil.
+- `tests/apps/`: the apps and fixtures the checks build; `tests/oracles/` the Node scripts that
+  check outputs with acorn and esbuild. `tests/node_modules/` and `tests/test262/` are not checked in.
+- `tools/`: building (`build-tools.sh`, `readers.sh`, `guard.py`), the checks (`verify.py`,
+  `same.py`, `same-lowered.py`, `same-split.py`), measuring (`altitude.py`, `bench.py`,
+  `profile.sh`, `min.sh`, `formats.sh`, `go.sh`). Run them from the top; they work in `tests/`.
+- `out/`: everything built: binaries, the reader artifact, the frozen baseline, the checks'
+  outputs. Not checked in, but for `out/package.json`, which runs outputs as ES modules.
 
-Coil issues found on the way are in `experiments/repros/`. Do not run `coil lint --fix` in
-`poc/` with a compiler older than the `reader-guest-spans` fix: it can overwrite DSL sources.
+Coil issues found on the way are in the `coil-bugs` pad. Do not run `coil lint --fix` here with a
+compiler older than the `reader-guest-spans` fix: it can overwrite DSL sources.
