@@ -507,6 +507,9 @@ record Parsed {
   scopes: sym.Table,
   analysis: Analysis,
   calls: [Text],        # with the analysis: what its final tree `require`s, then `import()`s
+  requires: [Text],     # what the tree as parsed `require`s, and `import()`s, when `found`
+  imports: [Text],
+  found: Bool,
   role: Role,           # in the walk: a whole file, a big file's pieces to come, a piece, or the
   pieces: Int           # resolution of one of its imports
 }
@@ -517,9 +520,10 @@ enum Role { Whole, Split, Piece, Resolved, Prepare }
 # leaf is, the names it leaves free, and whether it is CommonJS.
 # `shift`: how far the symbols `bindings` names moved when the file's own table joined the shared
 # one, which the bindings themselves catch up with once loading is done.
-record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs: Bool, shift: Int }
+# `defined`: whether a define changed the tree.
+record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs: Bool, shift: Int, defined: Bool }
 
-fn no-analysis() -> Analysis = Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, shift: 0)
+fn no-analysis() -> Analysis = Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, shift: 0, defined: false)
 
 # Scopes for one file, in `t`, under `scope`: the shared table on the linking thread, or a file's own.
 fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool,
@@ -558,7 +562,7 @@ fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx
   }
   let free-names = sym.free-names(t)
   let real-free = [f for f in free-names if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
-  Analysis(tree: final-tree, root: root, bindings: bindings, free: real-free, cjs: cjs, shift: 0)
+  Analysis(tree: final-tree, root: root, bindings: bindings, free: real-free, cjs: cjs, shift: 0, defined: defined)
 }
 
 # A file analysed on its own, moved into the shared table: its ids move by where it lands.
@@ -625,18 +629,23 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?) -> Parsed {
   var pure-calls = lowered.pure-calls
   for k in keys(typed.pure-calls) { pure-calls[k] = typed.pure-calls[k] ?? k }
   var specs: [Text] = known ?? []
+  var requires: [Text] = []
+  var imports: [Text] = []
   if is-none(known) {
     for s in typed.tree.kids[1].kids {
       if let some(spec) = import-spec-of(s) { specs += spec }
     }
     # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
     # file the build never uses, but never misses one it does.
-    require-calls!(typed.tree, specs)
-    import-calls!(typed.tree, specs)
+    require-calls!(typed.tree, requires)
+    import-calls!(typed.tree, imports)
+    specs ++= requires
+    specs ++= imports
   }
   Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
-         legal: legal.of-file(src, parsed), specs: specs, targets: {},
+         legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: requires, imports: imports,
+         found: is-none(known),
          analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], role: Whole, pieces: 1)
 }
 
@@ -647,7 +656,9 @@ fn analysed-file(p: Parsed) -> Parsed {
   var own = sym.table-new()
   let top = sym.new-scope!(own, -1, true)
   let a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers, own, top)
-  p with { analysed: true, scopes: own, analysis: a, calls: calls-in(a.tree) }
+  # The calls are the parsed tree's unless a define changed it, and those were found already.
+  let calls = if p.found and not a.defined then p.requires ++ p.imports else calls-in(a.tree)
+  p with { analysed: true, scopes: own, analysis: a, calls: calls }
 }
 
 # A file found by walking: parsed, and its imports resolved, all on one worker.
@@ -718,7 +729,7 @@ fn first-files(p: Parsed) -> [Text] = match p.role {
 fn blank-parsed(path: Text) -> Parsed =
   Parsed(path: path, src: "", parsed: None(), tree: None(), pure-calls: {}, helpers: [], jsx-imports: false,
          pure-at: {}, legal: [], specs: [], targets: {}, analysed: false, scopes: sym.table-new(),
-         analysis: no-analysis(), calls: [], role: Whole, pieces: 1)
+         analysis: no-analysis(), calls: [], requires: [], imports: [], found: false, role: Whole, pieces: 1)
 
 fn item-file(item: Text) -> Text {
   var at = 0
@@ -899,7 +910,7 @@ fn finished-file(path: Text) -> Parsed {
   let cjs = not pr.esm and (sym.has-free?(own, "module") or sym.has-free?(own, "exports") or sym.has-free?(own, "require"))
   if cjs or p.jsx-imports or defined { return analysed-file(p) with { targets: targets } }
   let real-free = [f for f in sym.free-names(own) if not (f in p.helpers)]
-  let a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: real-free, cjs: false, shift: 0)
+  let a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: real-free, cjs: false, shift: 0, defined: false)
   p with { analysed: true, scopes: own, analysis: a, calls: requires ++ imports, targets: targets }
 }
 
