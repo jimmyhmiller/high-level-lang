@@ -91,17 +91,11 @@ fn digits-value(s: Text, base: Int) -> Int? {
   if len(digits) == 0 then some(0) else digits-number(digits, base, 9007199254740992)
 }
 
-fn number-literal(t: Text) -> Int? {
-  if len(t) > 2 and t[0] == '0' {
-    let rest = t[2..len(t)]
-    match t[1] {
-      'x' | 'X' => return digits-value(rest, 16)
-      'b' | 'B' => return digits-value(rest, 2)
-      'o' | 'O' => return digits-value(rest, 8)
-      _ => {}
-    }
-  }
-  digits-value(t, 10)
+fn number-literal(t: Text) -> Int? = match if len(t) > 2 then ascii-lower(t[0..2]) else "" {
+  "0x" => digits-value(t[2..len(t)], 16)
+  "0b" => digits-value(t[2..len(t)], 2)
+  "0o" => digits-value(t[2..len(t)], 8)
+  _ => digits-value(t, 10)
 }
 
 fn int-of(v: Value?) -> Int? = match v {
@@ -109,7 +103,7 @@ fn int-of(v: Value?) -> Int? = match v {
   none => none
 }
 
-fn fold-unary(e: Node, known: {Text:Value}, self: Text, kind: Int) -> Value? {
+fn fold-unary(e: Node, known: [Settled], self: Text, kind: Int) -> Value? {
   if let some(v) = int-of(evaluated(e, known, self)) {
     return some(number-value(if kind == 0 then 0 - v else if kind == 1 then v else -1 - to-i32(v)))
   }
@@ -117,7 +111,7 @@ fn fold-unary(e: Node, known: {Text:Value}, self: Text, kind: Int) -> Value? {
 }
 
 # `kind` numbers the operators, in the order `fold-binary`'s callers use them.
-fn fold-binary(a: Node, b: Node, known: {Text:Value}, self: Text, kind: Int) -> Value? {
+fn fold-binary(a: Node, b: Node, known: [Settled], self: Text, kind: Int) -> Value? {
   let x = int-of(evaluated(a, known, self))
   let y = int-of(evaluated(b, known, self))
   if let some(p) = x {
@@ -143,7 +137,7 @@ fn fold-binary(a: Node, b: Node, known: {Text:Value}, self: Text, kind: Int) -> 
   none
 }
 
-fn evaluated(e: Node, known: {Text:Value}, self: Text) -> Value? = match e {
+fn evaluated(e: Node, known: [Settled], self: Text) -> Value? = match e {
   Num(t) => match number-literal(t) {
     some(v) => some(number-value(v))
     none => none
@@ -172,8 +166,8 @@ fn evaluated(e: Node, known: {Text:Value}, self: Text) -> Value? = match e {
   BitAnd(a, b) => fold-binary(a, b, known, self, 8)
   BitOr(a, b) => fold-binary(a, b, known, self, 9)
   BitXor(a, b) => fold-binary(a, b, known, self, 10)
-  Ident(x) => known[x]
-  Member(Ident(s), p) => if s == self then known[p.text] else none
+  Ident(x) => value-named(known, x)
+  Member(Ident(s), p) => if s == self then value-named(known, p.text) else none
   _ => none
 }
 
@@ -189,64 +183,60 @@ everywhere fn with-members(e: Node, names: [Text], param: Text) -> Node = match 
   Ident(x) => if x in names then Member(ident(param), PropName(x)) else e
 }
 
-# The function that fills an enum in, called on what `outer` evaluates to.
+# One member settled: its name, its value when it is known here, and the statement that sets it.
+record Settled { key: Text, value: Value?, set: Node }
+
+fn value-named(known: [Settled], x: Text) -> Value? = last s in known: if s.key == x then s.value else none
+
+# The function that fills an enum in, called on what `outer` evaluates to. Pure when every value
+# is known here.
 fn enum-call(n: Node, outer: Node) -> Node = match n {
   TsEnum(name, List(members...)) => {
     let param = fresh-name(name.text)
     let p = bind(param)
     let a = ident(param)
-    var known: {Text:Value} = {}
-    var names: [Text] = []
-    var next: Int? = some(0)
-    var constant = true
-    var body: [Node] = []
-    for m in members {
-      let k = member-key(m.key)
-      let key = string-node(k)
-      let init = m.init
-      let value: Value? = if init is None() then none else evaluated(lowered(init), known, name.text)
-      if init is None() {
-        match next {
-          some(v) => {
-            let number = number-node(v)
-            body += stmt`$a[$a[$key] = $number] = $key;`
-            known[k] = number-value(v)
-            next = some(v + 1)
-          }
-          none => panic "enum member {} needs an initializer: the one before it is not a number known here", k
-        }
-      } else {
-        match value {
-          some(v) => {
-            if v.is-text {
-              let text = v.node
-              body += stmt`$a[$key] = $text;`
-              next = none
-            } else {
-              let number = number-node(v.num)
-              body += stmt`$a[$a[$key] = $number] = $key;`
-              next = some(v.num + 1)
-            }
-            known[k] = v
-          }
-          none => {
-            constant = false
-            let computed = with-members(lowered(init), names, param)
-            body += stmt`$a[$a[$key] = $computed] = $key;`
-            next = none
-          }
-        }
-      }
-      names += k
-    }
-    body += stmt`return $a;`
+    let settled: [Settled] = fold done = [] for m in members: done ++ [member-settled(done, m, name.text, param, a)]
+    let body = [s.set for s in settled] ++ [stmt`return $a;`]
     let call = exp`(($p) => { $$body })($outer)`
     let at = fresh-offset()
-    if constant { pure[at] = at }
+    if all s in settled: is-some(s.value) { pure[at] = at }
     call with { lo: at, hi: at }
   }
   _ => panic "expected an enum"
 }
+
+# A member without an initializer counts on from a number before it; one whose initializer is not
+# known here is computed when the enum is made, where earlier members' bare names mean them.
+fn member-settled(done: [Settled], m: Node, self: Text, param: Text, a: Node) -> Settled {
+  let k = member-key(m.key)
+  let key = string-node(k)
+  if m.init is None() {
+    let v = following(done) ?? panic "enum member {} needs an initializer: the one before it is not a number known here", k
+    let number = number-node(v)
+    return Settled(key: k, value: some(number-value(v)), set: stmt`$a[$a[$key] = $number] = $key;`)
+  }
+  match evaluated(lowered(m.init), done, self) {
+    some(v) => {
+      if v.is-text {
+        let text = v.node
+        return Settled(key: k, value: some(v), set: stmt`$a[$key] = $text;`)
+      }
+      let number = number-node(v.num)
+      Settled(key: k, value: some(v), set: stmt`$a[$a[$key] = $number] = $key;`)
+    }
+    none => {
+      let computed = with-members(lowered(m.init), [s.key for s in done], param)
+      Settled(key: k, value: none, set: stmt`$a[$a[$key] = $computed] = $key;`)
+    }
+  }
+}
+
+# The number after the last member's, if that was a number known here.
+fn following(done: [Settled]) -> Int? =
+  if len(done) == 0 then some(0) else match last(done).value {
+    some(v) => if v.is-text then none else some(v.num + 1)
+    none => none
+  }
 
 fn enum-name(n: Node) -> Text = n.name.text
 
@@ -464,6 +454,28 @@ fn assigned(target: Node, key: Node, value: Node) -> Node {
   ExprStmt(Assignment(place, AssignOp("="), value))
 }
 
+fn prop-assignment(p: Node) -> Node {
+  let name = p.target.text
+  let value = ident(name)
+  stmt`this.$name = $value;`
+}
+
+# Where a member goes: kept in the class, or set by the constructor.
+record Placed { kept: [Node], assigns: [Node] }
+
+fn member-placed(m: Node) -> Placed = match m {
+  Field(key, init) if assign-fields =>
+    Placed(kept: [Field(key, None()) with { lo: m.lo, hi: m.hi } if key is PrivateName(_)],
+           assigns: [assigned(This(), key, lowered(init)) if not (init is None())])
+  StaticField(key, init) if assign-fields =>
+    Placed(kept: [StaticField(key, None()) with { lo: m.lo, hi: m.hi } if key is PrivateName(_)]
+                 ++ [StaticBlock(FuncBody(List(assigned(This(), key, lowered(init))))) with { lo: m.lo, hi: m.hi }
+                     if not (init is None())],
+           assigns: [])
+  TsErased() => Placed(kept: [], assigns: [])
+  _ => Placed(kept: [lowered(m) if not constructor?(m)], assigns: [])
+}
+
 fn synthesized-constructor(derived: Bool) -> Node {
   let calls: [Node] = if derived then [stmt`super(...arguments);`] else []
   Method(PropName("constructor"), Params(List()), FuncBody(List(calls...)))
@@ -477,40 +489,15 @@ fn class-body(n: Node, derived: Bool) -> Node = match n {
     let props = [parameter-properties(m)... for m in members if constructor?(m)]
     let has-fields = any m in members: m is Field(...) | StaticField(...)
     if len(props) == 0 and not (assign-fields and has-fields) { return n with { members: lowered(n.members) } }
-    var assigns: [Node] = []
-    for p in props {
-      let name = p.target.text
-      let value = ident(name)
-      assigns += stmt`this.$name = $value;`
-    }
-    var rest: [Node] = []
-    for m in members {
-      match m {
-        Field(key, init) => if not assign-fields { rest += lowered(m) } else {
-          if key is PrivateName(_) { rest += Field(key, None()) with { lo: m.lo, hi: m.hi } }
-          if not (init is None()) { assigns += assigned(This(), key, lowered(init)) }
-        }
-        StaticField(key, init) => if not assign-fields { rest += lowered(m) } else {
-          if key is PrivateName(_) { rest += StaticField(key, None()) with { lo: m.lo, hi: m.hi } }
-          if not (init is None()) {
-            rest += StaticBlock(FuncBody(List(assigned(This(), key, lowered(init))))) with { lo: m.lo, hi: m.hi }
-          }
-        }
-        TsErased() => {}
-        _ => if not constructor?(m) { rest += lowered(m) }
-      }
-    }
-    var out: [Node] = []
+    let from-props = [prop-assignment(p) for p in props]
+    let each = [member-placed(m) for m in members]
+    let assigns = from-props ++ [s for c in each for s in c.assigns]
     let existing = first m in members: if constructor?(m) then some(m) else none
-    let needs-constructor = len(assigns) > 0 or is-some(existing)
-    if needs-constructor {
-      out += constructor-with-assignments(existing ?? synthesized-constructor(derived), assigns)
-    }
-    for p in props {
-      let key = PropName(p.target.text) with { lo: p.target.lo, hi: p.target.hi }
-      if not assign-fields { out += Field(key, None()) with { lo: p.lo, hi: p.hi } }
-    }
-    out ++= rest
+    let made = [constructor-with-assignments(existing ?? synthesized-constructor(derived), assigns)
+                if len(assigns) > 0 or is-some(existing)]
+    let declared = [Field(PropName(p.target.text) with { lo: p.target.lo, hi: p.target.hi }, None()) with { lo: p.lo, hi: p.hi }
+                    for p in props if not assign-fields]
+    let out = made ++ declared ++ [k for c in each for k in c.kept]
     n with { members: List(out...) with { lo: n.members.lo, hi: n.members.hi } }
   }
   _ => panic "expected a class body"
@@ -595,38 +582,39 @@ fn decorated-class(class-decorators: [Node], cls: Node, exported: Bool) -> [Node
     panic "JavaScript decorators are not implemented yet; set \"experimentalDecorators\": true in tsconfig.json for TypeScript's"
   }
   let name = cls.name.text
-  let members = cls.body.members.kids
-  var after: [Node] = []
-  var constructor-params: [Node] = []
-  for pass in [false, true] {
-    for m in members {
-      let core = member-core(m)
-      if not (core is ClassEmpty() | TsErased()) and static-member?(m) == pass {
-        if core is Method(PropName("constructor"), ...) {
-          constructor-params = param-decorators(params-of-member(m))
-        } else {
-          let own: [Node] = match m {
-            TsDecoratedMember(List(ds...), _) => [lowered(d.expr) for d in ds]
-            _ => []
-          }
-          let all-decorators = own ++ param-decorators(params-of-member(m))
-          if len(all-decorators) > 0 {
-            let holder = ident(name)
-            let target = if pass then holder else Member(holder, PropName("prototype"))
-            after += ExprStmt(decorate-call(all-decorators, target, some(decorated-key(m)), member-kind(m)))
-          }
-        }
-      }
-    }
-  }
-  let whole = class-decorators ++ constructor-params
-  if len(whole) > 0 {
-    let holder = ident(name)
-    let value = decorate-call(whole, ident(name), none, 0)
-    after += stmt`$holder = $value;`
-  }
+  let each = [member-decorating(m, name, pass) for pass in [false, true] for m in cls.body.members.kids
+              if not (member-core(m) is ClassEmpty() | TsErased()) and static-member?(m) == pass]
+  let whole = class-decorators ++ ((last d in each: d.constructor) ?? [])
+  let after = [s for d in each for s in d.after] ++ class-decorating(whole, name)
   let plain = lowered(undecorated(cls))
   [if exported then ExportClass(plain) with { lo: cls.lo, hi: cls.hi } else plain] ++ after
+}
+
+# What a member's decorators become: for the constructor, the decorators of its parameters, which
+# decorate the class; for any other, a call after the class.
+record Decorating { constructor: [Node]?, after: [Node] }
+
+fn member-decorating(m: Node, name: Text, static: Bool) -> Decorating {
+  if member-core(m) is Method(PropName("constructor"), ...) {
+    return Decorating(constructor: some(param-decorators(params-of-member(m))), after: [])
+  }
+  let own: [Node] = match m {
+    TsDecoratedMember(List(ds...), _) => [lowered(d.expr) for d in ds]
+    _ => []
+  }
+  let all-decorators = own ++ param-decorators(params-of-member(m))
+  if len(all-decorators) == 0 { return Decorating(constructor: none, after: []) }
+  let holder = ident(name)
+  let target = if static then holder else Member(holder, PropName("prototype"))
+  Decorating(constructor: none, after: [ExprStmt(decorate-call(all-decorators, target, some(decorated-key(m)), member-kind(m)))])
+}
+
+# `C = __decorateClass([…], C)`, when anything decorates the class itself.
+fn class-decorating(decorators: [Node], name: Text) -> [Node] {
+  if len(decorators) == 0 { return [] }
+  let holder = ident(name)
+  let value = decorate-call(decorators, ident(name), none, 0)
+  [stmt`$holder = $value;`]
 }
 
 # ---------------------------------------------------------------- the walk
