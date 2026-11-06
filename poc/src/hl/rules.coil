@@ -334,7 +334,7 @@
 ;;; `everywhere fn f(n: Node, …) -> Node = match n { cases }`: a function over a whole tree, whose
 ;;; cases say only where it does something. Anywhere else it is `f` of each child: the node rebuilt
 ;;; from them, shared when none changed; for `-> Void`, each child visited; for `-> Bool`, whether
-;;; any child's is true. Read as the plain function with that last case, which is what everything
+;;; any child's is true; for a list, the children's lists one after another. Read as the plain function with that last case, which is what everything
 ;;; after the parse sees.
 (defn with-everywhere [(src (slice u8)) (path (slice u8)) (tree g/Node)] (-> g/Node)
   (let [decls (kid tree 2)
@@ -344,7 +344,10 @@
         tree
         (let [(mut out) (g/new-kids)]
           (for d (.kids decls)
-            (push! (mut out) (if (= (.kind d) (g/KEverywhereFn)) (everywhere-fn src path d) d)))
+            (cond
+              (not (= (.kind d) (g/KEverywhereFn))) (push! (mut out) d)
+              (= (.kind (kid d 2)) (g/KTList)) (for f (everywhere-list-fns src path d) (push! (mut out) f))
+              :else (push! (mut out) (everywhere-fn src path d))))
           (let [(mut t) tree
                 (mut kids) (g/new-kids)]
             (push! (mut kids) (kid tree 0))
@@ -412,6 +415,69 @@
           (push! (mut fn-kids) ret)
           (push! (mut fn-kids) (g/node2 (g/KMatch) (kid body 0) (list-node arms (kid body 1))))
           (g/mk (g/KFn) fn-kids (.lo d) (.hi d)))))))
+
+;;; The cases' checks: a match on the node, with no `_` of its own.
+(defn everywhere-check [(src (slice u8)) (path (slice u8)) (d g/Node)] (-> void)
+  (let [params (.kids (kid d 1))
+        body (kid d 3)]
+    (when (= (len params) 0) (sugar-fail src path d "an everywhere function takes the node first"))
+    (let [node (.text (kid (get params 0) 0))]
+      (unless (and (= (.kind body) (g/KMatch)) (= (.kind (kid body 0)) (g/KName)) (= (.text (kid body 0)) node))
+        (sugar-fail src path body (cat3 "an everywhere function is a match on its node, " node "")))
+      (for arm (.kids (kid body 1))
+        (let [p (kid arm 0)]
+          (when (and (= (.kind p) (g/KName)) (= (.text p) "_") (= (.kind (kid arm 1)) (g/KNone)))
+            (sugar-fail src path arm "an everywhere function's last case is its children, so it has no `_` of its own")))))))
+
+;;; `everywhere fn f(n: Node, …) -> [T]`: each case's list, and elsewhere the children's in order.
+;;; It is two functions: `f-into!`, which adds to one list it is handed, so a walk makes one list
+;;; and not one per node, and `f`, which hands it an empty one.
+(defn everywhere-list-fns [(src (slice u8)) (path (slice u8)) (d g/Node)] (-> (ArrayList g/Node))
+  (everywhere-check src path d)
+  (let [fname (kid d 0)
+        params (.kids (kid d 1))
+        ret (kid d 2)
+        body (kid d 3)
+        node (.text (kid (get params 0) 0))
+        into (cat (.text fname) "-into!")
+        acc "everywhere-out"
+        each "each-kid"
+        acc-type (g/mk (g/KTMut) (one ret) (.lo ret) (.hi ret))
+        (mut into-params) (g/new-kids)
+        (mut into-args) (passed-on each params body)
+        (mut wrap-args) (passed-on node params body)
+        (mut arms) (g/new-kids)]
+    (for p params (push! (mut into-params) p))
+    (push! (mut into-params) (g/node2 (g/KParam) (name-node acc body) acc-type))
+    (push! (mut into-args) (name-node acc body))
+    (push! (mut wrap-args) (name-node acc body))
+    (for a (.kids (kid body 1))
+      (push! (mut arms) (g/mk (g/KArm) (three (kid a 0) (kid a 1) (g/node2 (g/KExtend) (name-node acc a) (kid a 2)))
+                              (.lo a) (.hi a))))
+    (let [call (g/node2 (g/KCall) (name-node into body) (list-node into-args body))
+          kids-of (g/node2 (g/KFieldE) (name-node node body) (name-node "kids" body))
+          head (g/node2 (g/KInHead) (name-node each body) kids-of)
+          walk (g/node2 (g/KFor) head (g/mk (g/KBlock) (one (list-node (one call) body)) (.lo body) (.hi body)))
+          (mut into-kids) (g/new-kids)
+          (mut wrap-kids) (g/new-kids)
+          (mut stmts) (g/new-kids)
+          (mut out) (g/new-kids)]
+      (push! (mut arms) (g/mk (g/KArm) (three (name-node "_" body) (g/none-node) walk) (.lo body) (.hi body)))
+      (push! (mut into-kids) (name-node into fname))
+      (push! (mut into-kids) (list-node into-params (kid d 1)))
+      (push! (mut into-kids) (g/none-node))
+      (push! (mut into-kids) (g/node2 (g/KMatch) (kid body 0) (list-node arms (kid body 1))))
+      (push! (mut out) (g/mk (g/KFn) into-kids (.lo d) (.hi d)))
+      (push! (mut stmts) (g/mk (g/KVar) (three (name-node acc body) ret (g/mk (g/KListLit) (one (list-node (g/new-kids) body)) (.lo body) (.lo body)))
+                               (.lo body) (.hi body)))
+      (push! (mut stmts) (g/node2 (g/KCall) (name-node into body) (list-node wrap-args body)))
+      (push! (mut stmts) (name-node acc body))
+      (push! (mut wrap-kids) fname)
+      (push! (mut wrap-kids) (kid d 1))
+      (push! (mut wrap-kids) ret)
+      (push! (mut wrap-kids) (g/mk (g/KBlock) (one (list-node stmts body)) (.lo body) (.hi body)))
+      (push! (mut out) (g/mk (g/KFn) wrap-kids (.lo d) (.hi d)))
+      out)))
 
 ;;; `"bundle.js" = "src/bundle/js.syntax"` lines under [modules].
 (defn read-manifest! [(k (mut Comp)) (manifest (slice u8))] (-> void)

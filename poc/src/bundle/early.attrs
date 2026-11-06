@@ -135,46 +135,50 @@ fn check-binding(n: Node) -> Void {
 # ---------------------------------------------------------------- declarations
 
 # Bindings of a declaration or pattern, in order.
-everywhere fn binds!(n: Node, out: mut [Text]) -> Void = match n {
-  BindName(x) => { out += unescaped(x) }
-  _ if sc.opens?(n.kind) => {}
+everywhere fn bound-names(n: Node) -> [Text] = match n {
+  BindName(x) => [unescaped(x)]
+  _ if sc.opens?(n.kind) => []
 }
 
 fn duplicates?(xs: [Text]) -> Bool =
   any i in 0..len(xs): any j in 0..i: xs[i] == xs[j]
 
 # `var` names hoisting through a statement list, not entering nested functions.
-everywhere fn var-names!(n: Node, out: mut [Text]) -> Void = match n {
-  _ if sc.var?(n.kind) => binds!(n, out)
-  _ if sc.function?(n.kind) => {}
+everywhere fn var-names(n: Node) -> [Text] = match n {
+  _ if sc.var?(n.kind) => bound-names(n)
+  _ if sc.function?(n.kind) => []
 }
 
-# Names a statement list declares lexically.
-fn lexical-of!(s: Node, function-top: Bool, names: mut [Text], functions: mut [Text]) -> Void = match s {
-  LetDecl(...) | ConstDecl(...) | Import(...) => binds!(s, names)
-  ClassDecl(name, ...) => { names += unescaped(name.text) }
-  FuncDecl(name, ...) => if not function-top { functions += unescaped(name.text) }
+# Names a statement declares lexically, but for plain functions in a block.
+fn lexical-names(s: Node, function-top: Bool) -> [Text] = match s {
+  LetDecl(...) | ConstDecl(...) | Import(...) => bound-names(s)
+  ClassDecl(name, ...) => [unescaped(name.text)]
   GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) =>
-    if not function-top { names += unescaped(name.text) }
-  ExportFunction(d) => lexical-of!(d, function-top, names, functions)
+    if function-top then [] else [unescaped(name.text)]
+  ExportFunction(d) => lexical-names(d, function-top)
   ExportDefaultDecl(d) => match d.name {
-    BindName(x) => { names += unescaped(x) }
-    _ => {}
+    BindName(x) => [unescaped(x)]
+    _ => []
   }
-  ExportLexical(d) | ExportClass(d) => lexical-of!(d, false, names, functions)
-  Labeled(_, body) => lexical-of!(body, function-top, names, functions)
-  _ => {}
+  ExportLexical(d) | ExportClass(d) => lexical-names(d, false)
+  Labeled(_, body) => lexical-names(body, function-top)
+  _ => []
+}
+
+# Plain function declarations in a block, which sloppy code may declare twice.
+fn block-functions(s: Node, function-top: Bool) -> [Text] = match s {
+  FuncDecl(name, ...) => if function-top then [] else [unescaped(name.text)]
+  ExportFunction(d) => block-functions(d, function-top)
+  ExportLexical(d) | ExportClass(d) => block-functions(d, false)
+  Labeled(_, body) => block-functions(body, function-top)
+  _ => []
 }
 
 # The first problem with what a statement list declares, under strictness `now-strict`.
 fn declaration-problem(stmts: [Node], function-top: Bool, params: [Text], at: Node, now-strict: Bool) -> Problem? {
-  var names: [Text] = []
-  var functions: [Text] = []
-  var vars: [Text] = []
-  for s in stmts {
-    lexical-of!(s, function-top, names, functions)
-    var-names!(s, vars)
-  }
+  let names = [lexical-names(s, function-top)... for s in stmts]
+  let functions = [block-functions(s, function-top)... for s in stmts]
+  let vars = [var-names(s)... for s in stmts]
   let twice = Problem(message: "this name is declared twice in one block", at: at.lo)
   if duplicates?(names) { return some(twice) }
   for f in functions {
@@ -248,10 +252,13 @@ fn function-checks(params: Node, body: Node, f: FnKind) -> Void {
   let stmts = body-stmts(body)
   let own-strict = has-use-strict?(stmts)
   let now-strict = strict or own-strict
-  var param-names: [Text] = []
+  let param-names = match params {
+    Params(...) => bound-names(params)
+    BindName(x) => [unescaped(x)]
+    _ => []
+  }
   match params {
     Params(...) => {
-      binds!(params, param-names)
       if f.arrow and in-generator and "yield" in param-names {
         report("yield is reserved in a generator", params)
       }
@@ -266,7 +273,6 @@ fn function-checks(params: Node, body: Node, f: FnKind) -> Void {
         report("yield and await expressions cannot be parameter defaults here", params)
       }
     }
-    BindName(x) => { param-names += unescaped(x) }
     _ => {}
   }
   if body is FuncBody(...) { check-declarations(stmts, true, param-names, body, now-strict) }
@@ -371,8 +377,7 @@ fn decl-list-checks(list: Node, need-init: Bool, lexical: Bool) -> Void {
           report("this declaration needs an initial value", d)
         }
         if lexical {
-          var names: [Text] = []
-          binds!(target, names)
+          let names = bound-names(target)
           for n in names {
             if n == "let" { report("let cannot be the name of a lexical binding", d) }
           }
@@ -385,11 +390,9 @@ fn decl-list-checks(list: Node, need-init: Bool, lexical: Bool) -> Void {
 }
 
 fn head-collision(head: Node, body: Node) -> Void {
-  var names: [Text] = []
-  var vars: [Text] = []
-  binds!(head, names)
+  let names = bound-names(head)
   if duplicates?(names) { report("a name is bound twice in one pattern", head) }
-  var-names!(body, vars)
+  let vars = var-names(body)
   for n in names {
     if n in vars { report("a var in the body collides with the loop's binding", head) }
     if n == "let" { report("let cannot be the name of a lexical binding", head) }
@@ -526,23 +529,16 @@ fn spec-text(n: Node) -> Text = match n {
   _ => unescaped(n.text)
 }
 
-fn export-spec-name!(spec: Node, out: mut [Text]) -> Void = match spec {
-  TsErased() => {}
-  ExportAs(_, to) => { out += spec-text(to) }
-  _ => { out += spec-text(spec.local) }
-}
-
 # The names a module exports, for spotting one exported twice.
-fn exported-names!(s: Node, out: mut [Text]) -> Void = match s {
-  ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) => {
-    for spec in specs { export-spec-name!(spec, out) }
-  }
-  ExportAllAs(name, _) => { out += spec-text(name) }
-  ExportDefault(...) | ExportDefaultDecl(...) => { out += "default" }
-  ExportVar(...) => binds!(s, out)
-  ExportLexical(d) => binds!(d, out)
-  ExportFunction(d) | ExportClass(d) => { out += d.name.text }
-  _ => {}
+fn exported-names(s: Node) -> [Text] = match s {
+  ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) =>
+    [if spec is ExportAs(...) then spec-text(spec.exported) else spec-text(spec.local) for spec in specs if not (spec is TsErased())]
+  ExportAllAs(name, _) => [spec-text(name)]
+  ExportDefault(...) | ExportDefaultDecl(...) => ["default"]
+  ExportVar(...) => bound-names(s)
+  ExportLexical(d) => bound-names(d)
+  ExportFunction(d) | ExportClass(d) => [d.name.text]
+  _ => []
 }
 
 fn module-statement?(s: Node) -> Bool =
@@ -554,22 +550,16 @@ fn module-statement?(s: Node) -> Bool =
 
 fn program-has-module-syntax?(tree: Node) -> Bool = any s in tree.body.kids: module-statement?(s)
 
+fn top-declared(s: Node) -> [Text] = match s {
+  Import(...) => bound-names(s)
+  FuncDecl(name, ...) => [name.text]
+  ExportFunction(d) => [d.name.text]
+  _ => []
+}
+
 # Every name a module declares at its top level.
 fn module-names(stmts: [Node]) -> [Text] {
-  var names: [Text] = []
-  var functions: [Text] = []
-  for s in stmts {
-    lexical-of!(s, false, names, functions)
-    var-names!(s, names)
-    match s {
-      Import(...) => binds!(s, names)
-      FuncDecl(name, ...) => { names += name.text }
-      ExportFunction(d) => { names += d.name.text }
-      _ => {}
-    }
-  }
-  for f in functions { names += f }
-  names
+  [(lexical-names(s, false) ++ var-names(s) ++ top-declared(s))... for s in stmts] ++ [block-functions(s, false)... for s in stmts]
 }
 
 
@@ -941,24 +931,13 @@ on LetDecl(list) { decl-list-checks(list, false, true) }
 on ConstDecl(list) { decl-list-checks(list, true, true) }
 on Catch(head, body) {
   let stmts = body.stmts.kids
-  var names: [Text] = []
-  var lexical: [Text] = []
-  var funcs: [Text] = []
-  if not (head is None()) {
-    binds!(head, names)
-    if duplicates?(names) { report("a catch parameter is bound twice", head) }
-  }
-  for s in stmts { lexical-of!(s, false, lexical, funcs) }
-  for l in lexical {
-    if l in names { report("this name collides with the catch parameter", body) }
-  }
-  for l in funcs {
+  let names = if head is None() then [] else bound-names(head)
+  if duplicates?(names) { report("a catch parameter is bound twice", head) }
+  for l in [lexical-names(s, false)... for s in stmts] ++ [block-functions(s, false)... for s in stmts] {
     if l in names { report("this name collides with the catch parameter", body) }
   }
   if not (head is None()) and not (head.target is BindName(_)) {
-    var vars: [Text] = []
-    for s in stmts { var-names!(s, vars) }
-    for v in vars {
+    for v in [var-names(s)... for s in stmts] {
       if v in names { report("a var collides with a destructured catch parameter", body) }
     }
   }
@@ -997,9 +976,7 @@ on ExportDefault(...) | ExportDefaultDecl(...) | ExportLexical(...) | ExportFunc
 fn head-problem(tree: Node, is-module: Bool, now-strict: Bool) -> Problem? {
   let stmts = tree.body.kids
   if is-module {
-    var names: [Text] = []
-    for s in stmts { exported-names!(s, names) }
-    if duplicates?(names) { return some(Problem(message: "a name is exported twice", at: tree.lo)) }
+    if duplicates?([exported-names(s)... for s in stmts]) { return some(Problem(message: "a name is exported twice", at: tree.lo)) }
   }
   declaration-problem(stmts, not is-module, [], tree, now-strict)
 }
