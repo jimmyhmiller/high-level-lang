@@ -230,6 +230,11 @@ fn calls-in(tree: Node) -> [Text] {
   found.requires ++ found.imports
 }
 
+fn loads-of(tree: Node) -> Checked {
+  let found = calls.run(tree)
+  Checked(tree: tree, requires: found.requires, imports: found.imports)
+}
+
 # ---------------------------------------------------------------- defines
 
 # A Member chain rooted at a free identifier, as dotted text: `process.env.NODE_ENV`.
@@ -559,35 +564,18 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
   let typed = if loader == "ts" or loader == "tsx"
               then ts.lower(lowered.tree, src, jsx.kept-names(src, path, file-jsx), tsc.define-fields?(config), config.verbatim, config.decorators)
               else ts.Lowered(tree: lowered.tree, pure-calls: {}, helpers: [])
-  var pure-calls = lowered.pure-calls
-  for k in keys(typed.pure-calls) { pure-calls[k] = typed.pure-calls[k] ?? k }
-  var specs: [Text] = known ?? []
-  var requires: [Text] = []
-  var imports: [Text] = []
-  if is-none(known) {
-    for s in typed.tree.body.kids {
-      if let some(spec) = import-spec-of(s) { specs += spec }
-    }
-    # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
-    # file the build never uses, but never misses one it does.
-    # The check found them already, in the tree a plain JavaScript file keeps.
-    match checked {
-      some(c) if not lowered-loader?(loader) => {
-        requires = c.requires
-        imports = c.imports
-      }
-      _ => {
-        let found = calls.run(typed.tree)
-        requires = found.requires
-        imports = found.imports
-      }
-    }
-    specs ++= requires
-    specs ++= imports
+  let pure-calls = {k: v for m in [lowered.pure-calls, typed.pure-calls] for k in keys(m) if let some(v) = m[k]}
+  # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
+  # file the build never uses, but never misses one it does. The check found them already, in the
+  # tree a plain JavaScript file keeps. A file put together from pieces knows its specifiers.
+  let found = if is-some(known) then Checked(tree: typed.tree, requires: [], imports: []) else match checked {
+    some(c) if not lowered-loader?(loader) => c
+    _ => loads-of(typed.tree)
   }
+  let specs = known ?? ([spec for s in typed.tree.body.kids if let some(spec) = import-spec-of(s)] ++ found.requires ++ found.imports)
   Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
-         legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: requires, imports: imports,
+         legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: found.requires, imports: found.imports,
          found: is-none(known),
          analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], role: Whole, pieces: 1)
 }
@@ -618,9 +606,7 @@ fn visit-file(item: Text) -> Parsed {
     }
     if what[0] == '?' {
       let spec = what[1..len(what)]
-      var found: {Text:Text} = {}
-      if let some(t) = unhooked-target(spec, path) { found[spec] = t }
-      return blank-parsed(path) with { role: Resolved, targets: found }
+      return blank-parsed(path) with { role: Resolved, targets: {spec: t for some(t) in [unhooked-target(spec, path)]} }
     }
     # A piece. The last of a file's pieces to be parsed prepares the file.
     let pc = piece-of(item)
@@ -847,53 +833,32 @@ fn ahead-target(spec: Text, importer: Text) -> Text? {
 # and their imports are the next wave.
 fn parse-ahead!(paths: [Text]) -> Void {
   if loading.load-threads <= 1 { return }
+  let roots = [p for p in paths if ahead?(p) distinct p]
   # Without hooks, a worker can resolve what it parsed: a walk that never waits for a wave.
-  if len(loading.on-load) == 0 and len(loading.on-resolve) == 0 {
-    let roots = [p for p in paths if ahead?(p)]
-    var resolved: [Parsed] = []
-    for d in parallel-walk(roots, visit-file, next-files, first-files, loading.load-threads) {
-      match d.role {
-        Whole => { parsed-ahead[d.path] = d }
-        Resolved => { resolved += d }
-        _ => {}
-      }
-    }
-    # Imports resolved as items of their own join their file's.
-    for r in resolved {
-      if let some(p) = parsed-ahead[r.path] {
-        var targets = p.targets
-        for s in keys(r.targets) { targets[s] = r.targets[s] ?? s }
-        parsed-ahead[r.path] = p with { targets: targets }
-      }
-    }
-    return
-  }
-  var seen: {Text:Bool} = {}
-  var wave: [Text] = []
-  for p in paths {
-    if not (p in seen) and ahead?(p) {
-      seen[p] = true
-      wave += p
-    }
-  }
-  while len(wave) > 0 {
-    let hooked = len(loading.on-load) > 0
-    let items = [Pending(path: p, text: if hooked then module-text(source-of(p), p) else "", ready: hooked) for p in wave]
-    let done = parallel-map(items, parsed-file, loading.load-threads)
-    var next: [Text] = []
-    for d in done {
-      parsed-ahead[d.path] = d
-      for spec in d.specs {
-        if let some(target) = ahead-target(spec, d.path) {
-          if not (target in seen) and ahead?(target) {
-            seen[target] = true
-            next += target
-          }
-        }
-      }
-    }
-    wave = next
-  }
+  parsed-ahead = if len(loading.on-load) == 0 and len(loading.on-resolve) == 0 then walked-ahead(roots)
+                 else {d.path: d for d in parsed-waves(roots, {p: true for p in roots})}
+}
+
+fn walked-ahead(roots: [Text]) -> {Text:Parsed} {
+  let walked = parallel-walk(roots, visit-file, next-files, first-files, loading.load-threads)
+  let resolved = {r.path ++ "\n" ++ s: t for r in walked if r.role is Resolved for s in keys(r.targets) if let some(t) = r.targets[s]}
+  {d.path: with-resolved(d, resolved) for d in walked if d.role is Whole}
+}
+
+# A file's targets, once those of its imports resolved as items of their own (see `first-files`) join it.
+fn with-resolved(p: Parsed, resolved: {Text:Text}) -> Parsed =
+  if len(keys(p.targets)) > 0 or len(p.specs) <= resolve-alone then p
+  else p with { targets: {s: t for s in p.specs if let some(t) = resolved[p.path ++ "\n" ++ s]} }
+
+# With hooks, which only this thread may call: a wave's files are parsed at once, and the files
+# their imports lead to that none has led to before are the next wave.
+fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] {
+  if len(wave) == 0 { return [] }
+  let hooked = len(loading.on-load) > 0
+  let items = [Pending(path: p, text: if hooked then module-text(source-of(p), p) else "", ready: hooked) for p in wave]
+  let done = parallel-map(items, parsed-file, loading.load-threads)
+  let next = [t for d in done for spec in d.specs if let some(t) = ahead-target(spec, d.path) if ahead?(t) and not (t in seen) distinct t]
+  done ++ parsed-waves(next, {p: true for ps in [keys(seen), next] for p in ps})
 }
 
 fn load-file(path: Text, effects: Bool) -> Int {
