@@ -100,6 +100,12 @@ enum LinkKind { ByName, ByIndex, Called, TaggedBy }
 
 record Link { kind: LinkKind, optional: Bool, part: Node }
 
+# What a link of a chain hangs from.
+fn chain-base(n: Node) -> Node = match n {
+  Member(o, _) | OptMember(o, _) | Index(o, _) | OptIndex(o, _) | CallExpr(o, _) | OptCall(o, _) | Tagged(o, _) => o
+  _ => panic "not a link of a chain: {}", js.kind-name(n.kind)
+}
+
 # A chain from its root upward. Answers the root.
 fn links-of!(n: Node, out: mut [Link]) -> Node {
   let link: Link? = match n {
@@ -115,7 +121,7 @@ fn links-of!(n: Node, out: mut [Link]) -> Node {
   match link {
     none => n
     some(l) => {
-      let root = links-of!(n.kids[0], out)
+      let root = links-of!(chain-base(n), out)
       out += l
       root
     }
@@ -273,12 +279,12 @@ fn assignment(n: Node, t: Node, op: Text, v: Node) -> Node {
     }
     _ => {}
   }
-  n with { kids: [if t is ObjectLit(...) | ArrayLit(...) then lowered-pattern-target(t) else lowered(t), n.kids[1], lowered(v)] }
+  n with { target: if t is ObjectLit(...) | ArrayLit(...) then lowered-pattern-target(t) else lowered(t), value: lowered(v) }
 }
 
 # A destructuring target's spreads are rest elements, already refused above.
 fn lowered-pattern-target(t: Node) -> Node = match t {
-  ObjectLit(List(xs...)) => t with { kids: [list-of([lowered(x) for x in xs]) with { lo: t.kids[0].lo, hi: t.kids[0].hi }] }
+  ObjectLit(List(xs...)) => t with { props: list-of([lowered(x) for x in xs]) with { lo: t.props.lo, hi: t.props.hi } }
   _ => lowered(t)
 }
 
@@ -330,7 +336,7 @@ fn excluded-key(p: Node) -> Node = match p {
 
 # `const { a, ...r } = o` is `const _a = o, { a } = _a, r = __objRest(_a, ["a"])`.
 fn rest-declarators(pattern: Node, init: Node, at: Node) -> [Node] {
-  let props = pattern.kids[0].kids
+  let props = pattern.props.kids
   var plain: [Node] = []
   var keys: [Node] = []
   var rest: Node = None()
@@ -423,7 +429,7 @@ fn params-node(params: Node) -> Node = match params {
 fn outer-parameter-count(params: Node) -> Int {
   var count = 0
   var go = true
-  for p in params.kids[0].kids {
+  for p in params.items.kids {
     if go and p is Param(_, None()) { count += 1 } else { go = false }
   }
   count
@@ -485,7 +491,7 @@ fn function-node(n: Node) -> Node {
     match k {
       Params(_) => {
         let split = if before?(2018) then rest-prologue(k) else Wrapped(params: k, body: FuncBody(List()))
-        prologue = split.body.kids[0].kids
+        prologue = split.body.stmts.kids
         params = generic(split.params)
       }
       FuncBody(_) | ExprBody(_) => { body = k }
@@ -538,7 +544,7 @@ fn rebuilt-function(n: Node, params: Node, body: Node) -> Node {
     }
     AsyncArrow(p, b) => if not old then same else {
       let w = wrapped-in-generator(p, b, arrow-self(b), "__async", false)
-      Arrow(w.params, ExprBody(w.body.kids[0].kids[0].kids[0])) with { lo: n.lo, hi: n.hi }
+      Arrow(w.params, ExprBody(w.body.stmts.kids[0].value)) with { lo: n.lo, hi: n.hi }
     }
     AsyncMethod(key, p, b) => if not old then same else {
       let w = wrapped-in-generator(p, b, This(), "__async", false)
@@ -604,7 +610,7 @@ fn for-await(n: Node) -> Node = match n {
 
 # ---------------------------------------------------------------- classes
 
-fn class-needs-lowering?(body: Node) -> Bool = any m in body.kids[0].kids:
+fn class-needs-lowering?(body: Node) -> Bool = any m in body.members.kids:
   m is Field(...) | StaticField(...) | StaticBlock(...) or private-member?(m)
 
 fn inner-member(m: Node) -> Node = match m {
@@ -756,7 +762,7 @@ fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Te
 }
 
 fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> ClassParts {
-  let members = body.kids[0].kids
+  let members = body.members.kids
   var setup: [Node] = []
   let table = scan-privates(members, privates, setup)
   var after: [Node] = []
@@ -826,7 +832,7 @@ fn as-class-name(n: Node, ref: Node, inner-name: Text) -> Node = match n {
 
 fn lowered-function-body(b: Node) -> Node {
   frames += []
-  let stmts = lowered-list(b.kids[0].kids)
+  let stmts = lowered-list(b.stmts.kids)
   let temps = frames[len(frames) - 1]
   pop(frames)
   FuncBody(list-of(with-temps(stmts, temps)))
@@ -909,7 +915,7 @@ fn class-statements!(n: Node, out: mut [Node]) -> Void = match n {
 # `(_a = class { … }, __publicField(_a, "x", 1), _a)`
 fn class-expression(n: Node) -> Node = match n {
   ClassExpr(name, heritage, body) => {
-    if not class-needs-lowering?(body) { return n with { kids: [name, lowered(heritage), lowered(body)] } }
+    if not class-needs-lowering?(body) { return n with { heritage: lowered(heritage), body: lowered(body) } }
     let holder = Ident(temp())
     let inner-name = if name is BindName(_) then name.text else ""
     let parts = lowered-class(body, not (heritage is None()), inner-name, holder)
@@ -917,8 +923,8 @@ fn class-expression(n: Node) -> Node = match n {
     if len(parts.before) == 0 and len(parts.after) == 0 and len(parts.statics) == 0 { return plain }
     var items = parts.before
     items += assign(holder, plain)
-    for s in parts.after { items += s.kids[0] }
-    for s in parts.statics { items += s.kids[0] }
+    for s in parts.after { items += s.expr }
+    for s in parts.statics { items += s.expr }
     items += holder
     seq(items)
   }
@@ -1017,7 +1023,7 @@ fn generic(n: Node) -> Node = if len(n.kids) == 0 then n else n with { kids: [lo
 
 fn helper-definitions() -> [Node] {
   if len(helpers) == 0 { return [] }
-  let all-stmts = js.parse(include-text("lower_runtime.js"), "<lower runtime>").kids[1].kids
+  let all-stmts = js.parse(include-text("lower_runtime.js"), "<lower runtime>").body.kids
   var wanted: {Text:Bool} = {}
   for h in helpers { wanted[h] = true }
   # What a wanted helper mentions is wanted too.
@@ -1058,7 +1064,7 @@ fn shortened(n: Node, short: {Text:Text}) -> Node = match n {
   _ => if len(n.kids) == 0 then n else n with { kids: [shortened(k, short) for k in n.kids] }
 }
 
-fn helper-name-of(s: Node) -> Text = s.kids[0].kids[0].kids[0].text
+fn helper-name-of(s: Node) -> Text = s.declarators.kids[0].target.text
 
 # A program for an older target. `names` is every name already in use.
 fn run(program: Node, year: Int, names: [Text], minify: Bool) -> Node {
@@ -1070,11 +1076,11 @@ fn run(program: Node, year: Int, names: [Text], minify: Bool) -> Node {
   frames = [[]]
   helpers = []
   next-temp = 0
-  let stmts = lowered-list(program.kids[1].kids)
+  let stmts = lowered-list(program.body.kids)
   let temps = frames[0]
   let defs = helper-definitions()
   let whole = defs ++ with-temps(stmts, temps)
-  let plain = Program(program.kids[0], List(whole...))
+  let plain = Program(program.hashbang, List(whole...))
   if not minify { return plain }
   var short: {Text:Text} = {}
   for d in defs { short[helper-name-of(d)] = fresh-name("$") }
