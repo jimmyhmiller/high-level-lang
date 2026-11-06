@@ -1,6 +1,6 @@
 # From a solved graph to one program: name every symbol, rewrite identifiers to their final names,
 # wrap CommonJS modules and pick the live statements.
-rules bundle.emit over bundle.js
+attrs bundle.emit over bundle.js
 use bundle.js as js
 use bundle.scopes as sc
 use bundle.modules as m
@@ -259,80 +259,77 @@ fn wrapper-param(name: Text) -> Int {
   sym.scope-at(m.table, wrapper).names[name] ?? panic "{}: a CommonJS wrapper has no {} symbol", here.path, name
 }
 
-fn rw-kids(n: Node, depth: Int) -> Node = n with { kids: [rw(k, depth) for k in n.kids] }
+# Identifiers take their final names, and what reads another module reads it as the bundle has it.
+# `depth` counts the functions, arrows aside, and class bodies around a node: `this` at the top of
+# a module is its `exports`, or nothing.
+inh depth: Int = 0
 
-# Rewrite identifiers to final names. `depth` counts `this`-rebinding functions.
-fn rw(n: Node, depth: Int) -> Node = match n {
-  Ident(x) => match cjs-import-of(n) {
-    some(ci) => cjs-read(ci)
-    none => match here.bindings[n.lo] {
-      some(s) => dynamic-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
-      # A free `undefined` is the shorter `void 0` under --minify-syntax.
-      none => if x in here.helpers then Ident(helper-name(x)) with { lo: n.lo, hi: n.hi }
-              else if void-undefined and x == "undefined" then void-zero() else n
-    }
-  }
-  BindName(_) => match here.bindings[n.lo] {
-    some(s) => BindName(final-of(s)) with { lo: n.lo, hi: n.hi }
-    none => n
-  }
-  This() =>
-    if depth > 0 then n
-    else if here.kind == Cjs then Ident(final-of(wrapper-param("exports")))
-    else void-zero()
-  Shorthand(old) => {
-    let new = rw(old, depth)
-    if new is Ident(_) and new.text == old.text then n else Prop(PropName(old.text), new)
-  }
-  PatShort(old, default-value) => {
-    let new = rw(old, depth)
-    let init = rw(default-value, depth)
-    if new.text == old.text then PatShort(new, init) with { lo: new.lo, hi: init.hi }
-    else PatProp(PropName(old.text), BindElement(new, init) with { lo: new.lo, hi: init.hi })
-  }
-  CallExpr(...) => rw-call(n, depth)
-  Member(object, property) => match namespace-read(n) {
-    some(read) => read
-    none => {
-      let o = rw(object, depth)
-      Member(o, property) with { lo: o.lo, hi: property.hi }
-    }
-  }
-  ImportCall(...) => match an.known-import-call-target(here, n) {
-    some(t) => if m.modules[t].kind == External then n
-               else if an.splitting then import-chunk(m.modules[t])
-               else import-call(m.modules[t])
-    none => rw-kids(n, depth)
-  }
-  ImportMeta() => exp`({})`.expr
-  _ => if len(n.kids) == 0 then n else {
-    let inner = if rebinds-this?(n) or n is ClassBody(...) then depth + 1 else depth
-    # An empty statement in a statement list does nothing.
-    n with { kids: [rw(k, inner) for k in n.kids if not (n is List(...) and k is Empty())] }
+on FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncExpr(...) | GenExpr(...)
+  | AsyncFuncExpr(...) | AsyncGenExpr(...) | Method(...) | GenMethod(...) | AsyncMethod(...)
+  | AsyncGenMethod(...) | Getter(...) | Setter(...) | StaticBlock(...) | ClassBody(...) { kids.depth = depth + 1 }
+
+rewrite Ident(x) as n => final-ident(n, x)
+rewrite BindName(_) as n => match here.bindings[n.lo] {
+  some(s) => BindName(final-of(s)) with { lo: n.lo, hi: n.hi }
+  none => n
+}
+rewrite This() as n =>
+  if depth > 0 then n
+  else if here.kind == Cjs then Ident(final-of(wrapper-param("exports")))
+  else void-zero()
+rewrite Shorthand(old) as n =>
+  if old.out is Ident(_) and old.out.text == old.text then n else Prop(PropName(old.text), old.out)
+rewrite PatShort(old, init) => short-pattern(old, old.out, init.out)
+rewrite CallExpr(callee, _) as n => final-call(n, callee, n.out)
+rewrite Member(object, property) as n =>
+  namespace-read(n) ?? Member(object.out, property) with { lo: object.out.lo, hi: property.hi }
+rewrite ImportCall(...) as n => match an.known-import-call-target(here, n) {
+  some(t) => if m.modules[t].kind == External then n
+             else if an.splitting then import-chunk(m.modules[t])
+             else import-call(m.modules[t])
+  none => n.out
+}
+rewrite ImportMeta() => exp`({})`.expr
+# An empty statement in a statement list does nothing.
+rewrite List(...) as n => without-empty(n.out)
+
+fn without-empty(l: Node) -> Node = l with { kids: [k for k in l.kids if not (k is Empty())] }
+
+# A statement with its final names.
+fn rewritten(s: Node) -> Node = run(s).tree
+
+fn final-ident(n: Node, x: Text) -> Node = match cjs-import-of(n) {
+  some(ci) => cjs-read(ci)
+  none => match here.bindings[n.lo] {
+    some(s) => dynamic-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
+    # A free `undefined` is the shorter `void 0` under --minify-syntax.
+    none => if x in here.helpers then Ident(helper-name(x)) with { lo: n.lo, hi: n.hi }
+            else if void-undefined and x == "undefined" then void-zero() else n
   }
 }
 
+fn short-pattern(old: Node, new: Node, init: Node) -> Node =
+  if new.text == old.text then PatShort(new, init) with { lo: new.lo, hi: init.hi }
+  else PatProp(PropName(old.text), BindElement(new, init) with { lo: new.lo, hi: init.hi })
+
 # `require("x")` becomes `require_x()`; a call of a CommonJS import keeps `this` undefined by
-# reading the function first: `(0, import_x.f)(…)`.
-fn rw-call(n: Node, depth: Int) -> Node {
-  let callee = n.callee
-  let args = n.args
+# reading the function first: `(0, import_x.f)(…)`. `out` is the call with its parts rewritten.
+fn final-call(n: Node, callee: Node, out: Node) -> Node {
   if let some(target) = an.known-require-target(here, n) {
     let t = m.modules[target]
     return match t.kind {
       Cjs => require-of(t)
-      External => rw-kids(n, depth)
+      External => out
       _ => require-esm(t)
     }
   }
-  let new-callee = rw(callee, depth)
-  let new-args = rw(args, depth)
+  let new-callee = out.callee
   let import-read: an.CjsImport? = if callee is Ident(_) then cjs-import-of(callee) else none
   let wrapped = match import-read {
     some(ci) => if ci.namespace then new-callee else exp`(0, $new_callee)`
     none => new-callee
   }
-  CallExpr(wrapped, new-args) with { lo: wrapped.lo, hi: new-args.hi }
+  CallExpr(wrapped, out.args) with { lo: wrapped.lo, hi: out.args.hi }
 }
 
 fn init-call(t: m.Module) -> Node? {
@@ -402,9 +399,9 @@ fn part-output(s: Node) -> Node? = match s {
   ExportAllAs(_, from) | ExportFrom(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
   ExportNamed(...) => none
   Import(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
-  ExportVar(list) => some(rw(VarDecl(list) with { lo: s.lo, hi: s.hi }, 0))
-  ExportLexical(d) | ExportFunction(d) | ExportClass(d) => some(rw(d, 0))
-  _ => some(rw(s, 0))
+  ExportVar(list) => some(rewritten(VarDecl(list) with { lo: s.lo, hi: s.hi }))
+  ExportLexical(d) | ExportFunction(d) | ExportClass(d) => some(rewritten(d))
+  _ => some(rewritten(s))
 }
 
 # For a source map: each leaf's offset gains its module, as (module+1)<<32 | offset.
@@ -424,7 +421,7 @@ fn cjs-part() -> Node {
   let mo = wrapper-param("module")
   let use-module = sym.symbol-at(m.table, mo).uses > 0
   let use-exports = use-module or sym.symbol-at(m.table, e).uses > 0
-  let body = [stamped(rw(s, 0)) for s in here.tree.body.kids]
+  let body = [stamped(rewritten(s)) for s in here.tree.body.kids]
   let name = final-of(here.require-sym)
   let wrap = helper-name("__commonJS")
   let path = Str(quote-text(here.path))

@@ -92,7 +92,11 @@
    (eq-slots (ArrayList EqSlot))  ; where its equations for children put their values
    (ovr-slots (ArrayList OvrSlot))
    (givens (ArrayList Given))
+   (outs (ArrayList Out))         ; in a rewrite, the names whose rewritten form `.out` reads
    (attrs-from (slice u8))])     ; the attribute grammar whose blocks are being read; "" for this one
+
+;;; A name a rewrite's pattern binds to a child, or to its node, and that one's rewritten form.
+(defstruct Out [(sym (slice u8)) (code Code)])
 
 ;;; A `given` attribute and the value a child has when its parent's equations give it none.
 (defstruct Given [(attr (slice u8)) (default Code)])
@@ -1285,6 +1289,25 @@
     `(let [~x ~code]
        (get (.kids ~x) ~(child-index-code (mut k) gr field x)))))
 
+;;; Whether `base` is a name a rewrite's pattern bound, with a rewritten form.
+(defn out-bound? [(k (mut Comp)) (base g/Node)] (-> bool)
+  (and (= (.kind base) (g/KName))
+       (match (find-local (mut k) (.text base))
+         (Some [l] (let [(mut hit) false] (for o (.outs k) (when (= (.sym o) (.sym l)) (set! hit true))) hit))
+         (None [] false))))
+
+;;; `x.out` in a rewrite: what the child `x` became, or with the rule's `as` name, the node rebuilt
+;;; from its children's.
+(defn out-of [(k (mut Comp)) (n g/Node) (base g/Node)] (-> Code)
+  (let [(mut hit) (None [Code])]
+    (when (= (.kind base) (g/KName))
+      (match (find-local (mut k) (.text base))
+        (Some [l] (for o (.outs k) (when (= (.sym o) (.sym l)) (set! hit (Some (.code o))))))
+        (None [] 0)))
+    (match hit
+      (Some [c] c)
+      (None [] (die (mut k) n "only in a rewrite, of its node or of a child its pattern names, is there an `out`")))))
+
 ;;; Where node `x` keeps its child `field`.
 (defn child-index-code [(k (mut Comp)) (gr Mod) (field (slice u8)) (x Code)] (-> Code)
   (let [(mut arms) (primitive/code-list-new)]
@@ -2011,10 +2034,12 @@
                     (None [] (die (mut k) n (cat4 module " has nothing named " field ""))))))))
           (None []
             (let [b (expr (mut k) base "")]
+              (if (and (= field "out") (out-bound? (mut k) base))
+                  (te (out-of (mut k) n base) (.ty b))
               (if (named-child? (mut k) (.ty b) field)
                   (te (child-code (mut k) (.ty b) field (.code b)) (.ty b))
                   (te `(~(primitive/code-symbol "." field) ~(.code b))
-                      (field-type (mut k) n (.ty b) field))))))))
+                      (field-type (mut k) n (.ty b) field)))))))))
     (g/KCall [] (call-expr (mut k) n want))
     (g/KCtor [] (ctor (mut k) n (.text (kid n 0)) (list-kids (kid n 1))))
     (g/KIndex []
@@ -3079,9 +3104,10 @@
     (set! (.path k) saved-path)
     (clear! (mut (.locals k)))))
 
-;;; `rewrite Pattern if guard => value`: what a node becomes, once its children have become what
-;;; they become. Tried in the file's order; the first that matches gives the node, a list of
-;;; nodes in a list's place, and a node no rule matches is rebuilt from its new children.
+;;; `rewrite Pattern if guard => value`: what a node becomes. The pattern and the guard see the node
+;;; as it was; `x.out` is what a child the pattern names became, and with the rule's `as` name, the
+;;; node rebuilt from its children's. Tried in the file's order; the first that matches gives the
+;;; node, or a list of nodes in a list's place, and a node no rule matches is rebuilt.
 (defstruct RwAlt [(pat g/Node) (as-name g/Node) (guard g/Node) (body g/Node)])
 
 (defn rewrite-alts [(decls (ArrayList g/Node))] (-> (ArrayList RwAlt))
@@ -3105,14 +3131,22 @@
 (defn results-field [(task Code)] (-> Code) `(.attrs-results ~task))
 
 ;;; One rule at a node of kind `head`: on a match, its value goes where the node was.
-(defn rw-alt-code [(k (mut Comp)) (a RwAlt) (subject Code) (ty (slice u8)) (head (slice u8))
+(defn rw-alt-code [(k (mut Comp)) (a RwAlt) (subject Code) (rebuilt Code) (ty (slice u8)) (head (slice u8))
                    (label Code) (task Code)] (-> Code)
   (let [mark (locals-mark (mut k))
         (mut steps) (ArrayList::new [Step] (malloc-allocator))]
     (pat! (mut k) (.pat a) subject ty (mut steps) head)
+    (clear! (mut (.outs k)))
+    ;; The children the pattern names at its top, and its node, have rewritten forms.
+    (for i (range mark (len (.locals k)))
+      (let [l (get (.locals k) i)]
+        (match (child-index (.pat a) (.name l) subject)
+          (Some [index] (push! (mut (.outs k)) (Out :sym (.sym l) :code `(get (.kids ~rebuilt) ~index))))
+          (None [] 0))))
     (unless (none? (.as-name a))
       (let [s (bind-local! (mut k) (.text (.as-name a)) ty false)]
-        (push! (mut steps) (SBind s subject))))
+        (push! (mut steps) (SBind s subject))
+        (push! (mut (.outs k)) (Out :sym s :code rebuilt))))
     (set! (.in-on k) true)
     (let [guard (if (none? (.guard a))
                     `true
@@ -3126,19 +3160,21 @@
                  (= (.ty v) many) `(for (ref ~(sym each)) ~(.code v) (push! (mut ~(results-field task)) ~(sym each)))
                  :else (die (mut k) (.body a) (cat4 "a rewrite gives a " ty " or a " (cat3 many ", not " (.ty v)))))]
       (set! (.in-on k) false)
+      (clear! (mut (.outs k)))
       (when (.returned k) (die (mut k) (.body a) "a rewrite cannot return"))
       (locals-reset! (mut k) mark)
       (wrap-steps steps 0 `(when ~guard ~push (return-from ~label 0))))))
 
 ;;; The rules for a node of kind `head`, then the node as rebuilt.
-(defn rw-arm-code [(k (mut Comp)) (alts (ArrayList RwAlt)) (head (slice u8)) (subject Code) (ty (slice u8)) (task Code)] (-> Code)
+(defn rw-arm-code [(k (mut Comp)) (alts (ArrayList RwAlt)) (head (slice u8)) (subject Code) (rebuilt Code)
+                   (ty (slice u8)) (task Code)] (-> Code)
   (let [label (primitive/code-symbol ":" (fresh (mut k) "rw"))
         (mut tries) (primitive/code-list-new)]
     (for a alts
       (let [h (rw-head a)]
         (when (or (= h head) (= (len h) 0))
-          (push! (mut tries) (rw-alt-code (mut k) a subject ty head label task)))))
-    `(block ~label ~@tries (push! (mut ~(results-field task)) ~subject) 0)))
+          (push! (mut tries) (rw-alt-code (mut k) a subject rebuilt ty head label task)))))
+    `(block ~label ~@tries (push! (mut ~(results-field task)) ~rebuilt) 0)))
 
 ;;; The traversal's rewriting: each visit leaves what its node became on `attrs-results`, so a
 ;;; node finds its children's past `mark`. A node whose children all stayed is itself.
@@ -3146,6 +3182,7 @@
                    (node-coil Code) (task Code)] (-> Code)
   (let [alts (rewrite-alts decls)
         n (sym "rw-node")
+        rebuilt (sym "rw-rebuilt")
         (mut heads) (text-list)
         (mut arms) (primitive/code-list-new)
         alias (alias-of (.name gr))
@@ -3164,8 +3201,8 @@
     (set! (.ret k) "Void")
     (set! (.in-fn k) true)
     (for h heads
-      (push! (mut arms) `(~(kind-code gr h) [] ~(rw-arm-code (mut k) alts h n ty task))))
-    (let [wild (rw-arm-code (mut k) alts "" n ty task)]
+      (push! (mut arms) `(~(kind-code gr h) [] ~(rw-arm-code (mut k) alts h n rebuilt ty task))))
+    (let [wild (rw-arm-code (mut k) alts "" n rebuilt ty task)]
       (set! (.in-fn k) false)
       (clear! (mut (.locals k)))
       `(do
@@ -3184,7 +3221,7 @@
                    (let [(mut x) ~n]
                      (set! (.kids x) (~sublist ~(results-field task) mark (len ~(results-field task))))
                      x)))))
-         (defn attrs-rewrite! [(~n ~node-coil) (~task (ptr RulesTask))] (-> void)
+         (defn attrs-rewrite! [(~n ~node-coil) (~rebuilt ~node-coil) (~task (ptr RulesTask))] (-> void)
            (match (.kind ~n) ~@arms (_ ~wild))
            0)
          (defn attrs-truncate! [(~task (ptr RulesTask)) (mark i64)] (-> void)
@@ -3308,7 +3345,7 @@
                 post (if rw
                          `(let [rebuilt (attrs-rebuilt ~n ~task ~rw-mark)]
                             (attrs-truncate! ~task ~rw-mark)
-                            (attrs-rewrite! rebuilt ~task))
+                            (attrs-rewrite! ~n rebuilt ~task))
                          `0)
                 start (sym "rw-start")]
             (when rw
@@ -3542,6 +3579,7 @@
                       :eq-slots (ArrayList::new [EqSlot] (malloc-allocator))
                       :ovr-slots (ArrayList::new [OvrSlot] (malloc-allocator))
                       :givens (ArrayList::new [Given] (malloc-allocator))
+                      :outs (ArrayList::new [Out] (malloc-allocator))
                       :attrs-from "")
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)

@@ -15,7 +15,7 @@ PATTERNS = collections.OrderedDict([
     ("buf",     re.compile(r"\bbuf-")),
     ("out-arg", re.compile(r"\bmut \[")),
 ])
-DECL = re.compile(r"\n(?=(?:memo )?fn |on |const |record |state |task state |enum |inh |given |collect |input |use |rules |attrs )")
+DECL = re.compile(r"\n(?=(?:memo )?fn |on |rewrite |const |record |state |task state |enum |inh |given |collect |input |use |rules |attrs |#)")
 STATE = re.compile(r"^(?:task )?state ([a-z][\w\-?!]*)", re.M)
 
 
@@ -39,7 +39,7 @@ def main():
         writes = [re.compile(r"^\s*" + re.escape(n) + r"(\[[^\]]*\])?\s*(=|\+=|\+\+=)[^=>]", re.M) for n in names]
         low_here = all_here = 0
         for chunk in DECL.split(src):
-            if not re.match(r"(memo )?fn |on ", chunk):
+            if not re.match(r"(memo )?fn |on |rewrite ", chunk):
                 continue
             n = len(code_lines(chunk))
             total_lines += n
@@ -59,7 +59,7 @@ def main():
                     head = chunk.split("\n")[0][:70]
                     print(f"  {os.path.basename(path)}: {head}  [{', '.join(hits)}]")
         per_file.append((os.path.basename(path), all_here, low_here))
-    print(f"{total_fns} functions and `on` blocks, {total_lines} lines of code; {states} global state declarations")
+    print(f"{total_fns} functions, `on` blocks and rewrites, {total_lines} lines of code; {states} global state declarations")
     for k in list(PATTERNS) + ["global", "any"]:
         print(f"  {k:8} {fns[k]:4} functions  {lines[k]:5} lines  {100 * lines[k] // max(total_lines, 1):3}%")
     print("by file (lines of code, of which low-level):")
