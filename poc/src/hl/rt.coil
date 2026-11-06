@@ -288,15 +288,15 @@
    (ws-ends (ArrayList i32))
    (ws-base i64)])            ; the offset `ws-ends` starts at
 
-;;; A memo table: open addressing on the key, which is never negative, so -1 is an empty slot.
+;;; A memo table: open addressing on the key, which is never negative and is kept plus one, so a
+;;; slot of zeros is empty and a table is made by zeroing memory.
 (defstruct MemoTable [(keys (ArrayList i64)) (vals (ArrayList MemoHit)) (count i64) (mask i64)])
 
 (defn memo-table [(cap i64)] (-> MemoTable)
   (let [(mut keys) (ArrayList::new [i64] (malloc-allocator))
         (mut vals) (ArrayList::new [MemoHit] (malloc-allocator))]
-    (for _ (range 0 cap)
-      (push! (mut keys) -1)
-      (push! (mut vals) (MemoHit :ok false :end 0 :node 0)))
+    (ArrayList::extend-zeroed! (mut keys) cap)
+    (ArrayList::extend-zeroed! (mut vals) cap)
     (MemoTable :keys keys :vals vals :count 0 :mask (- cap 1))))
 
 (defn memo-hash :inline (Always) [(key i64)] (-> i64)
@@ -310,8 +310,8 @@
     (while go
       (let [k (get (.keys t) i)]
         (cond
-          (= k key) (do (set! out (Some (get (.vals t) i))) (set! go false))
-          (= k -1) (set! go false)
+          (= k (+ key 1)) (do (set! out (Some (get (.vals t) i))) (set! go false))
+          (= k 0) (set! go false)
           :else (set! i (& (+ i 1) (.mask t))))))
     out))
 
@@ -321,7 +321,7 @@
           (mut bigger) (memo-table (* (+ (.mask t) 1) 2))]
       (for i (range 0 (len (.keys old)))
         (let [k (get (.keys old) i)]
-          (when (>= k 0) (memo-table-put! (mut bigger) k (get (.vals old) i)))))
+          (when (> k 0) (memo-table-put! (mut bigger) (- k 1) (get (.vals old) i)))))
       (free! (mut (.keys t)))
       (free! (mut (.vals t)))
       (set! t bigger)))
@@ -330,9 +330,9 @@
     (while go
       (let [k (get (.keys t) i)]
         (cond
-          (= k key) (do (set! (mut (.vals t)) i hit) (set! go false))
-          (= k -1)
-            (do (set! (mut (.keys t)) i key)
+          (= k (+ key 1)) (do (set! (mut (.vals t)) i hit) (set! go false))
+          (= k 0)
+            (do (set! (mut (.keys t)) i (+ key 1))
                 (set! (mut (.vals t)) i hit)
                 (set! (.count t) (+ (.count t) 1))
                 (set! go false))
@@ -677,19 +677,24 @@
 ;;; membership hashes into a chain, and each column gets an index on first use.
 ;;; Rules queue new rows and flush after a scan, so nothing grows under a loop.
 ;;; A table from integers to row numbers or bucket numbers, which are never negative: open
-;;; addressing on the key, -1 for an empty slot.
+;;; addressing on the key. A value is kept plus one, so a slot of zeros is empty, and a table is
+;;; made, or grown, by zeroing memory.
 (defstruct IntTable [(keys (ArrayList i64)) (vals (ArrayList i64)) (count i64) (mask i64)])
 
+;;; Capacity 0: nothing allocated until the first put.
 (defn int-table [(cap i64)] (-> IntTable)
   (let [(mut keys) (ArrayList::new [i64] (malloc-allocator))
         (mut vals) (ArrayList::new [i64] (malloc-allocator))]
-    ;; Capacity 0: nothing allocated until the first put.
-    (reserve! (mut keys) cap)
-    (reserve! (mut vals) cap)
-    (for _ (range 0 cap)
-      (push! (mut keys) 0)
-      (push! (mut vals) -1))
+    (when (> cap 0)
+      (ArrayList::extend-zeroed! (mut keys) cap)
+      (ArrayList::extend-zeroed! (mut vals) cap))
     (IntTable :keys keys :vals vals :count 0 :mask (- cap 1))))
+
+;;; A capacity that holds `n` keys without growing.
+(defn int-capacity [(n i64)] (-> i64)
+  (let [(mut cap) 64]
+    (while (< cap (* n 2)) (set! cap (* cap 2)))
+    cap))
 
 ;;; The value for `key`, or -1.
 (defn int-get [(t (mut IntTable)) (key i64)] (-> i64)
@@ -699,8 +704,8 @@
     (while go
       (let [v (get (.vals t) i)]
         (cond
-          (< v 0) (set! go false)
-          (= (get (.keys t) i) key) (do (set! out v) (set! go false))
+          (= v 0) (set! go false)
+          (= (get (.keys t) i) key) (do (set! out (- v 1)) (set! go false))
           :else (set! i (& (+ i 1) (.mask t))))))
     out))
 
@@ -710,7 +715,7 @@
           (mut bigger) (int-table (if (< (.mask t) 31) 64 (* (+ (.mask t) 1) 2)))]
       (for i (range 0 (len (.vals old)))
         (let [v (get (.vals old) i)]
-          (when (>= v 0) (int-put! (mut bigger) (get (.keys old) i) v))))
+          (when (> v 0) (int-put! (mut bigger) (get (.keys old) i) (- v 1)))))
       (free! (mut (.keys t)))
       (free! (mut (.vals t)))
       (set! t bigger)))
@@ -719,12 +724,12 @@
     (while go
       (let [v (get (.vals t) i)]
         (cond
-          (< v 0)
+          (= v 0)
             (do (set! (mut (.keys t)) i key)
-                (set! (mut (.vals t)) i val)
+                (set! (mut (.vals t)) i (+ val 1))
                 (set! (.count t) (+ (.count t) 1))
                 (set! go false))
-          (= (get (.keys t) i) key) (do (set! (mut (.vals t)) i val) (set! go false))
+          (= (get (.keys t) i) key) (do (set! (mut (.vals t)) i (+ val 1)) (set! go false))
           :else (set! i (& (+ i 1) (.mask t))))))
     0))
 
@@ -801,6 +806,21 @@
          :seen 0
          :delta-from 0
          :delta-to 0)))
+
+;;; Room for `n` more rows, when about that many are known to be coming: no growing as they come.
+(defn rel-reserve! [(r (mut Rel)) (n i64)] (-> void)
+  (reserve! (mut (.data r)) (+ (len (.data r)) (* n (.arity r))))
+  (reserve! (mut (.next r)) (+ (len (.next r)) n))
+  (when (> (.arity r) 1)
+    (let [cap (int-capacity (+ (.count r) n))]
+      (when (> cap (+ (.mask (.heads r)) 1))
+        (let [(mut bigger) (int-table cap)
+              old (.heads r)]
+          (for i (range 0 (len (.vals old)))
+            (let [v (get (.vals old) i)]
+              (when (> v 0) (int-put! (mut bigger) (get (.keys old) i) (- v 1)))))
+          (set! (.heads r) bigger)))))
+  0)
 
 (defn rel-at :inline (Always) [(r (mut Rel)) (row i64) (col i64)] (-> i64)
   (get (.data r) (+ (* row (.arity r)) col)))
@@ -941,6 +961,7 @@
     (when (= (atomic/read flag) 0)
       (init-lock!)
       (when (= (atomic/read flag) 0)
+        (set! (.table (elem (mut (.pair-index r)) slot)) (int-table (int-capacity (.count r))))
         (for row (range 0 (.count r)) (pair-index-add! (mut r) slot c1 c2 row))
         (atomic/store flag 1))
       (init-unlock!))
