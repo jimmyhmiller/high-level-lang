@@ -17,6 +17,8 @@ PATTERNS = collections.OrderedDict([
 ])
 DECL = re.compile(r"\n(?=(?:memo )?fn |on |rewrite |const |record |state |task state |enum |inh |given |collect |input |use |rules |attrs |#)")
 STATE = re.compile(r"^(?:task )?state ([a-z][\w\-?!]*)", re.M)
+# A context is bound for a scope with `with`; written to any other way it is state like the rest.
+CONTEXT = re.compile(r"^context ([a-z][\w\-?!]*)", re.M)
 
 
 def code_lines(chunk):
@@ -36,7 +38,8 @@ def main():
         src = open(path).read()
         names = STATE.findall(src)
         states += len(names)
-        writes = [re.compile(r"^\s*" + re.escape(n) + r"(\[[^\]]*\])?\s*(=|\+=|\+\+=)[^=>]", re.M) for n in names]
+        names += CONTEXT.findall(src)
+        writes = [re.compile(r"(?:^|\{)\s*" + re.escape(n) + r"(\[[^\]]*\])?\s*(=|\+=|\+\+=)[^=>]", re.M) for n in names]
         low_here = all_here = 0
         for chunk in DECL.split(src):
             if not re.match(r"(memo )?fn |on |rewrite ", chunk):
