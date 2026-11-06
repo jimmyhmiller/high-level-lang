@@ -440,14 +440,13 @@ fn export-getter(name-id: Int) -> Node {
 fn unique-names(rows: [Int]) -> [Int] = [n for n in rows distinct n]
 
 # `var x_exports = {}; __export(x_exports, { a: () => a, … });`, names sorted.
-fn namespace-stmts!(out: mut [Node]) -> Void {
+fn namespace-stmts() -> [Node] {
   let ns = final-of(here.ns-sym)
   let names = unique-names([n for m.db.resolved(here.id, ?n, _)])
   let sorted = sort n in names by name-of(m.names, n)
   let getters = [export-getter(n) for n in sorted]
   let export-all = helper-name("__export")
-  out += stmt`var $ns = {};`
-  out += stmt`$export_all($ns, { $$getters });`
+  [stmt`var $ns = {};`, stmt`$export_all($ns, { $$getters });`]
 }
 
 # A binding pattern says the same thing as an assignment target, in other nodes.
@@ -487,70 +486,59 @@ fn prop-expr(p: Node) -> Node = match p {
 }
 
 # The names a pattern binds, as declarators, without entering its default values.
-fn pattern-names!(t: Node, out: mut [Node]) -> Void = match t {
-  BindName(x) => { out += Declarator(BindName(x), None()) }
-  ArrayPattern(List(slots...)) => {
-    for s in slots {
-      match s {
-        PatHole() => {}
-        PatRest(x) => pattern-names!(x, out)
-        PatItem(e) | PatLast(e) => pattern-names!(e.target, out)
-        _ => panic "unexpected array pattern slot: {}", js.kind-name(s.kind)
-      }
-    }
-  }
-  ObjectPattern(List(props...)) => {
-    for p in props {
-      match p {
-        PatPropRest(x) => pattern-names!(x, out)
-        PatProp(_, e) => pattern-names!(e.target, out)
-        PatShort(name, _) => pattern-names!(name, out)
-        _ => panic "unexpected object pattern property: {}", js.kind-name(p.kind)
-      }
-    }
-  }
+fn pattern-names(t: Node) -> [Node] = match t {
+  BindName(x) => [Declarator(BindName(x), None())]
+  ArrayPattern(List(slots...)) => [slot-names(s)... for s in slots]
+  ObjectPattern(List(props...)) => [property-names(p)... for p in props]
   _ => panic "unexpected binding pattern: {}", js.kind-name(t.kind)
+}
+
+fn slot-names(s: Node) -> [Node] = match s {
+  PatHole() => []
+  PatRest(x) => pattern-names(x)
+  PatItem(e) | PatLast(e) => pattern-names(e.target)
+  _ => panic "unexpected array pattern slot: {}", js.kind-name(s.kind)
+}
+
+fn property-names(p: Node) -> [Node] = match p {
+  PatPropRest(x) => pattern-names(x)
+  PatProp(_, e) => pattern-names(e.target)
+  PatShort(name, _) => pattern-names(name)
+  _ => panic "unexpected object pattern property: {}", js.kind-name(p.kind)
 }
 
 fn function-decl?(n: Node) -> Bool = n is FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...)
 
 # `var a, b; function f() {} var init_x = __esm({ "path"() { a = 1; } });` A `var` statement inside
 # an initialiser: its names hoist out and its values become assignments. Functions hoist whole.
-fn wrapped-module!(outputs: [Node], out: mut [Node]) -> Void {
-  var hoisted: [Node] = []
-  var functions: [Node] = []
-  var body: [Node] = []
-  for s in outputs {
-    if function-decl?(s) {
-      functions += s
-    } else {
-      match s {
-        VarDecl(List(ds...)) => {
-          for d in ds {
-            match d {
-              Declarator(BindName(x), init) => {
-                hoisted += Declarator(BindName(x), None())
-                if not (init is None()) { body += stmt`$x = $init;` }
-              }
-              # `({ a, b } = init);` with the names hoisted, as esbuild does.
-              Declarator(target, init) => {
-                pattern-names!(target, hoisted)
-                body += ExprStmt(Assignment(pattern-expr(target), AssignOp("="), init))
-              }
-              _ => panic "a declaration list holds declarators"
-            }
-          }
-        }
-        _ => { body += s }
-      }
-    }
-  }
-  if len(hoisted) > 0 { out += VarDecl(List(hoisted...)) }
-  out ++= functions
+fn wrapped-module(outputs: [Node]) -> [Node] {
+  let rest = [s for s in outputs if not function-decl?(s)]
+  let hoisted = [declared-names(d)... for VarDecl(List(ds...)) in rest for d in ds]
+  let body = [initializing(s)... for s in rest]
   let name = final-of(here.init-sym)
   let wrap = helper-name("__esm")
   let path = Str(quote-text(here.path))
-  out += stmt`var $name = $wrap({ $path() { $$body } });`
+  (if len(hoisted) > 0 then [VarDecl(List(hoisted...))] else []) ++ [s for s in outputs if function-decl?(s)]
+  ++ [stmt`var $name = $wrap({ $path() { $$body } });`]
+}
+
+# A wrapped module's variables are declared outside it and set inside it.
+fn declared-names(d: Node) -> [Node] = match d {
+  Declarator(BindName(x), _) => [Declarator(BindName(x), None())]
+  Declarator(target, _) => pattern-names(target)
+  _ => panic "a declaration list holds declarators"
+}
+
+fn initializing(s: Node) -> [Node] = match s {
+  VarDecl(List(ds...)) => [assigning(d)... for d in ds]
+  _ => [s]
+}
+
+# `x = init;`, and `({ a, b } = init);` with the names hoisted, as esbuild does.
+fn assigning(d: Node) -> [Node] = match d {
+  Declarator(BindName(x), init) => if init is None() then [] else [stmt`$x = $init;`]
+  Declarator(target, init) => [ExprStmt(Assignment(pattern-expr(target), AssignOp("="), init))]
+  _ => panic "a declaration list holds declarators"
 }
 
 # Every live statement, in module order. Namespace objects go right after the runtime: their
@@ -569,73 +557,48 @@ record Unit { module: Int, from: Int, to: Int }
 
 const unit-parts: Int = 64
 
-fn units-of-order() -> [Unit] {
-  var out: [Unit] = []
-  for id in m.order {
-    let mo = m.modules[id]
-    let n = len(parts-of(id))
-    if mo.kind == m.Esm and not mo.wrapped and n > 2 * unit-parts {
-      var at = 0
-      while at < n {
-        let to = if at + unit-parts < n then at + unit-parts else n
-        out += Unit(module: id, from: at, to: to)
-        at = to
-      }
-    } else {
-      out += Unit(module: id, from: 0, to: n)
-    }
-  }
-  out
+fn units-of-order() -> [Unit] = [module-units(id)... for id in m.order]
+
+fn module-units(id: Int) -> [Unit] {
+  let mo = m.modules[id]
+  let n = len(parts-of(id))
+  if not (mo.kind == m.Esm and not mo.wrapped and n > 2 * unit-parts) { return [Unit(module: id, from: 0, to: n)] }
+  [Unit(module: id, from: k * unit-parts, to: min(n, (k + 1) * unit-parts)) for k in 0..(n + unit-parts - 1) / unit-parts]
 }
 
 state units: [Unit] = []
 
 fn unit-emitted(i: Int) -> Emitted {
   let u = units[i]
-  let id = u.module
   found-externals = []
-  var out: [Node] = []
-  var namespace: [Node] = []
-  if included?(id) and any-part-here?(id) {
-    with here = m.modules[id] {
-      if here.kind == Cjs {
-        out += cjs-part()
-      } else {
-        var outputs: [Node] = []
-        let ps = parts-of(id)
-        for j in u.from..u.to {
-          let p = ps[j]
-          if live?(p) and in-this-chunk?(p) {
-            match an.part-stmt[p] {
-              None() => namespace-stmts!(namespace)
-              Flag() => {}
-              s => if let some(o) = part-output(s) {
-                if here.wrapped { outputs += stamped(o) } else { out += stamped(o) }
-              }
-            }
-          }
-        }
-        if here.wrapped { wrapped-module!(outputs, out) }
-      }
+  if not (included?(u.module) and any-part-here?(u.module)) { return Emitted(body: [], namespace: [], externals: []) }
+  with here = m.modules[u.module] {
+    if here.kind == Cjs {
+      let body = [cjs-part()]
+      Emitted(body: body, namespace: [], externals: found-externals)
+    } else {
+      # Each part in order, as what it adds to the namespace object or to the body.
+      let pieces = [part-emitted(p) for p in parts-of(u.module)[u.from..u.to] if live?(p) and in-this-chunk?(p)]
+      let outputs = [s for pc in pieces for s in pc.body]
+      Emitted(body: if here.wrapped then wrapped-module(outputs) else outputs,
+              namespace: [s for pc in pieces for s in pc.namespace], externals: found-externals)
     }
   }
-  Emitted(body: out, namespace: namespace, externals: found-externals)
+}
+
+fn part-emitted(p: Int) -> Emitted = match an.part-stmt[p] {
+  None() => Emitted(body: [], namespace: namespace-stmts(), externals: [])
+  Flag() => Emitted(body: [], namespace: [], externals: [])
+  s => Emitted(body: [stamped(o) for some(o) in [part-output(s)]], namespace: [], externals: [])
 }
 
 fn program() -> Node {
   units = units-of-order()
   let emitted = parallel-map([i for i in 0..len(units)], unit-emitted, emit-threads)
-  var out: [Node] = []
-  var namespaces: [Node] = []
-  var runtime-count = 0
-  for i in 0..len(units) {
-    out ++= emitted[i].body
-    namespaces ++= emitted[i].namespace
-    for line in emitted[i].externals {
-      if not (line in external-imports) { external-imports += line }
-    }
-    if units[i].module == 0 { runtime-count = len(out) }
-  }
-  let all-stmts = out[0..runtime-count] ++ namespaces ++ out[runtime-count..len(out)]
-  Program(None(), List(all-stmts...))
+  external-imports ++= [line for em in emitted for line in em.externals if not (line in external-imports) distinct line]
+  # The namespace objects go after the runtime's statements and before everything else.
+  let runtime-units = (last i in 0..len(units): if units[i].module == 0 then some(i + 1) else none) ?? 0
+  let runtime = [s for em in emitted[0..runtime-units] for s in em.body]
+  let rest = [s for em in emitted[runtime-units..len(emitted)] for s in em.body]
+  Program(None(), List((runtime ++ [s for em in emitted for s in em.namespace] ++ rest)...))
 }
