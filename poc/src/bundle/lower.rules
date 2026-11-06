@@ -13,9 +13,11 @@ const no-lowering: Int = 9999
 state target: Int = 9999
 state short-names: Bool = false
 state taken: {Text:Bool} = {}
-state frames: [[Text]] = []
-state helpers: [Text] = []
 state next-temp: Int = 0
+
+# The variables the function being lowered needs declared, and the helpers the program needs.
+context temps: [Text] = []
+context helpers: [Text] = []
 
 record Private {
   holder: Text,   # the WeakMap or WeakSet
@@ -32,20 +34,21 @@ fn before?(year: Int) -> Bool = target < year
 
 const temp-letters: Text = "abcdefghijklmnopqrstuvwxyz"
 
+# The `n`th name: `_a` to `_z`, then `_a1` and on.
+fn spelled(prefix: Text, n: Int) -> Text =
+  prefix ++ byte-text(temp-letters[n % 26]) ++ (if n >= 26 then int-text(n / 26) else "")
+
 fn fresh-name(prefix: Text) -> Text {
-  var name = prefix ++ byte-text(temp-letters[next-temp % 26])
-  var round = next-temp / 26
-  if round > 0 { name = name ++ int-text(round) }
-  next-temp += 1
-  if name in taken { return fresh-name(prefix) }
-  taken[name] = true
-  name
+  let n = first i in next-temp..: if spelled(prefix, i) in taken then none else some(i)
+  next-temp = n + 1
+  taken[spelled(prefix, n)] = true
+  spelled(prefix, n)
 }
 
 # A variable of the function being lowered.
 fn temp() -> Text {
   let name = fresh-name("_")
-  frames[len(frames) - 1] += name
+  temps += name
   name
 }
 
@@ -454,53 +457,46 @@ fn arrow?(n: Node) -> Bool = n is Arrow(...) | AsyncArrow(...)
 
 # Lower a function: its parameters belong to the function around it, its body to itself.
 fn function-node(n: Node) -> Node {
-  var prologue: [Node] = []
-  var params: Node = None()
-  var body: Node = None()
-  for k in n.kids {
-    match k {
-      Params(_) => {
-        let split = if before?(2018) then rest-prologue(k) else Wrapped(params: k, body: FuncBody(List()))
-        prologue = split.body.stmts.kids
-        params = generic(split.params)
-      }
-      FuncBody(_) | ExprBody(_) => { body = k }
-      BindName(_) => if arrow?(n) { params = k }
-      _ => {}
+  let split = first k in n.kids:
+    if k is Params(_) then some(if before?(2018) then rest-prologue(k) else Wrapped(params: k, body: FuncBody(List()))) else none
+  let params = match split {
+    some(s) => generic(s.params)
+    none => (first k in n.kids: if k is BindName(_) and arrow?(n) then some(k) else none) ?? None()
+  }
+  let prologue = match split {
+    some(s) => s.body.stmts.kids
+    none => []
+  }
+  let body = (first k in n.kids: if k is FuncBody(_) | ExprBody(_) then some(k) else none) ?? None()
+  rebuilt-function(n, params, lowered-body(body, prologue))
+}
+
+# A function's body lowered, with the temporaries it needs declared at its top. Its parameters
+# were lowered already: what they need belongs to the function around it.
+fn lowered-body(body: Node, prologue: [Node]) -> Node {
+  with temps = [] {
+    match body {
+      FuncBody(List(ss...)) => body with { kids: [list-of(with-temps(lowered-list(prologue ++ ss), temps))] }
+      ExprBody(e) =>
+        if len(prologue) > 0 then FuncBody(list-of(with-temps(lowered-list(prologue ++ [Return(e)]), temps)))
+        else {
+          let x = lowered(e)
+          if len(temps) == 0 then body with { kids: [x] } else FuncBody(list-of(with-temps([Return(x)], temps)))
+        }
+      _ => body with { kids: [list-of(with-temps([], temps))] }
     }
   }
-  frames += []
-  let stmts: [Node] = match body {
-    FuncBody(List(ss...)) => lowered-list(prologue ++ ss)
-    ExprBody(e) => if len(prologue) > 0 then lowered-list(prologue ++ [Return(e)]) else []
-    _ => []
-  }
-  let plain-expression: Node? = match body {
-    ExprBody(e) => if len(prologue) > 0 then none else some(lowered(e))
-    _ => none
-  }
-  let temps = frames[len(frames) - 1]
-  pop(frames)
-  let new-body: Node = match plain-expression {
-    some(e) => if len(temps) == 0 then body with { kids: [e] }
-               else FuncBody(list-of(with-temps([Return(e)], temps)))
-    none => if body is ExprBody(_) then FuncBody(list-of(with-temps(stmts, temps)))
-            else body with { kids: [list-of(with-temps(stmts, temps))] }
-  }
-  rebuilt-function(n, params, new-body)
+}
+
+fn function-part(k: Node, params: Node, body: Node) -> Node = match k {
+  Params(_) => params
+  FuncBody(_) | ExprBody(_) => body
+  BindName(_) => k
+  _ => lowered(k)
 }
 
 fn rebuilt-function(n: Node, params: Node, body: Node) -> Node {
-  var fresh-kids: [Node] = []
-  for k in n.kids {
-    match k {
-      Params(_) => { fresh-kids += params }
-      FuncBody(_) | ExprBody(_) => { fresh-kids += body }
-      BindName(_) => { fresh-kids += k }
-      _ => { fresh-kids += lowered(k) }
-    }
-  }
-  let same = n with { kids: fresh-kids }
+  let same = n with { kids: [function-part(k, params, body) for k in n.kids] }
   let old = before?(2017)
   let old-generators = before?(2018)
   match same {
@@ -794,11 +790,7 @@ everywhere fn as-class-name(n: Node, ref: Node, inner-name: Text) -> Node = matc
 }
 
 fn lowered-function-body(b: Node) -> Node {
-  frames += []
-  let stmts = lowered-list(b.stmts.kids)
-  let temps = frames[len(frames) - 1]
-  pop(frames)
-  FuncBody(list-of(with-temps(stmts, temps)))
+  with temps = [] { FuncBody(list-of(with-temps(lowered-list(b.stmts.kids), temps))) }
 }
 
 fn constructor-method?(m: Node) -> Bool = m is Method(PropName("constructor"), _, _)
@@ -1011,18 +1003,12 @@ fn run(program: Node, year: Int, names: [Text], minify: Bool) -> Node {
   if year >= no-lowering { return program }
   if year < 2015 { panic "the configured target is older than esbuild supports: es{}", year }
   target = year
-  taken = {}
-  for x in names { taken[x] = true }
-  frames = [[]]
-  helpers = []
+  taken = {x: true for x in names}
   next-temp = 0
-  let stmts = lowered-list(program.body.kids)
-  let temps = frames[0]
-  let defs = helper-definitions()
-  let whole = defs ++ with-temps(stmts, temps)
-  let plain = Program(program.hashbang, List(whole...))
-  if not minify { return plain }
-  var short: {Text:Text} = {}
-  for d in defs { short[helper-name-of(d)] = fresh-name("$") }
-  shortened(plain, short)
+  with temps = [], helpers = [] {
+    let stmts = lowered-list(program.body.kids)
+    let defs = helper-definitions()
+    let plain = Program(program.hashbang, List((defs ++ with-temps(stmts, temps))...))
+    if not minify then plain else shortened(plain, {helper-name-of(d): fresh-name("$") for d in defs})
+  }
 }
