@@ -1129,6 +1129,8 @@
               (None [] (die (mut k) e (cat4 module " has no state named " field "")))))
           (None []
             (let [b (place (mut k) base)]
+              (when (named-child? (mut k) (.ty b) field)
+                (die (mut k) e (cat3 "a node's children do not change in place; make a new node with `with { " field ": ... }`")))
               (te `(~(primitive/code-symbol "." field) ~(.code b))
                   (field-type (mut k) e (.ty b) field)))))))
     (g/KIndex []
@@ -1137,6 +1139,41 @@
         (let [i (expect (mut k) (kid e 1) (expr (mut k) (kid e 1) "Int") "Int")]
           (te `(elem (mut ~(.code b)) ~(.code i)) (elem-of (.ty b))))))
     (_ (die (mut k) e "this cannot be assigned or passed by reference"))))
+
+;;; A named child: each kind that names a child `field`, and where that child is.
+(defstruct Slot [(kind (slice u8)) (index i64)])
+
+(defn child-slots [(gr Mod) (field (slice u8))] (-> (ArrayList Slot))
+  (let [(mut out) (ArrayList::new [Slot] (malloc-allocator))]
+    (for e (.kinds gr)
+      (for i (range 0 (len (.fields e)))
+        (when (= (get (.fields e) i) field) (push! (mut out) (Slot :kind (.name e) :index i)))))
+    out))
+
+(defn node-builtin-field? [(field (slice u8))] (-> bool)
+  (or (= field "text") (= field "lo") (= field "hi") (= field "gen") (= field "kids") (= field "kind")))
+
+(defn named-child? [(k (mut Comp)) (ty (slice u8)) (field (slice u8))] (-> bool)
+  (and (not (builtin-type? ty)) (> (last-dot ty) 0) (= (type-name ty) "Node")
+       (not (node-builtin-field? field))
+       (> (len (child-slots (mod-at (mut k) (type-module ty)) field)) 0)))
+
+;;; `n.field`: the child of that name, wherever this node's kind keeps it. A kind with no child of
+;;; that name is a mistake in the program, so it stops.
+(defn child-code [(k (mut Comp)) (ty (slice u8)) (field (slice u8)) (code Code)] (-> Code)
+  (let [gr (mod-at (mut k) (type-module ty))
+        x (sym (fresh (mut k) "n"))]
+    `(let [~x ~code]
+       (get (.kids ~x) ~(child-index-code (mut k) gr field x)))))
+
+;;; Where node `x` keeps its child `field`.
+(defn child-index-code [(k (mut Comp)) (gr Mod) (field (slice u8)) (x Code)] (-> Code)
+  (let [(mut arms) (primitive/code-list-new)]
+    (for s (child-slots gr field)
+      (push! (mut arms) `(~(kind-code gr (.kind s)) [] ~(.index s))))
+    `(match (.kind ~x)
+       ~@arms
+       (_ (panic ~(cat "a {} node has no child named " field) (~(primitive/code-symbol (alias-of (.name gr)) "/kind-name") (.kind ~x)))))))
 
 ;;; `base` names an imported module, rather than a value.
 (defn module-prefix [(k (mut Comp)) (base g/Node)] (-> (Option (slice u8)))
@@ -1157,7 +1194,9 @@
         (= field "gen") "Int"
         (= field "kids") (cat3 "[" ty "]")
         (= field "kind") (cat (type-module ty) ".Kind")
-        :else (die (mut k) n (cat "a node has text, lo, hi, kids and kind, not " field)))
+        (> (len (child-slots (mod-at (mut k) (type-module ty)) field)) 0) ty
+        :else (die (mut k) n (cat4 "a node has text, lo, hi, kids, kind and its grammar's named children, not "
+                                   field "" "")))
     :else
       (match (find-rec (mod-at (mut k) (type-module ty)) (type-name ty))
         (None [] (die (mut k) n (cat4 ty " has no field named " field "")))
@@ -1519,17 +1558,12 @@
               (mut spread) false
               kids (fresh (mut k) "kids")]
           (for a args
-            (if (= (.kind a) (g/KRest))
-                (let [name (subslice (.text a) 0 (- (len (.text a)) 3))]
-                  (match (find-local (mut k) name)
-                    (None [] (die (mut k) a (cat "nothing named " name)))
-                    (Some [l]
-                      (unless (= (.ty l) (cat3 "[" ty "]"))
-                        (die (mut k) a (cat4 "only a list of nodes can be spread here, not " (.ty l) "" "")))
-                      (set! spread true)
-                      (let [each (fresh (mut k) "each")]
-                        (push! (mut pushes)
-                               `(for (ref ~(sym each)) ~(sym (.sym l)) (push! (mut ~(sym kids)) ~(sym each))))))))
+            (if (spread-arg? a)
+                (let [xs (spread-list (mut k) a (cat3 "[" ty "]"))
+                      each (fresh (mut k) "each")]
+                  (set! spread true)
+                  (push! (mut pushes)
+                         `(for (ref ~(sym each)) ~xs (push! (mut ~(sym kids)) ~(sym each)))))
                 (let [x (expect (mut k) a (expr (mut k) a ty) ty)]
                   (set! count (+ count 1))
                   (push! (mut pushes) `(push! (mut ~(sym kids)) ~(.code x))))))
@@ -1540,6 +1574,20 @@
                  ~@pushes
                  (~(primitive/code-symbol alias "/mk") (~kind) ~(sym kids) 0 0))
               ty)))))
+
+(defn spread-arg? [(a g/Node)] (-> bool) (or (= (.kind a) (g/KRest)) (= (.kind a) (g/KSpread))))
+
+;;; `xs...` or `e...` in a list or a node: the list whose items go in, which must be a `want`.
+(defn spread-list [(k (mut Comp)) (a g/Node) (want (slice u8))] (-> Code)
+  (if (= (.kind a) (g/KRest))
+      (let [name (subslice (.text a) 0 (- (len (.text a)) 3))]
+        (match (find-local (mut k) name)
+          (None [] (die (mut k) a (cat "nothing named " name)))
+          (Some [l]
+            (unless (= (.ty l) want)
+              (die (mut k) a (cat4 "only a " want " can be spread here, not " (.ty l))))
+            (sym (.sym l)))))
+      (.code (expect (mut k) (kid a 0) (expr (mut k) (kid a 0) want) want))))
 
 (defn ctor [(k (mut Comp)) (n g/Node) (name (slice u8)) (args (ArrayList g/Node))] (-> TE)
   (let [m (self-mod (mut k))]
@@ -1803,8 +1851,10 @@
                     (None [] (die (mut k) n (cat4 module " has nothing named " field ""))))))))
           (None []
             (let [b (expr (mut k) base "")]
-              (te `(~(primitive/code-symbol "." field) ~(.code b))
-                  (field-type (mut k) n (.ty b) field)))))))
+              (if (named-child? (mut k) (.ty b) field)
+                  (te (child-code (mut k) (.ty b) field (.code b)) (.ty b))
+                  (te `(~(primitive/code-symbol "." field) ~(.code b))
+                      (field-type (mut k) n (.ty b) field))))))))
     (g/KCall [] (call-expr (mut k) n want))
     (g/KCtor [] (ctor (mut k) n (.text (kid n 0)) (list-kids (kid n 1))))
     (g/KIndex []
@@ -1844,14 +1894,11 @@
             o (fresh (mut k) "out")
             (mut pushes) (primitive/code-list-new)]
         (for a args
-          (if (= (.kind a) (g/KRest))
-              (let [name (subslice (.text a) 0 (- (len (.text a)) 3))
+          (if (spread-arg? a)
+              (let [xs (spread-list (mut k) a (cat3 "[" elem "]"))
                     each (fresh (mut k) "each")]
-                (match (find-local (mut k) name)
-                  (None [] (die (mut k) a (cat "nothing named " name)))
-                  (Some [l]
-                    (push! (mut pushes)
-                           `(for (ref ~(sym each)) ~(sym (.sym l)) (push! (mut ~(sym o)) ~(sym each)))))))
+                (push! (mut pushes)
+                       `(for (ref ~(sym each)) ~xs (push! (mut ~(sym o)) ~(sym each)))))
               (let [x (expect (mut k) a (expr (mut k) a elem) elem)]
                 (push! (mut pushes) `(push! (mut ~(sym o)) ~(.code x))))))
         (te `(let [(mut ~(sym o)) ~(new-list (mut k) elem)] ~@pushes ~(sym o))
@@ -2026,7 +2073,12 @@
           (let [name (.text (kid f 0))
                 ft (field-type (mut k) f (.ty base) name)
                 v (expect (mut k) (kid f 1) (expr (mut k) (kid f 1) ft) ft)]
-            (push! (mut sets) `(set! (~(primitive/code-symbol "." name) ~(sym t)) ~(.code v)))))
+            (if (named-child? (mut k) (.ty base) name)
+                (let [gr (mod-at (mut k) (type-module (.ty base)))]
+                  (push! (mut sets) `(set! (.kids ~(sym t))
+                                           (~(primitive/code-symbol (alias-of (.name gr)) "/kids-with")
+                                            (.kids ~(sym t)) ~(child-index-code (mut k) gr name (sym t)) ~(.code v)))))
+                (push! (mut sets) `(set! (~(primitive/code-symbol "." name) ~(sym t)) ~(.code v))))))
         (te `(let [(mut ~(sym t)) ~(.code base)] ~@sets ~(sym t)) (.ty base))))
 
 ;;; Whether `e` is `name.field`.

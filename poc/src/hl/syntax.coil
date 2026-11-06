@@ -37,6 +37,9 @@
 ;;; X?, ( … )?, !X, &X, ~X (keep this child's parentheses), with(a -b) X, if(a),
 ;;; unless(a), @eof, @nl, @nonl. In a token or fragment: also [class] and `.`.
 ;;;
+;;; `-> Label(a, b)` names the node's children, so other languages can write `n.a`; an infix
+;;; operator's are `left` and `right`.
+;;;
 ;;; An alternative with no `-> Label` has exactly one capture and passes it on.
 ;;; `X*` captures one List node, and `X?` captures its one capture or a None.
 (module hl.syntax)
@@ -74,7 +77,7 @@
    (off (ArrayList (slice u8)))
    (tok rt/Tok)])
 
-(defstruct Alt [(seq PE) (label (slice u8))])
+(defstruct Alt [(seq PE) (label (slice u8)) (fields (ArrayList (slice u8)))])
 (defstruct Op [(lit (slice u8)) (kind (slice u8)) (level i64) (unless-flag (slice u8)) (tok rt/Tok)])
 
 (defstruct Drop [(lit (slice u8)) (level i64) (flag (slice u8)) (nonl bool) (rule (slice u8)) (tok rt/Tok)])
@@ -102,7 +105,7 @@
   (POp [(op Op)])
   (PLeaf []))
 
-(defstruct KindDef [(name (slice u8)) (arity i64) (level i64) (print Print)])
+(defstruct KindDef [(name (slice u8)) (arity i64) (level i64) (print Print) (fields (ArrayList (slice u8)))])
 (defstruct Named [(name (slice u8)) (value i64)])
 (defstruct Lit [(text (slice u8)) (id i64)])
 
@@ -143,6 +146,13 @@
 
 (defn empty-pes [] (-> (ArrayList PE)) (ArrayList::new [PE] (malloc-allocator)))
 (defn empty-strs [] (-> (ArrayList (slice u8))) (ArrayList::new [(slice u8)] (malloc-allocator)))
+
+;;; An infix operator's two children.
+(defn left-right [] (-> (ArrayList (slice u8)))
+  (let [(mut out) (empty-strs)]
+    (push! (mut out) "left")
+    (push! (mut out) "right")
+    out))
 
 (defn pe-new [(op PEOp) (text (slice u8)) (tok rt/Tok)] (-> PE)
   (PE :op op :text text :kids (empty-pes)
@@ -321,6 +331,39 @@
           out)
         first)))
 
+;;; A child's name may have dashes, as names do in the languages that read it: `type-params`. The
+;;; words and dashes must touch, or `a - b` would be one name.
+(defn dashed-name [(c (mut dsl/Cur)) (first rt/Tok)] (-> (slice u8))
+  (let [(mut name) (.text first)
+        (mut end) (+ (.col first) (len (.text first)))
+        (mut go) true]
+    (while go
+      (let [d (dsl/peek (mut c))]
+        (if (and (dsl/at? (mut c) "-") (= (.line d) (.line first)) (= (.col d) end))
+            (do
+              (dsl/advance! (mut c))
+              (let [w (dsl/name! (mut c) "a word after the dash")]
+                (unless (= (.col w) (+ end 1)) (dsl/die (mut c) w "a dashed name has no spaces"))
+                (set! name (dsl/join3 name "-" (.text w)))
+                (set! end (+ (.col w) (len (.text w))))))
+            (set! go false))))
+    name))
+
+;;; `-> Label(a, b)`: names for the node's children, in order, after the `(`.
+(defn read-field-names [(c (mut dsl/Cur))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (empty-strs)
+        (mut go) (not (dsl/accept! (mut c) ")"))]
+    (while go
+      (let [t (dsl/name! (mut c) "a child's name")
+            name (dashed-name (mut c) t)]
+        (for x out
+          (when (= x name) (dsl/die (mut c) t (dsl/join3 "the child name " name " is used twice"))))
+        (push! (mut out) name))
+      (unless (dsl/accept! (mut c) ",")
+        (dsl/expect! (mut c) ")")
+        (set! go false)))
+    out))
+
 ;;; `seq -> Label`, with a `|` between alternatives and a `;` after the last.
 (defn read-alts [(c (mut dsl/Cur))] (-> (ArrayList Alt))
   (let [(mut alts) (ArrayList::new [Alt] (malloc-allocator))
@@ -330,8 +373,11 @@
       (let [s (read-seq (mut c))
             label (if (dsl/accept! (mut c) "->")
                       (.text (dsl/name! (mut c) "a node label"))
-                      "")]
-        (push! (mut alts) (Alt :seq s :label label))
+                      "")
+            fields (if (and (> (len label) 0) (dsl/accept! (mut c) "("))
+                       (read-field-names (mut c))
+                       (empty-strs))]
+        (push! (mut alts) (Alt :seq s :label label :fields fields))
         (unless (dsl/accept! (mut c) "|") (set! go false))))
     (dsl/expect! (mut c) ";")
     alts))
@@ -572,14 +618,34 @@
           (unless same
             (dsl/die (mut c) t (dsl/join3 "the label " (.name k)
                                           " is used with two different forms; a printer needs one form per label"))))))
+    (when (and (> (len (.fields k)) 0) (!= (len (.fields k)) (.arity k)))
+      (dsl/die (mut c) t (dsl/join3 (dsl/join3 "the node " (.name k) " has ")
+                                    (rt/num-text (.arity k))
+                                    (dsl/join3 " children, but " (rt/num-text (len (.fields k))) " names"))))
+    (for i (range 0 (len (.kinds g)))
+      (let [old (get (.kinds g) i)]
+        (when (and (= (.name old) (.name k)) (> (len (.fields k)) 0))
+          (if (= (len (.fields old)) 0)
+              (set! (mut (.kinds g)) i (with-fields old (.fields k)))
+              (unless (same-strs? (.fields old) (.fields k))
+                (dsl/die (mut c) t (dsl/join3 "the node " (.name k) " names its children differently here")))))))
     (unless dup (push! (mut (.kinds g)) k))))
+
+(defn with-fields [(k KindDef) (fields (ArrayList (slice u8)))] (-> KindDef)
+  (KindDef :name (.name k) :arity (.arity k) :level (.level k) :print (.print k) :fields fields))
+
+(defn same-strs? [(a (ArrayList (slice u8))) (b (ArrayList (slice u8)))] (-> bool)
+  (and (= (len a) (len b))
+       (let [(mut same) true]
+         (for i (range 0 (len a)) (unless (= (get a i) (get b i)) (set! same false)))
+         same)))
 
 (defn set-kind-level! [(g (mut Grammar)) (name (slice u8)) (level i64)] (-> void)
   (for i (range 0 (len (.kinds g)))
     (let [k (get (.kinds g) i)]
       (when (= (.name k) name)
         (set! (mut (.kinds g)) i
-              (KindDef :name (.name k) :arity (.arity k) :level level :print (.print k)))))))
+              (KindDef :name (.name k) :arity (.arity k) :level level :print (.print k) :fields (.fields k)))))))
 
 (defn set-kind-base! [(g (mut Grammar)) (name (slice u8)) (base-min i64)] (-> void)
   (for i (range 0 (len (.kinds g)))
@@ -591,7 +657,7 @@
             (when (> base-min old)
               (set! (mut (.kinds g)) i
                     (KindDef :name (.name k) :arity (.arity k) :level (.level k)
-                          :print (PAlt a base-min)))))
+                          :print (PAlt a base-min) :fields (.fields k)))))
           (_ 0))))))
 
 (defn check-refs! [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> void)
@@ -609,7 +675,7 @@
         (> (len (.label a)) 0)
           (add-kind! (mut g) (mut c) (.tok (.seq a))
                      (KindDef :name (.label a) :arity (+ n extra) :level (no-level)
-                           :print (PAlt a 0)))
+                           :print (PAlt a 0) :fields (.fields a)))
         (and (= extra 0) (!= n 1))
           (dsl/die (mut c) (.tok (.seq a))
                    "an alternative with no label must capture exactly one thing")
@@ -631,7 +697,7 @@
             (for op (.ops d)
               (add-lit! (mut g) (.lit op))
               (add-kind! (mut g) (mut c) (.tok op)
-                         (KindDef :name (.kind op) :arity 2 :level (no-level) :print (POp op))))
+                         (KindDef :name (.kind op) :arity 2 :level (no-level) :print (POp op) :fields (left-right))))
             (for dr (.drops d)
               (add-lit! (mut g) (.lit dr))
               (unless (= (decl-kind-of g (mut c) (.tok dr) (.rule dr)) (DHidden))
@@ -640,7 +706,7 @@
           (do
             (check-refs! g (mut c) (.body d))
             (add-kind! (mut g) (mut c) (.tok d)
-                       (KindDef :name (.name d) :arity 0 :level (no-level) :print (PLeaf))))
+                       (KindDef :name (.name d) :arity 0 :level (no-level) :print (PLeaf) :fields (empty-strs))))
         (= k (DHidden))
           (do (check-refs! g (mut c) (.body d))
               (collect-lits! (mut g) (mut c) (.body d)))
@@ -1676,6 +1742,11 @@
          (let [(mut out) (new-kids)]
            (for i (range from to) (push! (mut out) (get items i)))
            out))
+       ;; The same children with the one at `at` replaced: `n with { name: v }` for a named child.
+       (defn kids-with [(items (ArrayList Node)) (at i64) (v Node)] (-> (ArrayList Node))
+         (let [(mut out) (new-kids)]
+           (for i (range 0 (len items)) (push! (mut out) (if (= i at) v (get items i))))
+           out))
        (defn none-node [] (-> Node) (leaf (KNone) "" 0 0))
        (defn flag-node [] (-> Node) (leaf (KFlag) "" 0 0))
        (defn node2 [(k Kind) (a Node) (b Node)] (-> Node)
@@ -1929,7 +2000,7 @@
 (defstruct Loaded [(grammar Grammar) (cursor dsl/Cur)])
 
 ;;; One node a grammar declares: what another language checks itself against.
-(defstruct KindEntry [(name (slice u8)) (arity i64) (leaf bool)])
+(defstruct KindEntry [(name (slice u8)) (arity i64) (leaf bool) (fields (ArrayList (slice u8)))])
 
 ;;; Every node of a grammar, for languages that read one without generating it.
 (defn grammar-table [(source (slice u8)) (path (slice u8))] (-> (ArrayList KindEntry))
@@ -1938,14 +2009,15 @@
     (for k (.kinds (.grammar l))
       (push! (mut out)
              (KindEntry :name (.name k) :arity (.arity k)
-                        :leaf (match (.print k) (PLeaf [] true) (_ false)))))
-    (push! (mut out) (KindEntry :name "List" :arity -1 :leaf false))
-    (push! (mut out) (KindEntry :name "None" :arity 0 :leaf false))
-    (push! (mut out) (KindEntry :name "Flag" :arity 0 :leaf false))
+                        :leaf (match (.print k) (PLeaf [] true) (_ false))
+                        :fields (.fields k))))
+    (push! (mut out) (KindEntry :name "List" :arity -1 :leaf false :fields (empty-strs)))
+    (push! (mut out) (KindEntry :name "None" :arity 0 :leaf false :fields (empty-strs)))
+    (push! (mut out) (KindEntry :name "Flag" :arity 0 :leaf false :fields (empty-strs)))
     out))
 
 (defn load-grammar [(source (slice u8)) (path (slice u8))] (-> Loaded)
-  (let [(mut c) (dsl/grammar-cursor source path "-> ,* ,+ = | ; * + ? ! & ~ ( ) . @ -")
+  (let [(mut c) (dsl/grammar-cursor source path "-> ,* ,+ = | ; * + ? ! & ~ ( ) . @ - ,")
         (mut g) (Grammar
                   :start "" :space "" :word ""
                   :print-words "" :print-high false :apart "" :apart-digits "" :soft-close ""
