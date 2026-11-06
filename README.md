@@ -199,29 +199,28 @@ laptop shared with other work:
 
 | App | single | load-only | back-half | two | full | esbuild | full / esbuild |
 |---|---|---|---|---|---|---|---|
-| tree-shaken lodash-es | 45.8 | 28.3 | 43.4 | 31.9 | **22.6** | 25.8 | 0.88 |
-| all of lodash-es | 55.9 | 38.6 | 49.7 | 38.7 | **26.0** | 27.5 | 0.95 |
-| rxjs | 25.4 | 14.9 | 24.5 | 17.5 | **12.6** | 15.5 | 0.81 |
-| date-fns | 27.8 | 17.2 | 26.9 | 19.8 | **15.0** | 19.6 | 0.77 |
-| d3 | 57.2 | 25.0 | 54.7 | 37.0 | **18.0** | 16.6 | 1.08 |
-| zod | 79.2 | 53.4 | 61.2 | 49.6 | **22.9** | 16.0 | 1.43 |
+| tree-shaken lodash-es | 40.7 | 26.4 | 38.6 | 29.3 | **21.5** | 26.0 | 0.83 |
+| all of lodash-es | 50.7 | 35.8 | 43.3 | 34.8 | **23.7** | 28.3 | 0.84 |
+| rxjs | 22.9 | 13.8 | 22.3 | 15.8 | **12.1** | 15.8 | 0.76 |
+| date-fns | 25.1 | 15.9 | 24.1 | 17.8 | **14.2** | 20.2 | 0.70 |
+| d3 | 50.5 | 22.8 | 47.8 | 32.9 | **16.7** | 17.0 | 0.98 |
+| zod | 72.0 | 50.3 | 52.9 | 45.2 | **20.2** | 17.2 | 1.17 |
 
-Zod is not yet within 20% of esbuild, and what stands in the way is measured:
-- **Link is serial, about 3.7 ms:** the fact replay and the Datalog solve. Running long rule scans
-  in chunks on several threads, with the same rows in the same order, made it slower (6.0 ms):
-  at this size, dispatching costs more than the joins.
-- **Memory.** Zod touches 115 MB to esbuild's 50. A tree node is about 88 bytes, and emit and the
-  rewrite passes each build a new tree. Even exiting takes 2 ms, against 0.5 ms for a tiny build.
-- **Its biggest files sit at the end of an import chain:** about 6.5 ms of loading, even with
-  those files parsed and analysed in parallel pieces.
+Zod is the closest: 1.17 in this run and 1.21 in the next, so at the edge of 20%. What got it there
+from 1.45, besides what is above: linking's liveness reads `mentions` directly instead of a copy,
+`visits` is kept only for modules that forward names, and what a part mentions of its imports is
+joined once (link went from 4.4 to 2.7 ms); relations are made big enough for the facts about to be
+stated; a big file's early errors are checked per part; a file's `require()` and `import()` calls
+are found once; minifying, ASCII and printing run as one pass per part; whitespace skipping costs
+one comparison when the space was skipped already; task state is one thread-specific lookup.
 
-Also tried and taken out, because it was slower: keeping a node's children in the rewrite engine
+Tried and taken out, because they were slower: keeping a node's children in the rewrite engine
 when none changed (a rule that reuses them walks them again; minify on lodash-es went from 3 to 10
-ms), resolving each import as an item of its own for files with few imports, and starting big
-files ahead of the queue (loading zod is limited by how much work there is, not by one path).
+ms), data-parallel Datalog rule scans, resolving each import as an item of its own for files with
+few imports, starting big files ahead of the queue, and starting the worker pool from `main`.
 
-In CPU time this bundler does about 2.6 times esbuild's work on zod (130 ms to 50). Going further
-means a compact tree rewritten in place, a faster Datalog engine, and fewer passes over the tree.
+Per core this bundler still does about twice esbuild's work. The rest of the gap is a more compact
+tree, rewritten in place, and fewer passes over it.
 
 ## What it does
 
