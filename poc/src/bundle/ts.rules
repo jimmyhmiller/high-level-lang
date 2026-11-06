@@ -26,6 +26,8 @@ task state keeping-imports: Bool = false
 task state experimental-decorators: Bool = false
 task state helpers-used: [Text] = []
 context namespace-path: Text = ""
+# What the statement list being lowered declares already, so a namespace there need not.
+context declared: [Text] = []
 
 # Scope analysis finds a name's symbol by offset. Real offsets are not negative.
 fn fresh-offset() -> Int {
@@ -329,42 +331,31 @@ fn through-namespace(n: Node, names: [Text], param: Text) -> Node {
   n with { kids: [through-namespace(k, inner, param) for k in n.kids] }
 }
 
-fn exported-names-of!(ds: [Node], out: mut [Text]) -> Void {
-  for d in ds {
-    match d {
-      Declarator(BindName(x), _) => { out += x }
-      _ => panic "destructuring in `export` inside a namespace is not implemented yet"
-    }
-  }
+# The variables a namespace's body exports.
+fn exported-variables(stmts: [Node]) -> [Text] = [declarator-name(d) for s in stmts for d in exported-declarators(s)]
+
+fn exported-declarators(s: Node) -> [Node] = match s {
+  ExportVar(List(ds...)) => ds
+  ExportLexical(d) => d.declarators.kids
+  _ => []
 }
 
-fn exported-variables!(stmts: [Node], out: mut [Text]) -> Void {
-  for s in stmts {
-    match s {
-      ExportVar(List(ds...)) => exported-names-of!(ds, out)
-      ExportLexical(d) => exported-names-of!(d.declarators.kids, out)
-      _ => {}
-    }
-  }
+fn declarator-name(d: Node) -> Text = match d {
+  Declarator(BindName(x), _) => x
+  _ => panic "destructuring in `export` inside a namespace is not implemented yet"
 }
 
-fn assign-out!(out: mut [Node], param: Text, name: Text, value: Node) -> Void {
+fn assign-out(param: Text, name: Text, value: Node) -> Node {
   let ns = ident(param)
-  out += stmt`$ns.$name = $value;`
+  stmt`$ns.$name = $value;`
 }
 
 # One statement of a namespace's body, with its `export` turned into an assignment.
-fn namespace-statement!(s: Node, param: Text, out: mut [Node]) -> Void = match s {
-  ExportVar(List(ds...)) => export-declarators!(ds, param, out)
-  ExportLexical(d) => export-declarators!(d.declarators.kids, param, out)
-  ExportFunction(f) => {
-    out ++= lowered-statements([f])
-    assign-out!(out, param, f.name.text, ident(f.name.text))
-  }
-  ExportClass(c) => {
-    out ++= lowered-statements([c])
-    assign-out!(out, param, c.name.text, ident(c.name.text))
-  }
+fn namespace-statement(s: Node, param: Text) -> [Node] = match s {
+  ExportVar(List(ds...)) => export-declarators(ds, param)
+  ExportLexical(d) => export-declarators(d.declarators.kids, param)
+  ExportFunction(f) => lowered-statements([f]) ++ [assign-out(param, f.name.text, ident(f.name.text))]
+  ExportClass(c) => lowered-statements([c]) ++ [assign-out(param, c.name.text, ident(c.name.text))]
   TsExportEnum(e) => {
     let name = enum-name(e)
     let holder = bind(name)
@@ -374,24 +365,19 @@ fn namespace-statement!(s: Node, param: Text, out: mut [Node]) -> Void = match s
     let outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
     let call = enum-call(e, outer)
     pure-off(call)
-    out += stmt`let $holder;`
-    out += ExprStmt(call)
+    [stmt`let $holder;`, ExprStmt(call)]
   }
-  TsExportNamespace(TsNamespace(name, body)) => nested-namespace!(name.text, body, param, out)
-  TsExportImport(TsImportAlias(name, target)) => assign-out!(out, param, name.text, target)
+  TsExportNamespace(TsNamespace(name, body)) => nested-namespace(name.text, body, param)
+  TsExportImport(TsImportAlias(name, target)) => [assign-out(param, name.text, target)]
   TsExportImport(TsImportRequire(name, from)) => {
     let req = ident("require")
     let required = exp`$req($from)`
-    assign-out!(out, param, name.text, required)
+    [assign-out(param, name.text, required)]
   }
-  ExportNamed(List(specs...)) => for spec in specs {
-    match spec {
-      ExportName(x) => assign-out!(out, param, x.text, ident(x.text))
-      ExportAs(x, y) => assign-out!(out, param, y.text, ident(x.text))
-      _ => {}
-    }
-  }
-  _ => { out ++= lowered-statements([s]) }
+  ExportNamed(List(specs...)) =>
+    [assign-out(param, (if spec is ExportAs(...) then spec.exported else spec.local).text, ident(spec.local.text))
+     for spec in specs if spec is ExportName(_) | ExportAs(_, _)]
+  _ => lowered-statements([s])
 }
 
 fn pure-off(n: Node) -> Void {
@@ -400,65 +386,67 @@ fn pure-off(n: Node) -> Void {
   }
 }
 
-fn export-declarators!(ds: [Node], param: Text, out: mut [Node]) -> Void {
-  for d in ds {
-    match d {
-      Declarator(BindName(x), None()) => {}
-      Declarator(BindName(x), init) => assign-out!(out, param, x, lowered(init))
-      _ => panic "destructuring in `export` inside a namespace is not implemented yet"
-    }
+fn export-declarators(ds: [Node], param: Text) -> [Node] {
+  if any d in ds: not (d is Declarator(BindName(_), _)) {
+    panic "destructuring in `export` inside a namespace is not implemented yet"
   }
+  [assign-out(param, x, lowered(init)) for Declarator(BindName(x), init) in ds if not (init is None())]
 }
 
 # The function a namespace's body becomes, or nothing if the body held only types.
 fn namespace-call(name: Text, body: Node, outer: Node) -> Node? {
   let param = fresh-name(name)
-  let path = namespace-path ++ "." ++ name
-  var stmts: [Node] = []
-  with namespace-path = path {
-    match body {
-      TsNamespaceNested(inner, rest) => nested-namespace!(inner.text, rest, param, stmts)
-      TsNamespaceBlock(List(ss...)) => {
-        var exported = namespace-exports[path] ?? []
-        exported-variables!(ss, exported)
-        namespace-exports[path] = exported
-        for s in ss { namespace-statement!(s, param, stmts) }
-        stmts = [through-namespace(s, exported, param) for s in stmts]
-      }
-      _ => panic "unexpected namespace body"
-    }
-  }
+  let stmts = namespace-body(namespace-path ++ "." ++ name, body, param)
   if len(stmts) == 0 { return none }
   let p = bind(param)
   some(exp`(($p) => { $$stmts })($outer)`)
 }
 
+# What the namespace at `path` holds, as statements of the function its body becomes. Every body of
+# one namespace exports into the same object: what earlier ones exported is read through it.
+fn namespace-body(path: Text, body: Node, param: Text) -> [Node] {
+  with namespace-path = path {
+    match body {
+      TsNamespaceNested(inner, rest) => nested-namespace(inner.text, rest, param)
+      TsNamespaceBlock(List(ss...)) => {
+        let exported = (namespace-exports[path] ?? []) ++ exported-variables(ss)
+        namespace-exports[path] = exported
+        [through-namespace(s, exported, param) for s in [namespace-statement(s, param)... for s in ss]]
+      }
+      _ => panic "unexpected namespace body"
+    }
+  }
+}
+
 # `let M; ((M2) => { … })(M = N2.M || (N2.M = {}));`
-fn nested-namespace!(name: Text, body: Node, param: Text, out: mut [Node]) -> Void {
+fn nested-namespace(name: Text, body: Node, param: Text) -> [Node] {
   let ns1 = ident(param)
   let ns2 = ident(param)
   let local = ident(name)
   let outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
-  if let some(call) = namespace-call(name, body, outer) {
-    let holder = bind(name)
-    out += stmt`let $holder;`
-    out += ExprStmt(call)
+  match namespace-call(name, body, outer) {
+    some(call) => {
+      let holder = bind(name)
+      [stmt`let $holder;`, ExprStmt(call)]
+    }
+    none => []
   }
 }
 
 # `var N; ((N2) => { … })(N || (N = {}));`, without the `var` if something already declares N.
-fn namespace-statements!(n: Node, exported: Bool, declared: mut [Text], out: mut [Node]) -> Void = match n {
+fn namespace-statements(n: Node, exported: Bool) -> [Node] = match n {
   TsNamespace(name, body) => {
     let again1 = ident(name.text)
     let again2 = ident(name.text)
     let outer = exp`$again1 || ($again2 = {})`
-    if let some(call) = namespace-call(name.text, body, outer) {
-      if not (name.text in declared) {
+    match namespace-call(name.text, body, outer) {
+      none => []
+      some(call) => {
+        if name.text in declared { return [ExprStmt(call)] }
         declared += name.text
         let holder = Declarator(name, None()) with { lo: n.lo, hi: n.hi }
-        out += if exported then ExportVar(List(holder)) else VarDecl(List(holder))
+        [if exported then ExportVar(List(holder)) else VarDecl(List(holder)), ExprStmt(call)]
       }
-      out += ExprStmt(call)
     }
   }
   _ => panic "expected a namespace"
@@ -635,7 +623,7 @@ fn decorate-call(decorators: [Node], target: Node, key: Node?, kind: Int) -> Nod
 
 # `class A { @d m() {} }` and `@c class A {}`, as TypeScript's experimentalDecorators runs them:
 # members first, instance before static, then the class, which the decorators may replace.
-fn decorated-class!(class-decorators: [Node], cls: Node, exported: Bool, out: mut [Node]) -> Void {
+fn decorated-class(class-decorators: [Node], cls: Node, exported: Bool) -> [Node] {
   if not experimental-decorators {
     panic "JavaScript decorators are not implemented yet; set \"experimentalDecorators\": true in tsconfig.json for TypeScript's"
   }
@@ -671,8 +659,7 @@ fn decorated-class!(class-decorators: [Node], cls: Node, exported: Bool, out: mu
     after += stmt`$holder = $value;`
   }
   let plain = lowered(undecorated(cls))
-  out += if exported then ExportClass(plain) with { lo: cls.lo, hi: cls.hi } else plain
-  out ++= after
+  [if exported then ExportClass(plain) with { lo: cls.lo, hi: cls.hi } else plain] ++ after
 }
 
 # ---------------------------------------------------------------- the walk
@@ -690,48 +677,42 @@ fn declared-name(s: Node) -> [Text] = match s {
 }
 
 fn lowered-statements(xs: [Node]) -> [Node] {
-  var out: [Node] = []
-  var declared = declared-names(xs)
-  for x in xs {
-    match x {
-      TsErased() => {}
-      TsDecoratedClass(List(ds...), cls) => decorated-class!([lowered(d.expr) for d in ds], cls, false, out)
-      TsDecoratedExport(List(ds...), cls) | TsExportDecorated(List(ds...), cls) =>
-        decorated-class!([lowered(d.expr) for d in ds], cls, true, out)
-      TsDecoratedDefault(...) | TsDefaultDecorated(...) => panic "a decorated `export default class` is not implemented yet; name the class and export it"
-      ClassDecl(...) => if decorated-anything?(x) then decorated-class!([], x, false, out) else { out += lowered(x) }
-      ExportClass(c) => if decorated-anything?(c) then decorated-class!([], c, true, out) else { out += lowered(x) }
-      TsEnum(...) => { out += VarDecl(List(enum-declarator(x))) with { lo: x.lo, hi: x.hi } }
-      TsExportEnum(e) => { out += ExportVar(List(enum-declarator(e))) with { lo: x.lo, hi: x.hi } }
-      TsNamespace(...) => namespace-statements!(x, false, declared, out)
-      TsExportNamespace(n) => namespace-statements!(n, true, declared, out)
-      TsImportRequire(name, from) | TsExportImport(TsImportRequire(name, from)) => {
-        let req = ident("require")
+  with declared = declared-names(xs) { [statement-lowered(x)... for x in xs] }
+}
+
+fn statement-lowered(x: Node) -> [Node] = match x {
+  TsErased() => []
+  TsDecoratedClass(List(ds...), cls) => decorated-class([lowered(d.expr) for d in ds], cls, false)
+  TsDecoratedExport(List(ds...), cls) | TsExportDecorated(List(ds...), cls) =>
+    decorated-class([lowered(d.expr) for d in ds], cls, true)
+  TsDecoratedDefault(...) | TsDefaultDecorated(...) => panic "a decorated `export default class` is not implemented yet; name the class and export it"
+  ClassDecl(...) => if decorated-anything?(x) then decorated-class([], x, false) else [lowered(x)]
+  ExportClass(c) => if decorated-anything?(c) then decorated-class([], c, true) else [lowered(x)]
+  TsEnum(...) => [VarDecl(List(enum-declarator(x))) with { lo: x.lo, hi: x.hi }]
+  TsExportEnum(e) => [ExportVar(List(enum-declarator(e))) with { lo: x.lo, hi: x.hi }]
+  TsNamespace(...) => namespace-statements(x, false)
+  TsExportNamespace(n) => namespace-statements(n, true)
+  TsImportRequire(name, from) | TsExportImport(TsImportRequire(name, from)) => {
+    let req = ident("require")
     let required = exp`$req($from)`
-        let d = List(Declarator(name, required) with { lo: x.lo, hi: x.hi })
-        out += if x is TsExportImport(_) then ExportLexical(ConstDecl(d)) else ConstDecl(d)
-      }
-      TsImportAlias(name, target) => {
-        aliases[name.lo] = true
-        out += ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi })) with { lo: x.lo, hi: x.hi }
-      }
-      TsExportImport(TsImportAlias(name, target)) => {
-        out += ExportLexical(ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi }))) with { lo: x.lo, hi: x.hi }
-      }
-      TsExportAssign(e) => {
-        let value = lowered(e)
-        let holder = ident("module")
-        out += stmt`$holder.exports = $value;`
-      }
-      Import(ImportNamed(List(specs...)), _) | ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) => {
-        # `import {type A} from "x"` and its like are gone once their specifiers are.
-        let left = [s for s in specs if not (s is TsErased())]
-        if len(left) > 0 or len(specs) == 0 { out += lowered(x) }
-      }
-      _ => { out += lowered(x) }
-    }
+    let d = List(Declarator(name, required) with { lo: x.lo, hi: x.hi })
+    [if x is TsExportImport(_) then ExportLexical(ConstDecl(d)) else ConstDecl(d)]
   }
-  out
+  TsImportAlias(name, target) => {
+    aliases[name.lo] = true
+    [ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi })) with { lo: x.lo, hi: x.hi }]
+  }
+  TsExportImport(TsImportAlias(name, target)) =>
+    [ExportLexical(ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi }))) with { lo: x.lo, hi: x.hi }]
+  TsExportAssign(e) => {
+    let value = lowered(e)
+    let holder = ident("module")
+    [stmt`$holder.exports = $value;`]
+  }
+  # `import {type A} from "x"` and its like are gone once their specifiers are.
+  Import(ImportNamed(List(specs...)), _) | ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) =>
+    if len(specs) == 0 or (any s in specs: not (s is TsErased())) then [lowered(x)] else []
+  _ => [lowered(x)]
 }
 
 fn lowered(n: Node) -> Node = match n {
