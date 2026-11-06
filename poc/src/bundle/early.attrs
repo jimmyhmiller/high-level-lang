@@ -1,0 +1,1039 @@
+# Early errors: programs the grammar accepts, but which the language forbids because of what
+# surrounds them or what else is declared. An attribute grammar: what the code around a node
+# permits is inherited, and the problems are collected, the first in tree order winning.
+attrs bundle.early over bundle.js
+use bundle.js as js
+use bundle.scopes as sc
+use bundle.minhost as host
+use bundle.literal as lit
+
+record Problem { message: Text, at: Int }
+collect problem: Problem?
+
+# What the program is: an ES module, or CommonJS, whose top level is a function's body.
+input module: Bool
+input allow-top-return: Bool
+# `export { T }` of a type names nothing once the types have gone, and that is fine.
+input types-erased: Bool
+# A part of a big program, checked on its own: the program's own checks were made already, and
+# these are its strictness and what it declares.
+input part: Bool
+input program-strict: Bool
+input program-exportable: [Text]
+
+# What the code around a node permits.
+inh strict: Bool = false
+inh in-function: Bool = false
+inh in-generator: Bool = false
+inh in-async: Bool = false
+inh in-loop: Bool = false
+inh in-switch: Bool = false
+inh allow-new-target: Bool = false
+inh allow-super-prop: Bool = false
+inh allow-super-call: Bool = false
+inh top-level: Bool = false
+inh labels: [Text] = []
+inh loop-labels: [Text] = []
+inh exportable: [Text] = []
+# A class with a heritage, whose constructor may call super().
+inh in-derived: Bool = false
+# Where the language checks nothing: a tagged template's raw text, the names an import lists.
+inh checking: Bool = true
+
+# How a node's parent uses it, which decides what it may be.
+enum Role {
+  Plain, Target, PatTarget, PatElem, ArrSlots, ArrSlot, RestSlot, ObjPatProps, ObjPatProp,
+  ObjProps, ObjProp, ClassMembers, Member, StaticMember, Substmt, SubstmtFn, TaggedTpl, TaggedParts,
+  TaggedPart
+}
+given role: Role = Plain
+
+fn report(message: Text, n: Node) -> Void {
+  if checking { problem += Problem(message: message, at: n.lo) }
+}
+
+fn report-first(p: Problem?) -> Void {
+  if let some(x) = p {
+    if checking { problem += x }
+  }
+}
+
+# ---------------------------------------------------------------- names
+
+const strict-reserved: [Text] = ["implements", "interface", "let", "package", "private",
+                                 "protected", "public", "static", "yield"]
+const reserved-words: [Text] = ["break", "case", "catch", "class", "const", "continue", "debugger",
+  "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
+  "function", "if", "import", "in", "instanceof", "new", "null", "return", "super", "switch",
+  "this", "throw", "true", "try", "typeof", "var", "void", "while", "with"]
+
+fn restricted?(s: Text) -> Bool = s == "eval" or s == "arguments"
+
+fn hex-digit(d: Int) -> Int =
+  if digit-byte?(d) then d - '0'
+  else if d >= 'a' and d <= 'f' then d - 'a' + 10
+  else if d >= 'A' and d <= 'F' then d - 'A' + 10
+  else 0
+
+# The value of a run of hex digits, held just past the largest code point so it cannot overflow.
+fn hex-value(digits: Text) -> Int {
+  var v = 0
+  for c in digits { v = (if v > 1114111 then 1114112 else v) * 16 + hex-digit(c) }
+  v
+}
+
+# A name's code points: UTF-8 decoded, `\u0061` and `\u{61}` resolved.
+fn code-points(s: Text) -> [Int] {
+  var out: [Int] = []
+  for p in host.pieces(s) {
+    match p {
+      lit.Plain(t) => { out ++= code-points-of(t) }
+      lit.EscUni(t) => { out += hex-value(t[2..len(t)]) }
+      lit.EscBrace(t) => { out += hex-value(t[3..len(t) - 1]) }
+      _ => { out += -1 }
+    }
+  }
+  out
+}
+
+# `\u0061` in a name means `a`, and an escaped keyword is still a keyword.
+fn unescaped(s: Text) -> Text =
+  if not has-byte?(s, '\\') then s else text-of-points([cp for cp in code-points(s) if cp >= 0])
+
+const id-start-categories: [Text] = ["Lu", "Ll", "Lt", "Lm", "Lo", "Nl"]
+const id-part-categories: [Text] = ["Mn", "Mc", "Nd", "Pc"]
+const other-id-start: [Int] = [4256, 8472, 8494, 12443, 12444]
+const other-id-continue: [Int] = [183, 903, 6618]
+
+# ID_Start and ID_Continue, by general category, plus what the language adds.
+fn id-part?(cp: Int, first: Bool) -> Bool {
+  if cp < 0 or cp > 1114111 or (cp >= 55296 and cp <= 57343) { return false }
+  if cp == 36 or cp == 95 { return true }
+  if not first and (cp == 8204 or cp == 8205) { return true }
+  let cat = unicode-category(cp)
+  cat in id-start-categories or cp in other-id-start
+    or (not first and (cat in id-part-categories or cp in other-id-continue
+                       or (cp >= 4969 and cp <= 4977)))
+}
+
+fn valid-name?(s: Text) -> Bool {
+  if all c in s: c != '\\' and c < 128 { return true }
+  let points = code-points(s)
+  len(points) > 0 and (all i in 0..len(points): id-part?(points[i], i == 0))
+}
+
+fn check-name(n: Node) -> Void {
+  let name = unescaped(n.text)
+  if not valid-name?(n.text) { report("this is not a valid identifier", n) }
+  if name != n.text and name in reserved-words { report("a keyword cannot contain an escape", n) }
+  if strict and name in strict-reserved { report("this name is reserved in strict mode", n) }
+  if in-generator and name == "yield" { report("yield is reserved in a generator", n) }
+  if (in-async or module) and name == "await" { report("await is reserved here", n) }
+}
+
+fn check-binding(n: Node) -> Void {
+  check-name(n)
+  if strict and restricted?(unescaped(n.text)) {
+    report("eval and arguments cannot be bound in strict mode", n)
+  }
+}
+
+# ---------------------------------------------------------------- declarations
+
+# Bindings of a declaration or pattern, in order.
+fn binds!(n: Node, out: mut [Text]) -> Void = match n {
+  BindName(x) => { out += unescaped(x) }
+  _ => if not sc.opens?(n.kind) {
+    for k in n.kids { binds!(k, out) }
+  }
+}
+
+fn duplicates?(xs: [Text]) -> Bool =
+  any i in 0..len(xs): any j in 0..i: xs[i] == xs[j]
+
+# `var` names hoisting through a statement list, not entering nested functions.
+fn var-names!(n: Node, out: mut [Text]) -> Void {
+  if sc.var?(n.kind) {
+    binds!(n, out)
+  } else if not sc.function?(n.kind) {
+    for k in n.kids { var-names!(k, out) }
+  }
+}
+
+# Names a statement list declares lexically.
+fn lexical-of!(s: Node, function-top: Bool, names: mut [Text], functions: mut [Text]) -> Void = match s {
+  LetDecl(...) | ConstDecl(...) | Import(...) => binds!(s, names)
+  ClassDecl(name, ...) => { names += unescaped(name.text) }
+  FuncDecl(name, ...) => if not function-top { functions += unescaped(name.text) }
+  GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) =>
+    if not function-top { names += unescaped(name.text) }
+  ExportFunction(d) => lexical-of!(d, function-top, names, functions)
+  ExportDefaultDecl(d) => match d.kids[0] {
+    BindName(x) => { names += unescaped(x) }
+    _ => {}
+  }
+  ExportLexical(d) | ExportClass(d) => lexical-of!(d, false, names, functions)
+  Labeled(_, body) => lexical-of!(body, function-top, names, functions)
+  _ => {}
+}
+
+# The first problem with what a statement list declares, under strictness `now-strict`.
+fn declaration-problem(stmts: [Node], function-top: Bool, params: [Text], at: Node, now-strict: Bool) -> Problem? {
+  var names: [Text] = []
+  var functions: [Text] = []
+  var vars: [Text] = []
+  for s in stmts {
+    lexical-of!(s, function-top, names, functions)
+    var-names!(s, vars)
+  }
+  let twice = Problem(message: "this name is declared twice in one block", at: at.lo)
+  if duplicates?(names) { return some(twice) }
+  for f in functions {
+    if f in names or f in vars { return some(twice) }
+  }
+  if now-strict and duplicates?(functions) {
+    return some(Problem(message: "this function is declared twice in one block", at: at.lo))
+  }
+  for n in names {
+    if n in vars { return some(Problem(message: "a let or const collides with a var", at: at.lo)) }
+    if n in params { return some(Problem(message: "a let or const collides with a parameter", at: at.lo)) }
+  }
+  none
+}
+
+fn check-declarations(stmts: [Node], function-top: Bool, params: [Text], at: Node, now-strict: Bool) -> Void =
+  report-first(declaration-problem(stmts, function-top, params, at, now-strict))
+
+# ---------------------------------------------------------------- functions
+
+# Does the statement list begin with a `"use strict"` directive?
+fn has-use-strict?(stmts: [Node]) -> Bool {
+  var hit = false
+  var go = true
+  for s in stmts {
+    if go {
+      match s {
+        ExprStmt(Str(raw)) => if unquote(raw) == "use strict" { hit = true }
+        _ => { go = false }
+      }
+    }
+  }
+  hit
+}
+
+fn simple-params?(params: Node) -> Bool = match params {
+  Params(List(ps...)) => all p in ps: p is Param(BindName(_), None())
+  _ => false
+}
+
+fn contains-kind?(n: Node, yield-form: Bool) -> Bool = match n {
+  Yield(...) | YieldStar(...) if yield-form => true
+  Await(...) if not yield-form => true
+  _ => not sc.function?(n.kind) and (any k in n.kids: contains-kind?(k, yield-form))
+}
+
+record FnKind { gen: Bool, async: Bool, arrow: Bool, method: Bool, super-call: Bool }
+
+fn plain-fn(gen: Bool, async: Bool) -> FnKind =
+  FnKind(gen: gen, async: async, arrow: false, method: false, super-call: false)
+fn arrow-fn(async: Bool) -> FnKind =
+  FnKind(gen: false, async: async, arrow: true, method: false, super-call: false)
+fn method-fn(gen: Bool, async: Bool, super-call: Bool) -> FnKind =
+  FnKind(gen: gen, async: async, arrow: false, method: true, super-call: super-call)
+
+
+fn body-stmts(body: Node) -> [Node] = match body {
+  FuncBody(List(ss...)) => ss
+  _ => []
+}
+
+fn expression-fn?(n: Node) -> Bool = n is FuncExpr(...) | GenExpr(...) | AsyncFuncExpr(...) | AsyncGenExpr(...)
+
+# What kind of function a node is, and where it is: a class's constructor may call super().
+fn fn-kind(n: Node) -> FnKind = match n {
+  FuncDecl(...) | FuncExpr(...) => plain-fn(false, false)
+  GenDecl(...) | GenExpr(...) => plain-fn(true, false)
+  AsyncFuncDecl(...) | AsyncFuncExpr(...) => plain-fn(false, true)
+  AsyncGenDecl(...) | AsyncGenExpr(...) => plain-fn(true, true)
+  Arrow(...) => arrow-fn(false)
+  AsyncArrow(...) => arrow-fn(true)
+  Method(key, ...) => method-fn(false, false, role == Member and prop-is?(key, "constructor") and in-derived)
+  GenMethod(...) => method-fn(true, false, false)
+  AsyncMethod(...) => method-fn(false, true, false)
+  AsyncGenMethod(...) => method-fn(true, true, false)
+  Getter(...) | Setter(...) => method-fn(false, false, false)
+  _ => panic "fn-kind of a node that is no function"
+}
+
+# A function's own rules: its parameters, and what its body declares.
+fn function-checks(params: Node, body: Node, f: FnKind) -> Void {
+  let stmts = body-stmts(body)
+  let own-strict = has-use-strict?(stmts)
+  let now-strict = strict or own-strict
+  var param-names: [Text] = []
+  match params {
+    Params(...) => {
+      binds!(params, param-names)
+      if f.arrow and in-generator and "yield" in param-names {
+        report("yield is reserved in a generator", params)
+      }
+      if own-strict and not simple-params?(params) {
+        report("use strict needs simple parameters", params)
+      }
+      if duplicates?(param-names) and (now-strict or f.arrow or f.method or not simple-params?(params)) {
+        report("a parameter is named twice", params)
+      }
+      if ((f.gen or (f.arrow and in-generator)) and contains-kind?(params, true))
+         or ((f.async or (f.arrow and in-async)) and contains-kind?(params, false)) {
+        report("yield and await expressions cannot be parameter defaults here", params)
+      }
+    }
+    BindName(x) => { param-names += unescaped(x) }
+    _ => {}
+  }
+  if body is FuncBody(...) { check-declarations(stmts, true, param-names, body, now-strict) }
+}
+
+# What a method's name and parameters may be, in a class or an object.
+fn member-checks(n: Node, key: Node, params: Node) -> Void {
+  let in-class = role == Member or role == StaticMember
+  let is-static = role == StaticMember
+  match n {
+    Method(...) => if is-static and prop-is?(key, "prototype") {
+      report("a static method cannot be named prototype", key)
+    }
+    GenMethod(...) | AsyncMethod(...) | AsyncGenMethod(...) => if in-class { special-key(key, is-static) }
+    Getter(...) => {
+      accessor-params(params, 0)
+      if in-class { special-key(key, is-static) }
+    }
+    Setter(...) => {
+      accessor-params(params, 1)
+      if in-class { special-key(key, is-static) }
+    }
+    _ => {}
+  }
+}
+
+# ---------------------------------------------------------------- assignment targets
+
+fn target-role?(r: Role) -> Bool = r == Target or r == PatTarget or r == PatElem
+fn pattern-role?(r: Role) -> Bool = r == PatTarget or r == PatElem
+
+# Can this be assigned to? A pattern allows the destructuring forms, and a pattern's element a
+# default too.
+fn target-checks(t: Node) -> Void = match t {
+  Ident(x) => if strict and restricted?(unescaped(x)) {
+    report("eval and arguments cannot be assigned in strict mode", t)
+  }
+  Member(...) | Index(...) => {}
+  Paren(inner) => if not (inner is Ident(_) | Paren(_) | Member(...) | Index(...)) {
+    report("invalid assignment target", t)
+  }
+  ArrayLit(...) | ObjectLit(...) => if not pattern-role?(role) { report("invalid assignment target", t) }
+  Assignment(_, AssignOp("="), _) => if role != PatElem { report("invalid assignment target", t) }
+  _ => report("invalid assignment target", t)
+}
+
+fn array-pattern-checks(t: Node) -> Void {
+  let slots = t.kids[0].kids
+  for i in 0..len(slots) {
+    let s = slots[i]
+    if not (s is Hole()) {
+      match s.kids[0] {
+        Spread(inner) => {
+          if not (i == len(slots) - 1 and s is ElemLast(_)) {
+            report("a rest element must come last, with no comma after it", s)
+          }
+          if inner is Assignment(...) { report("a rest element cannot have a default", s) }
+        }
+        _ => {}
+      }
+    }
+  }
+}
+
+fn object-pattern-checks(t: Node) -> Void {
+  let props = t.kids[0].kids
+  for i in 0..len(props) {
+    let p = props[i]
+    match p {
+      SpreadProp(inner) => {
+        if i != len(props) - 1 { report("a rest property must come last", p) }
+        if not (inner is Ident(_) | Member(...) | Index(...)) {
+          report("a rest property must be a simple target", p)
+        }
+      }
+      _ => {}
+    }
+  }
+}
+
+# ---------------------------------------------------------------- statements
+
+fn substatement-kind(s: Node, allow-function: Bool) -> Void = match s {
+  LetDecl(...) | ConstDecl(...) => report("a lexical declaration needs a block here", s)
+  ClassDecl(...) => report("a class declaration needs a block here", s)
+  GenDecl(...) => report("a generator declaration needs a block here", s)
+  AsyncFuncDecl(...) => report("an async function declaration needs a block here", s)
+  AsyncGenDecl(...) => report("an async generator declaration needs a block here", s)
+  FuncDecl(...) => if not (allow-function and not strict) {
+    report("a function declaration needs a block here", s)
+  }
+  Labeled(_, body) => substatement-kind(body, false)
+  _ => {}
+}
+
+# A declaration's names must be initialised where the form requires it.
+fn decl-list-checks(list: Node, need-init: Bool, lexical: Bool) -> Void {
+  for d in list.kids {
+    match d {
+      Declarator(target, init) => {
+        if init is None() and (need-init or not (target is BindName(_))) {
+          report("this declaration needs an initial value", d)
+        }
+        if lexical {
+          var names: [Text] = []
+          binds!(target, names)
+          for n in names {
+            if n == "let" { report("let cannot be the name of a lexical binding", d) }
+          }
+          if duplicates?(names) { report("a name is bound twice in one pattern", d) }
+        }
+      }
+      _ => panic "a declaration list holds declarators"
+    }
+  }
+}
+
+fn head-collision(head: Node, body: Node) -> Void {
+  var names: [Text] = []
+  var vars: [Text] = []
+  binds!(head, names)
+  if duplicates?(names) { report("a name is bound twice in one pattern", head) }
+  var-names!(body, vars)
+  for n in names {
+    if n in vars { report("a var in the body collides with the loop's binding", head) }
+    if n == "let" { report("let cannot be the name of a lexical binding", head) }
+  }
+}
+
+fn for-head?(left: Node) -> Bool = left is VarLeft(...) | VarLeftInit(...) | LetLeft(...) | ConstLeft(...)
+
+fn for-left-checks(left: Node, body: Node, is-in: Bool) -> Void = match left {
+  VarLeftInit(target, _) => if strict or not is-in or not (target is BindName(_)) {
+    report("this for-in head cannot have an initial value", left)
+  }
+  LetLeft(...) | ConstLeft(...) => head-collision(left, body)
+  _ => {}
+}
+
+fn module-item(n: Node) -> Void {
+  if not top-level { report("import and export are only valid at the top level", n) }
+  if not module { report("import and export are only valid in a module", n) }
+}
+
+fn is-loop-through-labels?(s: Node) -> Bool = match s {
+  For(...) | ForIn(...) | ForOf(...) | While(...) | DoWhile(...) => true
+  Labeled(_, body) => is-loop-through-labels?(body)
+  _ => false
+}
+
+# ---------------------------------------------------------------- classes
+
+fn prop-is?(key: Node, name: Text) -> Bool = match key {
+  PropName(x) => x == name
+  Str(raw) => unquote(raw) == name
+  _ => false
+}
+
+fn private-decl(m: Node, privates: mut [Text]) -> Void {
+  let inner = if m is StaticMethod(_) then m.kids[0] else m
+  if len(inner.kids) > 0 {
+    match inner.kids[0] {
+      PrivateName(name) => {
+        let accessor = inner is Getter(...) | Setter(...)
+        if name == "#constructor" { report("#constructor is not a valid private name", inner) }
+        if name in privates and not accessor { report("a private name is declared twice", inner) }
+        privates += name
+      }
+      _ => {}
+    }
+  }
+}
+
+fn special-key(key: Node, is-static: Bool) -> Void {
+  if not is-static and prop-is?(key, "constructor") {
+    report("a constructor cannot be a generator, async, or an accessor", key)
+  }
+  if is-static and prop-is?(key, "prototype") {
+    report("a static method cannot be named prototype", key)
+  }
+}
+
+fn accessor-params(params: Node, wanted: Int) -> Void {
+  let list = params.kids[0].kids
+  if len(list) != wanted { report("a getter takes no parameters and a setter takes one", params) }
+  if wanted == 1 and len(list) == 1 and list[0] is RestParam(_) {
+    report("a setter's parameter cannot be a rest", params)
+  }
+}
+
+# A class's members together: private names, and constructors.
+fn class-checks(class: Node, body: Node) -> Void {
+  let members = body.kids[0].kids
+  var privates: [Text] = []
+  for m in members { private-decl(m, privates) }
+  let constructors = count m in members: m is Method(...) and prop-is?(m.kids[0], "constructor")
+  if constructors > 1 { report("a class has one constructor", class) }
+}
+# ---------------------------------------------------------------- literals
+
+fn octal-escape?(s: Text) -> Bool = any p in host.pieces(s): p is lit.EscOctal(_)
+
+# `\x` and `\u` must be complete, in strings and in untagged templates alike.
+fn bad-escape?(s: Text) -> Bool = any p in host.pieces(s): match p {
+  lit.EscOther("\\x") | lit.EscOther("\\u") => true
+  lit.EscBrace(t) => hex-value(t[3..len(t) - 1]) > 1114111
+  _ => false
+}
+
+fn regex-flags-bad?(text: Text) -> Bool {
+  var last = 0
+  for i in 0..len(text) {
+    if text[i] == '/' { last = i }
+  }
+  let flags = text[last + 1..len(text)]
+  any i in 0..len(flags):
+    not (flags[i] == 'd' or flags[i] == 'g' or flags[i] == 'i' or flags[i] == 'm'
+         or flags[i] == 's' or flags[i] == 'u' or flags[i] == 'v' or flags[i] == 'y')
+    or (any j in 0..i: flags[j] == flags[i])
+}
+
+fn legacy-octal?(t: Text) -> Bool = len(t) > 1 and t[0] == '0' and digit-byte?(t[1])
+
+fn template-chunk(n: Node) -> Void {
+  if bad-escape?(n.text) or octal-escape?(n.text) { report("an invalid escape in a template", n) }
+}
+
+# The name at the start of a member chain, or "".
+fn spine-root(n: Node) -> Text = match n {
+  Ident(x) => x
+  Member(o, _) | Index(o, _) => spine-root(o)
+  _ => ""
+}
+
+fn unparen(n: Node) -> Node = match n {
+  Paren(x) => unparen(x)
+  _ => n
+}
+
+fn optional-spine?(n: Node) -> Bool = match n {
+  OptMember(...) | OptIndex(...) | OptCall(...) => true
+  Member(o, _) | Index(o, _) | CallExpr(o, _) => optional-spine?(o)
+  _ => false
+}
+
+# ---------------------------------------------------------------- modules
+
+fn spec-text(n: Node) -> Text = match n {
+  Str(raw) => unquote(raw)
+  _ => unescaped(n.text)
+}
+
+fn export-spec-name!(spec: Node, out: mut [Text]) -> Void = match spec {
+  TsErased() => {}
+  ExportAs(_, to) => { out += spec-text(to) }
+  _ => { out += spec-text(spec.kids[0]) }
+}
+
+# The names a module exports, for spotting one exported twice.
+fn exported-names!(s: Node, out: mut [Text]) -> Void = match s {
+  ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) => {
+    for spec in specs { export-spec-name!(spec, out) }
+  }
+  ExportAllAs(name, _) => { out += spec-text(name) }
+  ExportDefault(...) | ExportDefaultDecl(...) => { out += "default" }
+  ExportVar(...) => binds!(s, out)
+  ExportLexical(d) => binds!(d, out)
+  ExportFunction(d) | ExportClass(d) => { out += d.kids[0].text }
+  _ => {}
+}
+
+fn module-statement?(s: Node) -> Bool =
+  s is Import(...) | ImportBare(...) | ExportAll(...) | ExportAllAs(...) | ExportFrom(...)
+     | ExportNamed(...) | ExportDefault(...) | ExportDefaultDecl(...) | ExportVar(...)
+     | ExportLexical(...) | ExportFunction(...) | ExportClass(...)
+     | TsExportAssign(...) | TsExportEnum(...) | TsExportNamespace(...) | TsExportImport(...)
+     | TsDecoratedExport(...) | TsExportDecorated(...) | TsDecoratedDefault(...) | TsDefaultDecorated(...)
+
+fn program-has-module-syntax?(tree: Node) -> Bool = any s in tree.kids[1].kids: module-statement?(s)
+
+# Every name a module declares at its top level.
+fn module-names(stmts: [Node]) -> [Text] {
+  var names: [Text] = []
+  var functions: [Text] = []
+  for s in stmts {
+    lexical-of!(s, false, names, functions)
+    var-names!(s, names)
+    match s {
+      Import(...) => binds!(s, names)
+      FuncDecl(name, ...) => { names += name.text }
+      ExportFunction(d) => { names += d.kids[0].text }
+      _ => {}
+    }
+  }
+  for f in functions { names += f }
+  names
+}
+
+
+# ---------------------------------------------------------------- equations
+
+# Names.
+on Ident(x) | LabelName(x) as n {
+  check-name(n)
+  if role != Plain and target-role?(role) { target-checks(n) }
+}
+on BindName(_) as n { check-binding(n) }
+
+# Whatever a node is, what its parent's use of it allows.
+on n {
+  if role != Plain {
+    if target-role?(role) and not (n is Ident(_)) { target-checks(n) }
+    if role == Substmt or role == SubstmtFn { substatement-kind(n, role == SubstmtFn) }
+    if role == ObjPatProp and not (n is Shorthand(_) | CoverInit(...) | Prop(...) | SpreadProp(_)) {
+      report("this cannot be destructured into", n)
+    }
+  }
+}
+
+# A list's elements are what its owner makes them.
+on List(...) {
+  kids.role = match role {
+    ArrSlots => ArrSlot
+    ObjPatProps => ObjPatProp
+    ObjProps => ObjProp
+    ClassMembers => Member
+    TaggedParts => TaggedPart
+    _ => Plain
+  }
+}
+
+# ---- literals
+on TsNamespaceBlock(List(ss...)) {
+  # A namespace's body is its own module, as far as what it may export.
+  kids.exportable = module-names(ss)
+  kids.top-level = true
+}
+on JsxElement(open, _, JsxClose(_, close)) {
+  if js.render(open, false) != js.render(close, false) {
+    report("this closing tag does not match its opening tag", close)
+  }
+}
+on Num(t) as n {
+  if strict and legacy-octal?(t) { report("a legacy octal literal is not allowed in strict mode", n) }
+  if legacy-octal?(t) and (any c in t: c == '_') { report("a legacy octal literal cannot contain _", n) }
+}
+on Str(raw) as n {
+  if bad-escape?(unquote(raw)) { report("an incomplete escape sequence", n) }
+  if strict and octal-escape?(unquote(raw)) { report("an octal escape is not allowed in strict mode", n) }
+}
+on TemplateFull(_) | TemplateHead(_) | TemplateMiddle(_) | TemplateTail(_) as n { template-chunk(n) }
+# A tagged template may have any escapes, and is not an optional chain's.
+on Tagged(tag, tpl) as n {
+  if optional-spine?(tag) { report("a tagged template cannot be in an optional chain", n) }
+  tpl.role = TaggedTpl
+  if not (tpl is Template(...)) { tpl.checking = false }
+}
+on Template(head, _, rest, tail) {
+  if role == TaggedTpl {
+    head.checking = false
+    tail.checking = false
+    rest.role = TaggedParts
+  }
+}
+on TemplatePart(chunk, _) { if role == TaggedPart { chunk.checking = false } }
+on Regex(t) as n { if regex-flags-bad?(t) { report("invalid regular expression flags", n) } }
+
+# ---- assignment, update and patterns
+on Assignment(target, AssignOp(op), _) { target.role = if op == "=" then PatTarget else Target }
+on PreInc(t) | PreDec(t) | PostInc(t) | PostDec(t) { t.role = Target }
+on Paren(inner) {
+  if target-role?(role) and (inner is Ident(_) | Paren(_)) { inner.role = Target }
+}
+on Delete(operand) as n {
+  let t = unparen(operand)
+  if strict and t is Ident(_) { report("delete of a name is not allowed in strict mode", n) }
+  match t {
+    Member(_, PrivateName(_)) | OptMember(_, PrivateName(_)) => report("a private member cannot be deleted", n)
+    _ => {}
+  }
+}
+on ArrayLit(slots) as n {
+  if pattern-role?(role) {
+    array-pattern-checks(n)
+    slots.role = ArrSlots
+  }
+}
+on Elem(e) | ElemLast(e) { if role == ArrSlot { e.role = if e is Spread(_) then RestSlot else PatElem } }
+on Spread(inner) { if role == RestSlot { inner.role = PatTarget } }
+on ObjectLit(props) as n {
+  if pattern-role?(role) {
+    object-pattern-checks(n)
+    props.role = ObjPatProps
+  } else {
+    if (count p in props.kids: p is Prop(...) and prop-is?(p.kids[0], "__proto__")) > 1 {
+      report("__proto__ is set twice", n)
+    }
+    props.role = ObjProps
+  }
+}
+on Shorthand(x) { if role == ObjPatProp { x.role = Target } }
+on CoverInit(x, _) as n {
+  if role == ObjPatProp { x.role = Target } else { report("`=` here is only allowed when destructuring", n) }
+}
+on Prop(_, v) { if role == ObjPatProp { v.role = PatElem } }
+on SpreadProp(inner) { if role == ObjPatProp { inner.role = Target } }
+
+# ---- classes
+on ClassDecl(name, heritage, body) as n {
+  class-checks(n, body)
+  name.strict = true
+  heritage.strict = true
+  heritage.top-level = false
+  body.strict = true
+  body.top-level = false
+  body.in-derived = not (heritage is None())
+}
+on ClassExpr(name, heritage, body) as n {
+  class-checks(n, body)
+  name.strict = true
+  heritage.strict = true
+  heritage.top-level = false
+  body.strict = true
+  body.top-level = false
+  body.in-derived = not (heritage is None())
+}
+on ClassBody(members) { members.role = ClassMembers }
+on StaticMethod(m) { if role == Member { m.role = StaticMember } }
+on Field(key, value) | StaticField(key, value) as n {
+  let is-static = n is StaticField(...)
+  if prop-is?(key, "constructor") { report("a field cannot be named constructor", key) }
+  if is-static and prop-is?(key, "prototype") { report("a field cannot be named prototype", key) }
+  value.in-function = true
+  value.allow-new-target = true
+  value.allow-super-prop = true
+  value.allow-super-call = false
+  value.in-async = false
+  value.in-generator = false
+}
+on StaticBlock(...) {
+  kids.in-function = false
+  kids.in-async = false
+  kids.in-generator = false
+  kids.allow-new-target = true
+  kids.allow-super-prop = true
+  kids.allow-super-call = false
+  kids.labels = []
+  kids.loop-labels = []
+  kids.in-loop = false
+  kids.in-switch = false
+}
+# What the language does not check in a class: decorated members, and the types.
+on TsDecoratedMember(...) | TsErased(...) { kids.checking = false }
+on Super() as n { report("super is only valid in a method", n) }
+on CallExpr(callee, _) as n {
+  if callee is Super() {
+    if not allow-super-call { report("super() is only valid in a derived constructor", n) }
+    callee.checking = false
+  }
+}
+on Member(object, _) | Index(object, _) as n {
+  if object is Super() {
+    if not allow-super-prop { report("super is only valid in a method", n) }
+    object.checking = false
+  }
+}
+on NewTarget() as n { if not allow-new-target { report("new.target is only valid in a function", n) } }
+on NewExpr(callee, _) as n {
+  if callee is ImportCall(...) { report("import() cannot be used with new", n) }
+  if optional-spine?(callee) { report("new cannot have an optional chain", n) }
+}
+on ImportMeta() as n { if not module { report("import.meta is only valid in a module", n) } }
+
+# ---- functions
+# A declaration's name belongs to the code around it, under the body's strictness; an
+# expression's is checked as its own. A method's name is the code around it.
+on FuncDecl(name, params, body) | GenDecl(name, params, body) | AsyncFuncDecl(name, params, body)
+   | AsyncGenDecl(name, params, body) | FuncExpr(name, params, body) | GenExpr(name, params, body)
+   | AsyncFuncExpr(name, params, body) | AsyncGenExpr(name, params, body)
+   | Method(name, params, body) | GenMethod(name, params, body) | AsyncMethod(name, params, body)
+   | AsyncGenMethod(name, params, body) | Getter(name, params, body) | Setter(name, params, body) as n {
+  let f = fn-kind(n)
+  member-checks(n, name, params)
+  function-checks(params, body, f)
+  let now = strict or has-use-strict?(body-stmts(body))
+  if not f.method {
+    name.strict = now
+    if expression-fn?(n) {
+      name.in-generator = f.gen
+      name.in-async = f.async
+    }
+  }
+  params.strict = now
+  params.in-function = true
+  params.in-loop = false
+  params.in-switch = false
+  params.labels = []
+  params.loop-labels = []
+  params.top-level = false
+  params.in-generator = f.gen
+  params.in-async = f.async
+  params.allow-new-target = true
+  params.allow-super-prop = f.method
+  params.allow-super-call = f.super-call
+  body.strict = now
+  body.in-function = true
+  body.in-loop = false
+  body.in-switch = false
+  body.labels = []
+  body.loop-labels = []
+  body.top-level = false
+  body.in-generator = f.gen
+  body.in-async = f.async
+  body.allow-new-target = true
+  body.allow-super-prop = f.method
+  body.allow-super-call = f.super-call
+}
+# An arrow resets `yield`, only ever adds `await`, and keeps the rest of the code around it.
+on Arrow(params, body) | AsyncArrow(params, body) as n {
+  let f = fn-kind(n)
+  function-checks(params, body, f)
+  let now = strict or has-use-strict?(body-stmts(body))
+  params.strict = now
+  params.in-function = true
+  params.in-loop = false
+  params.in-switch = false
+  params.labels = []
+  params.loop-labels = []
+  params.top-level = false
+  params.in-generator = false
+  params.in-async = in-async or f.async
+  body.strict = now
+  body.in-function = true
+  body.in-loop = false
+  body.in-switch = false
+  body.labels = []
+  body.loop-labels = []
+  body.top-level = false
+  body.in-generator = false
+  body.in-async = in-async or f.async
+}
+
+# ---- statements
+on Program(_, List(stmts...)) as n {
+  let s = if part then program-strict else module or has-use-strict?(stmts)
+  kids.strict = s
+  kids.in-async = module
+  kids.top-level = true
+  kids.exportable = if part then program-exportable else module-names(stmts)
+  if not part { report-first(head-problem(n, module, s)) }
+}
+on Block(List(stmts...)) | TryBlock(List(stmts...)) as n {
+  check-declarations(stmts, false, [], n, strict)
+  kids.top-level = false
+}
+on Return(...) as n {
+  if not (in-function or allow-top-return) { report("return is only valid in a function", n) }
+}
+on With(_, body) as n {
+  if strict { report("with is not allowed in strict mode", n) }
+  body.role = Substmt
+}
+on If(_, t, e) {
+  t.top-level = false
+  t.role = SubstmtFn
+  e.top-level = false
+  e.role = SubstmtFn
+}
+on While(_, body) {
+  body.in-loop = true
+  body.top-level = false
+  body.role = Substmt
+}
+on DoWhile(body, ...) {
+  body.in-loop = true
+  body.top-level = false
+  body.role = Substmt
+}
+# A `for` head's declarations: their names must not collide with the body's.
+on For(init, _, _, body) {
+  match init {
+    VarInit(list) => decl-list-checks(list, false, false)
+    LetInit(list) => {
+      decl-list-checks(list, false, true)
+      head-collision(init, body)
+    }
+    ConstInit(list) => {
+      decl-list-checks(list, true, true)
+      head-collision(init, body)
+    }
+    _ => {}
+  }
+  body.in-loop = true
+  body.top-level = false
+  body.role = Substmt
+}
+on ForIn(left, _, body) {
+  for-left-checks(left, body, true)
+  if not for-head?(left) { left.role = PatTarget }
+  body.in-loop = true
+  body.top-level = false
+  body.role = Substmt
+}
+on ForOf(wait, left, _, body) as n {
+  for-left-checks(left, body, false)
+  if spine-root(left) == "let" { report("for (let of …) is not allowed", left) }
+  if left is Ident("async") and wait is None() { report("for (async of …) is not allowed", left) }
+  if not (wait is None()) and not (in-async or (module and not in-function)) {
+    report("for await is only valid in an async function", n)
+  }
+  if not for-head?(left) { left.role = PatTarget }
+  body.in-loop = true
+  body.top-level = false
+  body.role = Substmt
+}
+on Switch(_, List(cases...) as list) as n {
+  var defaults = 0
+  var stmts: [Node] = []
+  for c in cases {
+    match c {
+      Case(_, List(ss...)) => { stmts ++= ss }
+      Default(List(ss...)) => {
+        defaults += 1
+        stmts ++= ss
+      }
+      _ => {}
+    }
+  }
+  if defaults > 1 { report("a switch has one default", n) }
+  check-declarations(stmts, false, [], n, strict)
+  list.in-switch = true
+  list.top-level = false
+}
+on Break(None()) as n {
+  if not (in-loop or in-switch) { report("break is only valid in a loop or switch", n) }
+}
+on Break(l) as n {
+  if not (l is None()) and not (l.text in labels) { report("break to an unknown label", n) }
+  kids.checking = false
+}
+on Continue(l) as n {
+  if not in-loop { report("continue is only valid in a loop", n) }
+  if not (l is None()) and not (l.text in loop-labels) {
+    report("continue to a label that is not a loop", n)
+  }
+  kids.checking = false
+}
+on Labeled(label, body) {
+  if label.text in labels { report("this label is already in use", label) }
+  let is-loop = is-loop-through-labels?(body)
+  body.labels = labels ++ [label.text]
+  body.loop-labels = if is-loop then loop-labels ++ [label.text] else loop-labels
+  body.top-level = false
+  body.role = SubstmtFn
+}
+on Try(_, handler, finisher) as n {
+  if handler is None() and finisher is None() { report("try needs catch or finally", n) }
+}
+on VarDecl(list) { decl-list-checks(list, false, false) }
+on ExportVar(list) as n {
+  module-item(n)
+  decl-list-checks(list, false, false)
+}
+on LetDecl(list) { decl-list-checks(list, false, true) }
+on ConstDecl(list) { decl-list-checks(list, true, true) }
+on Catch(head, body) {
+  let stmts = body.kids[0].kids
+  var names: [Text] = []
+  var lexical: [Text] = []
+  var funcs: [Text] = []
+  if not (head is None()) {
+    binds!(head, names)
+    if duplicates?(names) { report("a catch parameter is bound twice", head) }
+  }
+  for s in stmts { lexical-of!(s, false, lexical, funcs) }
+  for l in lexical {
+    if l in names { report("this name collides with the catch parameter", body) }
+  }
+  for l in funcs {
+    if l in names { report("this name collides with the catch parameter", body) }
+  }
+  if not (head is None()) and not (head.kids[0] is BindName(_)) {
+    var vars: [Text] = []
+    for s in stmts { var-names!(s, vars) }
+    for v in vars {
+      if v in names { report("a var collides with a destructured catch parameter", body) }
+    }
+  }
+  kids.top-level = false
+}
+
+# ---- modules
+# What an import or re-export lists names nothing here to check.
+on Import(...) | ImportBare(...) | ExportAll(...) | ExportAllAs(...) | ExportFrom(...) as n {
+  module-item(n)
+  kids.checking = false
+}
+on ExportNamed(List(specs...)) as n {
+  module-item(n)
+  for spec in specs {
+    if not (spec is TsErased()) {
+      let local = spec.kids[0]
+      if local is Str(_) or local.text in reserved-words {
+        report("this export names no local binding", local)
+      }
+      if not types-erased and not (unescaped(local.text) in exportable) {
+        report("this export names nothing declared in the module", local)
+      }
+    }
+  }
+  kids.checking = false
+}
+on ExportDefault(...) | ExportDefaultDecl(...) | ExportLexical(...) | ExportFunction(...) | ExportClass(...) as n {
+  module-item(n)
+}
+
+# ---------------------------------------------------------------- the checks
+
+# What concerns a program's statements together: names exported twice, and what its top level
+# declares. `now-strict` is the program's strictness.
+fn head-problem(tree: Node, is-module: Bool, now-strict: Bool) -> Problem? {
+  let stmts = tree.kids[1].kids
+  if is-module {
+    var names: [Text] = []
+    for s in stmts { exported-names!(s, names) }
+    if duplicates?(names) { return some(Problem(message: "a name is exported twice", at: tree.lo)) }
+  }
+  declaration-problem(stmts, not is-module, [], tree, now-strict)
+}
+
+# The first early error in a program. `is-module` is whether it is an ES module, which the
+# bundler decides from its syntax. `top-return` is for CommonJS, whose top level is a function.
+fn check(tree: Node, is-module: Bool, top-return: Bool, typed: Bool) -> Problem? =
+  run(tree, is-module, top-return, typed, false, false, []).problem
+
+# A big program checked in parts at once: first what concerns its statements together, then each
+# part's statements, in the program's context.
+fn check-head(tree: Node, is-module: Bool, top-return: Bool, typed: Bool) -> Problem? =
+  head-problem(tree, is-module, is-module or has-use-strict?(tree.kids[1].kids))
+
+# What a program's statements may export, which each part's check needs.
+fn exportable-of(tree: Node) -> [Text] = module-names(tree.kids[1].kids)
+
+fn check-part(tree: Node, is-module: Bool, top-return: Bool, typed: Bool, exportable: [Text], part: [Node]) -> Problem? =
+  run(Program(tree.kids[0], List(part...)), is-module, top-return, typed, true,
+      is-module or has-use-strict?(tree.kids[1].kids), exportable).problem
+
+

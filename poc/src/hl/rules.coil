@@ -29,6 +29,8 @@
 (import "coil.slice" :use [subslice])
 (import "coil.str" :as str)
 (import "coil.meta" :as meta)
+(import "coil.fs" :as fs)
+(import "coil.cc" :as cc)
 (import "hl.rt" :as rt)
 (import "hl.dsl" :as dsl)
 (import "hl.syntax" :as syntax)
@@ -45,7 +47,8 @@
 (defstruct RecDef [(name (slice u8)) (fields (ArrayList FieldDef))])
 (defstruct EnumDef [(name (slice u8)) (variants (ArrayList (slice u8)))])
 (defstruct Global [(name (slice u8)) (ty (slice u8)) (assignable bool) (task bool)
-                   (attr i64)])        ; an attribute: 1 inherited, 2 an input, 3 collected; else 0
+                   (attr i64)])        ; an attribute: 1 inherited, 2 an input, 3 collected, 4 given;
+                                       ; else 0
 (defstruct RelDef [(name (slice u8)) (arity i64)])
 (defstruct QuoteDef [(name (slice u8)) (path (ArrayList i64))])
 (defstruct Alias [(name (slice u8)) (module (slice u8))])
@@ -87,7 +90,11 @@
    (task-used bool)
    (in-on bool)                   ; compiling an `on` block of an attribute grammar
    (eq-slots (ArrayList EqSlot))  ; where its equations for children put their values
-   (ovr-slots (ArrayList OvrSlot))])
+   (ovr-slots (ArrayList OvrSlot))
+   (givens (ArrayList Given))])
+
+;;; A `given` attribute and the value a child has when its parent's equations give it none.
+(defstruct Given [(attr (slice u8)) (default Code)])
 
 ;;; An equation `child.attr = value` of an `on` block: the value waits in `sym` until the child
 ;;; is visited. `target` is a child the pattern names, or `kids` for all of them.
@@ -606,6 +613,7 @@
             (g/KTaskState [] (add-global! (mut k) ix2 name d true))
             (g/KContext [] (add-global! (mut k) ix2 name d true))
             (g/KInh [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
+            (g/KGiven [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
             (g/KInput [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
             (g/KCollect [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
             (g/KOn [] (attrs-only! (mut k) tree d))
@@ -642,8 +650,10 @@
   (let [ty (resolve-type (mut k) module (kid d 1))
         ;; A context is rebound for a dynamic extent, which is one thread's.
         task (or (= (.kind d) (g/KTaskState)) (= (.kind d) (g/KContext))
-                 (= (.kind d) (g/KInh)) (= (.kind d) (g/KInput)) (= (.kind d) (g/KCollect)))
+                 (= (.kind d) (g/KInh)) (= (.kind d) (g/KInput)) (= (.kind d) (g/KCollect))
+                 (= (.kind d) (g/KGiven)))
         attr (cond (= (.kind d) (g/KInh)) 1 (= (.kind d) (g/KInput)) 2 (= (.kind d) (g/KCollect)) 3
+                   (= (.kind d) (g/KGiven)) 4
                    :else 0)]
     (push! (mut (.globals (elem (mut (.mods k)) ix)))
            (Global :name (.text (kid d 0)) :ty ty :assignable assignable :task task :attr attr))))
@@ -2325,7 +2335,7 @@
   (let [(mut hit) false]
     (for w ["field" "len" "get" "set" "elem" "for" "let" "if" "do" "block" "match" "when" "unless" "while"
             "not" "and" "or" "range" "cond" "push!" "pop!" "clear!" "reserve!" "set!" "cast" "load"
-            "store!" "slice" "panic" "print" "println" "join" "call" "rules-state" "rules-init!"
+            "store!" "slice" "panic" "print" "println" "join" "call" "rules-state" "rules-state-first" "rules-init!"
             "main" "rules-worker" "mut" "ref" "fn" "defn" "const" "def" "import" "module" "export" "impl" "defstruct" "defsum"]
       (when (= w s) (set! hit true)))
     hit))
@@ -2370,6 +2380,8 @@
 ;;;   attrs bundle.calls over bundle.js
 ;;;   inh in-loop: Bool = false       # inherited: a child has its parent's, unless an equation
 ;;;                                   #   of the parent's says otherwise
+;;;   given role: Role = Plain        # inherited, not copied: a child has this, unless an
+;;;                                   #   equation of its parent's says otherwise
 ;;;   input bindings: {Int:Int}       # given to `run`, the same everywhere
 ;;;   collect requires: [Text]        # synthesized: what the nodes add, in tree order; an
 ;;;                                   #   option keeps the first some
@@ -2428,11 +2440,13 @@
 (defn task-field [(name (slice u8)) (task Code)] (-> Code)
   `(~(primitive/code-symbol "." name) ~task))
 
-;;; One alternative of an `on` block: or-patterns at the top become several.
-(defstruct OnAlt [(pat g/Node) (as-name g/Node) (body g/Node) (owner bool)])
+;;; One alternative of an `on` block: or-patterns at the top become several. `block` is which
+;;; block, in the file's order.
+(defstruct OnAlt [(pat g/Node) (as-name g/Node) (body g/Node) (owner bool) (block i64)])
 
 (defn on-alts [(k (mut Comp)) (decls (ArrayList g/Node))] (-> (ArrayList OnAlt))
-  (let [(mut out) (ArrayList::new [OnAlt] (malloc-allocator))]
+  (let [(mut out) (ArrayList::new [OnAlt] (malloc-allocator))
+        (mut b) 0]
     (for d decls
       (when (= (.kind d) (g/KOn))
         (let [p0 (kid d 0)
@@ -2442,11 +2456,20 @@
               owner (gives-children? (mut k) (kid d 1))]
           (if (= (.kind p) (g/KPOr))
               (do
-                (push! (mut out) (OnAlt :pat (kid p 0) :as-name as-name :body (kid d 1) :owner owner))
+                (push! (mut out) (OnAlt :pat (kid p 0) :as-name as-name :body (kid d 1) :owner owner :block b))
                 (for q (list-kids (kid p 1))
-                  (push! (mut out) (OnAlt :pat q :as-name as-name :body (kid d 1) :owner owner))))
-              (push! (mut out) (OnAlt :pat p :as-name as-name :body (kid d 1) :owner owner))))))
+                  (push! (mut out) (OnAlt :pat q :as-name as-name :body (kid d 1) :owner owner :block b))))
+              (push! (mut out) (OnAlt :pat p :as-name as-name :body (kid d 1) :owner owner :block b)))
+          (set! b (+ b 1)))))
     out))
+
+;;; A block's body, compiled once as a function of the node, the names its pattern binds and, for
+;;; the children its equations give attributes, where they are; each alternative of its pattern
+;;; only tests and calls. A block that gives a collected attribute a node's whole value stays
+;;; inline, since what it gives waits in the traversal's frame.
+(defstruct OnVar [(name (slice u8)) (ty (slice u8))])
+(defstruct OnBlock [(body g/Node) (owner bool) (inline bool) (vars (ArrayList OnVar))
+                    (targets (ArrayList (slice u8))) (fname (slice u8))])
 
 (defn on-head [(a OnAlt)] (-> (slice u8))
   (match (.kind (.pat a))
@@ -2458,7 +2481,12 @@
 (defn child-equation? [(k (mut Comp)) (s g/Node)] (-> bool)
   (and (= (.kind s) (g/KAssign)) (= (.kind (kid s 0)) (g/KFieldE))
        (= (.kind (kid (kid s 0) 0)) (g/KName))
-       (match (attr-global (mut k) (.text (kid (kid s 0) 1)) 1) (Some [_] true) (None [] false))))
+       (inherited? (mut k) (.text (kid (kid s 0) 1)))))
+
+(defn inherited? [(k (mut Comp)) (name (slice u8))] (-> bool)
+  (match (find-global (self-mod (mut k)) name)
+    (Some [x] (or (= (.attr x) 1) (= (.attr x) 4)))
+    (None [] false)))
 
 (defn gives-children? [(k (mut Comp)) (n g/Node)] (-> bool)
   (let [(mut hit) (child-equation? (mut k) n)]
@@ -2472,7 +2500,7 @@
           (mut seen) false]
       (for e out (when (and (= (.target e) target) (= (.attr e) attr)) (set! seen true)))
       (unless seen
-        (match (attr-global (mut k) attr 1)
+        (match (find-global (self-mod (mut k)) attr)
           (Some [x] (push! (mut out) (EqSlot :target target :attr attr :sym (fresh (mut k) "eq") :ty (.ty x))))
           (None [] 0)))))
   (for c (.kids n) (find-eqs! (mut k) c (mut out))))
@@ -2517,103 +2545,208 @@
                                     `(- (len (.kids ~subject)) ~(- n i))))))))
           out)))))
 
-;;; Visit `call`'s child with these inherited attributes, then put back the parent's.
+;;; Visit `call`'s child with these inherited attributes, and the `given` ones no equation gives
+;;; at their defaults, then put back the parent's.
 (defn with-attrs-code [(k (mut Comp)) (slots (ArrayList EqSlot)) (task Code) (call Code)] (-> Code)
-  (if (= (len slots) 0)
-      call
-      (let [(mut saves) (primitive/code-list-new)
-            (mut sets) (primitive/code-list-new)
-            (mut restores) (primitive/code-list-new)]
-        (for s slots
+  (let [(mut saves) (primitive/code-list-new)
+        (mut sets) (primitive/code-list-new)
+        (mut restores) (primitive/code-list-new)
+        (mut count) 0]
+    (for s slots
+      (let [saved (fresh (mut k) "saved")
+            field (task-field (.attr s) task)]
+        (set! count (+ count 1))
+        (push! (mut saves) (sym saved))
+        (push! (mut saves) field)
+        (push! (mut sets) `(set! ~field ~(sym (.sym s))))
+        (push! (mut restores) `(set! ~field ~(sym saved)))))
+    (for gv (.givens k)
+      (let [(mut covered) false]
+        (for s slots (when (= (.attr s) (.attr gv)) (set! covered true)))
+        (unless covered
           (let [saved (fresh (mut k) "saved")
-                field (task-field (.attr s) task)]
+                field (task-field (.attr gv) task)]
+            (set! count (+ count 1))
             (push! (mut saves) (sym saved))
             (push! (mut saves) field)
-            (push! (mut sets) `(set! ~field ~(sym (.sym s))))
-            (push! (mut restores) `(set! ~field ~(sym saved)))))
+            (push! (mut sets) `(set! ~field ~(.default gv)))
+            (push! (mut restores) `(set! ~field ~(sym saved)))))))
+    (if (= count 0)
+        call
         `(let [~@saves] ~@sets ~call ~@restores 0))))
 
 (defn default-traverse [(k (mut Comp)) (subject Code) (task Code) (visit Code)] (-> Code)
   (let [c (sym (fresh (mut k) "c"))]
-    `(for (ref ~c) (.kids ~subject) (~visit ~c ~task))))
+    `(for (ref ~c) (.kids ~subject)
+       ~(with-attrs-code (mut k) (ArrayList::new [EqSlot] (malloc-allocator)) task `(~visit ~c ~task)))))
 
 ;;; The children of a node an owner block matched, each with what the equations give it.
-(defn owner-traverse [(k (mut Comp)) (a OnAlt) (slots (ArrayList EqSlot)) (subject Code) (task Code) (visit Code)] (-> Code)
+;;; `indices` says where each of `targets` is among them.
+(defn owner-traverse [(k (mut Comp)) (at g/Node) (slots (ArrayList EqSlot)) (targets (ArrayList (slice u8)))
+                      (indices (ArrayList Code)) (subject Code) (task Code) (visit Code)] (-> Code)
   (let [ci (sym (fresh (mut k) "ci"))
         c (sym (fresh (mut k) "c"))
         call `(~visit ~c ~task)
-        (mut targets) (text-list)
         (mut arms) (primitive/code-list-new)
         (mut all-kids) (ArrayList::new [EqSlot] (malloc-allocator))]
-    (for s slots
-      (if (= (.target s) "kids")
-          (push! (mut all-kids) s)
-          (let [(mut seen) false]
-            (for t targets (when (= t (.target s)) (set! seen true)))
-            (unless seen (push! (mut targets) (.target s))))))
-    (for t targets
-      (let [(mut mine) (ArrayList::new [EqSlot] (malloc-allocator))]
+    (for s slots (when (= (.target s) "kids") (push! (mut all-kids) s)))
+    (for i (range 0 (len targets))
+      (let [t (get targets i)
+            (mut mine) (ArrayList::new [EqSlot] (malloc-allocator))]
         (for s slots (when (= (.target s) t) (push! (mut mine) s)))
         (for s all-kids
           (let [(mut shadowed) false]
             (for m slots (when (and (= (.target m) t) (= (.attr m) (.attr s))) (set! shadowed true)))
             (unless shadowed (push! (mut mine) s))))
-        (match (child-index (.pat a) t subject)
-          (Some [index]
-            (push! (mut arms) `(= ~ci ~index))
-            (push! (mut arms) (with-attrs-code (mut k) mine task call)))
-          (None [] (die (mut k) (.body a) (cat3 "an equation gives an attribute to a child, and " t
-                                                 " is not one this pattern names at its top"))))))
+        (push! (mut arms) `(= ~ci ~(get indices i)))
+        (push! (mut arms) (with-attrs-code (mut k) mine task call))))
     (if (= (len targets) 0)
         `(for (ref ~c) (.kids ~subject) ~(with-attrs-code (mut k) all-kids task call))
         `(for ~ci (range 0 (len (.kids ~subject)))
            (let [~c (get (.kids ~subject) ~ci)]
              (cond ~@arms :else ~(with-attrs-code (mut k) all-kids task call)))))))
 
-;;; One alternative's code at a node of kind `head` ("" when the dispatch knows none). An owner
-;;; visits the children and leaves `label`; any other just adds what it adds.
-(defn on-alt-code [(k (mut Comp)) (a OnAlt) (subject Code) (ty (slice u8)) (head (slice u8))
-                   (label Code) (task Code) (visit Code)] (-> Code)
+;;; The children a block's equations name, `kids` aside, in the order first named.
+(defn eq-targets [(slots (ArrayList EqSlot))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (text-list)]
+    (for s slots
+      (unless (= (.target s) "kids")
+        (let [(mut seen) false]
+          (for x out (when (= x (.target s)) (set! seen true)))
+          (unless seen (push! (mut out) (.target s))))))
+    out))
+
+(defn target-indices [(k (mut Comp)) (a OnAlt) (targets (ArrayList (slice u8))) (subject Code)] (-> (ArrayList Code))
+  (let [(mut out) (ArrayList::new [Code] (malloc-allocator))]
+    (for t targets
+      (match (child-index (.pat a) t subject)
+        (Some [index] (push! (mut out) index))
+        (None [] (die (mut k) (.body a) (cat3 "an equation gives an attribute to a child, and " t
+                                               " is not one this pattern names at its top")))))
+    out))
+
+;;; The block's statements, with the slots its equations fill; then, for an owner, the children.
+(defn on-body-code [(k (mut Comp)) (body-node g/Node) (owner bool) (slots (ArrayList EqSlot))
+                    (targets (ArrayList (slice u8))) (indices (ArrayList Code))
+                    (subject Code) (task Code) (visit Code) (label Code) (leave bool)] (-> Code)
+  (set! (.eq-slots k) slots)
+  (set! (.in-on k) true)
+  (let [body (expr (mut k) body-node "Void")]
+    (set! (.in-on k) false)
+    (set! (.eq-slots k) (ArrayList::new [EqSlot] (malloc-allocator)))
+    (when (.returned k) (die (mut k) body-node "an `on` block cannot return"))
+    (let [(mut decls) (primitive/code-list-new)]
+      (for s slots
+        (push! (mut decls) `(mut ~(sym (.sym s))))
+        (push! (mut decls) (task-field (.attr s) task)))
+      (if owner
+          `(let [~@decls]
+             ~(.code body)
+             ~(owner-traverse (mut k) body-node slots targets indices subject task visit)
+             ~(if leave `(return-from ~label 0) `0))
+          `(do ~(.code body) 0)))))
+
+;;; The names an alternative's pattern binds, its own included, with their types.
+(defn alt-vars [(k (mut Comp)) (a OnAlt) (subject Code) (ty (slice u8))] (-> (ArrayList OnVar))
   (let [mark (locals-mark (mut k))
         (mut steps) (ArrayList::new [Step] (malloc-allocator))
+        (mut out) (ArrayList::new [OnVar] (malloc-allocator))]
+    (pat! (mut k) (.pat a) subject ty (mut steps) (on-head a))
+    (unless (none? (.as-name a)) (bind-local! (mut k) (.text (.as-name a)) ty false))
+    (for i (range mark (len (.locals k)))
+      (let [l (get (.locals k) i)]
+        (push! (mut out) (OnVar :name (.name l) :ty (.ty l)))))
+    (locals-reset! (mut k) mark)
+    out))
+
+(defn on-blocks [(k (mut Comp)) (alts (ArrayList OnAlt)) (count i64) (subject Code) (ty (slice u8))] (-> (ArrayList OnBlock))
+  (let [(mut out) (ArrayList::new [OnBlock] (malloc-allocator))]
+    (for b (range 0 count)
+      (let [(mut first) (None [OnAlt])]
+        (for a alts (when (and (= (.block a) b) (match first (None [] true) (Some [_] false))) (set! first (Some a))))
+        (match first
+          (None [] (die (mut k) (g/none-node) "an `on` block with no pattern"))
+          (Some [a0]
+            (let [vars (alt-vars (mut k) a0 subject ty)
+                  (mut ovrs) (ArrayList::new [OvrSlot] (malloc-allocator))
+                  (mut slots) (ArrayList::new [EqSlot] (malloc-allocator))]
+              (for a alts
+                (when (= (.block a) b)
+                  (let [mine (alt-vars (mut k) a subject ty)
+                        (mut same) (= (len mine) (len vars))]
+                    (for v vars
+                      (let [(mut hit) false]
+                        (for w mine (when (and (= (.name w) (.name v)) (= (.ty w) (.ty v))) (set! hit true)))
+                        (unless hit (set! same false))))
+                    (unless same
+                      (die (mut k) (.pat a) "every alternative of an `on` pattern binds the same names, of the same types")))))
+              (find-ovrs! (mut k) (.body a0) (mut ovrs))
+              (when (.owner a0) (find-eqs! (mut k) (.body a0) (mut slots)))
+              (push! (mut out) (OnBlock :body (.body a0) :owner (.owner a0) :inline (> (len ovrs) 0)
+                                        :vars vars :targets (eq-targets slots)
+                                        :fname (cat "attrs-block-" (rt/num-text b)))))))))
+    out))
+
+(defn on-block-fn [(k (mut Comp)) (b OnBlock) (subject Code) (node-coil Code) (task Code) (visit Code)] (-> Code)
+  (clear! (mut (.locals k)))
+  (set! (.returned k) false)
+  (let [(mut params) (primitive/code-list-new)
+        (mut indices) (ArrayList::new [Code] (malloc-allocator))
         (mut slots) (ArrayList::new [EqSlot] (malloc-allocator))]
+    (for v (.vars b)
+      (let [s (bind-local! (mut k) (.name v) (.ty v) false)]
+        (push! (mut params) `(~(sym s) ~(coil-type (mut k) (.ty v))))))
+    (for t (.targets b)
+      (let [s (fresh (mut k) "at")]
+        (push! (mut indices) (sym s))
+        (push! (mut params) `(~(sym s) i64))))
+    (when (.owner b) (find-eqs! (mut k) (.body b) (mut slots)))
+    (let [code (on-body-code (mut k) (.body b) (.owner b) slots (.targets b) indices subject task visit `0 false)]
+      (clear! (mut (.locals k)))
+      `(defn ~(sym (.fname b)) [(~subject ~node-coil) (~task (ptr RulesTask)) ~@params] (-> void)
+         ~code
+         0))))
+
+;;; One alternative at a node of kind `head` ("" when the dispatch knows none): its pattern's
+;;; test, then its block, called or inline. An owner visits the children and leaves `label`.
+(defn on-alt-code [(k (mut Comp)) (a OnAlt) (b OnBlock) (subject Code) (ty (slice u8)) (head (slice u8))
+                   (label Code) (task Code) (visit Code)] (-> Code)
+  (let [mark (locals-mark (mut k))
+        (mut steps) (ArrayList::new [Step] (malloc-allocator))]
     (pat! (mut k) (.pat a) subject ty (mut steps) head)
     (unless (none? (.as-name a))
       (let [s (bind-local! (mut k) (.text (.as-name a)) ty false)]
         (push! (mut steps) (SBind s subject))))
-    (when (.owner a) (find-eqs! (mut k) (.body a) (mut slots)))
-    (set! (.eq-slots k) slots)
-    (set! (.in-on k) true)
-    (let [body (expr (mut k) (.body a) "Void")]
-      (set! (.in-on k) false)
-      (set! (.eq-slots k) (ArrayList::new [EqSlot] (malloc-allocator)))
-      (when (.returned k) (die (mut k) (.body a) "an `on` block cannot return"))
-      (let [(mut decls) (primitive/code-list-new)]
-        (for s slots
-          (push! (mut decls) `(mut ~(sym (.sym s))))
-          (push! (mut decls) (task-field (.attr s) task)))
-        (let [code (if (.owner a)
-                       `(let [~@decls]
-                          ~(.code body)
-                          ~(owner-traverse (mut k) a slots subject task visit)
-                          (return-from ~label 0))
-                       `(do ~(.code body) 0))]
-          (locals-reset! (mut k) mark)
-          (wrap-steps steps 0 code))))))
+    (let [indices (target-indices (mut k) a (.targets b) subject)
+          code (if (.inline b)
+                   (let [(mut slots) (ArrayList::new [EqSlot] (malloc-allocator))]
+                     (when (.owner b) (find-eqs! (mut k) (.body b) (mut slots)))
+                     (on-body-code (mut k) (.body b) (.owner b) slots (.targets b) indices subject task visit label true))
+                   (let [(mut args) (primitive/code-list-new)]
+                     (for v (.vars b)
+                       (match (find-local (mut k) (.name v))
+                         (Some [l] (push! (mut args) (sym (.sym l))))
+                         (None [] (die (mut k) (.pat a) (cat "this pattern does not bind " (.name v))))))
+                     (for i indices (push! (mut args) i))
+                     (let [call `(~(sym (.fname b)) ~subject ~task ~@args)]
+                       (if (.owner b) `(do ~call (return-from ~label 0)) call))))]
+      (locals-reset! (mut k) mark)
+      (wrap-steps steps 0 code))))
 
 ;;; At a node of kind `head`: the blocks that only add, in the file's order, then the first
 ;;; owner that matches visits the children; with none, they are visited as they are.
-(defn on-arm-code [(k (mut Comp)) (alts (ArrayList OnAlt)) (head (slice u8)) (subject Code) (ty (slice u8))
-                   (task Code) (visit Code)] (-> Code)
+(defn on-arm-code [(k (mut Comp)) (alts (ArrayList OnAlt)) (blocks (ArrayList OnBlock)) (head (slice u8))
+                   (subject Code) (ty (slice u8)) (task Code) (visit Code)] (-> Code)
   (let [(mut adds) (primitive/code-list-new)
         (mut owners) (primitive/code-list-new)
         label (primitive/code-symbol ":" (fresh (mut k) "own"))]
     (for a alts
-      (let [h (on-head a)]
+      (let [h (on-head a)
+            b (get blocks (.block a))]
         (when (or (= h head) (= (len h) 0))
           (if (.owner a)
-              (push! (mut owners) (on-alt-code (mut k) a subject ty head label task visit))
-              (push! (mut adds) (on-alt-code (mut k) a subject ty head label task visit))))))
+              (push! (mut owners) (on-alt-code (mut k) a b subject ty head label task visit))
+              (push! (mut adds) (on-alt-code (mut k) a b subject ty head label task visit))))))
     `(do ~@adds
          (block ~label ~@owners ~(default-traverse (mut k) subject task visit) 0)
          0)))
@@ -2631,6 +2764,15 @@
         (mut ovrs) (ArrayList::new [OvrSlot] (malloc-allocator))
         (mut heads) (text-list)]
     (for d decls (when (= (.kind d) (g/KOn)) (find-ovrs! (mut k) (kid d 1) (mut ovrs))))
+    (let [(mut givens) (ArrayList::new [Given] (malloc-allocator))]
+      (for d decls
+        (when (= (.kind d) (g/KGiven))
+          (let [x (match (attr-global (mut k) (.text (kid d 0)) 4)
+                    (Some [g] g) (None [] (die (mut k) d "this was not collected")))]
+            (push! (mut givens)
+                   (Given :attr (.name x)
+                          :default (.code (expect (mut k) (kid d 2) (expr (mut k) (kid d 2) (.ty x)) (.ty x))))))))
+      (set! (.givens k) givens))
     (for a alts
       (let [h (on-head a) (mut seen) (= (len h) 0)]
         (for x heads (when (= x h) (set! seen true)))
@@ -2644,11 +2786,18 @@
     (set! (.in-fn k) true)
     (set! (.ovr-slots k) ovrs)
     (let [(mut arms) (primitive/code-list-new)
+          (mut block-fns) (primitive/code-list-new)
           (mut marks) (primitive/code-list-new)
-          (mut fixups) (primitive/code-list-new)]
-      (for h heads
-        (push! (mut arms) `(~(kind-code gr h) [] ~(on-arm-code (mut k) alts h n ty task visit))))
-      (let [wild (on-arm-code (mut k) alts "" n ty task visit)]
+          (mut fixups) (primitive/code-list-new)
+          (mut count) 0]
+      (for d decls (when (= (.kind d) (g/KOn)) (set! count (+ count 1))))
+      (let [blocks (on-blocks (mut k) alts count n ty)]
+        (for b blocks
+          (unless (.inline b) (push! (mut block-fns) (on-block-fn (mut k) b n node-coil task visit))))
+        (clear! (mut (.locals k)))
+        (for h heads
+          (push! (mut arms) `(~(kind-code gr h) [] ~(on-arm-code (mut k) alts blocks h n ty task visit))))
+      (let [wild (on-arm-code (mut k) alts blocks "" n ty task visit)]
         (set! (.in-fn k) false)
         (set! (.ovr-slots k) (ArrayList::new [OvrSlot] (malloc-allocator)))
         (for o ovrs
@@ -2698,6 +2847,7 @@
                 (push! (mut fields) (primitive/code-symbol ":" name))
                 (push! (mut fields) (task-field name t)))))
           `(do
+             ~@block-fns
              (defn ~visit [(~n ~node-coil) (~task (ptr RulesTask))] (-> void)
                (let [~@marks]
                  (match (.kind ~n) ~@arms (_ ~wild))
@@ -2710,7 +2860,7 @@
                  (~visit ~root ~t)
                  (let [result (Attrs ~@fields)]
                    ~@restores
-                   result)))))))))
+                   result))))))))))
 
 ;; ---------------------------------------------------------------- memo functions
 
@@ -2844,11 +2994,20 @@
       (push! (mut fields) `(~(sym (.name f)) ~(coil-type (mut k) (.ty f)))))
     `(defstruct ~(sym (.name r)) [~@fields])))
 
+;;; An enum, compared by its tag: one load each, where a derived comparison is a call.
 (defn compile-enum [(e EnumDef)] (-> Code)
-  (let [(mut variants) (primitive/code-list-new)]
-    (for v (.variants e) (push! (mut variants) `(~(sym v))))
-    `(do (defsum ~(sym (.name e)) ~@variants)
-         (derive Eq ~(sym (.name e))))))
+  (let [(mut variants) (primitive/code-list-new)
+        (mut tags) (primitive/code-list-new)
+        ty (sym (.name e))
+        tag (sym (cat "enum-tag-" (.name e)))]
+    (for i (range 0 (len (.variants e)))
+      (let [v (get (.variants e) i)]
+        (push! (mut variants) `(~(sym v)))
+        (push! (mut tags) `(~(sym v) [] ~i))))
+    `(do (defsum ~ty ~@variants)
+         (defn ~tag :inline (Always) [(x ~ty)] (-> i64) (match x ~@tags))
+         (impl Eq ~ty
+           (= [(a ~ty) (b ~ty)] (-> bool) (= (~tag a) (~tag b)))))))
 
 ;;; Text, one form to a line, is what the generated module is.
 (defn emit! [(out (mut str/StrBuf)) (form Code)] (-> void)
@@ -2862,7 +3021,8 @@
   (let [(mut out) (primitive/code-list-new)]
     (for d decls
       (when (or (= (.kind d) (g/KTaskState)) (= (.kind d) (g/KContext))
-                (= (.kind d) (g/KInh)) (= (.kind d) (g/KInput)) (= (.kind d) (g/KCollect)))
+                (= (.kind d) (g/KInh)) (= (.kind d) (g/KInput)) (= (.kind d) (g/KCollect))
+                (= (.kind d) (g/KGiven)))
         (let [g-name (.text (kid d 0))
               x (match (find-global self g-name)
                   (Some [v] v)
@@ -2896,7 +3056,8 @@
                       :task-used false
                       :in-on false
                       :eq-slots (ArrayList::new [EqSlot] (malloc-allocator))
-                      :ovr-slots (ArrayList::new [OvrSlot] (malloc-allocator)))
+                      :ovr-slots (ArrayList::new [OvrSlot] (malloc-allocator))
+                      :givens (ArrayList::new [Given] (malloc-allocator)))
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)
     (load-prelude! (mut k))
@@ -2938,7 +3099,8 @@
           (for d decls
             (when (or (= (.kind d) (g/KState)) (= (.kind d) (g/KTaskState))
                       (= (.kind d) (g/KContext)) (= (.kind d) (g/KConst))
-                      (= (.kind d) (g/KInh)) (= (.kind d) (g/KInput)) (= (.kind d) (g/KCollect)))
+                      (= (.kind d) (g/KInh)) (= (.kind d) (g/KInput)) (= (.kind d) (g/KCollect))
+                      (= (.kind d) (g/KGiven)))
               (let [g-name (.text (kid d 0))
                     x (match (find-global self g-name)
                         (Some [v] v)
@@ -2956,23 +3118,39 @@
               (push! (mut task-fields) (memo-gen-field d))
               (push! (mut task-inits) (memo-near-init (mut k) d))
               (push! (mut task-inits) (memo-gen-init d))))
+          ;; Program state, set up by the first thread to use it while any other waits. The flag is
+          ;; read and written atomically, so a thread that sees it ready sees what was set: 0 not
+          ;; set up, 2 being set up by `rules-owner`, which may use what it has set so far, 1 ready.
           (emit! (mut out)
-                 `(defstruct RulesState [(rules-ready bool) ~@state-fields]))
+                 `(defstruct RulesState [(rules-ready i64) (rules-owner i64) (rules-lock i64) ~@state-fields]))
           (emit! (mut out)
                  `(defn rules-init! [(s (ptr RulesState))] (-> void)
-                    (set! (.rules-ready s) true)
                     ~@state-inits
                     0))
           (emit! (mut out)
                  `(defn rules-state [] (-> (ptr RulesState))
                     (let [s (primitive/alloc-static RulesState)]
-                      (unless (.rules-ready s) (rules-init! s))
-                      s)))
-          ;; Task state: one copy per worker slot, made the first time its own thread asks.
+                      (if (= (atomic/read (field s rules-ready)) 1) s (rules-state-first s)))))
+          (emit! (mut out)
+                 `(defn rules-state-first [(s (ptr RulesState))] (-> (ptr RulesState))
+                    (let [me (+ (rt/worker-slot) 1)]
+                      (if (and (= (atomic/read (field s rules-ready)) 2) (= (atomic/read (field s rules-owner)) me))
+                          s
+                          (do
+                            (rt/spin-lock! (field s rules-lock))
+                            (when (= (atomic/read (field s rules-ready)) 0)
+                              (atomic/store (field s rules-owner) me)
+                              (atomic/store (field s rules-ready) 2)
+                              (rules-init! s)
+                              (atomic/store (field s rules-ready) 1))
+                            (rt/spin-unlock! (field s rules-lock))
+                            s)))))
+          ;; Task state: one copy per worker slot, made the first time its own thread asks. The
+          ;; slots and the key are published by an atomic store of `ready`, after them.
           (emit! (mut out)
                  `(defstruct RulesTask [(rules-ready bool) ~@task-fields]))
           (emit! (mut out)
-                 `(defstruct RulesTasks [(ready bool) (slots (ArrayList RulesTask)) (key i64)]))
+                 `(defstruct RulesTasks [(ready i64) (slots (ArrayList RulesTask)) (key i64)]))
           (emit! (mut out)
                  `(defn rules-task-init! [(s (ptr RulesTask))] (-> void)
                     (set! (.rules-ready s) true)
@@ -2982,7 +3160,7 @@
 ;; A thread finds its own copy through a thread-specific value: one lookup, after the first.
                  `(defn rules-task [] (-> (ptr RulesTask))
                     (let [all (primitive/alloc-static RulesTasks)]
-                      (if (.ready all)
+                      (if (= (atomic/read (field all ready)) 1)
                           (let [found (rt/key-get (.key all))]
                             (if (= (primitive/cast i64 found) 0)
                                 (rules-task-first all)
@@ -2990,15 +3168,15 @@
                           (rules-task-first all)))))
           (emit! (mut out)
                  `(defn rules-task-first [(all (ptr RulesTasks))] (-> (ptr RulesTask))
-                    (unless (.ready all)
+                    (unless (= (atomic/read (field all ready)) 1)
                       (rt/init-lock!)
-                      (unless (.ready all)
+                      (unless (= (atomic/read (field all ready)) 1)
                         (let [(mut slots) (ArrayList::new [RulesTask] (malloc-allocator))]
                           (for _ (range 0 (rt/max-workers))
                             (push! (mut slots) (RulesTask :rules-ready false ~@(task-zeroes (mut k) self decls))))
                           (set! (.slots all) slots))
                         (set! (.key all) (rt/key-new))
-                        (set! (.ready all) true))
+                        (atomic/store (field all ready) 1))
                       (rt/init-unlock!))
                     (let [s (elem (mut (.slots all)) (rt/worker-slot))]
                       (unless (.rules-ready s) (rules-task-init! s))
@@ -3051,5 +3229,20 @@
     (for d (list-kids (kid tree 2))
       (when (= (.kind d) (g/KForeign)) (add-foreign! (mut k) d "hl.prelude")))))
 
+;;; With HL_DUMP_DIR set, each module's generated Coil is also written there, for reading what a
+;;; language made of a file.
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+(defn dump-generated! [(context Code) (text (slice u8))] (-> void)
+  (let [dir (getenv c"HL_DUMP_DIR")]
+    (unless (= (primitive/cast i64 dir) 0)
+      (let [path (dsl/path-of context)
+            (mut slash) -1]
+        (for i (range 0 (len path)) (when (= (get path i) #\/) (set! slash i)))
+        (fs/write-file (malloc-allocator) (cat3 (str/from-cstr dir) "/" (subslice path (+ slash 1) (len path)))
+                       text)
+        0))))
+
 (defn read-rules [(context Code)] (-> Code)
-  (primitive/code-read (compile-module context) `(reader-config)))
+  (let [text (compile-module context)]
+    (dump-generated! context text)
+    (primitive/code-read text `(reader-config))))
