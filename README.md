@@ -60,6 +60,18 @@ other lists in any order, and make lists, joined lists and maps:
 fn unique-name(name: Text) -> Text = untaken(name) ?? first i in 2..: untaken(name ++ int-text(i))
 ```
 
+A walk over a tree says only where it does something. An `everywhere fn` is a match on its node,
+and wherever no case matches it is the same function of each child: the node rebuilt from them,
+shared when none changed; for `-> Void`, each child visited; for `-> Bool`, whether any child's is
+true. A guarded case is where a walk stops:
+
+```
+everywhere fn super-through(n: Node, name: Text) -> Node = match n {
+  CallExpr(Super(), args) => CallExpr(Ident(name), super-through(args, name))
+  _ if own-this?(n) => n
+}
+```
+
 It is closer to a small ML than to a one-purpose language, and much of it is still written at a low
 level: `corpus/tools/altitude.py` counts 61% of the lines of `.rules` and `.attrs` in functions with
 loops over indices, variables updated in place, global state or byte scanning.
@@ -80,7 +92,20 @@ on Continue(_) as n { if not in-loop { report("continue is only valid in a loop"
 
 Early errors (`early.attrs`, 1,045 lines) are written this way, and include what a file loads
 (`calls.attrs`), so a JavaScript file is checked and its `require` and `import()` calls found in one
-traversal.
+traversal. So is what each top-level statement declares and mentions, for linking.
+
+An attribute grammar may also rewrite the tree, in the same traversal. `rewrite Pattern => value`
+says what a node becomes: the pattern sees the node as it was, and `x.out` is what a child the
+pattern names became. A node no rule matches is rebuilt from its children, and is itself when they
+all stayed; a rule giving `[…]` puts several nodes, or none, in a list's place. JSX lowering is
+twelve such rules, and emit's renaming ten:
+
+```
+rewrite JsxAttr(name, v) as a => Prop(key-of(name), v.out) with { lo: a.lo, hi: a.hi }
+rewrite JsxContainer(None()) => []
+rewrite Member(object, property) as n =>
+  namespace-read(n) ?? Member(object.out, property) with { lo: object.out.lo, hi: property.hi }
+```
 
 The languages' readers are one provider, `hl.readers`, compiled once as a native reader artifact
 (`corpus/tools/readers.sh`, rebuilt only when the readers or the compiler change). Built from
