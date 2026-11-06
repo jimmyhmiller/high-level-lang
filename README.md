@@ -29,17 +29,17 @@ tables, Datalog and rewriting in general, plus a runtime of buffers, files and U
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 8,654 | Resolution, modules, JSX, TypeScript, tsconfig, early errors, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
+| `.rules` | 9,191 | Resolution, modules, JSX, TypeScript, tsconfig, early errors, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
 | `.syntax` | 780 | JavaScript with JSX and TypeScript, CSS, literals, comments, package.json and tsconfig.json |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
 | `.facts` | 114 | Linking, tree shaking, and which root reaches what for code splitting |
 | `.js` | 171 | The bundle's runtime helpers, and those lowering adds |
 | `.bundler` | 70 | A demo build |
-| `.pipeline` | 44 | Which stages may run in parallel, and five plans for running them |
+| `.pipeline` | 48 | Which stages may run in parallel, and five plans for running them |
 | `.scopes` | 26 | Scoping |
 | `.coil` | 15 | Four `main` functions, because a package's entry must be plain Coil |
 
-The compilers for those languages are about 7,800 lines of Coil and 300 of grammars.
+The compilers for those languages are about 8,400 lines of Coil and 300 of grammars.
 
 `.rules` is the least specific of these languages: a typed language over the grammar's nodes, with
 pattern matching, relations, dynamic scope and code templates written in JavaScript's own syntax:
@@ -136,9 +136,10 @@ How the build divides its work is a language of its own. `poc/src/app/build.pipe
 stages that work on one file, module or part at a time, the functions each runs, and plans:
 
 ```
-stage load     per file   bundle.modules/visit-file bundle.modules/next-files ...
+stage load     per file   bundle.modules/visit-file bundle.modules/next-files bundle.modules/first-files ...
 stage facts    per module bundle.analysis/on-demand-calls bundle.analysis/summaries-of
-stage optimize per part   bundle.api/default-optimize
+stage emit     per module bundle.mangle/unit-usage bundle.emit/unit-emitted
+stage optimize per part   bundle.api/default-optimize bundle.ascii/converted
 stage print    per part   bundle.api/render-part
 stage link     whole      bundle.analysis/link
 
@@ -146,8 +147,9 @@ plan full
   threads auto
   load parallel
   facts parallel
-  optimize parallel 8 parts 8
-  print parallel 8 parts 8
+  emit parallel
+  optimize parallel auto parts 48
+  print parallel auto parts 24
 end
 ```
 
@@ -165,37 +167,49 @@ plan unsafe runs graph in parallel, but bundle.modules/load-file
   ...
 ```
 
-`.rules` has what the stages need for this:
-- `task state`: one copy per worker, for caches and scratch space.
-- `memo fn`: an answer computed once per build by whichever worker asks first, then shared.
-  Directory listings and `package.json` are memos, so twelve threads read a directory once, not twelve times.
-- `parallel-map` and `parallel-walk`: the second follows imports as workers find them.
-- A pool of parked worker threads in the runtime.
+A query of a `.facts` database counts as a read; relations make the indexes queries need under a
+lock, so many threads can query at once.
 
-The per-file stage now parses, lowers, analyses scopes in a table of the file's own, and resolves
-its imports. The serial pass grafts that table into the shared one.
+`.rules` has what the stages need:
+- `task state`: one copy per worker, for caches and scratch space.
+- `memo fn`: an answer computed once per build by whichever worker asks first, then shared. A
+  worker that asks while another computes it waits. Directory listings, `package.json`, and a big
+  file's pieces are memos.
+- `parallel-map`, and `parallel-walk`, which follows imports as workers find them. Its optional
+  `first` names follow-ups that carry on an item's own work, ahead of what is waiting.
+- `arrive!(key, n)`: of `n` items, the last to finish is told so and goes on, so no worker waits
+  for the others.
+
+The runtime has a pool of parked workers, and a work queue that idle workers sleep on.
+
+**Big files.** A big plain-JavaScript file is parsed in pieces. A piece starts at a top-level
+declaration, found by a scan of the bytes; a wrong guess only means a piece is no program by
+itself, and then the file is parsed whole. The last piece to finish prepares the file. Each part is
+then walked for scopes in a table of its own, at the same time as early errors and comment scans.
+The last of those grafts the parts' tables back in order, giving the same symbol and scope ids a
+single walk would. A file with many imports resolves each as an item of its own.
 
 Every plan gives the same output, byte for byte, as the serial build. That holds for 12 apps,
-plain, minified, pretty and with source maps. Parts are cut by weight and only after declarations,
-which no minification rule merges across. `--pipeline=NAME` picks a plan, and `--threads=N` runs
-every stage on N threads.
+plain, minified, pretty and with source maps, and the verify suite passes under the `full` plan.
+Parts are cut by weight and only after declarations, which no minification rule merges across.
+`--pipeline=NAME` picks a plan, and `--threads=N` runs every stage on N threads.
 
-`--minify`, ms, best of three passes of best of 9, 12-core M-series laptop:
+`--minify`, ms, best of 15, every column measured side by side, 12-core (8 fast, 4 slow) M-series
+laptop shared with other work:
 
-| App | single | load-only | back-half | two | full | esbuild |
-|---|---|---|---|---|---|---|
-| tree-shaken lodash-es | 50.2 | 29.8 | 47.8 | 35.8 | **26.5** | 26.4 |
-| all of lodash-es | 61.1 | 41.5 | 55.5 | 44.3 | **33.9** | 28.0 |
-| rxjs | 29.0 | 18.0 | 29.4 | 21.0 | **16.5** | 15.9 |
-| date-fns | 32.1 | 18.9 | 31.9 | 23.2 | **17.5** | 20.2 |
-| d3 | 78.8 | 36.9 | 76.8 | 50.3 | **30.8** | 16.8 |
-| zod | 102.6 | 66.6 | 84.6 | 66.9 | **46.7** | 15.5 |
+| App | single | load-only | back-half | two | full | esbuild | full / esbuild |
+|---|---|---|---|---|---|---|---|
+| tree-shaken lodash-es | 46.4 | 29.9 | 45.1 | 33.1 | **24.2** | 26.8 | 0.90 |
+| all of lodash-es | 57.6 | 40.8 | 51.1 | 40.0 | **27.7** | 28.0 | 0.99 |
+| rxjs | 26.2 | 15.9 | 25.6 | 18.1 | **13.2** | 16.2 | 0.82 |
+| date-fns | 29.7 | 18.1 | 28.6 | 21.4 | **16.3** | 21.0 | 0.77 |
+| d3 | 60.6 | 28.2 | 58.5 | 40.7 | **21.0** | 17.5 | 1.20 |
+| zod | 88.0 | 60.2 | 68.3 | 53.5 | **25.0** | 17.6 | 1.42 |
 
-On apps of many small files the full plan is as fast as esbuild on all its cores. Where one big
-file dominates, as in zod and d3, the parser is the limit: it is a general PEG parser, slower per
-file than esbuild's hand-written one, and a file is parsed by one thread. What is
-still serial: linking's fact replay and Datalog solve (about 5 ms on lodash-es), naming, and
-renaming identifiers in the emitted program (8 ms on zod).
+Zod is not yet within 20% of esbuild. Per core this bundler does about 2.6 times esbuild's work
+on it (130 ms of CPU to esbuild's 50), so it needs nearly perfect parallelism, and about 4.7 ms is
+still serial: replaying linking's facts and solving the Datalog. Its biggest file also sits at the
+end of an import chain.
 
 ## What it does
 
