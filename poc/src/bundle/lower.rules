@@ -105,27 +105,24 @@ fn chain-base(n: Node) -> Node = match n {
   _ => panic "not a link of a chain: {}", js.kind-name(n.kind)
 }
 
-# A chain from its root upward. Answers the root.
-fn links-of!(n: Node, out: mut [Link]) -> Node {
-  let link: Link? = match n {
-    Member(_, p) => some(Link(kind: ByName, optional: false, part: p))
-    OptMember(_, p) => some(Link(kind: ByName, optional: true, part: p))
-    Index(_, e) => some(Link(kind: ByIndex, optional: false, part: e))
-    OptIndex(_, e) => some(Link(kind: ByIndex, optional: true, part: e))
-    CallExpr(_, Args(list)) => some(Link(kind: Called, optional: false, part: list))
-    OptCall(_, list) => some(Link(kind: Called, optional: true, part: list))
-    Tagged(_, t) => some(Link(kind: TaggedBy, optional: false, part: t))
-    _ => none
-  }
-  match link {
-    none => n
-    some(l) => {
-      let root = links-of!(chain-base(n), out)
-      out += l
-      root
-    }
-  }
+fn link-of(n: Node) -> Link? = match n {
+  Member(_, p) => some(Link(kind: ByName, optional: false, part: p))
+  OptMember(_, p) => some(Link(kind: ByName, optional: true, part: p))
+  Index(_, e) => some(Link(kind: ByIndex, optional: false, part: e))
+  OptIndex(_, e) => some(Link(kind: ByIndex, optional: true, part: e))
+  CallExpr(_, Args(list)) => some(Link(kind: Called, optional: false, part: list))
+  OptCall(_, list) => some(Link(kind: Called, optional: true, part: list))
+  Tagged(_, t) => some(Link(kind: TaggedBy, optional: false, part: t))
+  _ => none
 }
+
+# A chain's links from its root upward, and the root.
+fn links-of(n: Node) -> [Link] = match link-of(n) {
+  some(l) => links-of(chain-base(n)) ++ [l]
+  none => []
+}
+
+fn chain-root(n: Node) -> Node = if is-some(link-of(n)) then chain-root(chain-base(n)) else n
 
 fn read-link(base: Node, l: Link) -> Node = match l.kind {
   ByIndex => Index(base, lowered(l.part))
@@ -139,8 +136,8 @@ fn read-link(base: Node, l: Link) -> Node = match l.kind {
 # the chain, each `?.` adds a test and leaves the value in hand somewhere it can be read twice. A
 # call that needs its `this` by hand has the object kept from the link before.
 fn chain(n: Node, miss: Node, deleting: Bool) -> Node {
-  var links: [Link] = []
-  let root = links-of!(n, links)
+  let links = links-of(n)
+  let root = chain-root(n)
   var value = if root is Super() then root else lowered(root)
   var self: Node? = none
   var tests: [Node] = []
@@ -289,23 +286,22 @@ fn lowered-pattern-target(t: Node) -> Node = match t {
 
 # ---------------------------------------------------------------- object spread and rest
 
+# What an object literal is so far: the object its spreads have made, and the plain properties
+# since the last of them.
+record Spreading { base: Node?, plain: [Node] }
+
 fn object-spread(items: [Node]) -> Node {
-  var base: Node? = none
-  var plain: [Node] = []
-  for x in items {
-    match x {
-      SpreadProp(e) => {
-        base = some(helper-call("__spreadValues", [spread-base(base, plain), lowered(e)]))
-        plain = []
-      }
-      _ => { plain += lowered(x) }
-    }
+  let s = fold s = Spreading(base: none, plain: []) for x in items: spread-step(s, x)
+  if len(s.plain) == 0 { return s.base ?? ObjectLit(List()) }
+  match s.base {
+    some(b) => helper-call("__spreadProps", [b, ObjectLit(List(s.plain...))])
+    none => ObjectLit(List(s.plain...))
   }
-  if len(plain) == 0 { return base ?? ObjectLit(List()) }
-  match base {
-    some(b) => helper-call("__spreadProps", [b, ObjectLit(List(plain...))])
-    none => ObjectLit(List(plain...))
-  }
+}
+
+fn spread-step(s: Spreading, x: Node) -> Spreading = match x {
+  SpreadProp(e) => Spreading(base: some(helper-call("__spreadValues", [spread-base(s.base, s.plain), lowered(e)])), plain: [])
+  _ => s with { plain: s.plain ++ [lowered(x)] }
 }
 
 fn spread-base(base: Node?, plain: [Node]) -> Node = match base {
@@ -843,17 +839,12 @@ fn constructor-with-fields(existing: Node?, fields: [Node], derived: Bool) -> No
   _ => panic "expected a constructor"
 }
 
-fn class-statements!(n: Node, out: mut [Node]) -> Void = match n {
+fn class-statements(n: Node) -> [Node] = match n {
   ClassDecl(name, heritage, body) => {
-    if not class-needs-lowering?(body) {
-      out += lowered(n)
-    } else {
-      let parts = lowered-class(body, not (heritage is None()), "", Ident(name.text))
-      for b in parts.before { out += ExprStmt(b) }
-      out += ClassDecl(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }
-      out ++= parts.after
-      out ++= parts.statics
-    }
+    if not class-needs-lowering?(body) { return [lowered(n)] }
+    let parts = lowered-class(body, not (heritage is None()), "", Ident(name.text))
+    [ExprStmt(b) for b in parts.before] ++ [ClassDecl(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }]
+    ++ parts.after ++ parts.statics
   }
   _ => panic "expected a class declaration"
 }
@@ -875,22 +866,12 @@ fn class-expression(n: Node) -> Node = match n {
 # ---------------------------------------------------------------- the walk
 
 # A statement list, lowered: one statement may become several.
-fn lowered-list(xs: [Node]) -> [Node] {
-  var out: [Node] = []
-  for x in xs {
-    match x {
-      ClassDecl(...) => if before?(2022) then class-statements!(x, out) else { out += lowered(x) }
-      Declarator(t, init) => {
-        if before?(2018) and top-rest?(t) {
-          out ++= rest-declarators(t, lowered(init), x)
-        } else {
-          out += lowered(x)
-        }
-      }
-      _ => { out += lowered(x) }
-    }
-  }
-  out
+fn lowered-list(xs: [Node]) -> [Node] = [lowered-item(x)... for x in xs]
+
+fn lowered-item(x: Node) -> [Node] = match x {
+  ClassDecl(...) => if before?(2022) then class-statements(x) else [lowered(x)]
+  Declarator(t, init) => if before?(2018) and top-rest?(t) then rest-declarators(t, lowered(init), x) else [lowered(x)]
+  _ => [lowered(x)]
 }
 
 fn check-number(n: Node, t: Text) -> Node {
