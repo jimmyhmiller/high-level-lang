@@ -1,6 +1,6 @@
 # JSX becomes calls, before anything else looks at the program, so the rest of the bundler never
 # meets it. Which call is the build's choice, or a pragma comment's.
-rules bundle.jsx over bundle.js
+attrs bundle.jsx over bundle.js
 use bundle.js as js
 use bundle.comments as cm
 use bundle.minhost as host
@@ -23,13 +23,15 @@ fn options-new() -> Options =
 
 # What one file is being lowered under.
 record Lowered { tree: Node, pure-calls: {Int:Int}, imports: Bool }
+record Span { lo: Int, hi: Int }
 
-task state now: Options = options-new()
-task state src: Text = ""
-task state path: Text = ""
-task state pure-calls: {Int:Int} = {}
-task state imported: {Text:Text} = {}
-task state import-order: [Text] = []
+input now: Options
+input src: Text
+input path: Text
+# Calls that may go if nothing uses them, and the runtime's names the calls use, as `from\nname`.
+collect pure: [Span]
+collect imports: [Text]
+
 task state entities: {Text:Int} = {}
 
 # ---------------------------------------------------------------- pragmas
@@ -57,24 +59,24 @@ fn pragma(comment: Text, name: Text) -> Text? {
   none
 }
 
-fn runtime-named(s: Text) -> Runtime = match s {
+fn runtime-named(s: Text, file: Text) -> Runtime = match s {
   "automatic" => Automatic
   "classic" => Classic
-  other => panic "{}: @jsxRuntime is automatic or classic, not {}", path, other
+  other => panic "{}: @jsxRuntime is automatic or classic, not {}", file, other
 }
 
 # A file's comments may override the build, unless the build keeps JSX as it is.
-fn with-pragmas(o: Options) -> Options {
-  if not contains-text?(src, "@jsx") { return o }
+fn with-pragmas(o: Options, source: Text, file: Text) -> Options {
+  if not contains-text?(source, "@jsx") { return o }
   var out = o
-  match cm.parse(src, "<comments>") {
+  match cm.parse(source, "<comments>") {
     cm.Scan(List(parts...)) => for p in parts {
       if p is cm.Comment(_) {
         if let some(v) = pragma(p.text, "jsx") { out.factory = v }
         if let some(v) = pragma(p.text, "jsxFrag") { out.fragment = v }
         if let some(v) = pragma(p.text, "jsxImportSource") { out.import-source = v }
         if let some(v) = pragma(p.text, "jsxRuntime") {
-          if o.runtime != Preserve { out.runtime = runtime-named(v) }
+          if o.runtime != Preserve { out.runtime = runtime-named(v, file) }
         }
       }
     }
@@ -209,24 +211,14 @@ fn placed(n: Node, lo: Int) -> Node =
   if len(n.kids) == 0 then n with { lo: lo, hi: lo }
   else n with { lo: lo, hi: lo, kids: [placed(k, lo) for k in n.kids] }
 
-fn fresh-name(base: Text) -> Text {
-  var name = base
-  var n = 1
-  while contains-text?(src, name) {
-    name = base ++ "_" ++ int-text(n)
-    n += 1
-  }
-  name
-}
+# A name the source does not have in it anywhere, so it can be no one else's.
+fn fresh-name(base: Text, source: Text) -> Text = unused(base, source) ?? first n in 1..: unused(base ++ "_" ++ int-text(n), source)
+
+fn unused(name: Text, source: Text) -> Text? = if contains-text?(source, name) then none else some(name)
 
 fn imported-ref(name: Text, from: Text, lo: Int) -> Node {
-  let key = from ++ "\n" ++ name
-  if not (key in imported) {
-    imported[key] = fresh-name(name)
-    import-order += key
-  }
-  let local = imported[key] ?? panic "{} has no local name", name
-  Ident(local) with { lo: lo, hi: lo }
+  imports += from ++ "\n" ++ name
+  Ident(fresh-name(name, src)) with { lo: lo, hi: lo }
 }
 
 fn runtime-module() -> Text =
@@ -240,20 +232,16 @@ fn cut-at-newline(key: Text) -> Int {
 
 # `import { jsx } from "react/jsx-runtime"`, one statement per name, at the top of the file. A
 # binding's offset identifies it too, and real offsets are not negative.
-fn import-statements() -> [Node] {
-  var out: [Node] = []
-  var at = -2
-  for key in import-order {
-    let cut = cut-at-newline(key)
-    let local = imported[key] ?? panic "an import without a local name"
-    let bind = BindName(local) with { lo: at, hi: at }
-    let from = Str(host.js-string(key[0..cut]))
-    let name = PropName(key[cut + 1..len(key)])
-    out += Import(ImportNamed(List(ImportAs(name, bind))), from)
-    at = at - 1
-  }
-  out
+fn import-statements(keys: [Text], source: Text) -> [Node] = [import-statement(keys[i], -2 - i, source) for i in 0..len(keys)]
+
+fn import-statement(key: Text, at: Int, source: Text) -> Node {
+  let cut = cut-at-newline(key)
+  let name = key[cut + 1..len(key)]
+  let bind = BindName(fresh-name(name, source)) with { lo: at, hi: at }
+  Import(ImportNamed(List(ImportAs(PropName(name), bind))), Str(host.js-string(key[0..cut])))
 }
+
+fn first-of-each(xs: [Text]) -> [Text] = [xs[i] for i in 0..len(xs) if not (any j in 0..i: xs[j] == xs[i])]
 
 # ---------------------------------------------------------------- the calls
 
@@ -269,39 +257,14 @@ fn key-of(name: Node) -> Node = match name {
   _ => panic "unexpected attribute name"
 }
 
-fn value-of(v: Node) -> Node = match v {
-  None() => True()
-  JsxStr(raw) => string-at(attr-text(raw), v)
-  JsxValue(e) => lowered(e)
-  _ => lowered(v)
-}
-
-fn prop-of(attr: Node) -> Node = match attr {
-  JsxSpreadAttr(e) => SpreadProp(lowered(e)) with { lo: attr.lo, hi: attr.hi }
-  JsxAttr(name, v) => Prop(key-of(name), value-of(v)) with { lo: attr.lo, hi: attr.hi }
-  _ => panic "unexpected attribute"
-}
-
-fn child-values(kids: [Node]) -> [Node] {
-  var out: [Node] = []
-  for k in kids {
-    match k {
-      JsxText(raw) => {
-        let t = child-text(raw)
-        if len(t) > 0 { out += string-at(t, k) with { lo: k.lo + leading-space(raw) } }
-      }
-      JsxContainer(None()) => {}
-      JsxContainer(e) => { out += lowered(e) }
-      JsxSpreadChild(e) => { out += Spread(lowered(e)) with { lo: k.lo, hi: k.hi } }
-      _ => { out += lowered(k) }
-    }
-  }
-  out
-}
-
 fn call-of(callee: Node, args: [Node], at: Node) -> Node {
-  if not now.side-effects { pure-calls[at.lo] = at.hi }
+  if not now.side-effects { pure += Span(lo: at.lo, hi: at.hi) }
   CallExpr(callee, Args(List(args...))) with { lo: at.lo, hi: at.hi }
+}
+
+fn text-child(raw: Text, at: Node) -> [Node] {
+  let t = child-text(raw)
+  if len(t) > 0 then [string-at(t, at) with { lo: at.lo + leading-space(raw) }] else []
 }
 
 fn classic(tag: Node, props: [Node], children: [Node], at: Node) -> Node {
@@ -382,42 +345,32 @@ fn fragment-tag(at: Node) -> Node = match now.runtime {
   _ => dotted(now.fragment, at.lo + 1)
 }
 
-fn lowered-element(n: Node) -> Node = match n {
-  JsxFragment(List(kids...)) => {
-    let children = child-values(kids)
-    if now.runtime == Automatic then automatic(fragment-tag(n), [], children, n)
-    else classic(fragment-tag(n), [], children, n)
-  }
-  JsxElement(tag, List(attrs...), rest) => {
-    let props = [prop-of(a) for a in attrs]
-    let children = match rest {
-      JsxClose(List(kids...), _) => child-values(kids)
-      _ => []
-    }
-    if now.runtime == Automatic then automatic(tag-value(tag), props, children, n)
-    else classic(tag-value(tag), props, children, n)
-  }
-  _ => panic "unexpected JSX node"
-}
+fn element(tag: Node, props: [Node], children: [Node], at: Node) -> Node =
+  if now.runtime == Automatic then automatic(tag, props, children, at) else classic(tag, props, children, at)
 
-fn lowered(n: Node) -> Node = match n {
-  JsxFragment(...) | JsxElement(...) => lowered-element(n)
-  _ => if len(n.kids) == 0 then n else n with { kids: [lowered(k) for k in n.kids] }
-}
+# What each piece of JSX becomes, its own pieces having become theirs: an element a call, an
+# attribute a property, text a string, a `{…}` what it holds.
+rewrite JsxFragment(List(kids...)) as n => element(fragment-tag(n), [], kids, n)
+rewrite JsxElement(tag, List(props...), JsxClose(List(kids...), _)) as n => element(tag-value(tag), props, kids, n)
+rewrite JsxElement(tag, List(props...), _) as n => element(tag-value(tag), props, [], n)
+rewrite JsxAttr(name, None()) as a => Prop(key-of(name), True()) with { lo: a.lo, hi: a.hi }
+rewrite JsxAttr(name, v) as a => Prop(key-of(name), v) with { lo: a.lo, hi: a.hi }
+rewrite JsxSpreadAttr(e) as a => SpreadProp(e) with { lo: a.lo, hi: a.hi }
+rewrite JsxStr(raw) as v => string-at(attr-text(raw), v)
+rewrite JsxValue(e) => e
+rewrite JsxText(raw) as k => text-child(raw, k)
+rewrite JsxContainer(None()) => []
+rewrite JsxContainer(e) => e
+rewrite JsxSpreadChild(e) as k => Spread(e) with { lo: k.lo, hi: k.hi }
 
 # A tree with no JSX left in it, and which of its calls may go if unused.
 fn lower(tree: Node, source: Text, file: Text, o: Options) -> Lowered {
-  src = source
-  path = file
-  now = with-pragmas(o)
-  pure-calls = {}
-  imported = {}
-  import-order = []
-  if now.runtime == Preserve { return Lowered(tree: tree, pure-calls: {}, imports: false) }
-  let body = [lowered(s) for s in tree.body.kids]
-  let stmts = import-statements() ++ body
-  let whole = Program(tree.hashbang, List(stmts...))
-  Lowered(tree: whole, pure-calls: pure-calls, imports: len(import-order) > 0)
+  let now-options = with-pragmas(o, source, file)
+  if now-options.runtime == Preserve { return Lowered(tree: tree, pure-calls: {}, imports: false) }
+  let a = run(tree, now-options, source, file)
+  let keys = first-of-each(a.imports)
+  let whole = Program(a.tree.hashbang, List(import-statements(keys, source) ++ a.tree.body.kids...))
+  Lowered(tree: whole, pure-calls: {s.lo: s.hi for s in a.pure}, imports: len(keys) > 0)
 }
 
 # Names a kept `<div/>` will need once something else lowers it, so TypeScript must not take their
@@ -429,9 +382,7 @@ fn root-of(dotted: Text) -> Text {
 }
 
 fn kept-names(source: Text, file: Text, o: Options) -> [Text] {
-  src = source
-  path = file
-  let now-options = with-pragmas(o)
+  let now-options = with-pragmas(o, source, file)
   if now-options.runtime != Preserve { return [] }
   [root-of(now-options.factory), root-of(now-options.fragment)]
 }

@@ -623,6 +623,7 @@
             (g/KInput [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
             (g/KCollect [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
             (g/KOn [] (attrs-only! (mut k) tree d))
+            (g/KRewrite [] (attrs-only! (mut k) tree d))
             (g/KInclude [] (attrs-only! (mut k) tree d))
             (g/KConst [] (add-global! (mut k) ix2 name d false))
             (g/KMemoFn [] (collect-fn! (mut k) ix2 name d))
@@ -672,6 +673,16 @@
     (not (.task x)) `(rules-state)
     (.in-fn k) (do (set! (.task-used k) true) `rules-task-here)
     :else `(rules-task)))
+
+;;; A global's value. An input has one only while `run` runs: read at any other time it would be
+;;; the empty value, silently, so that stops.
+(defn global-read [(k (mut Comp)) (x Global)] (-> Code)
+  (let [field `(~(primitive/code-symbol "." (.name x)) ~(storage-call (mut k) x))]
+    (if (= (.attr x) 2)
+        `(do (when (= (.attrs-depth ~(storage-call (mut k) x)) 0)
+               (panic ~(cat3 "the input " (.name x) " was read outside run, where it has no value")))
+             ~field)
+        field)))
 
 (defn storage-of [(k (mut Comp)) (module (slice u8)) (x Global)] (-> Code)
   `(~(sym (qualified (mut k) module (if (.task x) "rules-task" "rules-state")))))
@@ -1971,7 +1982,7 @@
         (None []
           (let [m (self-mod (mut k))]
             (match (find-global m (.text n))
-              (Some [x] (te `(~(primitive/code-symbol "." (.name x)) ~(storage-call (mut k) x)) (.ty x)))
+              (Some [x] (te (global-read (mut k) x) (.ty x)))
               (None []
                 (match (find-func m (.text n))
                   (Some [f] (te `(fnptr-of ~(sym (.coil f))) (func-type f)))
@@ -2621,6 +2632,10 @@
         (param (mut f) (.text (kid d 0)) (resolve-type (mut k) name (kid d 1)) false))
       (when (and (= (.kind d) (g/KFn)) (= (.text (kid d 0)) "run"))
         (die (mut k) d "an attribute grammar's `run` is its own")))
+    (when (rewrites? decls)
+      (for f2 fields
+        (when (= (.name f2) "tree") (die (mut k) (g/none-node) "`tree` is the rewritten tree; a collection cannot be named so")))
+      (push! (mut fields) (FieldDef :name "tree" :ty (cat over ".Node"))))
     ;; An included grammar's equations run in this one's traversal, and what it collects is
     ;; this one's answer too.
     (for d decls
@@ -2641,6 +2656,18 @@
         (set! (.fields (elem (mut (.recs (elem (mut (.mods k)) ix2))) i)) fields)))
     (push! (mut (.funcs (elem (mut (.mods k)) ix2))) f)))
 
+;;; Whether a grammar rewrites trees as well as computing attributes.
+;;; Whether a grammar takes inputs: they hold only while `run` runs, which `attrs-depth` counts.
+(defn inputs? [(decls (ArrayList g/Node))] (-> bool)
+  (let [(mut hit) false]
+    (for d decls (when (= (.kind d) (g/KInput)) (set! hit true)))
+    hit))
+
+(defn rewrites? [(decls (ArrayList g/Node))] (-> bool)
+  (let [(mut hit) false]
+    (for d decls (when (= (.kind d) (g/KRewrite)) (set! hit true)))
+    hit))
+
 ;;; The attribute grammar whose attributes a block's names mean: this module's, or while an
 ;;; included one's blocks are read, that one's.
 (defn attrs-mod [(k (mut Comp))] (-> Mod)
@@ -2660,6 +2687,20 @@
     (= ty "Int") `0
     (= ty "Bool") `false
     (= ty "Text") `""
+    ;; A record's is its fields' empty values, and an enum's its first value.
+    (> (last-dot ty) 0)
+      (let [m (mod-at (mut k) (type-module ty))]
+        (match (find-rec m (type-name ty))
+          (Some [r]
+            (let [(mut inits) (primitive/code-list-new)]
+              (for f (.fields r)
+                (push! (mut inits) (primitive/code-symbol ":" (.name f)))
+                (push! (mut inits) (default-of (mut k) at (.ty f))))
+              `(~(sym (qualified (mut k) (type-module ty) (.name r))) ~@inits)))
+          (None []
+            (match (find-enum-named m (type-name ty))
+              (Some [e] `(~(sym (qualified (mut k) (type-module ty) (get (.variants e) 0)))))
+              (None [] (die (mut k) at (cat "no empty value of " ty)))))))
     :else (die (mut k) at (cat "no empty value of " ty))))
 
 ;;; A global's first value: its own expression, or the empty one for an input or a collection.
@@ -3038,6 +3079,118 @@
     (set! (.path k) saved-path)
     (clear! (mut (.locals k)))))
 
+;;; `rewrite Pattern if guard => value`: what a node becomes, once its children have become what
+;;; they become. Tried in the file's order; the first that matches gives the node, a list of
+;;; nodes in a list's place, and a node no rule matches is rebuilt from its new children.
+(defstruct RwAlt [(pat g/Node) (as-name g/Node) (guard g/Node) (body g/Node)])
+
+(defn rewrite-alts [(decls (ArrayList g/Node))] (-> (ArrayList RwAlt))
+  (let [(mut out) (ArrayList::new [RwAlt] (malloc-allocator))]
+    (for d decls
+      (when (= (.kind d) (g/KRewrite))
+        (let [p0 (kid d 0)
+              has-as (= (.kind p0) (g/KPAs))
+              as-name (if has-as (kid p0 1) (g/none-node))
+              p (if has-as (kid p0 0) p0)]
+          (for q (top-alternatives p)
+            (push! (mut out) (RwAlt :pat q :as-name as-name :guard (kid d 1) :body (kid d 2)))))))
+    out))
+
+(defn rw-head [(a RwAlt)] (-> (slice u8))
+  (match (.kind (.pat a))
+    (g/KPNode [] (.text (kid (.pat a) 0)))
+    (g/KPNodeQ [] (.text (kid (.pat a) 1)))
+    (_ "")))
+
+(defn results-field [(task Code)] (-> Code) `(.attrs-results ~task))
+
+;;; One rule at a node of kind `head`: on a match, its value goes where the node was.
+(defn rw-alt-code [(k (mut Comp)) (a RwAlt) (subject Code) (ty (slice u8)) (head (slice u8))
+                   (label Code) (task Code)] (-> Code)
+  (let [mark (locals-mark (mut k))
+        (mut steps) (ArrayList::new [Step] (malloc-allocator))]
+    (pat! (mut k) (.pat a) subject ty (mut steps) head)
+    (unless (none? (.as-name a))
+      (let [s (bind-local! (mut k) (.text (.as-name a)) ty false)]
+        (push! (mut steps) (SBind s subject))))
+    (set! (.in-on k) true)
+    (let [guard (if (none? (.guard a))
+                    `true
+                    (.code (expect (mut k) (.guard a) (expr (mut k) (.guard a) "Bool") "Bool")))
+          many (cat3 "[" ty "]")
+          ;; `[…]` is the nodes that go in the node's place; anything else, the one node.
+          v (expr (mut k) (.body a) (if (= (.kind (.body a)) (g/KListLit)) many ty))
+          each (fresh (mut k) "each")
+          push (cond
+                 (= (.ty v) ty) `(push! (mut ~(results-field task)) ~(.code v))
+                 (= (.ty v) many) `(for (ref ~(sym each)) ~(.code v) (push! (mut ~(results-field task)) ~(sym each)))
+                 :else (die (mut k) (.body a) (cat4 "a rewrite gives a " ty " or a " (cat3 many ", not " (.ty v)))))]
+      (set! (.in-on k) false)
+      (when (.returned k) (die (mut k) (.body a) "a rewrite cannot return"))
+      (locals-reset! (mut k) mark)
+      (wrap-steps steps 0 `(when ~guard ~push (return-from ~label 0))))))
+
+;;; The rules for a node of kind `head`, then the node as rebuilt.
+(defn rw-arm-code [(k (mut Comp)) (alts (ArrayList RwAlt)) (head (slice u8)) (subject Code) (ty (slice u8)) (task Code)] (-> Code)
+  (let [label (primitive/code-symbol ":" (fresh (mut k) "rw"))
+        (mut tries) (primitive/code-list-new)]
+    (for a alts
+      (let [h (rw-head a)]
+        (when (or (= h head) (= (len h) 0))
+          (push! (mut tries) (rw-alt-code (mut k) a subject ty head label task)))))
+    `(block ~label ~@tries (push! (mut ~(results-field task)) ~subject) 0)))
+
+;;; The traversal's rewriting: each visit leaves what its node became on `attrs-results`, so a
+;;; node finds its children's past `mark`. A node whose children all stayed is itself.
+(defn rewrite-fns [(k (mut Comp)) (decls (ArrayList g/Node)) (gr Mod) (over (slice u8)) (ty (slice u8))
+                   (node-coil Code) (task Code)] (-> Code)
+  (let [alts (rewrite-alts decls)
+        n (sym "rw-node")
+        (mut heads) (text-list)
+        (mut arms) (primitive/code-list-new)
+        alias (alias-of (.name gr))
+        same (primitive/code-symbol alias "/same-node?")
+        sublist (primitive/code-symbol alias "/sublist")
+        kind-name (primitive/code-symbol alias "/kind-name")]
+    (for a alts
+      (let [h (rw-head a) (mut seen) (= (len h) 0)]
+        (for x heads (when (= x h) (set! seen true)))
+        (unless seen
+          (unless (match (find-kind gr h) (Some [_] true) (None [] false))
+            (die (mut k) (.pat a) (cat4 "the grammar " over " has no node named " h)))
+          (push! (mut heads) h))))
+    (clear! (mut (.locals k)))
+    (set! (.returned k) false)
+    (set! (.ret k) "Void")
+    (set! (.in-fn k) true)
+    (for h heads
+      (push! (mut arms) `(~(kind-code gr h) [] ~(rw-arm-code (mut k) alts h n ty task))))
+    (let [wild (rw-arm-code (mut k) alts "" n ty task)]
+      (set! (.in-fn k) false)
+      (clear! (mut (.locals k)))
+      `(do
+         (defn attrs-rebuilt [(~n ~node-coil) (~task (ptr RulesTask)) (mark i64)] (-> ~node-coil)
+           (let [kids (.kids ~n)
+                 got (- (len ~(results-field task)) mark)
+                 (mut same) (= got (len kids))]
+             (when same
+               (for i (range 0 got)
+                 (unless (~same (get ~(results-field task) (+ mark i)) (get kids i)) (set! same false))))
+             (if same
+                 ~n
+                 (do
+                   (unless (or (= (.kind ~n) (~(kind-code gr "List"))) (= got (len kids)))
+                     (panic "a rewrite gave {} nodes in place of one child of a {} node" got (~kind-name (.kind ~n))))
+                   (let [(mut x) ~n]
+                     (set! (.kids x) (~sublist ~(results-field task) mark (len ~(results-field task))))
+                     x)))))
+         (defn attrs-rewrite! [(~n ~node-coil) (~task (ptr RulesTask))] (-> void)
+           (match (.kind ~n) ~@arms (_ ~wild))
+           0)
+         (defn attrs-truncate! [(~task (ptr RulesTask)) (mark i64)] (-> void)
+           (while (> (len ~(results-field task)) mark) (pop! (mut ~(results-field task))))
+           0)))))
+
 ;;; The traversal, and `run`.
 (defn compile-attrs [(k (mut Comp)) (tree g/Node) (decls (ArrayList g/Node))] (-> Code)
   (let [over (.text (kid tree 1))
@@ -3148,21 +3301,40 @@
                     (push! (mut sets) `(set! ~(task-field (.name x) its) ~(default-of (mut k) d (.ty x))))
                     (push! (mut fields) (primitive/code-symbol ":" (.name x)))
                     (push! (mut fields) (task-field (.name x) its)))))))
-          `(do
-             ~@block-fns
-             (defn ~visit [(~n ~node-coil) (~task (ptr RulesTask))] (-> void)
-               (let [~@marks]
-                 (match (.kind ~n) ~@arms (_ ~wild))
-                 ~@fixups
-                 0))
-             (defn run [(~root ~node-coil) ~@params] (-> Attrs)
-               (let [~t (rules-task)
-                     ~@saves]
-                 ~@sets
-                 (~visit ~root ~t)
-                 (let [result (Attrs ~@fields)]
-                   ~@restores
-                   result))))))))))
+          (let [rw (rewrites? decls)
+                rw-mark (sym "rw-mark")
+                rw-fns (if rw (rewrite-fns (mut k) decls gr over ty node-coil task) `(do))
+                visit-marks (if rw `(~@marks ~rw-mark (len ~(results-field task))) `(~@marks))
+                post (if rw
+                         `(let [rebuilt (attrs-rebuilt ~n ~task ~rw-mark)]
+                            (attrs-truncate! ~task ~rw-mark)
+                            (attrs-rewrite! rebuilt ~task))
+                         `0)
+                start (sym "rw-start")]
+            (when rw
+              (push! (mut fields) `:tree)
+              (push! (mut fields) `(get ~(results-field t) ~start)))
+            `(do
+               ~@block-fns
+               ~rw-fns
+               (defn ~visit [(~n ~node-coil) (~task (ptr RulesTask))] (-> void)
+                 (let [~@visit-marks]
+                   (match (.kind ~n) ~@arms (_ ~wild))
+                   ~@fixups
+                   ~post
+                   0))
+               (defn run [(~root ~node-coil) ~@params] (-> Attrs)
+                 (let [~t (rules-task)
+                       ~start ~(if rw `(len ~(results-field t)) `0)
+                       ~@saves]
+                   ~@sets
+                   ~(if (inputs? decls) `(set! (.attrs-depth ~t) (+ (.attrs-depth ~t) 1)) `0)
+                   (~visit ~root ~t)
+                   (let [result (Attrs ~@fields)]
+                     ~(if rw `(attrs-truncate! ~t ~start) `0)
+                     ~(if (inputs? decls) `(set! (.attrs-depth ~t) (- (.attrs-depth ~t) 1)) `0)
+                     ~@restores
+                     result)))))))))))
 
 ;; ---------------------------------------------------------------- memo functions
 
@@ -3340,6 +3512,12 @@
         (push! (mut out) (memo-new-map (mut k) d))
         (push! (mut out) (primitive/code-symbol ":" (memo-near-gen (.text (kid d 0)))))
         (push! (mut out) `-1)))
+    (when (inputs? decls)
+      (push! (mut out) `:attrs-depth)
+      (push! (mut out) `0))
+    (when (rewrites? decls)
+      (push! (mut out) `:attrs-results)
+      (push! (mut out) (new-list (mut k) (cat (.over self) ".Node"))))
     `(~@out)))
 
 (defn compile-module [(context Code)] (-> (slice u8))
@@ -3430,6 +3608,13 @@
               (push! (mut task-fields) (memo-gen-field d))
               (push! (mut task-inits) (memo-near-init (mut k) d))
               (push! (mut task-inits) (memo-gen-init d))))
+          (when (inputs? decls)
+            (push! (mut task-fields) `(attrs-depth i64))
+            (push! (mut task-inits) `(set! (.attrs-depth s) 0)))
+          (when (and (= (.kind tree) (g/KAttrsFile)) (rewrites? decls))
+            (let [lt (cat3 "[" (.text (kid tree 1)) ".Node]")]
+              (push! (mut task-fields) `(attrs-results ~(coil-type (mut k) lt)))
+              (push! (mut task-inits) `(set! (.attrs-results s) ~(new-list (mut k) (elem-of lt))))))
           ;; Program state, set up by the first thread to use it while any other waits. The flag is
           ;; read and written atomically, so a thread that sees it ready sees what was set: 0 not
           ;; set up, 2 being set up by `rules-owner`, which may use what it has set so far, 1 ready.
