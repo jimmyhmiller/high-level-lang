@@ -216,9 +216,16 @@
     (unless (.has-host k)
       (die (mut k) (mut c) name "@name needs a `host` module in the header"))
     (for a (.kids (get (.kids e) 1))
-      (var-sort (mut k) (mut c) a (.text a))
-      (push! (mut args) (var-sym (.text a))))
+      (if (= (var-sort (mut k) (mut c) a (.text a)) (VNode))
+          (push! (mut args) (normal-capture (.text a)))
+          (push! (mut args) (var-sym (.text a)))))
     `(~(host-sym (.text name)) ~@args)))
+
+;;; A node the pattern captured, as the right-hand side uses it. Everything under the node a rule
+;;; matched is normal for this pass already, so the copy says so, and is not walked again; the
+;;; captured node itself, which others may share, is never written.
+(defn normal-capture [(name (slice u8))] (-> Code)
+  `(syn/with-gen ~(var-sym name) pass))
 
 ;;; A leaf's text on a right-hand side: a literal or a variable.
 (defn leaf-value [(k (mut Comp)) (c (mut dsl/Cur)) (a g/Node)] (-> Code)
@@ -239,7 +246,7 @@
       (do
         (unless (= (var-sort (mut k) (mut c) e (.text e)) (VNode))
           (die (mut k) (mut c) e (dsl/join3 "the variable " (.text e) " is not a node")))
-        (var-sym (.text e))))
+        (normal-capture (.text e))))
     (g/KRNode []
       (let [t (get (.kids e) 0)
             args (.kids (get (.kids e) 1))]
@@ -259,7 +266,7 @@
                       (unless (= (var-sort (mut k) (mut c) a name) (VList))
                         (die (mut k) (mut c) a (dsl/join3 "the variable " name " is not a rest")))
                       (set! spread true)
-                      (push! (mut pushes) `(for each ~(var-sym name) (push! (mut kids) each))))
+                      (push! (mut pushes) `(for each ~(var-sym name) (push! (mut kids) (syn/with-gen each pass)))))
                     (do
                       (push! (mut pushes) `(push! (mut kids) ~(rhs (mut k) (mut c) a)))
                       (set! count (+ count 1)))))
@@ -404,12 +411,12 @@
             ;; The tail of `s0`'s children is the window: `scan` is where it starts.
             ;; The rest variables are bound to empty lists, so the result holds only the
             ;; replacement.
-            `(defn ~(rule-sym (mut k) index) [(s0 syn/Node)] (-> (Option syn/Node))
+            `(defn ~(rule-sym (mut k) index) [(s0 syn/Node) (pass i64)] (-> (Option syn/Node))
                (let [empty (syn/new-kids)
                      ~(var-sym (.window-prefix k)) empty
                      ~(var-sym (.window-suffix k)) empty]
                  (block :r ~(wrap-steps-window (.steps k) 0 guarded))))
-            `(defn ~(rule-sym (mut k) index) [(s0 syn/Node)] (-> (Option syn/Node))
+            `(defn ~(rule-sym (mut k) index) [(s0 syn/Node) (pass i64)] (-> (Option syn/Node))
                (block :r ~(wrap-steps (.steps k) 0 guarded))))))))
 
 ;;; Try each rule with this head in order.
@@ -419,7 +426,7 @@
     (or (!= (.head (get (.rules k) i)) head) (> (.width (get (.rules k) i)) 0))
       (try-rules (mut k) head (+ i 1))
     :else
-      `(match (~(rule-sym (mut k) i) n)
+      `(match (~(rule-sym (mut k) i) n pass)
          (Some [r] (Some r))
          (None [] ~(try-rules (mut k) head (+ i 1))))))
 
@@ -462,7 +469,7 @@
           (push! (mut windows)
                  `(when (>= (len out) ~(.width r))
                     (let [probe (syn/mk (syn/KList) out 0 0)]
-                      (match (~(rule-sym (mut k) i) probe)
+                      (match (~(rule-sym (mut k) i) probe pass)
                         (Some [repl]
                           (for _ (range 0 ~(.width r)) (pop! (mut out)))
                           (set! fuel (- fuel 1))
@@ -475,11 +482,12 @@
       (push! (mut uses) `(~(.where u) ~(.name u) ~(.arity u))))
     (let [step (pfx-sym (mut k) "step")
           go (pfx-sym (mut k) "go")
+          same (pfx-sym (mut k) "same")
           run (pfx-sym (mut k) "run")
           check (pfx-sym (mut k) "check")]
       `(do
          ~@forms
-         (defn ~step [(n syn/Node)] (-> (Option syn/Node))
+         (defn ~step [(n syn/Node) (pass i64)] (-> (Option syn/Node))
            (match (.kind n) ~@arms (_ ~(no-match))))
          ;;; Window rules run as a peephole: normalise each element, push it, and try
          ;;; the rules on the end of the output. A replacement is fed back in. Earlier
@@ -490,9 +498,20 @@
              ~@windows
              0)
            0)
+         ;;; Whether `r`, what a walk gave for `n`, is `n` itself: the same kind, text, place and
+         ;;; children, whatever its stamp.
+         (defn ~same [(r syn/Node) (n syn/Node)] (-> bool)
+           (and (= (.kind r) (.kind n)) (= (.lo r) (.lo n)) (= (.hi r) (.hi n))
+                (= (len (.kids r)) (len (.kids n)))
+                (= (primitive/cast i64 (data (slice (.kids r)))) (primitive/cast i64 (data (slice (.kids n)))))
+                (= (len (.text r)) (len (.text n)))
+                (= (primitive/cast i64 (data (.text r))) (primitive/cast i64 (data (.text n))))))
+
          ;;; Bottom up: normal children first, then rules here until none applies. A
          ;;; node stamped with this pass is already normal, so a rule's reused children
-         ;;; are not walked again, and the whole pass stays linear.
+         ;;; are not walked again, and the whole pass stays linear. A node none of whose
+         ;;; children changed keeps its children, unchanged and shared: only its own copy is
+         ;;; stamped, and a rule that takes one of them out stamps that copy too.
          (defn ~go [(n syn/Node) (pass i64) (fuel (mut i64))] (-> syn/Node)
            ;; A loop, not recursion on the result: a long statement list can fire
            ;; thousands of rules in a row.
@@ -500,14 +519,28 @@
              (while go-on
                (if (= (.gen cur) pass)
                    (set! go-on false)
-                   (let [(mut kids) (syn/new-kids)]
-                     (reserve! (mut kids) (len (.kids cur)))
+                   ;; `kids` starts as the old list only to have a value: nothing is pushed
+                   ;; before a change replaces it with a new list of this thread's.
+                   (let [(mut kids) (.kids cur)
+                         (mut changed) false]
                      (if (= (.kind cur) (syn/KList))
-                         (for (ref child) (.kids cur) (~feed child pass (mut fuel) (mut kids)))
-                         (for (ref child) (.kids cur) (push! (mut kids) (~go child pass (mut fuel)))))
-                     (let [(mut rebuilt) (syn/mk (.kind cur) kids (.lo cur) (.hi cur))]
+                         (do
+                           (set! changed true)
+                           (set! kids (syn/new-kids))
+                           (reserve! (mut kids) (len (.kids cur)))
+                           (for (ref child) (.kids cur) (~feed child pass (mut fuel) (mut kids))))
+                         (for i (range 0 (len (.kids cur)))
+                           (let [child (get (.kids cur) i)
+                                 r (~go child pass (mut fuel))]
+                             (when (and (not changed) (not (~same r child)))
+                               (set! changed true)
+                               (set! kids (syn/new-kids))
+                               (reserve! (mut kids) (len (.kids cur)))
+                               (for j (range 0 i) (push! (mut kids) (get (.kids cur) j))))
+                             (when changed (push! (mut kids) r)))))
+                     (let [(mut rebuilt) (if changed (syn/mk (.kind cur) kids (.lo cur) (.hi cur)) cur)]
                        (set! (.text rebuilt) (.text cur))
-                       (match (~step rebuilt)
+                       (match (~step rebuilt pass)
                          (None []
                            (set! (.gen rebuilt) pass)
                            (set! cur rebuilt)
@@ -529,6 +562,7 @@
     (when (> (len host) 0) (push! (mut extra) `(import ~host :as host)))
     `(do
        (import "coil.control" :use [return-from])
+       (import "coil.primitive" :as primitive)
        (import "coil.arraylist" :use [ArrayList])
        (import "hl.rt" :as rt)
        (import "hl.check" :as check)

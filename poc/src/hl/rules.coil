@@ -1962,15 +1962,9 @@
             t (fresh (mut k) "m")]
         (te `(let [~(sym t) ~(.code s)] ~(pat-test (mut k) (kid n 1) (sym t) (.ty s))) "Bool")))
     (g/KWithE []
-      (let [base (expr (mut k) (kid n 0) want)
-            t (fresh (mut k) "w")
-            (mut sets) (primitive/code-list-new)]
-        (for f (list-kids (kid n 1))
-          (let [name (.text (kid f 0))
-                ft (field-type (mut k) f (.ty base) name)
-                v (expect (mut k) (kid f 1) (expr (mut k) (kid f 1) ft) ft)]
-            (push! (mut sets) `(set! (~(primitive/code-symbol "." name) ~(sym t)) ~(.code v)))))
-        (te `(let [(mut ~(sym t)) ~(.code base)] ~@sets ~(sym t)) (.ty base))))
+      (match (kids-mapped (mut k) n)
+        (Some [shared] shared)
+        (None [] (with-fields (mut k) n want))))
     (g/KPanic []
       (let [(mut args) (primitive/code-list-new)]
         (for a (list-kids (kid n 1)) (push! (mut args) (.code (expr (mut k) a ""))))
@@ -1984,6 +1978,79 @@
           (let [v (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) (.ret k)) (.ret k))]
             (te `(return-from :fn ~(.code v)) "Never"))))
     (_ (die (mut k) n (cat "this is not an expression: " (g/kind-name (.kind n)))))))
+
+;;; `n with { … }`: a copy of `n` with the given fields.
+(defn with-fields [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+      (let [base (expr (mut k) (kid n 0) want)
+            t (fresh (mut k) "w")
+            (mut sets) (primitive/code-list-new)]
+        (for f (list-kids (kid n 1))
+          (let [name (.text (kid f 0))
+                ft (field-type (mut k) f (.ty base) name)
+                v (expect (mut k) (kid f 1) (expr (mut k) (kid f 1) ft) ft)]
+            (push! (mut sets) `(set! (~(primitive/code-symbol "." name) ~(sym t)) ~(.code v)))))
+        (te `(let [(mut ~(sym t)) ~(.code base)] ~@sets ~(sym t)) (.ty base))))
+
+;;; Whether `e` is `name.field`.
+(defn field-of? [(e g/Node) (name (slice u8)) (field (slice u8))] (-> bool)
+  (and (= (.kind e) (g/KFieldE)) (= (.kind (kid e 0)) (g/KName)) (= (.text (kid e 0)) name)
+       (= (.text (kid e 1)) field)))
+
+;;; `n with { kids: [f(c) for c in n.kids if p(c)] }` on a node. Nodes are values that never change,
+;;; so when every child is kept and each `f(c)` is `c`, the result is `n` itself: an unchanged tree is
+;;; shared, not copied. A new list starts at the first child that changes or is left out.
+(defn kids-mapped [(k (mut Comp)) (n g/Node)] (-> (Option TE))
+  (let [base-n (kid n 0)
+        fields (list-kids (kid n 1))]
+    (if (not (and (= (.kind base-n) (g/KName)) (= (len fields) 1)
+                  (= (.text (kid (get fields 0) 0)) "kids")
+                  (= (.kind (kid (get fields 0) 1)) (g/KComp))))
+        (None [TE])
+        (let [comp (kid (get fields 0) 1)
+              heads (list-kids (kid comp 1))]
+          (if (not (and (= (len heads) 1) (= (.kind (get heads 0)) (g/KInHead))
+                        (field-of? (kid (get heads 0) 1) (.text base-n) "kids")))
+              (None [TE])
+              (match (find-local (mut k) (.text base-n))
+                (None [] (None [TE]))
+                (Some [l]
+                  (let [ty (.ty l)]
+                    (if (not (and (not (builtin-type? ty)) (> (last-dot ty) 0) (= (type-name ty) "Node")))
+                        (None [TE])
+                        (Some (shared-kids-code (mut k) comp (get heads 0) (sym (.sym l)) ty)))))))))))
+
+(defn shared-kids-code [(k (mut Comp)) (comp g/Node) (head g/Node) (base Code) (ty (slice u8))] (-> TE)
+  (let [gr (grammar-of-type (mut k) comp ty)
+        same (primitive/code-symbol (alias-of (.name gr)) "/same-node?")
+        mark (locals-mark (mut k))
+        v (bind-local! (mut k) (.text (kid head 0)) ty false)
+        value (expect (mut k) (kid comp 0) (expr (mut k) (kid comp 0) ty) ty)
+        filter (kid comp 2)
+        keep (if (none? filter) `true (.code (expect (mut k) filter (expr (mut k) filter "Bool") "Bool")))
+        w (fresh (mut k) "w") src (fresh (mut k) "src") o (fresh (mut k) "out")
+        changed (fresh (mut k) "changed") i (fresh (mut k) "i") j (fresh (mut k) "j") r (fresh (mut k) "r")
+        start `(do (set! ~(sym changed) true)
+                   (set! ~(sym o) ~(new-list (mut k) ty))
+                   (reserve! (mut ~(sym o)) (len ~(sym src)))
+                   (for ~(sym j) (range 0 ~(sym i)) (push! (mut ~(sym o)) (get ~(sym src) ~(sym j)))))]
+    (locals-reset! (mut k) mark)
+    ;; `out` starts as the old list only to have a value: nothing is pushed before a change
+    ;; replaces it with a new one.
+    (te `(let [~(sym w) ~base
+               ~(sym src) (.kids ~(sym w))
+               (mut ~(sym o)) ~(sym src)
+               (mut ~(sym changed)) false]
+           (for ~(sym i) (range 0 (len ~(sym src)))
+             (let [~(sym v) (get ~(sym src) ~(sym i))]
+               (if ~keep
+                   (let [~(sym r) ~(.code value)]
+                     (when (and (not ~(sym changed)) (not (~same ~(sym r) ~(sym v)))) ~start)
+                     (when ~(sym changed) (push! (mut ~(sym o)) ~(sym r))))
+                   (unless ~(sym changed) ~start))))
+           (if ~(sym changed)
+               (let [(mut ~(sym w)) ~(sym w)] (set! (.kids ~(sym w)) ~(sym o)) ~(sym w))
+               ~(sym w)))
+        ty)))
 
 (defn first-elem-type [(k (mut Comp)) (a g/Node)] (-> TE) (expr (mut k) a ""))
 
