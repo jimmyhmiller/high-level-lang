@@ -12,30 +12,12 @@ record Options {
 
 record Resolved { path: Text, side-effects: Bool }
 
-# Answers derived from the filesystem's, so each is worked out once per worker: they are caches,
-# and a new build's generation empties them. What the filesystem itself says is a memo, below,
-# asked once for all workers.
-task state files: {Text:Bool} = {}
-task state resolved: {Text:Text} = {}
-task state effects: {Text:[Text]} = {}
-task state type-module: {Text:Bool} = {}
-task state seen-generation: Int = -1
-state generation: Int = 0
+# How the build looks names up. Every answer below is a memo, worked out once for all workers, and
+# a new build, which may look names up differently, starts them over.
+state options: Options = Options(main-fields: [], conditions: [], extensions: [], external: [], node-builtins: false)
 
-fn fresh-caches!() -> Void {
-  if seen-generation != generation {
-    files = {}
-    resolved = {}
-    effects = {}
-    type-module = {}
-    seen-generation = generation
-  }
-}
-
-# A new build: every worker's caches start over the next time it asks, and the memos now. The
-# number comes from a counter no reset of this module's state can rewind.
-fn new-generation!() -> Void {
-  generation = next-pass!()
+fn new-build!(o: Options) -> Void {
+  options = o
   forget-memos!()
 }
 
@@ -54,14 +36,10 @@ memo fn listing-of(dir: Text) -> {Text:Int} {
   out
 }
 
-fn file?(path: Text) -> Bool {
-  fresh-caches!()
-  if let some(known) = files[path] { return known }
+memo fn file?(path: Text) -> Bool {
   let kind = listing-of(dir-of(path))[path-base(path)] ?? 0
   # A link is the one case the listing cannot answer.
-  let there = if kind == 'l' then readable-file?(path) else kind == 'f'
-  files[path] = there
-  there
+  if kind == 'l' then readable-file?(path) else kind == 'f'
 }
 
 memo fn doc-of(path: Text) -> pkg.Node = pkg.parse(read-file(path), path)
@@ -77,34 +55,34 @@ fn text-member(object: pkg.Node, key: Text) -> Text? = match member(object, key)
 }
 
 # A package `exports` value: a path, or conditions tried in the file's order.
-fn exports-target(v: pkg.Node, o: Options) -> Text? = match v {
+fn exports-target(v: pkg.Node) -> Text? = match v {
   pkg.Str(raw) => some(unquote(raw))
-  pkg.Object(List(ms...)) => first m in ms: condition-target(m, o)
+  pkg.Object(List(ms...)) => first m in ms: condition-target(m)
   _ => none
 }
 
-fn condition-target(m: pkg.Node, o: Options) -> Text? {
+fn condition-target(m: pkg.Node) -> Text? {
   let key = unquote(m.key.text)
-  if key == "default" or key in o.conditions then exports-target(m.value, o) else none
+  if key == "default" or key in options.conditions then exports-target(m.value) else none
 }
 
-fn package-exports(doc: pkg.Node, subpath: Text, o: Options) -> Text? = match member(doc, "exports") {
+fn package-exports(doc: pkg.Node, subpath: Text) -> Text? = match member(doc, "exports") {
   none => none
   some(e) => match e {
     pkg.Object(List(first-member, ...)) =>
       if unquote(first-member.key.text)[0] == '.' {
         match member(e, subpath) {
-          some(v) => exports-target(v, o)
+          some(v) => exports-target(v)
           none => none
         }
-      } else if subpath == "." then exports-target(e, o) else none
-    _ => if subpath == "." then exports-target(e, o) else none
+      } else if subpath == "." then exports-target(e) else none
+    _ => if subpath == "." then exports-target(e) else none
   }
 }
 
-fn try-file(base: Text, o: Options) -> Text? {
+fn try-file(base: Text) -> Text? {
   if file?(base) { return some(base) }
-  let found = first ext in o.extensions: if file?(base ++ ext) then some(base ++ ext) else none
+  let found = first ext in options.extensions: if file?(base ++ ext) then some(base ++ ext) else none
   found ?? typescript-instead(base)
 }
 
@@ -123,20 +101,20 @@ fn same-stem(base: Text, cut: Int, exts: [Text]) -> Text? {
 }
 
 # A directory: its package.json entry, then its index.
-fn try-dir(dir: Text, o: Options) -> Text? {
+fn try-dir(dir: Text) -> Text? {
   let pj = dir ++ "/package.json"
   let from-main: Text? =
     if file?(pj) {
       let doc = doc-of(pj)
-      first field-name in o.main-fields: match text-member(doc, field-name) {
-        some(target) => try-path(path-normalize(dir ++ "/" ++ target), o)
+      first field-name in options.main-fields: match text-member(doc, field-name) {
+        some(target) => try-path(path-normalize(dir ++ "/" ++ target))
         none => none
       }
     } else { none }
-  from-main ?? try-file(dir ++ "/index", o)
+  from-main ?? try-file(dir ++ "/index")
 }
 
-fn try-path(base: Text, o: Options) -> Text? = try-file(base, o) ?? try-dir(base, o)
+fn try-path(base: Text) -> Text? = try-file(base) ?? try-dir(base)
 
 fn top-of-tree?(dir: Text) -> Bool = dir == "." or len(dir) == 0 or dir == "/"
 
@@ -153,49 +131,27 @@ fn package-json-for(start: Text) -> Text? {
 }
 
 # Is the package.json governing a file `"type": "module"`?
-fn package-type-module?(path: Text) -> Bool {
-  fresh-caches!()
-  let dir = dir-of(path)
-  if let some(known) = type-module[dir] { return known }
-  let answer = match package-json-for(dir) {
-    none => false
-    some(pj) => match text-member(doc-of(pj), "type") {
-      some(t) => t == "module"
-      none => false
-    }
-  }
-  type-module[dir] = answer
-  answer
+fn package-type-module?(path: Text) -> Bool = type-module-dir?(dir-of(path))
+
+memo fn type-module-dir?(dir: Text) -> Bool = match package-json-for(dir) {
+  none => false
+  some(pj) => (text-member(doc-of(pj), "type") ?? "") == "module"
 }
 
 # `"sideEffects"` in the package.json governing a file: `false`, or the files that have them. No
 # list at all is every file, written as the empty pattern.
-fn effect-patterns(dir: Text) -> [Text] {
-  fresh-caches!()
-  if let some(known) = effects[dir] { return known }
-  let answer: [Text] = match package-json-for(dir) {
-    none => [""]
-    some(pj) => match member(doc-of(pj), "sideEffects") {
-      some(pkg.False()) => []
-      some(pkg.Array(List(items...))) => {
-        let root = dir-of(pj)
-        var out: [Text] = []
-        for item in items {
-          if item is pkg.Str(_) {
-            # A pattern with no slash may be anywhere in the package.
-            let pattern = unquote(item.text)
-            let anywhere = all c in pattern: c != '/'
-            out += path-normalize(root ++ (if anywhere then "/**/" else "/") ++ pattern)
-          }
-        }
-        out
-      }
-      _ => [""]
-    }
+memo fn effect-patterns(dir: Text) -> [Text] = match package-json-for(dir) {
+  none => [""]
+  some(pj) => match member(doc-of(pj), "sideEffects") {
+    some(pkg.False()) => []
+    some(pkg.Array(List(items...))) => [package-pattern(dir-of(pj), unquote(item.text)) for item in items if item is pkg.Str(_)]
+    _ => [""]
   }
-  effects[dir] = answer
-  answer
 }
+
+# A pattern with no slash may be anywhere in the package.
+fn package-pattern(root: Text, pattern: Text) -> Text =
+  path-normalize(root ++ (if has-byte?(pattern, '/') then "/" else "/**/") ++ pattern)
 
 fn side-effects-of(path: Text) -> Bool =
   any p in effect-patterns(dir-of(path)): len(p) == 0 or glob-match?(p, 0, path, 0)
@@ -246,7 +202,7 @@ fn split-package(spec: Text) -> Int {
   out
 }
 
-fn resolve-bare(spec: Text, from-dir: Text, o: Options) -> Text? {
+fn resolve-bare(spec: Text, from-dir: Text) -> Text? {
   let cut = split-package(spec)
   let name = spec[0..cut]
   let sub = if cut < len(spec) then "." ++ spec[cut..len(spec)] else "."
@@ -255,10 +211,10 @@ fn resolve-bare(spec: Text, from-dir: Text, o: Options) -> Text? {
     let pdir = if dir == "." then "node_modules/" ++ name else dir ++ "/node_modules/" ++ name
     let pj = pdir ++ "/package.json"
     if file?(pj) {
-      match package-exports(doc-of(pj), sub, o) {
+      match package-exports(doc-of(pj), sub) {
         some(target) => return some(path-normalize(pdir ++ "/" ++ target))
         none => {
-          let found = if sub == "." then try-dir(pdir, o) else try-path(path-normalize(pdir ++ "/" ++ sub), o)
+          let found = if sub == "." then try-dir(pdir) else try-path(path-normalize(pdir ++ "/" ++ sub))
           if let some(p) = found { return some(p) }
         }
       }
@@ -278,48 +234,25 @@ const node-builtin-names: [Text] = ["assert", "async_hooks", "buffer", "child_pr
 fn node-builtin?(spec: Text) -> Bool = starts-with(spec, "node:") or spec in node-builtin-names
 
 # Is this import left for the runtime to resolve?
-fn external?(spec: Text, o: Options) -> Bool =
-  (o.node-builtins and node-builtin?(spec)) or spec in o.external
+fn external?(spec: Text) -> Bool =
+  (options.node-builtins and node-builtin?(spec)) or spec in options.external
 
 fn relative?(spec: Text) -> Bool =
   starts-with(spec, "./") or starts-with(spec, "../") or spec == "." or spec == ".." or starts-with(spec, "/")
 
-fn target-of(spec: Text, from-dir: Text, o: Options) -> Text? =
-  if relative?(spec) then try-path(path-normalize(if starts-with(spec, "/") then spec else from-dir ++ "/" ++ spec), o)
-  else resolve-bare(spec, from-dir, o)
+fn target-of(spec: Text, from-dir: Text) -> Text? =
+  if relative?(spec) then try-path(path-normalize(if starts-with(spec, "/") then spec else from-dir ++ "/" ++ spec))
+  else resolve-bare(spec, from-dir)
 
-fn resolve-uncached(spec: Text, importer: Text, from-dir: Text, o: Options) -> Text =
-  target-of(spec, from-dir, o) ?? panic "{}: could not resolve {}", importer, spec
+memo fn resolution(from-dir: Text, spec: Text) -> Text? = target-of(spec, from-dir)
 
 # The same, or nothing: for looking ahead at imports that may never be needed.
-fn resolve-opt(spec: Text, importer: Text, o: Options) -> Resolved? {
-  fresh-caches!()
-  let from-dir = dir-of(importer)
-  let key = from-dir ++ "\n" ++ spec
-  let found: Text? = match resolved[key] {
-    some(p) => some(p)
-    none => target-of(spec, from-dir, o)
-  }
-  match found {
-    some(p) => {
-      resolved[key] = p
-      some(Resolved(path: p, side-effects: side-effects-of(p)))
-    }
-    none => none
-  }
+fn resolve-opt(spec: Text, importer: Text) -> Resolved? = match resolution(dir-of(importer), spec) {
+  some(p) => some(Resolved(path: p, side-effects: side-effects-of(p)))
+  none => none
 }
 
-fn resolve(spec: Text, importer: Text, o: Options) -> Resolved {
-  fresh-caches!()
-  let from-dir = dir-of(importer)
-  let key = from-dir ++ "\n" ++ spec
-  let path = match resolved[key] {
-    some(p) => p
-    none => {
-      let p = resolve-uncached(spec, importer, from-dir, o)
-      resolved[key] = p
-      p
-    }
-  }
+fn resolve(spec: Text, importer: Text) -> Resolved {
+  let path = resolution(dir-of(importer), spec) ?? panic "{}: could not resolve {}", importer, spec
   Resolved(path: path, side-effects: side-effects-of(path))
 }

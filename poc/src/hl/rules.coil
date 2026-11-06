@@ -3633,21 +3633,40 @@
   (let [f (match (find-func (self-mod (mut k)) (.text (kid d 0)))
             (Some [x] x)
             (None [] (die (mut k) d "this function was not collected")))]
-    (unless (= (len (.params f)) 1)
-      (die (mut k) d "a memo function takes one argument, for now"))
-    (let [p (get (.params f) 0)]
+    (when (= (len (.params f)) 0)
+      (die (mut k) d "a memo function takes what it remembers by: at least one argument"))
+    (for p (.params f)
       (when (.by-ref p) (die (mut k) d "a memo function's argument cannot be mut"))
       (unless (or (= (.ty p) "Text") (= (.ty p) "Int"))
-        (die (mut k) d "a memo function's argument is Text or Int, for now")))
+        (die (mut k) d "a memo function's arguments are Text or Int, for now")))
     (when (= (.ret f) "Void") (die (mut k) d "a memo function must answer something"))
     f))
 
+;;; What a memo is looked up by: its one argument, or its arguments' text joined.
+(defn memo-key-type [(f Func)] (-> (slice u8))
+  (if (= (len (.params f)) 1) (.ty (get (.params f) 0)) "Text"))
+
+;;; The memo's own name for its argument `i`.
+(defn memo-arg [(i i64)] (-> Code) (sym (cat "memo-arg-" (rt/num-text i))))
+
+(defn memo-key-code [(f Func)] (-> Code)
+  (if (= (len (.params f)) 1)
+      (memo-arg 0)
+      (let [(mut pushes) (primitive/code-list-new)]
+        (for i (range 0 (len (.params f)))
+          (push! (mut pushes)
+                 `(push! (mut memo-parts)
+                         ~(if (= (.ty (get (.params f) i)) "Int") `(rt/num-text ~(memo-arg i)) (memo-arg i)))))
+        `(let [(mut memo-parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
+           ~@pushes
+           (rt/memo-key-of memo-parts)))))
+
 (defn memo-map-type [(f Func)] (-> (slice u8))
-  (cat4 "{" (.ty (get (.params f) 0)) ":" (cat (.ret f) "}")))
+  (cat4 "{" (memo-key-type f) ":" (cat (.ret f) "}")))
 
 ;;; Who is computing an answer: the worker's slot plus one.
 (defn memo-busy-type [(f Func)] (-> (slice u8))
-  (cat3 "{" (.ty (get (.params f) 0)) ":Int}"))
+  (cat3 "{" (memo-key-type f) ":Int}"))
 
 (defn memo-near [(name (slice u8))] (-> (slice u8)) (cat "memo-near--" name))
 (defn memo-near-gen [(name (slice u8))] (-> (slice u8)) (cat "memo-near-gen--" name))
@@ -3677,9 +3696,12 @@
         compute (cat "memo-compute--" name)
         near (primitive/code-symbol "." (memo-near name))
         near-gen (primitive/code-symbol "." (memo-near-gen name))
-        p (get (.params f) 0)
-        kt (coil-type (mut k) (.ty p))
+        (mut params) (primitive/code-list-new)
+        (mut args) (primitive/code-list-new)
         rt (coil-type (mut k) (.ret f))]
+    (for i (range 0 (len (.params f)))
+      (push! (mut params) `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
+      (push! (mut args) (memo-arg i)))
     (emit! (mut out) (compile-fn-as (mut k) d compute))
     ;; The lock word comes first, so the store's address is the word's.
     (emit! (mut out) `(defstruct ~store [(lock i64) (ready bool) (gen i64) (table ~(coil-type (mut k) mt))
@@ -3697,8 +3719,9 @@
                   (rt/init-unlock!))
                 s)))
     (emit! (mut out)
-           `(defn ~(sym name) [(key ~kt)] (-> ~rt)
-              (let [t (rules-task)
+           `(defn ~(sym name) [~@params] (-> ~rt)
+              (let [key ~(memo-key-code f)
+                    t (rules-task)
                     s (~store-fn)
                     word (cast (ptr i64) s)]
                 (when (!= (~near-gen t) (.gen s))
@@ -3724,7 +3747,7 @@
                                 :else
                                   (do (set! (mut (.busy s)) key me)
                                       (rt/spin-unlock! word)
-                                      (let [made (~(sym compute) key)]
+                                      (let [made (~(sym compute) ~@args)]
                                         (rt/spin-lock! word)
                                         (set! (mut (.table s)) key made)
                                         (set! (mut (.busy s)) key 0)
