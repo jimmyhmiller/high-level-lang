@@ -14,29 +14,24 @@ state count-threads: Int = 1
 # tag names it.
 record Use { symbol: Int, tag: Bool }
 
-fn bound-target(mo: m.Module, at: Int) -> [Int] = match mo.bindings[at] {
-  some(s) => [e.target-of(s)]
-  none => []
-}
-
 everywhere fn uses-in(n: Node, mo: m.Module) -> [Use] = match n {
-  Ident(_) | BindName(_) => [Use(symbol: s, tag: false) for s in bound-target(mo, n.lo)]
+  Ident(_) | BindName(_) => [Use(symbol: e.target-of(s), tag: false) if let some(s) = mo.bindings[n.lo]]
   JsxElement(Ident(_), ...) =>
-    [Use(symbol: s, tag: true) for s in bound-target(mo, n.tag.lo)] ++ [uses-in(k, mo)... for k in n.kids]
+    [Use(symbol: e.target-of(s), tag: true) if let some(s) = mo.bindings[n.tag.lo]] ++ [uses-in(k, mo)... for k in n.kids]
 }
 
-# What one unit of live code uses: how often each symbol, which name kept JSX tags, how often each
-# byte, and the top-level symbols its parts declare, in order. Units are counted at once; the sums
-# do not depend on the order they are added in.
-record Usage { uses: {Int:Int}, tags: [Int], freq: [Int], toplevel: [Int] }
+# What one unit of live code uses: each symbol once for each use, which name kept JSX tags, how
+# often each byte, and the top-level symbols its parts declare, in order. Units are counted at once;
+# the sums do not depend on the order they are added in.
+record Usage { used: [Int], tags: [Int], freq: [Int], toplevel: [Int] }
 
 fn unit-usage(i: Int) -> Usage {
   let u = e.units[i]
-  if not e.included?(u.module) { return Usage(uses: {}, tags: [], freq: [], toplevel: []) }
+  if not e.included?(u.module) { return Usage(used: [], tags: [], freq: [], toplevel: []) }
   let mo = m.modules[u.module]
   let live = [p for p in e.parts-of(u.module)[u.from..u.to] if e.live?(p)]
   let found = [x for p in live for x in uses-in(an.part-stmt[p], mo)]
-  Usage(uses: tally([x.symbol for x in found if not x.tag]),
+  Usage(used: [x.symbol for x in found if not x.tag],
         tags: [x.symbol for x in found if x.tag],
         freq: if u.from == 0 then byte-counts(mo.text) else [],
         toplevel: [s for p in live for m.db.declares(p, ?s) if not e.import-symbol?(s)])
@@ -103,7 +98,7 @@ fn assign-minified() -> Void {
   # Live code: uses, character frequency, and the top-level symbols in order.
   e.units = e.units-of-order()
   let usages = parallel-map([i for i in 0..len(e.units)], unit-usage, count-threads)
-  let uses = tally([s for u in usages for s in keys(u.uses)], [u.uses[s] ?? 0 for u in usages for s in keys(u.uses)])
+  let uses = histogram(sym.symbol-count(m.table), [s for u in usages for s in u.used])
   let tagged = {s: true for u in usages for s in u.tags}
   let freq = [sum u in usages: if len(u.freq) > 0 then u.freq[c] else 0 for c in 0..256]
   # Nested slots first, so top-level symbols never collide with them.
@@ -111,13 +106,14 @@ fn assign-minified() -> Void {
   let first-top = fold top = 0 for x in nested: max(top, x.at + 1)
   let toplevel = [s for u in usages for s in u.toplevel]
   let slotted = nested ++ [Slotted(symbol: toplevel[i], at: first-top + i) for i in 0..len(toplevel)]
-  let counts = tally([x.at for x in slotted], [uses[x.symbol] ?? 0 for x in slotted])
+  let slots = first-top + len(toplevel)
+  let counts = histogram(slots, [x.at for x in slotted], [uses[x.symbol] for x in slotted])
   let capital = {x.at: true for x in slotted if x.symbol in tagged}
   let head = sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$", freq)
   let tail = sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$0123456789", freq)
   let capitals = sorted-chars("ABCDEFGHIJKLMNOPQRSTUVWXYZ", freq)
   # Slot numbers, by descending use; ties keep slot order.
-  let order = sort i in [i for i in 0..first-top + len(toplevel)] by counts[i] ?? 0 desc
+  let order = sort i in [i for i in 0..slots] by counts[i] desc
   let names = slot-names(order, capital, head, tail, capitals)
   # Every slotted symbol named, the last slot it took deciding; a dynamic scope's keep theirs.
   for x in slotted { sym.set-final!(m.table, x.symbol, names[x.at] ?? panic "a slot with no name") }

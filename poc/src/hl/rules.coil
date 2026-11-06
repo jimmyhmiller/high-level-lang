@@ -326,7 +326,7 @@
 
 (defn parse-file [(k (mut Comp)) (src (slice u8)) (path (slice u8))] (-> g/Node)
   (match (g/parse-result src path 0)
-    (Ok [t] (with-everywhere src path t))
+    (Ok [t] (with-accumulators (with-everywhere src path t)))
     (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
 
 ;; ---------------------------------------------------------------- everywhere functions
@@ -478,6 +478,104 @@
       (push! (mut wrap-kids) (g/mk (g/KBlock) (one (list-node stmts body)) (.lo body) (.hi body)))
       (push! (mut out) (g/mk (g/KFn) wrap-kids (.lo d) (.hi d)))
       out)))
+
+;;; A function that gives a list partly made of what it gives itself, `fn f(…) -> [T]` calling `f`, is
+;;; two functions, as a list-giving everywhere function is: `f-into!`, adding its answer to a list it
+;;; is handed, which its own calls add to as well, and `f`, handing it an empty one. A recursion
+;;; then makes one list, not one per call copied into the next. Only one with no `return` and an
+;;; answer at its end.
+(defn with-accumulators [(tree g/Node)] (-> g/Node)
+  (let [decls (kid tree 2)
+        (mut out) (g/new-kids)
+        (mut any) false]
+    (for d (.kids decls)
+      (if (accumulates? d)
+          (do (set! any true)
+              (for f (accumulator-fns d) (push! (mut out) f)))
+          (push! (mut out) d)))
+    (if (not any)
+        tree
+        (let [(mut t) tree
+              (mut kids) (g/new-kids)]
+          (push! (mut kids) (kid tree 0))
+          (push! (mut kids) (kid tree 1))
+          (push! (mut kids) (g/mk (g/KList) out (.lo decls) (.hi decls)))
+          (set! (.kids t) kids)
+          t))))
+
+(defn calls-named? [(n g/Node) (name (slice u8))] (-> bool)
+  (or (and (= (.kind n) (g/KCall)) (= (.kind (kid n 0)) (g/KName)) (= (.text (kid n 0)) name))
+      (let [(mut hit) false]
+        (for c (.kids n) (when (and (not hit) (calls-named? c name)) (set! hit true)))
+        hit)))
+
+(defn has-kind? [(n g/Node) (kind g/Kind)] (-> bool)
+  (or (= (.kind n) kind)
+      (let [(mut hit) false]
+        (for c (.kids n) (when (and (not hit) (has-kind? c kind)) (set! hit true)))
+        hit)))
+
+;;; What a function answers with: its body, or its block's last statement when that is an expression.
+(defn answer-of [(body g/Node)] (-> (Option g/Node))
+  (if (= (.kind body) (g/KBlock))
+      (let [stmts (.kids (kid body 0))]
+        (if (= (len stmts) 0)
+            (None [g/Node])
+            (let [last (get stmts (- (len stmts) 1))
+                  kd (.kind last)]
+              (if (or (= kd (g/KLet)) (= kd (g/KVar)) (= kd (g/KFor)) (= kd (g/KWhile)) (= kd (g/KAssign))
+                      (= kd (g/KAppend)) (= kd (g/KExtend)) (= kd (g/KWithCtx)) (= kd (g/KPrint)) (= kd (g/KAssert)))
+                  (None [g/Node])
+                  (Some last)))))
+      (Some body)))
+
+(defn accumulates? [(d g/Node)] (-> bool)
+  (and (= (.kind d) (g/KFn))
+       (= (.kind (kid d 2)) (g/KTList))
+       (> (len (.kids (kid d 1))) 0)
+       (calls-named? (kid d 3) (.text (kid d 0)))
+       (not (has-kind? (kid d 3) (g/KReturn)))
+       (match (answer-of (kid d 3)) (Some [_] true) (None [] false))))
+
+(defn accumulator-fns [(d g/Node)] (-> (ArrayList g/Node))
+  (let [fname (kid d 0)
+        params (.kids (kid d 1))
+        ret (kid d 2)
+        body (kid d 3)
+        into (cat (.text fname) "-into!")
+        acc "accumulated"
+        acc-type (g/mk (g/KTMut) (one ret) (.lo ret) (.hi ret))
+        (mut into-params) (g/new-kids)
+        (mut wrap-args) (g/new-kids)
+        (mut stmts) (g/new-kids)
+        (mut wrap-stmts) (g/new-kids)
+        (mut into-kids) (g/new-kids)
+        (mut wrap-kids) (g/new-kids)
+        (mut out) (g/new-kids)
+        answer (match (answer-of body) (Some [a] a) (None [] (panic "accumulator-fns of a function with no answer")))]
+    (for p params (push! (mut into-params) p))
+    (push! (mut into-params) (g/node2 (g/KParam) (name-node acc body) acc-type))
+    (for p params (push! (mut wrap-args) (name-node (.text (kid p 0)) body)))
+    (push! (mut wrap-args) (name-node acc body))
+    (when (= (.kind body) (g/KBlock))
+      (let [all (.kids (kid body 0))]
+        (for i (range 0 (- (len all) 1)) (push! (mut stmts) (get all i)))))
+    (push! (mut stmts) (g/node2 (g/KExtend) (name-node acc answer) answer))
+    (push! (mut into-kids) (name-node into fname))
+    (push! (mut into-kids) (list-node into-params (kid d 1)))
+    (push! (mut into-kids) (g/none-node))
+    (push! (mut into-kids) (g/mk (g/KBlock) (one (list-node stmts body)) (.lo body) (.hi body)))
+    (push! (mut out) (g/mk (g/KFn) into-kids (.lo d) (.hi d)))
+    (push! (mut wrap-stmts) (g/mk (g/KVar) (three (name-node acc body) ret (g/mk (g/KListLit) (one (list-node (g/new-kids) body)) (.lo body) (.lo body)))
+                                  (.lo body) (.hi body)))
+    (push! (mut wrap-stmts) (g/node2 (g/KCall) (name-node into body) (list-node wrap-args body)))
+    (push! (mut wrap-stmts) (name-node acc body))
+    (push! (mut wrap-kids) fname)
+    (push! (mut wrap-kids) (kid d 1))
+    (push! (mut wrap-kids) ret)
+    (push! (mut wrap-kids) (g/mk (g/KBlock) (one (list-node wrap-stmts body)) (.lo body) (.hi body)))
+    (push! (mut out) (g/mk (g/KFn) wrap-kids (.lo d) (.hi d)))
+    out))
 
 ;;; `"bundle.js" = "src/bundle/js.syntax"` lines under [modules].
 (defn read-manifest! [(k (mut Comp)) (manifest (slice u8))] (-> void)
@@ -1605,6 +1703,59 @@
                     "Int")))
 ;; `tally(keys)`: how many times each key is in the list. `tally(keys, weights)`: the sum of the
       ;; weights at each key's places.
+;; `histogram(n, keys)`: for keys from 0 below `n`, how many times each is in the list, as a list
+      ;; of `n`; `histogram(n, keys, weights)` adds up the weights instead. Over a comprehension of
+      ;; keys, each is counted as it is made.
+      (and (= name "histogram") (or (= count 2) (= count 3)))
+        (let [size (expect (mut k) (get args 0) (expr (mut k) (get args 0) "Int") "Int")
+              o (fresh (mut k) "bins")
+              n-v (fresh (mut k) "n")
+              key-v (fresh (mut k) "key")]
+          (if (and (= count 2) (= (.kind (get args 1)) (g/KComp)))
+              (let [comp (get args 1)
+                    mark (locals-mark (mut k))
+                    (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))
+                    _ (for c (list-kids (kid comp 1)) (push! (mut opened) (clause-open! (mut k) c)))
+                    key (expect (mut k) (kid comp 0) (expr (mut k) (kid comp 0) "Int") "Int")
+                    body (clauses-code (mut k) (list-kids (kid comp 1)) opened
+                                       `(let [~(sym key-v) ~(.code key)] ~(histogram-add o key-v n-v `1)))]
+                (locals-reset! (mut k) mark)
+                (Some (te `(let [~(sym n-v) ~(.code size) (mut ~(sym o)) ~(zeros-code (mut k) n-v)] ~body ~(sym o)) "[Int]")))
+              (let [ks (expect (mut k) (get args 1) (expr (mut k) (get args 1) "[Int]") "[Int]")
+                    ws (if (= count 3) (.code (expect (mut k) (get args 2) (expr (mut k) (get args 2) "[Int]") "[Int]")) `0)
+                    kv (fresh (mut k) "keys")
+                    wv (fresh (mut k) "weights")
+                    i (fresh (mut k) "i")]
+                (Some (te `(let [~(sym n-v) ~(.code size)
+                                 ~(sym kv) ~(.code ks)
+                                 ~(sym wv) ~ws
+                                 (mut ~(sym o)) ~(zeros-code (mut k) n-v)]
+                             ~(if (= count 3)
+                                  `(unless (= (len ~(sym kv)) (len ~(sym wv))) (panic "histogram needs a weight for each key"))
+                                  `0)
+                             (for ~(sym i) (range 0 (len ~(sym kv)))
+                               (let [~(sym key-v) (get ~(sym kv) ~(sym i))]
+                                 ~(histogram-add o key-v n-v (if (= count 3) `(get ~(sym wv) ~(sym i)) `1))))
+                             ~(sym o))
+                          "[Int]")))))
+      ;; Over a comprehension, each key is counted as it is made: no list of them.
+      (and (= name "tally") (= count 1) (= (.kind (get args 0)) (g/KComp)))
+        (let [comp (get args 0)
+              mark (locals-mark (mut k))
+              (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))
+              _ (for c (list-kids (kid comp 1)) (push! (mut opened) (clause-open! (mut k) c)))
+              key (expr (mut k) (kid comp 0) "")
+              kt (.ty key)
+              _ (unless (or (= kt "Int") (= kt "Text")) (die (mut k) n (cat "tally's keys are Int or Text, not " kt)))
+              ty (cat3 "{" kt ":Int}")
+              o (fresh (mut k) "tally")
+              kv (fresh (mut k) "key")
+              body (clauses-code (mut k) (list-kids (kid comp 1)) opened
+                                 `(let [~(sym kv) ~(.code key)]
+                                    (set! (mut ~(sym o)) ~(sym kv)
+                                          (+ (match (get ~(sym o) ~(sym kv)) (Some [v] v) (None [] 0)) 1))))]
+          (locals-reset! (mut k) mark)
+          (Some (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~body ~(sym o)) ty)))
       (and (= name "tally") (or (= count 1) (= count 2)))
         (let [ks (expr (mut k) (get args 0) "")
               _ (unless (list? (.ty ks)) (die (mut k) n "tally counts the keys of a list"))
@@ -2194,15 +2345,21 @@
         value (kid n 0)
         (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
     (for c (list-kids (kid n 1)) (push! (mut opened) (clause-open! (mut k) c)))
-    (let [v (expr (mut k) value (if spread want (if (list? want) (elem-of want) "")))
+    (let [twin (if spread (into-twin (mut k) value) (None [Func]))
+          v (match twin
+              (Some [f] (te `0 (.ty (get (.params f) (len (list-kids (kid value 1)))))))
+              (None [] (expr (mut k) value (if spread want (if (list? want) (elem-of want) "")))))
           _ (when (and spread (not (list? (.ty v))))
               (die (mut k) value (cat "only a list can be spread, not " (.ty v))))
           elem (if spread (elem-of (.ty v)) (.ty v))
           o (fresh (mut k) "out")
           each (fresh (mut k) "each")
-          push-code (if spread
-                        `(for (ref ~(sym each)) ~(.code v) (push! (mut ~(sym o)) ~(sym each)))
-                        `(push! (mut ~(sym o)) ~(.code v)))
+          push-code (match twin
+                      (Some [_] (spread-into (mut k) value (sym o) (.ty v)))
+                      (None []
+                        (if spread
+                            `(for (ref ~(sym each)) ~(.code v) (push! (mut ~(sym o)) ~(sym each)))
+                            `(push! (mut ~(sym o)) ~(.code v)))))
           body (clauses-code (mut k) (list-kids (kid n 1)) opened push-code)]
       (locals-reset! (mut k) mark)
       (te `(let [(mut ~(sym o)) ~(new-list (mut k) elem)] ~body ~(sym o))
@@ -2245,6 +2402,17 @@
              ~body
              (finish! (mut ~(sym b))))
           "Text"))))
+
+(defn zeros-code [(k (mut Comp)) (n-v (slice u8))] (-> Code)
+  `(let [(mut z) ~(new-list (mut k) "Int")]
+     (reserve! (mut z) ~(sym n-v))
+     (for _ (range 0 ~(sym n-v)) (push! (mut z) 0))
+     z))
+
+(defn histogram-add [(o (slice u8)) (key-v (slice u8)) (n-v (slice u8)) (w Code)] (-> Code)
+  `(do (when (or (< ~(sym key-v) 0) (>= ~(sym key-v) ~(sym n-v)))
+         (panic "histogram key {} is outside 0 to {}" ~(sym key-v) ~(sym n-v)))
+       (set! (mut ~(sym o)) ~(sym key-v) (+ (get ~(sym o) ~(sym key-v)) ~w))))
 
 ;;; `fold acc = init for …: e`: `acc` starts as `init`, and each time round becomes `e`. With
 ;;; `scan`, the list of what it became each time.
@@ -2757,10 +2925,96 @@
             t (.ty p)]
         (check-assignable! (mut k) (kid s 0))
         (unless (list? t) (die (mut k) s (cat "++= extends a list, not " t)))
-        (let [v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) t) t)
-              e (fresh (mut k) "e")]
-          (te `(for (ref ~(sym e)) ~(.code v) (push! (mut ~(.code p)) ~(sym e))) "Void"))))
+        (te (extend-code (mut k) (kid s 1) (.code p) t) "Void")))
     (_ (expr (mut k) s want))))
+
+;;; `xs ++= e`: a list literal's items, or a comprehension's, go straight into `xs`, with no list
+;;; made for them on the way.
+(defn extend-code [(k (mut Comp)) (e g/Node) (target Code) (t (slice u8))] (-> Code)
+  (let [elem (elem-of t)]
+    (match (.kind e)
+      (g/KListLit []
+        (let [(mut pushes) (primitive/code-list-new)]
+          (for a (list-kids (kid e 0))
+            (if (spread-arg? a)
+                (push! (mut pushes)
+                       (if (= (.kind a) (g/KSpread))
+                           (spread-into (mut k) (kid a 0) target t)
+                           (let [each (fresh (mut k) "each")]
+                             `(for (ref ~(sym each)) ~(spread-list (mut k) a t) (push! (mut ~target) ~(sym each))))))
+                (let [x (expect (mut k) a (expr (mut k) a elem) elem)]
+                  (push! (mut pushes) `(push! (mut ~target) ~(.code x))))))
+          `(do ~@pushes 0)))
+      ;; `a ++ b` of lists: each in turn.
+      (g/KConcat []
+        `(do ~(extend-code (mut k) (kid e 0) target t) ~(extend-code (mut k) (kid e 1) target t) 0))
+      (g/KCompSpread []
+        (let [mark (locals-mark (mut k))
+              (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+          (for c (list-kids (kid e 1)) (push! (mut opened) (clause-open! (mut k) c)))
+          (let [body (clauses-code (mut k) (list-kids (kid e 1)) opened (spread-into (mut k) (kid e 0) target t))]
+            (locals-reset! (mut k) mark)
+            `(do ~body 0))))
+      ;; `if c then a else b`: whichever it is goes in.
+      (g/KIf []
+        (if (or (none? (kid e 2)) (= (.kind (kid e 1)) (g/KBlock)) (= (.kind (kid e 2)) (g/KBlock)))
+            (extend-whole (mut k) e target t)
+            (let [c (expect (mut k) (kid e 0) (expr (mut k) (kid e 0) "Bool") "Bool")]
+              `(if ~(.code c) (do ~(extend-code (mut k) (kid e 1) target t) 0) (do ~(extend-code (mut k) (kid e 2) target t) 0)))))
+      (g/KComp []
+        (let [mark (locals-mark (mut k))
+              (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+          (for c (list-kids (kid e 1)) (push! (mut opened) (clause-open! (mut k) c)))
+          (let [v (expect (mut k) (kid e 0) (expr (mut k) (kid e 0) elem) elem)
+                body (clauses-code (mut k) (list-kids (kid e 1)) opened `(push! (mut ~target) ~(.code v)))]
+            (locals-reset! (mut k) mark)
+            `(do ~body 0))))
+      (g/KCall [] (spread-into (mut k) e target t))
+      (_ (extend-whole (mut k) e target t)))))
+
+(defn extend-whole [(k (mut Comp)) (e g/Node) (target Code) (t (slice u8))] (-> Code)
+  (let [v (expect (mut k) e (expr (mut k) e t) t)
+        x (fresh (mut k) "e")]
+    `(for (ref ~(sym x)) ~(.code v) (push! (mut ~target) ~(sym x)))))
+
+;;; The function `g` of a call `g(…)`, when it has a twin `g-into!` that adds its answer to a list it
+;;; is handed: a list-giving `everywhere fn`, or a function that gives a list partly made of its own.
+(defn into-twin [(k (mut Comp)) (call g/Node)] (-> (Option Func))
+  (if (and (= (.kind call) (g/KCall)) (= (.kind (kid call 0)) (g/KName))
+           (match (find-local (mut k) (.text (kid call 0))) (Some [_] false) (None [] true)))
+      (match (find-func (self-mod (mut k)) (cat (.text (kid call 0)) "-into!"))
+        (Some [f]
+          (let [n (len (list-kids (kid call 1)))]
+            (if (and (= (len (.params f)) (+ n 1)) (.by-ref (get (.params f) n))
+                     (all-plain-args? (list-kids (kid call 1))))
+                (Some f)
+                (None [Func]))))
+        (None [] (None [Func])))
+      (None [Func])))
+
+(defn all-plain-args? [(args (ArrayList g/Node))] (-> bool)
+  (let [(mut ok) true]
+    (for a args (when (or (spread-arg? a) (= (.kind a) (g/KNamed))) (set! ok false)))
+    ok))
+
+;;; A list's items into `target`: by the twin of a call that has one, else one at a time.
+(defn spread-into [(k (mut Comp)) (e g/Node) (target Code) (t (slice u8))] (-> Code)
+  (match (into-twin (mut k) e)
+    (Some [f]
+      (let [args (list-kids (kid e 1))
+            (mut codes) (primitive/code-list-new)]
+        (unless (= (.ty (get (.params f) (len args))) t)
+          (die (mut k) e (cat4 "this adds to a " t ", but its function makes a " (.ty (get (.params f) (len args))))))
+        (for i (range 0 (len args))
+          (let [p (get (.params f) i)
+                a (get args i)]
+            (when (.by-ref p) (die (mut k) a "a twin's arguments are values"))
+            (push! (mut codes) (.code (expect (mut k) a (expr (mut k) a (.ty p)) (.ty p))))))
+        `(~(sym (qualified (mut k) (.self k) (.coil f))) ~@codes (mut ~target))))
+    (None []
+      (let [v (expect (mut k) e (expr (mut k) e t) t)
+            x (fresh (mut k) "each")]
+        `(for (ref ~(sym x)) ~(.code v) (push! (mut ~target) ~(sym x)))))))
 
 ;;; In an `on` block, `child.attr = value` for an inherited attribute, and `c = value` for a
 ;;; collected one. Anywhere else a collected attribute is only added to.
