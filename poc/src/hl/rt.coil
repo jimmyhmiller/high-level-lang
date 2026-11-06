@@ -297,7 +297,7 @@
       (push! (mut vals) (MemoHit :ok false :end 0 :node 0)))
     (MemoTable :keys keys :vals vals :count 0 :mask (- cap 1))))
 
-(defn memo-hash [(key i64)] (-> i64)
+(defn memo-hash :inline (Always) [(key i64)] (-> i64)
   (let [h (primitive/imul key -7046029254386353131)]
     (^ h (>> h 29))))
 
@@ -786,7 +786,7 @@
          :delta-from 0
          :delta-to 0)))
 
-(defn rel-at [(r (mut Rel)) (row i64) (col i64)] (-> i64)
+(defn rel-at :inline (Always) [(r (mut Rel)) (row i64) (col i64)] (-> i64)
   (get (.data r) (+ (* row (.arity r)) col)))
 
 ;;; FNV-style mixing, which wraps on purpose.
@@ -817,7 +817,7 @@
 (defn rel-has? [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
   (chain-has? (mut r) (int-get (mut (.heads r)) (row-hash a b c d)) a b c d))
 
-(defn dense-key? [(key i64)] (-> bool) (and (>= key 0) (< key 4194304)))
+(defn dense-key? :inline (Always) [(key i64)] (-> bool) (and (>= key 0) (< key 4194304)))
 
 (defn index-add! [(r (mut Rel)) (col i64) (row i64)] (-> void)
   (let [key (rel-at (mut r) row col)]
@@ -882,20 +882,24 @@
 ;;; The rows whose column equals `key`. Stable until the next flush.
 ;;; An index is made the first time a query needs it. Queries may run on many threads at once
 ;;; once nothing adds rows, so the first to need it makes it under a lock, and says so last.
-(defn rel-bucket [(r (mut Rel)) (col i64) (key i64)] (-> (ArrayList i64))
-  (let [flag (elem (mut (.indexed r)) col)]
-    (when (= (atomic/read flag) 0)
-      (init-lock!)
-      (when (= (atomic/read flag) 0)
-        (for row (range 0 (.count r)) (index-add! (mut r) col row))
-        (atomic/store flag 1))
-      (init-unlock!)))
+(defn rel-bucket :inline (Always) [(r (mut Rel)) (col i64) (key i64)] (-> (ArrayList i64))
+  (when (= (atomic/read (elem (mut (.indexed r)) col)) 0) (rel-index-column! (mut r) col))
   (if (dense-key? key)
       (let [d (get (.dense r) col)]
         (if (< key (len d)) (get d key) (no-rows)))
       (index-rows (elem (mut (.index r)) col) key)))
 
 ;;; The rows whose two columns equal these keys, and perhaps a few others. Stable until the next flush.
+;;; The index a query needs first, made under a lock by whichever thread needs it first.
+(defn rel-index-column! [(r (mut Rel)) (col i64)] (-> void)
+  (let [flag (elem (mut (.indexed r)) col)]
+    (init-lock!)
+    (when (= (atomic/read flag) 0)
+      (for row (range 0 (.count r)) (index-add! (mut r) col row))
+      (atomic/store flag 1))
+    (init-unlock!)
+    0))
+
 (defn rel-bucket2 [(r (mut Rel)) (c1 i64) (c2 i64) (k1 i64) (k2 i64)] (-> (ArrayList i64))
   (let [slot (+ (* c1 (.arity r)) c2)
         flag (elem (mut (.pair-indexed r)) slot)]
@@ -914,7 +918,7 @@
   (set! (.seen r) (.count r))
   (< (.delta-from r) (.delta-to r)))
 
-(defn rel-delta? [(r (mut Rel))] (-> bool) (< (.delta-from r) (.delta-to r)))
+(defn rel-delta? :inline (Always) [(r (mut Rel))] (-> bool) (< (.delta-from r) (.delta-to r)))
 
 ;;; Strings to the dense ids relations hold.
 (defstruct Names [(ids (HashMap (slice u8) i64)) (strs (ArrayList (slice u8)))])
@@ -1062,7 +1066,9 @@
 (defstruct Buf [(bytes (ArrayList u8))])
 (defn buf-new [] (-> Buf) (Buf :bytes (ArrayList::new [u8] (malloc-allocator))))
 (defn buf-add! [(b (mut Buf)) (s (slice u8))] (-> void)
-  (for c s (push! (mut (.bytes b)) c)))
+  (when (> (len s) 0)
+    (ArrayList::extend! (mut (.bytes b)) (data s) (len s)))
+  0)
 (defn buf-byte! [(b (mut Buf)) (c i64)] (-> void) (push! (mut (.bytes b)) (cast u8 c)))
 (defn buf-text [(b (mut Buf))] (-> (slice u8)) (slice (.bytes b)))
 (defn buf-len [(b (mut Buf))] (-> i64) (len (.bytes b)))
@@ -1263,6 +1269,35 @@
           (when (= (.left p) 0)
             (match (Condition::notify-all! (field p done)) (Ok [_] 0) (Err [_] (pool-fail "cannot notify")))))))
     arg))
+
+;;; Arrivals: of the `total` callers that arrive with one key, the last is told so, and goes on
+;;; with what needed all of them, while the others go do something else. Nobody waits.
+(defstruct Arrivals [(lock i64) (ready bool) (counts (HashMap (slice u8) i64))])
+
+(defn arrivals [] (-> (ptr Arrivals))
+  (let [a (primitive/alloc-static Arrivals)]
+    (unless (.ready a)
+      (init-lock!)
+      (unless (.ready a)
+        (set! (.counts a) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+        (set! (.ready a) true))
+      (init-unlock!))
+    a))
+
+(defn arrive! [(key (slice u8)) (total i64)] (-> bool)
+  (let [a (arrivals)
+        word (cast (ptr i64) a)]
+    (spin-lock! word)
+    (let [n (+ (match (get (.counts a) key) (Some [c] c) (None [] 0)) 1)]
+      (set! (mut (.counts a)) key n)
+      (spin-unlock! word)
+      (= n total))))
+
+;;; A new build: nobody has arrived anywhere. Only while no other thread runs.
+(defn arrivals-reset! [] (-> void)
+  (let [a (arrivals)]
+    (set! (.counts a) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+    0))
 
 ;;; A lock to wait under: whoever finds nothing to do sleeps on it until whoever adds work, or
 ;;; finishes the last of it, wakes them.

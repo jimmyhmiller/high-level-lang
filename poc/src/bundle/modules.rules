@@ -296,6 +296,17 @@ fn mentions-define?(src: Text) -> Bool = any d in defines: {
   contains-text?(src, d.key[0..end])
 }
 
+# Whether `substitute` would replace anything here: a free name, or a chain from one, that a define
+# names. A file can mention a define's name, in a comment or as a property, and use none.
+fn defines-apply?(n: Node, b: {Int:Int}) -> Bool {
+  if n is Ident(_) | Member(...) {
+    if let some(key) = dotted-name(n, b) {
+      if is-some(define-of(key)) { return true }
+    }
+  }
+  any k in n.kids: defines-apply?(k, b)
+}
+
 fn define-of(key: Text) -> Node? {
   var out: Node? = none
   for d in defines {
@@ -500,7 +511,7 @@ record Parsed {
   pieces: Int           # resolution of one of its imports
 }
 
-enum Role { Whole, Split, Piece, Resolved }
+enum Role { Whole, Split, Piece, Resolved, Prepare }
 
 # A file's scope analysis: its tree once defines are applied, its root scope, which symbol each name
 # leaf is, the names it leaves free, and whether it is CommonJS.
@@ -526,7 +537,7 @@ fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx
   }
   # Defines are substituted and the branches they decide removed, then the result is analysed
   # again, so what they kill is never seen by tree shaking.
-  let defined = mentions-define?(src)
+  let defined = mentions-define?(src) and defines-apply?(tree, bindings)
   let final-tree = if defined then dce.run(substitute(tree, bindings)) else tree
   var analysed-root = first-root
   if defined {
@@ -640,14 +651,27 @@ fn visit-file(item: Text) -> Parsed {
   if has-byte?(item, '\n') {
     let path = item-file(item)
     let what = item-part(item)
-    if what == "all" { return joined-file(path) }
+    # The rest of a big file's work, at once; the last of it to finish puts the file together.
+    if what == "early" or what == "from" or what[0] == 'w' {
+      if what == "early" { early-of(path) }
+      if what == "from" { from-of(path) }
+      if what[0] == 'w' { walked-of(item) }
+      if arrive!(path ++ "\nrest", len(prepared-of(path).parts) + 2) { return finished-file(path) }
+      return blank-parsed(item) with { role: Piece }
+    }
     if what[0] == '?' {
       let spec = what[1..len(what)]
       var found: {Text:Text} = {}
       if let some(t) = unhooked-target(spec, path) { found[spec] = t }
       return blank-parsed(path) with { role: Resolved, targets: found }
     }
+    # A piece. The last of a file's pieces to be parsed prepares the file.
     let pc = piece-of(item)
+    if arrive!(path ++ "\npieces", len(split-source(path).starts)) {
+      let pr = prepared-of(path)
+      if not pr.whole { return finished-file(path) with { targets: pc.targets } }
+      return blank-parsed(path) with { role: Prepare, pieces: len(pr.parts), targets: pc.targets }
+    }
     return blank-parsed(item) with { role: Piece, targets: pc.targets }
   }
   let sp = split-source(item)
@@ -678,7 +702,9 @@ fn next-files(p: Parsed) -> [Text] = match p.role {
 # taken by whoever comes first, and then the whole, which waits for any still being parsed; or
 # the resolution of each of a file's many imports.
 fn first-files(p: Parsed) -> [Text] = match p.role {
-  Split => [p.path ++ "\n" ++ int-text(k) for k in 0..p.pieces] ++ [p.path ++ "\nall"]
+  Split => [p.path ++ "\n" ++ int-text(k) for k in 0..p.pieces]
+  # Then its parts' walks, its early errors and the rest, at once.
+  Prepare => [p.path ++ "\nw" ++ int-text(k) for k in 0..p.pieces] ++ [p.path ++ "\nearly", p.path ++ "\nfrom"]
   Whole => if len(p.specs) > resolve-alone and len(keys(p.targets)) == 0
            then [p.path ++ "\n?" ++ s for s in p.specs] else []
   _ => []
@@ -707,14 +733,14 @@ fn item-part(item: Text) -> Text {
 # that begins a declaration in its first column, outside every bracket, string, template, comment
 # and regular expression, as a scan of the bytes sees them. The scan can be wrong only one way that
 # matters: a piece before a wrong start is no program by itself, and then the file is parsed whole.
-const piece-bytes: Int = 12288
+const piece-bytes: Int = 8192
 
 record Parts { src: Text, starts: [Int] }
 
 # A file's text, and where its pieces start: at 0 alone unless it is big plain JavaScript.
 memo fn split-source(path: Text) -> Parts {
   let src = module-text(read-file(path), path)
-  if has-transform or loader-of(path) != "js" or len(src) < 3 * piece-bytes { return Parts(src: src, starts: [0]) }
+  if has-transform or loader-of(path) != "js" or len(src) < 2 * piece-bytes { return Parts(src: src, starts: [0]) }
   Parts(src: src, starts: [0] ++ piece-starts(src))
 }
 
@@ -745,9 +771,13 @@ memo fn piece-of(item: Text) -> PieceTree {
   }
 }
 
-# The pieces as one program, as if parsed whole; or the file parsed whole, when one of them is no
-# program by itself.
-fn joined-file(path: Text) -> Parsed {
+# A big file put together from its pieces, ready for its parts to be analysed at once: the program as
+# parsed, the program as analysed (its top level normalised one piece at a time), and a table that
+# holds the program's own names. Not `whole` when a piece is no program by itself.
+record Prepared { whole: Bool, tree0: Node, tree: Node, parts: [[Node]], scopes: sym.Table, root: Int, esm: Bool,
+                  mentions: Bool }
+
+memo fn prepared-of(path: Text) -> Prepared {
   let sp = split-source(path)
   var trees: [Node] = []
   var whole = true
@@ -757,20 +787,100 @@ fn joined-file(path: Text) -> Parsed {
       none => { whole = false }
     }
   }
-  if not whole { return targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true)))) }
+  if not whole {
+    return Prepared(whole: false, tree0: None(), tree: None(), parts: [], scopes: sym.table-new(), root: -1, esm: false,
+                    mentions: false)
+  }
   var stmts: [Node] = []
   for t in trees { stmts ++= t.kids[1].kids }
   let first = trees[0]
   let final = trees[len(trees) - 1]
   let body = first.kids[1] with { kids: stmts, hi: final.kids[1].hi }
-  let tree = first with { kids: [first.kids[0], body], hi: final.hi }
-  let a = analysed-file(parsed-from(path, sp.src, checked-early(tree, sp.src, path)))
+  let tree0 = first with { kids: [first.kids[0], body], hi: final.hi }
+  let base = base-name(path)
+  var parts: [[Node]] = []
+  var all: [Node] = []
+  for t in trees {
+    let normal = normalized-tree(t, base).kids[1].kids
+    parts += normal
+    all ++= normal
+  }
+  let tree = Program(tree0.kids[0], List(all...))
+  var own = sym.table-new()
+  let top = sym.new-scope!(own, -1, true)
+  let root = sym.new-scope!(own, top, true)
+  sc.declare-program!(tree, own, root)
+  Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, scopes: own, root: root,
+           esm: early.program-has-module-syntax?(tree0), mentions: mentions-define?(sp.src))
+}
+
+# One part's walk, in a table of its own under the program's scope.
+# `defined`: whether a define applies in the part, which only its own bindings can tell. Its
+# `require`s and `import()`s too, which the whole file's are made of.
+record Walked { scopes: sym.Table, bindings: {Int:Int}, defined: Bool, requires: [Text], imports: [Text] }
+
+memo fn walked-of(item: Text) -> Walked {
+  let path = item-file(item)
+  let what = item-part(item)
+  let k = parse-int(what[1..len(what)])
+  let pr = prepared-of(path)
+  var own = sym.table-under(pr.scopes, pr.root)
+  var bindings: {Int:Int} = {}
+  if k == 0 { sc.walk-part(pr.tree.kids[0], own, bindings) }
+  for s in pr.parts[k] { sc.walk-part(s, own, bindings) }
+  let defined = pr.mentions and (any s in pr.parts[k]: defines-apply?(s, bindings))
+  var requires: [Text] = []
+  var imports: [Text] = []
+  for s in pr.parts[k] { require-calls!(s, requires) }
+  for s in pr.parts[k] { import-calls!(s, imports) }
+  Walked(scopes: own, bindings: bindings, defined: defined, requires: requires, imports: imports)
+}
+
+# What parsing a file whole checks, and does after: each at once with the parts' walks.
+memo fn early-of(path: Text) -> Bool {
+  checked-early(prepared-of(path).tree0, split-source(path).src, path)
+  true
+}
+
+memo fn from-of(path: Text) -> Parsed = parsed-from(path, split-source(path).src, prepared-of(path).tree0)
+
+# The big file, analysed: its parts' tables grafted in order, as one walk would have filled the
+# table, ids and all. CommonJS, and code a define changes, are analysed again whole, as
+# `analysis-of` does.
+fn finished-file(path: Text) -> Parsed {
+  let pr = prepared-of(path)
+  let sp = split-source(path)
+  if not pr.whole { return targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true)))) }
+  early-of(path)
+  let p = from-of(path)
   var targets: {Text:Text} = {}
   for k in 0..len(sp.starts) {
     let pt = piece-of(path ++ "\n" ++ int-text(k)).targets
     for spec in keys(pt) { targets[spec] = pt[spec] ?? spec }
   }
-  a with { targets: targets }
+  var own = sym.table-copy(pr.scopes)
+  var bindings: {Int:Int} = {}
+  var defined = false
+  var requires: [Text] = []
+  var imports: [Text] = []
+  for k in 0..len(pr.parts) {
+    let w = walked-of(path ++ "\nw" ++ int-text(k))
+    if w.defined { defined = true }
+    requires ++= w.requires
+    imports ++= w.imports
+    let symbol-shift = sym.symbol-count(own)
+    var part = w.scopes
+    sym.graft!(own, part, pr.root)
+    for key in keys(w.bindings) {
+      let v = w.bindings[key] ?? 0
+      bindings[key] = if v < 0 then -1 - v else v + symbol-shift
+    }
+  }
+  let cjs = not pr.esm and (sym.has-free?(own, "module") or sym.has-free?(own, "exports") or sym.has-free?(own, "require"))
+  if cjs or p.jsx-imports or defined { return analysed-file(p) with { targets: targets } }
+  let real-free = [f for f in sym.free-names(own) if not (f in p.helpers)]
+  let a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: real-free, cjs: false, shift: 0)
+  p with { analysed: true, scopes: own, analysis: a, calls: requires ++ imports, targets: targets }
 }
 
 # Early errors, which `parse-file` checks of a file parsed whole.

@@ -3,8 +3,13 @@
 (module hl.symtab)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
-(import "coil.hashmap" :use [HashMap])
+(import "coil.hashmap" :use [HashMap for-entries])
 (import "coil.str" :as str)
+
+;;; A map from names. Names are the program's own text, which is never changed or freed, so the
+;;; map need not copy them.
+(defn names-map [] (-> (HashMap (slice u8) i64))
+  (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops-borrowed)))
 
 (defstruct Symbol
   [(name (slice u8))
@@ -24,18 +29,58 @@
 (defstruct Table
   [(scopes (ArrayList Scope))
    (symbols (ArrayList Symbol))
-   (free (HashMap (slice u8) i64))])
+   (free (HashMap (slice u8) i64))
+   ;; In a table under another (see `table-under`): uses of that table's symbols, by symbol.
+   (outer (HashMap i64 i64))])
 
 (defn table-new [] (-> Table)
   (Table :scopes (ArrayList::new [Scope] (malloc-allocator))
          :symbols (ArrayList::new [Symbol] (malloc-allocator))
-         :free (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+         :free (names-map)
+         :outer (HashMap::new-scalar [i64 i64] (malloc-allocator))))
+
+;;; A table of its own for code inside `scope` of `t`: its scope 0 stands for that scope, and
+;;; its names are `t`'s symbols, as -(id + 1). Code in it can be analysed while other code is,
+;;; and `graft!` puts it back.
+(defn table-under [(t Table) (scope i64)] (-> Table)
+  (let [(mut out) (table-new)
+        sc (get (.scopes t) scope)
+        (mut names) (names-map)]
+    (let [(mut src) (.names sc)]
+      (for-entries [k v (mut src)] (set! (mut names) (load k) (- -1 (load v)))))
+    (push! (mut (.scopes out))
+           (Scope :parent -1 :is-function (.is-function sc) :names names
+                  :symbols (ArrayList::new [i64] (malloc-allocator))
+                  :children (ArrayList::new [i64] (malloc-allocator))
+                  :dynamic false))
+    out))
+
+;;; A copy that changes apart from `t`.
+(defn table-copy [(t Table)] (-> Table)
+  (let [(mut out) (table-new)]
+    (for sc (.scopes t)
+      (let [(mut names) (names-map)
+            (mut symbols) (ArrayList::new [i64] (malloc-allocator))
+            (mut children) (ArrayList::new [i64] (malloc-allocator))]
+        (let [(mut src) (.names sc)]
+          (for-entries [k v (mut src)] (set! (mut names) (load k) (load v))))
+        (for s (.symbols sc) (push! (mut symbols) s))
+        (for c (.children sc) (push! (mut children) c))
+        (push! (mut (.scopes out))
+               (Scope :parent (.parent sc) :is-function (.is-function sc) :names names
+                      :symbols symbols :children children :dynamic (.dynamic sc)))))
+    (for sym (.symbols t) (push! (mut (.symbols out)) sym))
+    (for k (.free t)
+      (match (get (.free t) k)
+        (Some [n] (set! (mut (.free out)) k n))
+        (None [] 0)))
+    out))
 
 (defn new-scope! [(t (mut Table)) (parent i64) (is-function bool)] (-> i64)
   (let [id (len (.scopes t))]
     (push! (mut (.scopes t))
            (Scope :parent parent :is-function is-function
-                  :names (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+                  :names (names-map)
                   :symbols (ArrayList::new [i64] (malloc-allocator))
                   :children (ArrayList::new [i64] (malloc-allocator))
                   :dynamic false))
@@ -73,9 +118,12 @@
     out))
 
 (defn add-use! [(t (mut Table)) (s i64)] (-> void)
-  (let [(mut sym) (get (.symbols t) s)]
-    (set! (.uses sym) (+ (.uses sym) 1))
-    (set! (mut (.symbols t)) s sym)))
+  (if (< s 0)
+      (let [o (- -1 s)]
+        (set! (mut (.outer t)) o (+ (match (get (.outer t) o) (Some [n] n) (None [] 0)) 1)))
+      (let [(mut sym) (get (.symbols t) s)]
+        (set! (.uses sym) (+ (.uses sym) 1))
+        (set! (mut (.symbols t)) s sym))))
 
 (defn add-free! [(t (mut Table)) (name (slice u8))] (-> void)
   (match (get (.free t) name)
@@ -107,13 +155,11 @@
         symbol-shift (len (.symbols t))]
     (for i (range 1 (len (.scopes from)))
       (let [sc (get (.scopes from) i)
-            (mut names) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+            (mut names) (names-map)
             (mut symbols) (ArrayList::new [i64] (malloc-allocator))
             (mut children) (ArrayList::new [i64] (malloc-allocator))]
-        (for k (.names sc)
-          (match (get (.names sc) k)
-            (Some [s] (set! (mut names) k (+ s symbol-shift)))
-            (None [] 0)))
+        (let [(mut src) (.names sc)]
+          (for-entries [k v (mut src)] (set! (mut names) (load k) (+ (load v) symbol-shift))))
         (for s (.symbols sc) (push! (mut symbols) (+ s symbol-shift)))
         (for c (.children sc) (push! (mut children) (+ c scope-shift)))
         (push! (mut (.scopes t))
@@ -127,6 +173,18 @@
              (Symbol :name (.name sym) :scope (if (= (.scope sym) 0) parent (+ (.scope sym) scope-shift))
                      :uses (.uses sym) :final (.final sym) :pinned (.pinned sym))))
     (when (.dynamic (get (.scopes from) 0)) (mark-dynamic! (mut t) parent))
+    ;; A table made by `table-under` also used `t`'s own symbols, and met names nobody declared.
+    (for o (.outer from)
+      (match (get (.outer from) o)
+        (Some [n]
+          (let [(mut sym) (get (.symbols t) o)]
+            (set! (.uses sym) (+ (.uses sym) n))
+            (set! (mut (.symbols t)) o sym)))
+        (None [] 0)))
+    (for name (.free from)
+      (match (get (.free from) name)
+        (Some [n] (set! (mut (.free t)) name (+ (match (get (.free t) name) (Some [m] m) (None [] 0)) n)))
+        (None [] 0)))
     scope-shift))
 
 ;; ---------------------------------------------------------------- what `.rules` calls
@@ -147,7 +205,7 @@
     out))
 
 (defn take-free! [(t (mut Table))] (-> void)
-  (set! (.free t) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+  (set! (.free t) (names-map)))
 
 ;;; Forget a scope's newest child: an analysis that will be run again.
 (defn drop-last-child! [(t (mut Table)) (scope i64)] (-> void)
