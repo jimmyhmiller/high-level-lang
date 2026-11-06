@@ -671,6 +671,7 @@
 (defn int-table [(cap i64)] (-> IntTable)
   (let [(mut keys) (ArrayList::new [i64] (malloc-allocator))
         (mut vals) (ArrayList::new [i64] (malloc-allocator))]
+    ;; Capacity 0: nothing allocated until the first put.
     (reserve! (mut keys) cap)
     (reserve! (mut vals) cap)
     (for _ (range 0 cap)
@@ -682,7 +683,7 @@
 (defn int-get [(t (mut IntTable)) (key i64)] (-> i64)
   (let [(mut i) (& (memo-hash key) (.mask t))
         (mut out) -1
-        (mut go) true]
+        (mut go) (> (.count t) 0)]
     (while go
       (let [v (get (.vals t) i)]
         (cond
@@ -694,7 +695,7 @@
 (defn int-put! [(t (mut IntTable)) (key i64) (val i64)] (-> void)
   (when (> (* (+ (.count t) 1) 2) (+ (.mask t) 1))
     (let [old t
-          (mut bigger) (int-table (* (+ (.mask t) 1) 2))]
+          (mut bigger) (int-table (if (< (.mask t) 31) 64 (* (+ (.mask t) 1) 2)))]
       (for i (range 0 (len (.vals old)))
         (let [v (get (.vals old) i)]
           (when (>= v 0) (int-put! (mut bigger) (get (.keys old) i) v))))
@@ -719,13 +720,13 @@
 (defstruct Index [(table IntTable) (buckets (ArrayList (ArrayList i64)))])
 
 (defn index-new [] (-> Index)
-  (Index :table (int-table 64) :buckets (ArrayList::new [(ArrayList i64)] (malloc-allocator))))
+  (Index :table (int-table 0) :buckets (ArrayList::new [(ArrayList i64)] (malloc-allocator))))
 
 (defn index-push! [(x (mut Index)) (key i64) (row i64)] (-> void)
   (let [at (int-get (mut (.table x)) key)]
     (if (>= at 0)
         (push! (elem (mut (.buckets x)) at) row)
-        (let [(mut b) (ArrayList::new [i64] (malloc-allocator))]
+        (let [(mut b) (ArrayList::new [i64] (tree-allocator))]
           (push! (mut b) row)
           (int-put! (mut (.table x)) key (len (.buckets x)))
           (push! (mut (.buckets x)) b)))
@@ -753,6 +754,8 @@
    (pair-index (ArrayList Index))
    (pair-indexed (ArrayList i64))
    (queue (ArrayList i64))
+   ;; A one-column relation's small keys: which are there, by position, with no hashing.
+   (present (ArrayList u8))
    ;; The rows the last round added, for evaluating only what they make possible.
    (seen i64)
    (delta-from i64)
@@ -774,7 +777,7 @@
     (Rel :arity arity
          :data (ArrayList::new [i64] (malloc-allocator))
          :count 0
-         :heads (int-table 64)
+         :heads (int-table 0)
          :next (ArrayList::new [i64] (malloc-allocator))
          :index index
          :indexed indexed
@@ -782,6 +785,7 @@
          :pair-index pair-index
          :pair-indexed pair-indexed
          :queue (ArrayList::new [i64] (malloc-allocator))
+         :present (ArrayList::new [u8] (malloc-allocator))
          :seen 0
          :delta-from 0
          :delta-to 0)))
@@ -815,7 +819,9 @@
 
 ;;; Unused columns are passed as 0.
 (defn rel-has? [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
-  (chain-has? (mut r) (int-get (mut (.heads r)) (row-hash a b c d)) a b c d))
+  (if (and (= (.arity r) 1) (dense-key? a))
+      (and (< a (len (.present r))) (!= (get (.present r) a) (: 0 u8)))
+      (chain-has? (mut r) (int-get (mut (.heads r)) (row-hash a b c d)) a b c d)))
 
 (defn dense-key? :inline (Always) [(key i64)] (-> bool) (and (>= key 0) (< key 4194304)))
 
@@ -823,8 +829,9 @@
   (let [key (rel-at (mut r) row col)]
     (if (dense-key? key)
         (let [d (elem (mut (.dense r)) col)]
+          ;; Rows of a key come from the thread's arena: they last as long as the program.
           (while (<= (len (load d)) key)
-            (push! d (ArrayList::new [i64] (malloc-allocator))))
+            (push! d (ArrayList::new [i64] (tree-allocator))))
           (push! (elem d key) row))
         (index-push! (elem (mut (.index r)) col) key row))))
 
@@ -838,26 +845,42 @@
 
 ;;; True when the row is new.
 (defn rel-add! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
+  (if (and (= (.arity r) 1) (dense-key? a))
+      (if (rel-has? (mut r) a 0 0 0)
+          false
+          (do
+            (while (<= (len (.present r)) a) (push! (mut (.present r)) (: 0 u8)))
+            (set! (mut (.present r)) a (: 1 u8))
+            (rel-append! (mut r) a b c d -1)
+            true))
+      (rel-add-hashed! (mut r) a b c d)))
+
+(defn rel-add-hashed! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
   (let [h (row-hash a b c d)
         head (int-get (mut (.heads r)) h)]
     (if (chain-has? (mut r) head a b c d)
         false
-        (let [row (.count r) n (.arity r)]
-          (push! (mut (.data r)) a)
-          (when (>= n 2) (push! (mut (.data r)) b))
-          (when (>= n 3) (push! (mut (.data r)) c))
-          (when (>= n 4) (push! (mut (.data r)) d))
-          (push! (mut (.next r)) head)
-          (int-put! (mut (.heads r)) h row)
-          (set! (.count r) (+ row 1))
-          (for col (range 0 n)
-            (when (!= (get (.indexed r) col) 0)
-              (index-add! (mut r) col row)))
-          (for c1 (range 0 n)
-            (for c2 (range 0 n)
-              (when (!= (get (.pair-indexed r) (+ (* c1 n) c2)) 0)
-                (pair-index-add! (mut r) (+ (* c1 n) c2) c1 c2 row))))
-          true))))
+        (do (rel-append! (mut r) a b c d head)
+            (int-put! (mut (.heads r)) h (- (.count r) 1))
+            true))))
+
+;;; A new row at the end, in its indexes. `head`: the row it chains to, for a hashed relation.
+(defn rel-append! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64) (head i64)] (-> void)
+  (let [row (.count r) n (.arity r)]
+    (push! (mut (.data r)) a)
+    (when (>= n 2) (push! (mut (.data r)) b))
+    (when (>= n 3) (push! (mut (.data r)) c))
+    (when (>= n 4) (push! (mut (.data r)) d))
+    (push! (mut (.next r)) head)
+    (set! (.count r) (+ row 1))
+    (for col (range 0 n)
+      (when (!= (get (.indexed r) col) 0)
+        (index-add! (mut r) col row)))
+    (for c1 (range 0 n)
+      (for c2 (range 0 n)
+        (when (!= (get (.pair-indexed r) (+ (* c1 n) c2)) 0)
+          (pair-index-add! (mut r) (+ (* c1 n) c2) c1 c2 row))))
+    0))
 
 (defn rel-queue! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> void)
   (push! (mut (.queue r)) a)
@@ -1324,6 +1347,19 @@
 (defn gate-wake-all! [(g (ptr Gate))] (-> void)
   (match (Condition::notify-all! (field g cond)) (Ok [_] 0) (Err [_] (pool-fail "cannot notify"))))
 
+;;; One more worker, in the next slot. Under the pool's lock.
+(defn spawn-worker! [(p (ptr Pool))] (-> void)
+  (let [slot (+ (.started p) 1)]
+    (workers-in-use! (+ slot 1))
+    (when (!= (Thread::spawn-configured (elem (mut (.threads p)) slot)
+                                        (fnptr-of pool-worker)
+                                        (primitive/cast (ptr i8) slot)
+                                        (ThreadConfig :stack-size 536870912 :guard-size 0))
+              (: 0 i32))
+      (panic "could not start a worker thread"))
+    (set! (.started p) slot)
+    0))
+
 ;;; Run `body(job)` on `n` threads at once, this one among them, and wait for all. Each worker
 ;;; thread has a big stack, since a parse of a deep file recurses. A body takes work until there
 ;;; is none, so a run asked for inside another, or from a worker, is this thread's alone.
@@ -1336,16 +1372,7 @@
           (pool-lock! p)
           (when (= (.started p) 0) (prefer-fast-cores!))
           (set! (.born p) (.round p))
-          (while (< (.started p) (- count 1))
-            (let [slot (+ (.started p) 1)]
-              (workers-in-use! (+ slot 1))
-              (when (!= (Thread::spawn-configured (elem (mut (.threads p)) slot)
-                                                  (fnptr-of pool-worker)
-                                                  (primitive/cast (ptr i8) slot)
-                                                  (ThreadConfig :stack-size 536870912 :guard-size 0))
-                        (: 0 i32))
-                (panic "could not start a worker thread"))
-              (set! (.started p) slot)))
+          (while (< (.started p) (- count 1)) (spawn-worker! p))
           (set! (.running p) true)
           (set! (.body p) body)
           (set! (.job p) job)

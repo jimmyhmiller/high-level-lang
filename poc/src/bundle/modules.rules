@@ -610,7 +610,10 @@ fn parsed-file(item: Pending) -> Parsed {
 }
 
 # Everything after parsing, for a file parsed whole or put together from its pieces.
-fn parsed-from(path: Text, src: Text, parsed: Node) -> Parsed {
+fn parsed-from(path: Text, src: Text, parsed: Node) -> Parsed = parsed-with(path, src, parsed, none)
+
+# The same, with the specifiers its imports name when they are known already.
+fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?) -> Parsed {
   let loader = loader-of(path)
   let config = tsc.for-file(path)
   let file-jsx = configured-jsx(jsx-options, config)
@@ -621,14 +624,16 @@ fn parsed-from(path: Text, src: Text, parsed: Node) -> Parsed {
               else ts.Lowered(tree: lowered.tree, pure-calls: {}, helpers: [])
   var pure-calls = lowered.pure-calls
   for k in keys(typed.pure-calls) { pure-calls[k] = typed.pure-calls[k] ?? k }
-  var specs: [Text] = []
-  for s in typed.tree.kids[1].kids {
-    if let some(spec) = import-spec-of(s) { specs += spec }
+  var specs: [Text] = known ?? []
+  if is-none(known) {
+    for s in typed.tree.kids[1].kids {
+      if let some(spec) = import-spec-of(s) { specs += spec }
+    }
+    # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
+    # file the build never uses, but never misses one it does.
+    require-calls!(typed.tree, specs)
+    import-calls!(typed.tree, specs)
   }
-  # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
-  # file the build never uses, but never misses one it does.
-  require-calls!(typed.tree, specs)
-  import-calls!(typed.tree, specs)
   Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
          legal: legal.of-file(src, parsed), specs: specs, targets: {},
@@ -774,8 +779,9 @@ memo fn piece-of(item: Text) -> PieceTree {
 # A big file put together from its pieces, ready for its parts to be analysed at once: the program as
 # parsed, the program as analysed (its top level normalised one piece at a time), and a table that
 # holds the program's own names. Not `whole` when a piece is no program by itself.
-record Prepared { whole: Bool, tree0: Node, tree: Node, parts: [[Node]], scopes: sym.Table, root: Int, esm: Bool,
-                  mentions: Bool }
+# `raw`: each piece's statements as parsed, which early errors are checked on.
+record Prepared { whole: Bool, tree0: Node, tree: Node, parts: [[Node]], raw: [[Node]], scopes: sym.Table, root: Int,
+                  esm: Bool, mentions: Bool, exportable: [Text] }
 
 memo fn prepared-of(path: Text) -> Prepared {
   let sp = split-source(path)
@@ -788,8 +794,8 @@ memo fn prepared-of(path: Text) -> Prepared {
     }
   }
   if not whole {
-    return Prepared(whole: false, tree0: None(), tree: None(), parts: [], scopes: sym.table-new(), root: -1, esm: false,
-                    mentions: false)
+    return Prepared(whole: false, tree0: None(), tree: None(), parts: [], raw: [], scopes: sym.table-new(), root: -1,
+                    esm: false, mentions: false, exportable: [])
   }
   var stmts: [Node] = []
   for t in trees { stmts ++= t.kids[1].kids }
@@ -799,8 +805,10 @@ memo fn prepared-of(path: Text) -> Prepared {
   let tree0 = first with { kids: [first.kids[0], body], hi: final.hi }
   let base = base-name(path)
   var parts: [[Node]] = []
+  var raw: [[Node]] = []
   var all: [Node] = []
   for t in trees {
+    raw += t.kids[1].kids
     let normal = normalized-tree(t, base).kids[1].kids
     parts += normal
     all ++= normal
@@ -810,14 +818,16 @@ memo fn prepared-of(path: Text) -> Prepared {
   let top = sym.new-scope!(own, -1, true)
   let root = sym.new-scope!(own, top, true)
   sc.declare-program!(tree, own, root)
-  Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, scopes: own, root: root,
-           esm: early.program-has-module-syntax?(tree0), mentions: mentions-define?(sp.src))
+  Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, raw: raw, scopes: own, root: root,
+           esm: early.program-has-module-syntax?(tree0), mentions: mentions-define?(sp.src),
+           exportable: early.exportable-of(tree0))
 }
 
 # One part's walk, in a table of its own under the program's scope.
 # `defined`: whether a define applies in the part, which only its own bindings can tell. Its
 # `require`s and `import()`s too, which the whole file's are made of.
-record Walked { scopes: sym.Table, bindings: {Int:Int}, defined: Bool, requires: [Text], imports: [Text] }
+record Walked { scopes: sym.Table, bindings: {Int:Int}, defined: Bool, requires: [Text], imports: [Text],
+                problem: early.Problem? }
 
 memo fn walked-of(item: Text) -> Walked {
   let path = item-file(item)
@@ -833,16 +843,22 @@ memo fn walked-of(item: Text) -> Walked {
   var imports: [Text] = []
   for s in pr.parts[k] { require-calls!(s, requires) }
   for s in pr.parts[k] { import-calls!(s, imports) }
-  Walked(scopes: own, bindings: bindings, defined: defined, requires: requires, imports: imports)
+  let problem = early.check-part(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
+  Walked(scopes: own, bindings: bindings, defined: defined, requires: requires, imports: imports, problem: problem)
 }
 
-# What parsing a file whole checks, and does after: each at once with the parts' walks.
-memo fn early-of(path: Text) -> Bool {
-  checked-early(prepared-of(path).tree0, split-source(path).src, path)
-  true
+# What parsing a file whole checks of its statements together, at once with the parts' walks,
+# which check each part's.
+memo fn early-of(path: Text) -> early.Problem? {
+  let pr = prepared-of(path)
+  early.check-head(pr.tree0, pr.esm, not pr.esm, false)
 }
 
-memo fn from-of(path: Text) -> Parsed = parsed-from(path, split-source(path).src, prepared-of(path).tree0)
+memo fn from-of(path: Text) -> Parsed {
+  var specs: [Text] = []
+  for k in 0..len(split-source(path).starts) { specs ++= piece-of(path ++ "\n" ++ int-text(k)).specs }
+  parsed-with(path, split-source(path).src, prepared-of(path).tree0, some(specs))
+}
 
 # The big file, analysed: its parts' tables grafted in order, as one walk would have filled the
 # table, ids and all. CommonJS, and code a define changes, are analysed again whole, as
@@ -851,7 +867,6 @@ fn finished-file(path: Text) -> Parsed {
   let pr = prepared-of(path)
   let sp = split-source(path)
   if not pr.whole { return targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true)))) }
-  early-of(path)
   let p = from-of(path)
   var targets: {Text:Text} = {}
   for k in 0..len(sp.starts) {
@@ -863,8 +878,10 @@ fn finished-file(path: Text) -> Parsed {
   var defined = false
   var requires: [Text] = []
   var imports: [Text] = []
+  var problem = early-of(path)
   for k in 0..len(pr.parts) {
     let w = walked-of(path ++ "\nw" ++ int-text(k))
+    if is-none(problem) { problem = w.problem }
     if w.defined { defined = true }
     requires ++= w.requires
     imports ++= w.imports
@@ -875,6 +892,9 @@ fn finished-file(path: Text) -> Parsed {
       let v = w.bindings[key] ?? 0
       bindings[key] = if v < 0 then -1 - v else v + symbol-shift
     }
+  }
+  if let some(at) = problem {
+    panic "{}:{}:{}: {}", path, line-of(sp.src, at.at), col-of(sp.src, at.at), at.message
   }
   let cjs = not pr.esm and (sym.has-free?(own, "module") or sym.has-free?(own, "exports") or sym.has-free?(own, "require"))
   if cjs or p.jsx-imports or defined { return analysed-file(p) with { targets: targets } }
