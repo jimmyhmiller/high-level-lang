@@ -1085,6 +1085,98 @@
   (match (parse-num s)
     (Some [v] v)
     (None [] (panic "expected a number, got {}" s))))
+;; ---------------------------------------------------------------- text and paths
+
+;;; Text and file paths, what every language here needs and none should spell out byte by byte.
+
+(defn index-of [(s (slice u8)) (what (slice u8))] (-> (Option i64))
+  (let [(mut at) -1 (mut i) 0 n (- (len s) (len what))]
+    (while (and (< at 0) (<= i n))
+      (when (at? s i what) (set! at i))
+      (set! i (+ i 1)))
+    (if (< at 0) (None [i64]) (Some at))))
+
+(defn last-index-of [(s (slice u8)) (what (slice u8))] (-> (Option i64))
+  (let [(mut at) -1 (mut i) (- (len s) (len what))]
+    (while (and (< at 0) (>= i 0))
+      (when (at? s i what) (set! at i))
+      (set! i (- i 1)))
+    (if (< at 0) (None [i64]) (Some at))))
+
+;;; What comes before the first `sep`, or all of `s` without one; and what comes after it, or nothing.
+(defn text-before [(s (slice u8)) (sep (slice u8))] (-> (slice u8))
+  (match (index-of s sep) (Some [i] (subslice s 0 i)) (None [] s)))
+
+(defn text-after [(s (slice u8)) (sep (slice u8))] (-> (slice u8))
+  (match (index-of s sep) (Some [i] (subslice s (+ i (len sep)) (len s))) (None [] "")))
+
+;;; The pieces between `sep`s: n separators make n + 1 pieces, empty ones included.
+(defn split [(s (slice u8)) (sep (slice u8))] (-> (ArrayList (slice u8)))
+  (when (= (len sep) 0) (panic "split needs a separator that is not empty"))
+  (let [(mut out) (ArrayList::new [(slice u8)] (tree-allocator))
+        (mut start) 0
+        (mut i) 0]
+    (while (<= (+ i (len sep)) (len s))
+      (if (at? s i sep)
+          (do (push! (mut out) (subslice s start i))
+              (set! i (+ i (len sep)))
+              (set! start i))
+          (set! i (+ i 1))))
+    (push! (mut out) (subslice s start (len s)))
+    out))
+
+(defn joined [(xs (ArrayList (slice u8))) (sep (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (for i (range 0 (len xs))
+      (when (> i 0) (push-str! (mut b) sep))
+      (push-str! (mut b) (get xs i)))
+    (finish! (mut b))))
+
+(defn replace-all [(s (slice u8)) (what (slice u8)) (by (slice u8))] (-> (slice u8))
+  (if (or (= (len what) 0) (not (contains-text? s what)))
+      s
+      (joined (split s what) by)))
+
+(defn ascii-space? [(c u8)] (-> bool)
+  (or (= c #\space) (= c #\tab) (= c #\newline) (= c (cast u8 13)) (= c (cast u8 12)) (= c (cast u8 11))))
+
+;;; Without the ASCII space at either end.
+(defn trim [(s (slice u8))] (-> (slice u8))
+  (let [(mut from) 0 (mut to) (len s)]
+    (while (and (< from to) (ascii-space? (get s from))) (set! from (+ from 1)))
+    (while (and (> to from) (ascii-space? (get s (- to 1)))) (set! to (- to 1)))
+    (subslice s from to)))
+
+;;; A path's last segment, its extension (from the segment's last `.`, or nothing), and the
+;;; segment without it.
+(defn path-base [(p (slice u8))] (-> (slice u8))
+  (match (last-index-of p "/") (Some [i] (subslice p (+ i 1) (len p))) (None [] p)))
+
+(defn path-ext [(p (slice u8))] (-> (slice u8))
+  (let [base (path-base p)]
+    (match (last-index-of base ".") (Some [i] (subslice base i (len base))) (None [] ""))))
+
+(defn path-stem [(p (slice u8))] (-> (slice u8))
+  (let [base (path-base p)]
+    (subslice base 0 (- (len base) (len (path-ext base))))))
+
+;;; The segments that name something: no empty ones and no `.`.
+(defn path-segments [(p (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (tree-allocator))]
+    (for seg (split p "/")
+      (unless (or (= (len seg) 0) (= seg ".")) (push! (mut out) seg)))
+    out))
+
+;;; Without `.` and `..` segments, as far as the path itself says: a leading `..` stays.
+(defn path-normalize [(p (slice u8))] (-> (slice u8))
+  (let [(mut parts) (ArrayList::new [(slice u8)] (tree-allocator))]
+    (for seg (path-segments p)
+      (if (and (= seg "..") (> (len parts) 0) (!= (get parts (- (len parts) 1)) ".."))
+          (pop! (mut parts))
+          (push! (mut parts) seg)))
+    (let [body (joined parts "/")]
+      (if (and (> (len p) 0) (= (get p 0) #\/)) (join "/" body) body))))
+
 ;; ---------------------------------------------------------------- what `.rules` calls
 
 ;;; A leaf's text is this, or is this in quotes.
