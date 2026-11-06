@@ -1288,7 +1288,60 @@
         (HeadInfo :wrap-kind 7 :alts (no-alts) :var "" :seq (.code t) :hi `0 :lets (empty-code) :row ""
                   :tests (empty-code) :binds (empty-code))))
     (g/KLetClause [] (let-clause-open! (mut k) c))
+    (g/KWhileClause []
+      (let [t (expect (mut k) (kid c 0) (expr (mut k) (kid c 0) "Bool") "Bool")]
+        (HeadInfo :wrap-kind 9 :alts (no-alts) :var "" :seq (.code t) :hi `0 :lets (empty-code) :row ""
+                  :tests (empty-code) :binds (empty-code))))
+    ;; A key that is none always passes: `distinct` then sees only the items that have one.
+    (g/KDistinctClause []
+      (let [key (expr (mut k) (kid c 0) "")
+            t (if (opt? (.ty key)) (opt-of (.ty key)) (.ty key))]
+        (unless (or (= t "Int") (= t "Text"))
+          (die (mut k) (kid c 0) (cat "distinct keys are Int or Text, or optionally one, not " (.ty key))))
+        (HeadInfo :wrap-kind 10 :alts (no-alts) :var (fresh (mut k) "seen") :seq (.code key) :hi `0 :lets (empty-code)
+                  :row (.ty key) :tests (empty-code) :binds (empty-code))))
     (_ (do (bounded! (mut k) c) (head-open! (mut k) c)))))
+
+(defn loop-kind? [(w i64)] (-> bool) (and (>= w 0) (<= w 6)))
+
+;;; A comprehension's opened clauses around `inner`, the first outermost. A `while` leaves the
+;;; nearest loop before it; a `distinct` remembers, across the whole comprehension, the keys it let by.
+(defn clauses-code [(k (mut Comp)) (cs (ArrayList g/Node)) (opened (ArrayList HeadInfo)) (inner Code)] (-> Code)
+  (let [(mut labels) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut stops) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut seen) (primitive/code-list-new)]
+    (for _ opened (do (push! (mut labels) "") (push! (mut stops) "")))
+    (for i (range 0 (len opened))
+      (let [h (get opened i)]
+        (when (= (.wrap-kind h) 9)
+          (let [(mut j) (- i 1)]
+            (while (and (>= j 0) (not (loop-kind? (.wrap-kind (get opened j))))) (set! j (- j 1)))
+            (when (< j 0) (die (mut k) (get cs i) "a `while` stops the loop before it, and there is none"))
+            (when (= (len (get labels j)) 0) (set! (mut labels) j (fresh (mut k) "stop")))
+            (set! (mut stops) i (get labels j))))
+        (when (= (.wrap-kind h) 10)
+          (push! (mut seen) `(mut ~(sym (.var h))))
+          (push! (mut seen) (new-map (mut k) (cat3 "{" (if (opt? (.row h)) (opt-of (.row h)) (.row h)) ":Bool}"))))))
+    (let [(mut body) inner
+          (mut i) (- (len opened) 1)]
+      (while (>= i 0)
+        (let [h (get opened i)]
+          (cond
+            (= (.wrap-kind h) 9)
+              (set! body `(do (unless ~(.seq h) (return-from ~(primitive/code-symbol ":" (get stops i)) 0)) ~body))
+            (= (.wrap-kind h) 10)
+              (let [kv (fresh (mut k) "key")
+                    once `(unless (match (get ~(sym (.var h)) ~(sym kv)) (Some [_] true) (None [] false))
+                            (set! (mut ~(sym (.var h))) ~(sym kv) true)
+                            ~body)]
+                (set! body (if (opt? (.row h))
+                               `(match ~(.seq h) (Some [~(sym kv)] (do ~once 0)) (None [] (do ~body 0)))
+                               `(let [~(sym kv) ~(.seq h)] ~once))))
+            :else (set! body (head-wrap (mut k) h body)))
+          (when (> (len (get labels i)) 0)
+            (set! body `(block ~(primitive/code-symbol ":" (get labels i)) ~body 0))))
+        (set! i (- i 1)))
+      `(let [~@seen] ~body))))
 
 (defn head-wrap [(k (mut Comp)) (h HeadInfo) (inner Code)] (-> Code)
   (let [v (if (> (len (.var h)) 0) (sym (.var h)) `_)]
@@ -2031,11 +2084,7 @@
           push-code (if spread
                         `(for (ref ~(sym each)) ~(.code v) (push! (mut ~(sym o)) ~(sym each)))
                         `(push! (mut ~(sym o)) ~(.code v)))
-          (mut body) push-code
-          (mut i) (- (len opened) 1)]
-      (while (>= i 0)
-        (set! body (head-wrap (mut k) (get opened i) body))
-        (set! i (- i 1)))
+          body (clauses-code (mut k) (list-kids (kid n 1)) opened push-code)]
       (locals-reset! (mut k) mark)
       (te `(let [(mut ~(sym o)) ~(new-list (mut k) elem)] ~body ~(sym o))
           (cat3 "[" elem "]")))))
@@ -2049,13 +2098,22 @@
           val (expr (mut k) (kid n 1) (if (map? want) (map-val want) ""))
           ty (cat4 "{" (.ty key) ":" (cat (.ty val) "}"))
           o (fresh (mut k) "out")
-          (mut body) `(set! (mut ~(sym o)) ~(.code key) ~(.code val))
-          (mut i) (- (len opened) 1)]
-      (while (>= i 0)
-        (set! body (head-wrap (mut k) (get opened i) body))
-        (set! i (- i 1)))
+          body (clauses-code (mut k) (list-kids (kid n 2)) opened `(set! (mut ~(sym o)) ~(.code key) ~(.code val)))]
       (locals-reset! (mut k) mark)
       (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~body ~(sym o)) ty))))
+
+;;; `fold acc = init for …: e`: `acc` starts as `init`, and each time round becomes `e`.
+(defn fold-expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+  (let [mark (locals-mark (mut k))
+        init (expr (mut k) (kid n 1) want)
+        ty (.ty init)
+        acc (bind-local! (mut k) (.text (kid n 0)) ty false)
+        (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+    (for c (list-kids (kid n 2)) (push! (mut opened) (clause-open! (mut k) c)))
+    (let [step (expect (mut k) (kid n 3) (expr (mut k) (kid n 3) ty) ty)
+          body (clauses-code (mut k) (list-kids (kid n 2)) opened `(set! ~(sym acc) ~(.code step)))]
+      (locals-reset! (mut k) mark)
+      (te `(let [(mut ~(sym acc)) ~(.code init)] ~body ~(sym acc)) ty))))
 
 (defn loop-all [(k (mut Comp)) (n g/Node) (negate-empty bool)] (-> TE)
   (let [mark (locals-mark (mut k))
@@ -2175,6 +2233,7 @@
     (g/KComp [] (comprehension (mut k) n want false))
     (g/KCompSpread [] (comprehension (mut k) n want true))
     (g/KMapComp [] (map-comprehension (mut k) n want))
+    (g/KFold [] (fold-expr (mut k) n want))
     (g/KSum []
       (let [_ (bounded! (mut k) (kid n 0))
             mark (locals-mark (mut k))

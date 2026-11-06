@@ -12,32 +12,17 @@ fn worth-looking?(src: Text) -> Bool =
   contains-text?(src, "/*!") or contains-text?(src, "//!") or contains-text?(src, "@license")
   or contains-text?(src, "@preserve")
 
-fn comments-in!(src: Text, from: Int, to: Int, out: mut [Text]) -> Void {
-  if to <= from { return }
-  let gap = src[from..to]
-  if not worth-looking?(gap) { return }
-  match gaps.parse(gap, "<gap>") {
-    gaps.Gap(List(pieces...)) => for p in pieces {
-      if p is gaps.BlockNote(_) | gaps.LineNote(_) {
-        if legal?(p.text) { out += p.text }
-      }
-    }
+fn comments-in(src: Text, from: Int, to: Int) -> [Text] {
+  if to <= from or not worth-looking?(src[from..to]) { return [] }
+  match gaps.parse(src[from..to], "<gap>") {
+    gaps.Gap(List(pieces...)) => [p.text for gaps.BlockNote(_) | gaps.LineNote(_) as p in pieces if legal?(p.text)]
     _ => panic "a gap scans to pieces"
   }
 }
 
 # Where a comment might start being legal: every place a marker appears.
-fn markers(src: Text) -> [Int] {
-  var out: [Int] = []
-  for i in 0..len(src) {
-    let c = src[i]
-    if (c == '/' and (at?(src, i, "/*!") or at?(src, i, "//!")))
-       or (c == '@' and (at?(src, i, "@license") or at?(src, i, "@preserve"))) {
-      out += i
-    }
-  }
-  out
-}
+fn markers(src: Text) -> [Int] =
+  if not worth-looking?(src) then [] else [i for i in 0..len(src) if at?(src, i, "/*!") or at?(src, i, "//!") or at?(src, i, "@license") or at?(src, i, "@preserve")]
 
 # Where the last token ending at or before `at` ends, and the first starting after it starts, found
 # by walking down the tree: a node spans its tokens. -1 for the end means `at` is inside a token.
@@ -74,66 +59,29 @@ fn start-after(n: Node, at: Int, size: Int) -> Int {
 }
 
 # A file's legal comments, in order. Only the gaps between tokens that hold a marker are looked at.
-fn of-file(src: Text, tree: Node) -> [Text] {
-  let found = markers(src)
-  if len(found) == 0 { return [] }
-  var out: [Text] = []
-  var done: [Int] = []
-  for m in found {
-    let start = end-before(tree, m)
-    if start >= 0 and not (start in done) {
-      done += start
-      comments-in!(src, start, start-after(tree, m, len(src)), out)
-    }
-  }
-  out
-}
+fn of-file(src: Text, tree: Node) -> [Text] =
+  [comments-in(src, start, start-after(tree, m, len(src)))...
+   for m in markers(src) if let start = end-before(tree, m) if start >= 0 distinct start]
 
 # Each comment once, the first time it appears.
 fn once(xs: [Text]) -> [Text] = [xs[i] for i in 0..len(xs) if not (any j in 0..i: xs[j] == xs[i])]
 
 # The same, keeping each where it last appears, as esbuild does for a minified stylesheet.
-fn once-last(xs: [Text]) -> [Text] {
-  var out: [Text] = []
-  for i in 0..len(xs) {
-    let later = any j in i + 1..len(xs): xs[j] == xs[i]
-    if not later { out += xs[i] }
-  }
-  out
-}
+fn once-last(xs: [Text]) -> [Text] = [xs[i] for i in 0..len(xs) if not (any j in i + 1..len(xs): xs[j] == xs[i])]
 
-fn lines(xs: [Text]) -> Text {
-  var b = buf-new()
-  for x in xs {
-    buf-add!(b, x)
-    buf-add!(b, "\n")
-  }
-  buf-text(b)
-}
+fn lines(xs: [Text]) -> Text = join([x ++ "\n" for x in xs], "")
 
 record Placement { tail: Text, file: Text }
 
 # A legal comment and the file it came from.
 record Note { path: Text, text: Text }
 
-fn package-file(path: Text) -> Text? {
-  var at = -1
-  let marker = "node_modules/"
-  for i in 0..len(path) {
-    if at?(path, i, marker) { at = i + len(marker) }
-  }
-  if at < 0 then none else some(path[at..len(path)])
+fn package-file(path: Text) -> Text? = match last-index-of(path, "node_modules/") {
+  some(at) => some(path[at + len("node_modules/")..len(path)])
+  none => none
 }
 
-fn indented(text: Text) -> Text {
-  var b = buf-new()
-  buf-add!(b, "  ")
-  for c in text {
-    buf-byte!(b, c)
-    if c == '\n' { buf-add!(b, "  ") }
-  }
-  buf-text(b)
-}
+fn indented(text: Text) -> Text = "  " ++ replace-all(text, "\n", "\n  ")
 
 # Inside one `/*! … */`, a comment's own `/*` and `*/` become `(*` and `*)`.
 fn quoted(text: Text) -> Text =
@@ -144,48 +92,23 @@ record Split { local: [Text], files: [Text], by-file: [[Text]] }
 
 # Comments from packages are grouped by file; the program's own are kept apart, each once.
 fn split(notes: [Note]) -> Split {
-  var local: [Text] = []
-  var files: [Text] = []
-  var by-file: [[Text]] = []
-  for n in notes {
-    match package-file(n.path) {
-      none => if not (n.text in local) { local += n.text }
-      some(f) => {
-        var at = -1
-        for i in 0..len(files) {
-          if files[i] == f { at = i }
-        }
-        if at < 0 {
-          files += f
-          by-file += []
-          at = len(files) - 1
-        }
-        if not (n.text in by-file[at]) { by-file[at] += n.text }
-      }
-    }
-  }
-  Split(local: local, files: files, by-file: by-file)
+  let files = [f for n in notes if let some(f) = package-file(n.path) distinct f]
+  Split(local: [n.text for n in notes if is-none(package-file(n.path)) distinct n.text],
+        files: files,
+        by-file: [[n.text for n in notes if let some(g) = package-file(n.path) if g == f distinct n.text] for f in files])
 }
 
 fn same-texts?(a: [Text], b: [Text]) -> Bool = len(a) == len(b) and (all i in 0..len(a): a[i] == b[i])
 
 # Files in a row with the same comments share them: their names, then the comments once.
-fn bundled-block(sp: Split, quote: Bool) -> Text {
-  var b = buf-new()
-  for i in 0..len(sp.files) {
-    let same-as-next = i + 1 < len(sp.files) and same-texts?(sp.by-file[i + 1], sp.by-file[i])
-    let same-as-last = i > 0 and same-texts?(sp.by-file[i - 1], sp.by-file[i])
-    if i > 0 and not same-as-last { buf-add!(b, "\n") }
-    buf-add!(b, sp.files[i])
-    buf-add!(b, ":\n")
-    if not same-as-next {
-      for c in sp.by-file[i] {
-        buf-add!(b, indented(if quote then quoted(c) else c))
-        buf-add!(b, "\n")
-      }
-    }
-  }
-  buf-text(b)
+fn bundled-block(sp: Split, quote: Bool) -> Text = join([file-entry(sp, i, quote) for i in 0..len(sp.files)], "")
+
+fn file-entry(sp: Split, i: Int, quote: Bool) -> Text {
+  let same-as-next = i + 1 < len(sp.files) and same-texts?(sp.by-file[i + 1], sp.by-file[i])
+  let same-as-last = i > 0 and same-texts?(sp.by-file[i - 1], sp.by-file[i])
+  let gap = if i > 0 and not same-as-last then "\n" else ""
+  let comments = if same-as-next then "" else lines([indented(if quote then quoted(c) else c) for c in sp.by-file[i]])
+  gap ++ sp.files[i] ++ ":\n" ++ comments
 }
 
 fn eof-text(sp: Split) -> Text {
