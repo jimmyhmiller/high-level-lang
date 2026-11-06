@@ -1258,14 +1258,20 @@
     ;; Started for the run about to begin, which may have begun before this got the lock.
     (set! seen (.born p))
     (loop
-      (while (= (.round p) seen) (pool-wait! p (field p wake)))
+      ;; Runs often come one after another: look for the next a little while, then sleep.
+      (while (= (.round p) seen)
+        (pool-unlock! p)
+        (let [(mut spins) 0]
+          (while (and (< spins 20000) (= (atomic/read (field p round)) seen)) (set! spins (+ spins 1))))
+        (pool-lock! p)
+        (when (= (.round p) seen) (pool-wait! p (field p wake))))
       (set! seen (.round p))
       (when (< slot (.want p))
         (let [body (.body p) job (.job p)]
           (pool-unlock! p)
           (body job)
           (pool-lock! p)
-          (set! (.left p) (- (.left p) 1))
+          (atomic/store (field p left) (- (.left p) 1))
           (when (= (.left p) 0)
             (match (Condition::notify-all! (field p done)) (Ok [_] 0) (Err [_] (pool-fail "cannot notify")))))))
     arg))
@@ -1344,11 +1350,14 @@
           (set! (.body p) body)
           (set! (.job p) job)
           (set! (.want p) count)
-          (set! (.left p) (- count 1))
-          (set! (.round p) (+ (.round p) 1))
+          (atomic/store (field p left) (- count 1))
+          (atomic/store (field p round) (+ (.round p) 1))
           (match (Condition::notify-all! (field p wake)) (Ok [_] 0) (Err [_] (pool-fail "cannot notify")))
           (pool-unlock! p)
           (body job)
+          ;; The others are usually nearly done: watch a little while before sleeping.
+          (let [(mut spins) 0]
+            (while (and (< spins 20000) (> (atomic/read (field p left)) 0)) (set! spins (+ spins 1))))
           (pool-lock! p)
           (while (> (.left p) 0) (pool-wait! p (field p done)))
           (set! (.running p) false)

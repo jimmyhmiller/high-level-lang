@@ -199,17 +199,24 @@ laptop shared with other work:
 
 | App | single | load-only | back-half | two | full | esbuild | full / esbuild |
 |---|---|---|---|---|---|---|---|
-| tree-shaken lodash-es | 46.4 | 29.9 | 45.1 | 33.1 | **24.2** | 26.8 | 0.90 |
-| all of lodash-es | 57.6 | 40.8 | 51.1 | 40.0 | **27.7** | 28.0 | 0.99 |
-| rxjs | 26.2 | 15.9 | 25.6 | 18.1 | **13.2** | 16.2 | 0.82 |
-| date-fns | 29.7 | 18.1 | 28.6 | 21.4 | **16.3** | 21.0 | 0.77 |
-| d3 | 60.6 | 28.2 | 58.5 | 40.7 | **21.0** | 17.5 | 1.20 |
-| zod | 88.0 | 60.2 | 68.3 | 53.5 | **25.0** | 17.6 | 1.42 |
+| tree-shaken lodash-es | 48.3 | 30.9 | 47.0 | 35.5 | **24.2** | 27.1 | 0.89 |
+| all of lodash-es | 61.7 | 41.9 | 53.3 | 42.3 | **28.7** | 29.2 | 0.98 |
+| rxjs | 27.4 | 16.5 | 27.2 | 19.1 | **13.8** | 16.4 | 0.84 |
+| date-fns | 29.6 | 18.4 | 28.4 | 20.5 | **16.2** | 20.6 | 0.79 |
+| d3 | 58.5 | 27.2 | 56.2 | 38.6 | **19.7** | 17.3 | 1.13 |
+| zod | 80.5 | 55.2 | 62.0 | 50.5 | **24.0** | 16.6 | 1.45 |
 
-Zod is not yet within 20% of esbuild. Per core this bundler does about 2.6 times esbuild's work
-on it (130 ms of CPU to esbuild's 50), so it needs nearly perfect parallelism, and about 4.7 ms is
-still serial: replaying linking's facts and solving the Datalog. Its biggest file also sits at the
-end of an import chain.
+Zod is not yet within 20% of esbuild, and what stands in the way is measured:
+- **Link is serial, about 4.6 ms:** the fact replay and the Datalog solve. Running long rule scans
+  in chunks on several threads, with the same rows in the same order, made it slower (6.0 ms):
+  at this size, dispatching costs more than the joins.
+- **Memory.** Zod touches 115 MB to esbuild's 50. A tree node is about 88 bytes, and emit and the
+  rewrite passes each build a new tree. Even exiting takes 2 ms, against 0.5 ms for a tiny build.
+- **Its biggest files sit at the end of an import chain:** about 6.5 ms of loading, even with
+  those files parsed and analysed in parallel pieces.
+
+In CPU time this bundler does about 2.6 times esbuild's work on zod (130 ms to 50). Going further
+means a compact tree rewritten in place, a faster Datalog engine, and fewer passes over the tree.
 
 ## What it does
 
