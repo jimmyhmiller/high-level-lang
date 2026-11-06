@@ -50,8 +50,19 @@ ExportDefault(e) => var-of(default-binding(base), e)
 program-plus(p, stmt`$call_me();`)
 ```
 
-It is closer to a small ML than to a one-purpose language. Some of it is still byte loops, notably
-number spelling, VLQ and path normalising.
+A grammar names its nodes' children (`-> If(test, yes, no)`), so `.rules` reads `n.test` and
+writes `n with { body: b }`, never a child by position. Comprehensions take patterns, tests and
+other lists in any order, and make lists, joined lists and maps:
+
+```
+[name.text for FuncDecl(name, ...) | ClassDecl(name, ...) in stmts]
+{spec: t for spec in p.specs if let some(t) = unhooked-target(spec, p.path)}
+fn unique-name(name: Text) -> Text = untaken(name) ?? first i in 2..: untaken(name ++ int-text(i))
+```
+
+It is closer to a small ML than to a one-purpose language, and much of it is still written at a low
+level: `corpus/tools/altitude.py` counts 61% of the lines of `.rules` and `.attrs` in functions with
+loops over indices, variables updated in place, global state or byte scanning.
 
 `.attrs` is an attribute grammar over a grammar's trees, compiled by the same compiler. Nothing in
 it walks a tree: it declares attributes, and `on` blocks give equations for the nodes a pattern
