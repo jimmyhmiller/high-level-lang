@@ -326,8 +326,92 @@
 
 (defn parse-file [(k (mut Comp)) (src (slice u8)) (path (slice u8))] (-> g/Node)
   (match (g/parse-result src path 0)
-    (Ok [t] t)
+    (Ok [t] (with-everywhere src path t))
     (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
+
+;; ---------------------------------------------------------------- everywhere functions
+
+;;; `everywhere fn f(n: Node, …) -> Node = match n { cases }`: a function over a whole tree, whose
+;;; cases say only where it does something. Anywhere else it is `f` of each child: the node rebuilt
+;;; from them, shared when none changed; for `-> Void`, each child visited; for `-> Bool`, whether
+;;; any child's is true. Read as the plain function with that last case, which is what everything
+;;; after the parse sees.
+(defn with-everywhere [(src (slice u8)) (path (slice u8)) (tree g/Node)] (-> g/Node)
+  (let [decls (kid tree 2)
+        (mut any) false]
+    (for d (.kids decls) (when (= (.kind d) (g/KEverywhereFn)) (set! any true)))
+    (if (not any)
+        tree
+        (let [(mut out) (g/new-kids)]
+          (for d (.kids decls)
+            (push! (mut out) (if (= (.kind d) (g/KEverywhereFn)) (everywhere-fn src path d) d)))
+          (let [(mut t) tree
+                (mut kids) (g/new-kids)]
+            (push! (mut kids) (kid tree 0))
+            (push! (mut kids) (kid tree 1))
+            (push! (mut kids) (g/mk (g/KList) out (.lo decls) (.hi decls)))
+            (set! (.kids t) kids)
+            t)))))
+
+(defn sugar-fail [(src (slice u8)) (path (slice u8)) (n g/Node) (msg (slice u8))] (-> never)
+  (dsl/fail-at path (rt/line-of src (.lo n)) (rt/col-of src (.lo n)) msg))
+
+(defn name-node [(text (slice u8)) (at g/Node)] (-> g/Node) (g/leaf (g/KName) text (.lo at) (.lo at)))
+
+(defn list-node [(xs (ArrayList g/Node)) (at g/Node)] (-> g/Node) (g/mk (g/KList) xs (.lo at) (.hi at)))
+
+(defn one [(x g/Node)] (-> (ArrayList g/Node))
+  (let [(mut out) (g/new-kids)] (push! (mut out) x) out))
+
+(defn three [(a g/Node) (b g/Node) (c g/Node)] (-> (ArrayList g/Node))
+  (let [(mut out) (g/new-kids)] (push! (mut out) a) (push! (mut out) b) (push! (mut out) c) out))
+
+;;; The child, then the function's other parameters as they were given.
+(defn passed-on [(each (slice u8)) (params (ArrayList g/Node)) (at g/Node)] (-> (ArrayList g/Node))
+  (let [(mut out) (g/new-kids)]
+    (push! (mut out) (name-node each at))
+    (for i (range 1 (len params)) (push! (mut out) (name-node (.text (kid (get params i) 0)) at)))
+    out))
+
+(defn everywhere-fn [(src (slice u8)) (path (slice u8)) (d g/Node)] (-> g/Node)
+  (let [fname (kid d 0)
+        params (.kids (kid d 1))
+        ret (kid d 2)
+        body (kid d 3)]
+    (when (= (len params) 0) (sugar-fail src path d "an everywhere function takes the node first"))
+    (let [node (.text (kid (get params 0) 0))]
+      (unless (and (= (.kind body) (g/KMatch)) (= (.kind (kid body 0)) (g/KName)) (= (.text (kid body 0)) node))
+        (sugar-fail src path body (cat3 "an everywhere function is a match on its node, " node "")))
+      (for arm (.kids (kid body 1))
+        (let [p (kid arm 0)]
+          (when (and (= (.kind p) (g/KName)) (= (.text p) "_") (= (.kind (kid arm 1)) (g/KNone)))
+            (sugar-fail src path arm "an everywhere function's last case is its children, so it has no `_` of its own"))))
+      (let [each "each-kid"
+            call (g/node2 (g/KCall) (name-node (.text fname) body) (list-node (passed-on each params body) body))
+            kids-of (g/node2 (g/KFieldE) (name-node node body) (name-node "kids" body))
+            head (g/node2 (g/KInHead) (name-node each body) kids-of)
+            void (or (= (.kind ret) (g/KNone)) (and (= (.kind ret) (g/KUpper)) (= (.text ret) "Void")))
+            bool (and (= (.kind ret) (g/KUpper)) (= (.text ret) "Bool"))
+            walk (cond
+                   void (g/node2 (g/KFor) head (g/mk (g/KBlock) (one (list-node (one call) body)) (.lo body) (.hi body)))
+                   bool (g/node2 (g/KAny) head call)
+                   :else
+                     (let [(mut ck) (g/new-kids)]
+                       (push! (mut ck) call)
+                       (push! (mut ck) (list-node (one head) body))
+                       (g/node2 (g/KWithE) (name-node node body)
+                                (list-node (one (g/node2 (g/KFieldInit) (name-node "kids" body)
+                                                         (g/mk (g/KComp) ck (.lo body) (.hi body))))
+                                           body))))
+            (mut arms) (g/new-kids)]
+        (for a (.kids (kid body 1)) (push! (mut arms) a))
+        (push! (mut arms) (g/mk (g/KArm) (three (name-node "_" body) (g/none-node) walk) (.lo body) (.hi body)))
+        (let [(mut fn-kids) (g/new-kids)]
+          (push! (mut fn-kids) fname)
+          (push! (mut fn-kids) (kid d 1))
+          (push! (mut fn-kids) ret)
+          (push! (mut fn-kids) (g/node2 (g/KMatch) (kid body 0) (list-node arms (kid body 1))))
+          (g/mk (g/KFn) fn-kids (.lo d) (.hi d)))))))
 
 ;;; `"bundle.js" = "src/bundle/js.syntax"` lines under [modules].
 (defn read-manifest! [(k (mut Comp)) (manifest (slice u8))] (-> void)
