@@ -96,14 +96,15 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 ```
 
 It is closer to a small ML than to a one-purpose language, and some of it is still written at a low
-level: `corpus/tools/altitude.py` counts 41% of the lines of `.rules` and `.attrs` in functions with
+level: `corpus/tools/altitude.py` counts 32% of the lines of `.rules` and `.attrs` in functions with
 loops over indices, variables updated in place, global or context state written to, or byte
 scanning (67% on 2026-11-05). What is left is mostly the build's own sequencing, symbol tables
 passed by reference, naming, and printing.
 
 Where a big file can be cut for parsing in parallel is a grammar too (`coarse.syntax`), all of it
-fragments, so it builds one node for each stretch between cuts. It reads three.js's 1.5 MB file in
-3.9 ms where the hand-written scanner took 2.2.
+fragments, so it builds one node for each stretch between cuts, and a repetition of single bytes
+compiles to a loop over bytes. It costs three.js's build about 1.5 ms more than the hand-written
+scanner did (42 ms, 0.86 of esbuild's time).
 
 `.attrs` is an attribute grammar over a grammar's trees, compiled by the same compiler. Nothing in
 it walks a tree: it declares attributes, and `on` blocks give equations for the nodes a pattern
@@ -157,7 +158,8 @@ out/bin/spec                                              # the build build.bund
 `tools/same.py` compares a new build with a frozen one, byte for byte, across 189 outputs. That is
 how the code moved out of Coil without changing behaviour. It passes no `--target`, so
 `tools/same-lowered.py NEW BASE` compares lowered output (57 cases, TypeScript included), against
-the previous commit's build.
+the previous commit's build, and `tools/same-split.py NEW BASE` code splitting and stylesheet assets,
+hashed file names and maps included.
 
 ## Results
 
