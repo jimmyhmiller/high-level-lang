@@ -1006,7 +1006,8 @@
 ;; ---------------------------------------------------------------- loops
 
 (defstruct HeadInfo
-  [(wrap-kind i64)          ; 0 list, 1 map keys, 2 text, 3 range, 4 query
+  [(wrap-kind i64)          ; 0 list, 1 map keys, 2 text, 3 range, 4 query, 5 list by pattern, 6 from n up
+   (alts (ArrayList PatAlt))
    (var (slice u8))
    (seq Code)
    (hi Code)
@@ -1017,14 +1018,96 @@
 
 (defn empty-code [] (-> Code) `())
 
+;;; One alternative of a pattern loop head: its tests and bindings, then `moves`, which give the
+;;; names it bound to the symbols the loop's body was compiled against.
+(defstruct PatAlt [(steps (ArrayList Step)) (moves Code)])
+(defstruct Bound [(name (slice u8)) (ty (slice u8)) (sym (slice u8))])
+
+(defn no-alts [] (-> (ArrayList PatAlt)) (ArrayList::new [PatAlt] (malloc-allocator)))
+
+(defn top-alternatives [(p g/Node)] (-> (ArrayList g/Node))
+  (let [(mut out) (ArrayList::new [g/Node] (malloc-allocator))]
+    (if (= (.kind p) (g/KPOr))
+        (do (push! (mut out) (kid p 0))
+            (for q (list-kids (kid p 1)) (push! (mut out) q)))
+        (push! (mut out) p))
+    out))
+
+;;; `for Pat in xs`: the items that match.
+(defn pat-head-open! [(k (mut Comp)) (h g/Node)] (-> HeadInfo)
+  (let [e (expr (mut k) (kid h 1) "")
+        t (.ty e)
+        _ (unless (list? t) (die (mut k) h (cat "a pattern can only take the items of a list, not of " t)))
+        v (fresh (mut k) "item")]
+    (HeadInfo :wrap-kind 5 :alts (pattern-alts! (mut k) h (kid h 0) v (elem-of t)) :var v :seq (.code e) :hi `0
+              :lets (empty-code) :row "" :tests (empty-code) :binds (empty-code))))
+
+;;; `if let Pat = e` in a comprehension: on only when `e` matches.
+(defn let-clause-open! [(k (mut Comp)) (h g/Node)] (-> HeadInfo)
+  (let [e (expr (mut k) (kid h 1) "")
+        v (fresh (mut k) "value")]
+    (HeadInfo :wrap-kind 8 :alts (pattern-alts! (mut k) h (kid h 0) v (.ty e)) :var v :seq (.code e) :hi `0
+              :lets (empty-code) :row "" :tests (empty-code) :binds (empty-code))))
+
+;;; A pattern's alternatives against the value in `v`, each alternative of an or-pattern in turn.
+;;; Every alternative must bind the same names, with the same types; they are bound for what follows.
+(defn pattern-alts! [(k (mut Comp)) (h g/Node) (pattern g/Node) (v (slice u8)) (elem (slice u8))] (-> (ArrayList PatAlt))
+  (let [(mut shapes) (ArrayList::new [(ArrayList Bound)] (malloc-allocator))
+        (mut steps-of) (ArrayList::new [(ArrayList Step)] (malloc-allocator))]
+    (for alt (top-alternatives pattern)
+      (let [mark (locals-mark (mut k))
+            (mut steps) (ArrayList::new [Step] (malloc-allocator))
+            (mut bound) (ArrayList::new [Bound] (malloc-allocator))]
+        (pat! (mut k) alt (sym v) elem (mut steps) "")
+        (for i (range mark (len (.locals k)))
+          (let [l (get (.locals k) i)]
+            (push! (mut bound) (Bound :name (.name l) :ty (.ty l) :sym (.sym l)))))
+        (locals-reset! (mut k) mark)
+        (push! (mut shapes) bound)
+        (push! (mut steps-of) steps)))
+    (let [first-shape (get shapes 0)
+          (mut shared) (ArrayList::new [Bound] (malloc-allocator))
+          (mut alts) (no-alts)]
+      (for b first-shape
+        (push! (mut shared) (Bound :name (.name b) :ty (.ty b) :sym (bind-local! (mut k) (.name b) (.ty b) false))))
+      (for i (range 0 (len shapes))
+        (let [shape (get shapes i)
+              (mut moves) (primitive/code-list-new)]
+          (unless (= (len shape) (len shared))
+            (die (mut k) h "each alternative of this pattern must bind the same names"))
+          (for b shared
+            (let [(mut found) false]
+              (for x shape
+                (when (= (.name x) (.name b))
+                  (unless (= (.ty x) (.ty b))
+                    (die (mut k) h (cat4 (.name b) " is a " (.ty x) (cat " in one alternative and a " (.ty b)))))
+                  (set! found true)
+                  (push! (mut moves) (sym (.sym b)))
+                  (push! (mut moves) (sym (.sym x)))))
+              (unless found (die (mut k) h (cat4 "one alternative of this pattern does not bind " (.name b) "" "")))))
+          (push! (mut alts) (PatAlt :steps (get steps-of i) :moves `(~@moves)))))
+      alts)))
+
+;;; `n..` has no end: only what stops at an answer, `first`, `any` and `all`, may count up forever.
+(defn bounded! [(k (mut Comp)) (h g/Node)] (-> bool)
+  (when (= (.kind h) (g/KFromHead))
+    (die (mut k) h "`x in n..` has no end, so only first, any and all, which stop at an answer, can take it"))
+  true)
+
 (defn head-open! [(k (mut Comp)) (h g/Node)] (-> HeadInfo)
   (match (.kind h)
     (g/KRangeHead []
       (let [lo (expect (mut k) (kid h 1) (expr (mut k) (kid h 1) "Int") "Int")
             hi (expect (mut k) (kid h 2) (expr (mut k) (kid h 2) "Int") "Int")
             v (bind-local! (mut k) (.text (kid h 0)) "Int" false)]
-        (HeadInfo :wrap-kind 3 :var v :seq (.code lo) :hi (.code hi) :lets (empty-code) :row ""
+        (HeadInfo :wrap-kind 3 :alts (no-alts) :var v :seq (.code lo) :hi (.code hi) :lets (empty-code) :row ""
                   :tests (empty-code) :binds (empty-code))))
+    (g/KFromHead []
+      (let [lo (expect (mut k) (kid h 1) (expr (mut k) (kid h 1) "Int") "Int")
+            v (bind-local! (mut k) (.text (kid h 0)) "Int" false)]
+        (HeadInfo :wrap-kind 6 :alts (no-alts) :var v :seq (.code lo) :hi `0 :lets (empty-code) :row ""
+                  :tests (empty-code) :binds (empty-code))))
+    (g/KPatHead [] (pat-head-open! (mut k) h))
     (g/KInHead []
       (let [e (expr (mut k) (kid h 1) "")
             t (.ty e)
@@ -1033,7 +1116,7 @@
             v (bind-local! (mut k) (.text (kid h 0))
                            (cond (list? t) (elem-of t) (map? t) (map-key t) :else "Int")
                            false)]
-        (HeadInfo :wrap-kind kind :var v :seq (.code e) :hi `0 :lets (empty-code) :row ""
+        (HeadInfo :wrap-kind kind :alts (no-alts) :var v :seq (.code e) :hi `0 :lets (empty-code) :row ""
                   :tests (empty-code) :binds (empty-code))))
     (g/KQueryHead [] (query-open! (mut k) (kid h 0)))
     (_ (die (mut k) h "expected a loop head"))))
@@ -1073,7 +1156,7 @@
           (let [v (bind-local! (mut k) (subslice (.text a) 1 (len (.text a))) "Int" false)]
             (push! (mut binds) (sym v))
             (push! (mut binds) `(rt/rel-at ~rel-code ~rowsym ~i))))))
-    (HeadInfo :wrap-kind 4 :var ""
+    (HeadInfo :wrap-kind 4 :alts (no-alts) :var ""
               :seq (if (>= key-col 0)
                        `(rt/rel-bucket ~rel-code ~key-col ~(sym key-sym))
                        `(range 0 (.count (~(primitive/code-symbol "." rel-name) ~(.code db)))))
@@ -1088,6 +1171,26 @@
       (unless (= (.arity r) count)
         (die (mut k) n (cat4 rel " has " (rt/num-text (.arity r)) " columns"))))))
 
+;;; `inner` under the first alternative that matches.
+(defn alts-code [(k (mut Comp)) (alts (ArrayList PatAlt)) (inner Code)] (-> Code)
+  (if (= (len alts) 1)
+      (let [a (get alts 0)] (wrap-steps (.steps a) 0 `(let [~@(.moves a)] ~inner)))
+      (let [label (primitive/code-symbol ":" (fresh (mut k) "alt"))
+            (mut tries) (primitive/code-list-new)]
+        (for a alts
+          (push! (mut tries) (wrap-steps (.steps a) 0 `(let [~@(.moves a)] ~inner (return-from ~label 0)))))
+        `(block ~label ~@tries 0))))
+
+;;; A comprehension's clause, opened in order: a loop, a test, or a pattern.
+(defn clause-open! [(k (mut Comp)) (c g/Node)] (-> HeadInfo)
+  (match (.kind c)
+    (g/KIfClause []
+      (let [t (expect (mut k) (kid c 0) (expr (mut k) (kid c 0) "Bool") "Bool")]
+        (HeadInfo :wrap-kind 7 :alts (no-alts) :var "" :seq (.code t) :hi `0 :lets (empty-code) :row ""
+                  :tests (empty-code) :binds (empty-code))))
+    (g/KLetClause [] (let-clause-open! (mut k) c))
+    (_ (do (bounded! (mut k) c) (head-open! (mut k) c)))))
+
 (defn head-wrap [(k (mut Comp)) (h HeadInfo) (inner Code)] (-> Code)
   (let [v (if (> (len (.var h)) 0) (sym (.var h)) `_)]
     (cond
@@ -1097,6 +1200,11 @@
         (let [t (fresh (mut k) "c")]
           `(for ~(sym t) ~(.seq h) (let [~v (cast i64 ~(sym t))] ~inner)))
       (= (.wrap-kind h) 3) `(for ~v (range ~(.seq h) ~(.hi h)) ~inner)
+      (= (.wrap-kind h) 5) `(for (ref ~v) ~(.seq h) ~(alts-code (mut k) (.alts h) inner))
+      (= (.wrap-kind h) 7) `(when ~(.seq h) ~inner)
+      (= (.wrap-kind h) 8) `(let [~v ~(.seq h)] ~(alts-code (mut k) (.alts h) inner))
+      (= (.wrap-kind h) 6)
+        `(let [(mut ~v) ~(.seq h)] (while true ~inner (set! ~v (+ ~v 1))))
       :else
         `(let [~@(.lets h)]
            (for ~(sym (.row h)) ~(.seq h)
@@ -1790,6 +1898,47 @@
                    (block ~label ~wrapped ~(if (= ty "Void") `(do ~(.code b) 0) (.code b))))
                 ty))))))
 
+;;; `[e for …]`, or with `spread`, `[e... for …]`: each `e` a list whose items all go in.
+(defn comprehension [(k (mut Comp)) (n g/Node) (want (slice u8)) (spread bool)] (-> TE)
+  (let [mark (locals-mark (mut k))
+        value (kid n 0)
+        (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+    (for c (list-kids (kid n 1)) (push! (mut opened) (clause-open! (mut k) c)))
+    (let [v (expr (mut k) value (if spread want (if (list? want) (elem-of want) "")))
+          _ (when (and spread (not (list? (.ty v))))
+              (die (mut k) value (cat "only a list can be spread, not " (.ty v))))
+          elem (if spread (elem-of (.ty v)) (.ty v))
+          o (fresh (mut k) "out")
+          each (fresh (mut k) "each")
+          push-code (if spread
+                        `(for (ref ~(sym each)) ~(.code v) (push! (mut ~(sym o)) ~(sym each)))
+                        `(push! (mut ~(sym o)) ~(.code v)))
+          (mut body) push-code
+          (mut i) (- (len opened) 1)]
+      (while (>= i 0)
+        (set! body (head-wrap (mut k) (get opened i) body))
+        (set! i (- i 1)))
+      (locals-reset! (mut k) mark)
+      (te `(let [(mut ~(sym o)) ~(new-list (mut k) elem)] ~body ~(sym o))
+          (cat3 "[" elem "]")))))
+
+;;; `{key: value for …}`: a later key replaces an earlier one, as assigning would.
+(defn map-comprehension [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+  (let [mark (locals-mark (mut k))
+        (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+    (for c (list-kids (kid n 2)) (push! (mut opened) (clause-open! (mut k) c)))
+    (let [key (expr (mut k) (kid n 0) (if (map? want) (map-key want) ""))
+          val (expr (mut k) (kid n 1) (if (map? want) (map-val want) ""))
+          ty (cat4 "{" (.ty key) ":" (cat (.ty val) "}"))
+          o (fresh (mut k) "out")
+          (mut body) `(set! (mut ~(sym o)) ~(.code key) ~(.code val))
+          (mut i) (- (len opened) 1)]
+      (while (>= i 0)
+        (set! body (head-wrap (mut k) (get opened i) body))
+        (set! i (- i 1)))
+      (locals-reset! (mut k) mark)
+      (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~body ~(sym o)) ty))))
+
 (defn loop-all [(k (mut Comp)) (n g/Node) (negate-empty bool)] (-> TE)
   (let [mark (locals-mark (mut k))
         h (head-open! (mut k) (kid n 0))
@@ -1903,50 +2052,46 @@
                 (push! (mut pushes) `(push! (mut ~(sym o)) ~(.code x))))))
         (te `(let [(mut ~(sym o)) ~(new-list (mut k) elem)] ~@pushes ~(sym o))
             (cat3 "[" elem "]"))))
-    (g/KComp []
-      (let [mark (locals-mark (mut k))
-            value (kid n 0)
-            heads (list-kids (kid n 1))
-            filter (kid n 2)
-            (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
-        (for h heads (push! (mut opened) (head-open! (mut k) h)))
-        (let [v (expr (mut k) value (if (list? want) (elem-of want) ""))
-              o (fresh (mut k) "out")
-              push-code `(push! (mut ~(sym o)) ~(.code v))
-              guarded (if (none? filter)
-                          push-code
-                          `(when ~(.code (expect (mut k) filter (expr (mut k) filter "Bool") "Bool")) ~push-code))
-              (mut body) guarded
-              (mut i) (- (len opened) 1)]
-          (while (>= i 0)
-            (set! body (head-wrap (mut k) (get opened i) body))
-            (set! i (- i 1)))
-          (locals-reset! (mut k) mark)
-          (te `(let [(mut ~(sym o)) ~(new-list (mut k) (.ty v))] ~body ~(sym o))
-              (cat3 "[" (.ty v) "]")))))
+    (g/KComp [] (comprehension (mut k) n want false))
+    (g/KCompSpread [] (comprehension (mut k) n want true))
+    (g/KMapComp [] (map-comprehension (mut k) n want))
+    (g/KSum []
+      (let [_ (bounded! (mut k) (kid n 0))
+            mark (locals-mark (mut k))
+            h (head-open! (mut k) (kid n 0))
+            c (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")
+            total (fresh (mut k) "n")
+            code (head-wrap (mut k) h `(set! ~(sym total) (+ ~(sym total) ~(.code c))))]
+        (locals-reset! (mut k) mark)
+        (te `(let [(mut ~(sym total)) 0] ~code ~(sym total)) "Int")))
     (g/KAll [] (loop-all (mut k) n false))
     (g/KAny [] (loop-all (mut k) n true))
     (g/KCount []
-      (let [mark (locals-mark (mut k))
+      (let [_ (bounded! (mut k) (kid n 0))
+            mark (locals-mark (mut k))
             h (head-open! (mut k) (kid n 0))
             c (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Bool") "Bool")
             total (fresh (mut k) "n")
             code (head-wrap (mut k) h `(when ~(.code c) (set! ~(sym total) (+ ~(sym total) 1))))]
         (locals-reset! (mut k) mark)
         (te `(let [(mut ~(sym total)) 0] ~code ~(sym total)) "Int")))
+    ;; Over `n..`, which has no end, it finds an answer or runs forever: it is the answer itself.
     (g/KFirst []
-      (let [mark (locals-mark (mut k))
+      (let [endless (= (.kind (kid n 0)) (g/KFromHead))
+            mark (locals-mark (mut k))
             h (head-open! (mut k) (kid n 0))
-            v (expr (mut k) (kid n 1) want)
+            v (expr (mut k) (kid n 1) (if (and endless (> (len want) 0) (not (opt? want))) (cat want "?") want))
             label (primitive/code-symbol ":" (fresh (mut k) "q"))
             x (fresh (mut k) "x")]
         (unless (opt? (.ty v)) (die (mut k) n (cat "`first` takes the first some(…), but this is " (.ty v))))
         (let [code (head-wrap (mut k) h
                               `(match ~(.code v)
-                                 (Some [~(sym x)] (return-from ~label (Some ~(sym x))))
+                                 (Some [~(sym x)] (return-from ~label ~(if endless (sym x) `(Some ~(sym x)))))
                                  (None [] 0)))]
           (locals-reset! (mut k) mark)
-          (te `(block ~label ~code (None [~(coil-type (mut k) (opt-of (.ty v)))])) (.ty v)))))
+          (if endless
+              (te `(block ~label ~code (panic "a range with no end came to an end")) (opt-of (.ty v)))
+              (te `(block ~label ~code (None [~(coil-type (mut k) (opt-of (.ty v)))])) (.ty v))))))
     (g/KSort []
       (let [mark (locals-mark (mut k))
             items (expr (mut k) (kid n 1) "")
@@ -2098,7 +2243,8 @@
         (None [TE])
         (let [comp (kid (get fields 0) 1)
               heads (list-kids (kid comp 1))]
-          (if (not (and (= (len heads) 1) (= (.kind (get heads 0)) (g/KInHead))
+          (if (not (and (or (= (len heads) 1) (and (= (len heads) 2) (= (.kind (get heads 1)) (g/KIfClause))))
+                        (= (.kind (get heads 0)) (g/KInHead))
                         (field-of? (kid (get heads 0) 1) (.text base-n) "kids")))
               (None [TE])
               (match (find-local (mut k) (.text base-n))
@@ -2115,8 +2261,11 @@
         mark (locals-mark (mut k))
         v (bind-local! (mut k) (.text (kid head 0)) ty false)
         value (expect (mut k) (kid comp 0) (expr (mut k) (kid comp 0) ty) ty)
-        filter (kid comp 2)
-        keep (if (none? filter) `true (.code (expect (mut k) filter (expr (mut k) filter "Bool") "Bool")))
+        clauses (list-kids (kid comp 1))
+        keep (if (= (len clauses) 1)
+                 `true
+                 (let [filter (kid (get clauses 1) 0)]
+                   (.code (expect (mut k) filter (expr (mut k) filter "Bool") "Bool"))))
         w (fresh (mut k) "w") src (fresh (mut k) "src") o (fresh (mut k) "out")
         changed (fresh (mut k) "changed") i (fresh (mut k) "i") j (fresh (mut k) "j") r (fresh (mut k) "r")
         start `(do (set! ~(sym changed) true)
@@ -2186,7 +2335,8 @@
 (defn stmt [(k (mut Comp)) (s g/Node) (want (slice u8))] (-> TE)
   (match (.kind s)
     (g/KFor []
-      (let [mark (locals-mark (mut k))
+      (let [_ (bounded! (mut k) (kid s 0))
+            mark (locals-mark (mut k))
             h (head-open! (mut k) (kid s 0))
             body (expr (mut k) (kid s 1) "Void")
             code (head-wrap (mut k) h (.code body))]
