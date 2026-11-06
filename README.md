@@ -66,6 +66,15 @@ fn directive-count(stmts: [Node]) -> Int = len([s for s in stmts while s is Expr
 let places = scan p = Place(at: 0, breaks: 0, col: 0) for k in mapped: advanced(text, p, base + k.out)
 ```
 
+A map is written `{k: v, …}`, and `a ++ b` of maps is `a` with `b`'s entries, `b` winning. A
+fold whose step is `acc ++ more` adds `more` to its accumulator in place, never copying it, when
+`more` is made whole before it goes in, so a loop that keeps a list or a table is a fold at the
+same cost. Enum members settled one after another, each seeing those before it:
+
+```
+let settled: [Settled] = fold done = [] for m in members: done ++ [member-settled(done, m, name.text, param, a)]
+```
+
 A fixpoint is a recursive function, not a loop with a changed flag:
 
 ```
@@ -97,10 +106,11 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 ```
 
 It is closer to a small ML than to a one-purpose language, and some of it is still written at a low
-level: `tools/altitude.py` counts 32% of the lines of `.rules` and `.attrs` in functions with
+level: `tools/altitude.py` counts 16% of the lines of `.rules` and `.attrs` in functions with
 loops over indices, variables updated in place, global or context state written to, or byte
-scanning (67% on 2026-11-05). What is left is mostly the build's own sequencing, symbol tables
-passed by reference, naming, and printing.
+scanning (67% on 2026-11-05). What is left is mostly the registries a build fills as it loads and
+links (modules, parts, symbols), the supplies of fresh names, and byte-level spelling of numbers
+and strings. `tools.langtest` (`src/tools/langtest.rules`) checks what the collection forms mean.
 
 Where a big file can be cut for parsing in parallel is a grammar too (`coarse.syntax`), all of it
 fragments, so it builds one node for each stretch between cuts, and a repetition of single bytes
@@ -230,7 +240,7 @@ stages that work on one file, module or part at a time, the functions each runs,
 stage load     per file   bundle.modules/visit-file bundle.modules/next-files bundle.modules/first-files ...
 stage facts    per module bundle.analysis/on-demand-calls bundle.analysis/summaries-of
 stage emit     per module bundle.mangle/unit-usage bundle.emit/unit-emitted
-stage optimize per part   bundle.api/default-optimize bundle.ascii/converted
+stage optimize per part   bundle.api/default-optimize bundle.finish/ascii-only
 stage print    per part   bundle.api/render-part
 stage link     whole      bundle.analysis/link
 
