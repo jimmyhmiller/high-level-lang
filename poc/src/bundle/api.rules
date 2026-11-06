@@ -86,6 +86,7 @@ record Options {
   footer: Text,
   tree-shaking: Bool,
   has-transform: Bool,
+  has-optimize: Bool,
   charset-ascii: Bool,
   drop-console: Bool,
   drop-debugger: Bool,
@@ -115,7 +116,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
-          aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
+          aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
           packages-external: false, public-path: "", tsconfig: "", plan: serial-plan(), legal-comments: "eof", jsx: jsx.options-new(), target: lower.no-lowering,
           on-resolve: [], on-load: [],
           transform: keep-as-is, optimize: default-optimize)
@@ -363,6 +364,39 @@ fn optimized(o: Options, p: Node) -> Node {
   joined(p, heaviest-first(parts-of(p, o.plan.optimize-parts), o.optimize, o.plan.optimize-threads))
 }
 
+# ---------------------------------------------------------------- the back half at once
+
+# When nothing between minifying and printing needs the whole program, each part is minified,
+# made ASCII and printed in one go: no barrier between them, and no program put back together
+# only to be cut again. The parts print as the whole would, since printing cuts anywhere.
+fn fusable?(o: Options) -> Bool =
+  o.minify-syntax and not o.has-optimize and o.plan.optimize-parts > 1 and o.plan.print-parts > 1
+  and o.target >= lower.no-lowering and not o.drop-console and not o.drop-debugger
+
+state part-ascii: Bool = false
+
+fn finished-part(p: Node) -> Rendered {
+  let done = default-optimize(p)
+  render-part(if part-ascii then ascii.converted(done) else done)
+}
+
+fn finished-output(o: Options, f: Format, p: Node) -> Printed {
+  print-pretty = o.pretty
+  print-maps = o.sourcemap
+  part-ascii = o.charset-ascii
+  if o.charset-ascii { ascii.prepare!(o.target) }
+  let parts = parts-of(p, o.plan.optimize-parts)
+  let order = sort i in [i for i in 0..len(parts)] by part-weight(parts[i]) desc
+  let done = parallel-map([parts[i] for i in order], finished-part, o.plan.optimize-threads)
+  var pieces: [Rendered] = [done[0] for i in 0..len(parts)]
+  for k in 0..len(order) { pieces[order[k]] = done[k] }
+  # What the format adds goes after, as it is: it was never minified.
+  let exports = export-statements(f)
+  if len(exports) > 0 { pieces += render-part(Program(None(), List(exports...))) }
+  let r = pieces-joined(o, pieces)
+  Printed(text: f.prefix ++ r.text ++ f.suffix, base: len(f.prefix), marks: r.marks)
+}
+
 # `f` of each part at once, the heaviest started first, so the last to finish is a light one; the
 # results in the parts' order.
 fn heaviest-first(parts: [Node], f: Fn(Node)->Node, threads: Int) -> [Node] {
@@ -396,7 +430,10 @@ fn rendered-in-parts(o: Options, p: Node) -> Rendered {
   if o.plan.print-parts <= 1 { return js.render-tracked(p, o.pretty, o.sourcemap) }
   print-pretty = o.pretty
   print-maps = o.sourcemap
-  let pieces = parallel-map(parts-of(p, o.plan.print-parts), render-part, o.plan.print-threads)
+  pieces-joined(o, parallel-map(parts-of(p, o.plan.print-parts), render-part, o.plan.print-threads))
+}
+
+fn pieces-joined(o: Options, pieces: [Rendered]) -> Rendered {
   var b = buf-new()
   var marks: [Mark] = []
   let gap = if o.pretty then ";\n" else ";"
@@ -585,9 +622,10 @@ fn build-one(options: Options) -> Void {
   lap(o, "naming")
   let emitted = run-entry(e.program())
   lap(o, "emit: rewrite identifiers")
-  let p = for-target(o, if o.minify-syntax then optimized(o, emitted) else folded(o, emitted))
+  let fused = fusable?(o)
+  let p = if fused then emitted else for-target(o, if o.minify-syntax then optimized(o, emitted) else folded(o, emitted))
   lap(o, "minify rules")
-  let out0 = wrap-format(o, f, p)
+  let out0 = if fused then finished-output(o, f, p) else wrap-format(o, f, p)
   # The banner and hoisted external imports come first, ahead of everything the map describes.
   var hoisted = buf-new()
   if len(o.banner) > 0 {
