@@ -1,5 +1,5 @@
 # Each module's import/export structure and statements, as facts for link.facts.
-rules bundle.analysis over bundle.js
+attrs bundle.analysis over bundle.js
 use bundle.js as js
 use bundle.link as link
 use bundle.scopes as sc
@@ -82,18 +82,80 @@ record Summary { declares: [Int], mentions: [Mention], pure: Bool }
 
 fn no-summary() -> Summary = Summary(declares: [], mentions: [], pure: false)
 
-task state walk-declares: [Int] = []
-task state walk-mentions: [Mention] = []
-# The symbols this statement has mentioned already: a fact once is the fact.
-task state walk-seen: {Int:Bool} = {}
+# One traversal of a statement finds both. A top-level statement declares only its own names:
+# not those inside a function or a block, nor a function's other than its own name. What a
+# namespace read, a `require` or an `import()` stands for is one mention, not its pieces'.
+input declaring: Bool
+collect declares: [Int]
+collect mentions: [Mention]
+inh top: Bool = true
+inh counting: Bool = true
+
+on FuncDecl(name, ...) | GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) {
+  kids.top = false
+  name.top = top
+}
+on BindName(x) as n {
+  if declaring and top {
+    let s = here.bindings[n.lo] ?? panic "{}: no symbol for binding {}", here.path, x
+    if sym.symbol-at(m.table, s).scope == here.root { declares += s }
+  }
+}
+on Ident(x) as n {
+  if counting {
+    match here.bindings[n.lo] {
+      some(s) => mention(Symbol, s)
+      none => if x in here.helpers { mention(Symbol, helper(x)) }
+    }
+  }
+}
+on Member(object, property) {
+  if counting {
+    if let some(target) = namespace-of(here, object) {
+      mentions += Mention(reach: Member, id: target, name: property.text)
+      object.counting = false
+    }
+  }
+}
+on ImportCall(...) as n {
+  if counting {
+    if let some(from) = imported-str(n) {
+      mention(if splitting then Chunk else Whole, known-dep(here, from))
+      kids.counting = false
+    }
+  }
+}
+on CallExpr(...) as n {
+  if counting {
+    if let some(from) = required-str(here, n) {
+      mention(Whole, known-dep(here, from))
+      kids.counting = false
+    }
+  }
+}
+
+# Any other scope: its names are its own. Last, so the blocks above own the nodes they match.
+on _ as n { if sc.opens?(n.kind) { kids.top = false } }
+
+fn mention(reach: Reach, id: Int) -> Void { mentions += Mention(reach: reach, id: id, name: "") }
 
 fn summary-of(n: Node, declares: Bool) -> Summary {
-  walk-declares = []
-  walk-mentions = []
-  walk-seen = {}
-  if declares { declared-under(n) }
-  mentions-under(n)
-  Summary(declares: walk-declares, mentions: walk-mentions, pure: declares and tree-shaking and pure-stmt?(n))
+  let a = run(n, declares)
+  Summary(declares: a.declares, mentions: once-each-symbol(a.mentions),
+          pure: declares and tree-shaking and pure-stmt?(n))
+}
+
+# A symbol mentioned once is mentioned: the first mention of each stays, and the others go.
+fn once-each-symbol(ms: [Mention]) -> [Mention] {
+  var seen: {Int:Bool} = {}
+  var out: [Mention] = []
+  for x in ms {
+    if x.reach != Symbol or not (x.id in seen) {
+      if x.reach == Symbol { seen[x.id] = true }
+      out += x
+    }
+  }
+  out
 }
 
 # A module's summaries: CommonJS is one, of its whole tree; an ES module has one for each top-level
@@ -101,11 +163,8 @@ fn summary-of(n: Node, declares: Bool) -> Summary {
 fn summaries-of(id: Int) -> [Summary] {
   var out: [Summary] = []
   with here = m.modules[id] {
-    if here.kind == Cjs {
-      out += summary-of(here.tree, false)
-    } else {
-      for s in here.tree.body.kids { out += if walked?(s) then summary-of(s, true) else no-summary() }
-    }
+    out = if here.kind == Cjs then [summary-of(here.tree, false)]
+          else [if walked?(s) then summary-of(s, true) else no-summary() for s in here.tree.body.kids]
   }
   out
 }
@@ -113,53 +172,6 @@ fn summaries-of(id: Int) -> [Summary] {
 fn walked?(s: Node) -> Bool = match s {
   Import(...) | ImportBare(_) | ExportAll(_) | ExportAllAs(...) | ExportFrom(...) | ExportNamed(_) => false
   _ => true
-}
-
-# Every binding beneath `n`, by symbol. Does not enter nested functions: a top-level statement
-# declares only its own names.
-fn declared-under(n: Node) -> Void = match n {
-  BindName(x) => {
-    let s = here.bindings[n.lo] ?? panic "{}: no symbol for binding {}", here.path, x
-    if sym.symbol-at(m.table, s).scope == here.root { walk-declares += s }
-  }
-  _ =>
-    if sc.hoist-name?(n.kind) {
-      declared-under(n.name)
-    } else if not sc.opens?(n.kind) {
-      for k in n.kids { declared-under(k) }
-    }
-}
-
-fn mentions-kids(n: Node) -> Void {
-  for k in n.kids { mentions-under(k) }
-}
-
-fn mention(reach: Reach, id: Int) -> Void {
-  if reach == Symbol {
-    if id in walk-seen { return }
-    walk-seen[id] = true
-  }
-  walk-mentions += Mention(reach: reach, id: id, name: "")
-}
-
-fn mentions-under(n: Node) -> Void = match n {
-  Ident(x) => match here.bindings[n.lo] {
-    some(s) => mention(Symbol, s)
-    none => if x in here.helpers { mention(Symbol, helper(x)) }
-  }
-  Member(object, property) => match namespace-of(here, object) {
-    some(target) => { walk-mentions += Mention(reach: Member, id: target, name: property.text) }
-    none => mentions-under(object)
-  }
-  ImportCall(...) => match imported-str(n) {
-    some(from) => mention(if splitting then Chunk else Whole, known-dep(here, from))
-    none => mentions-kids(n)
-  }
-  CallExpr(...) => match required-str(here, n) {
-    some(from) => mention(Whole, known-dep(here, from))
-    none => mentions-kids(n)
-  }
-  _ => mentions-kids(n)
 }
 
 # The facts a summary stands for, in `part`.
