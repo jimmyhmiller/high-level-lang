@@ -71,8 +71,11 @@ Early errors (`early.attrs`, 1,045 lines) are written this way, and include what
 (`calls.attrs`), so a JavaScript file is checked and its `require` and `import()` calls found in one
 traversal.
 
-Compile time is the real cost: building the tools peaks at about 9 GB, of which the reader image
-is about 3.2 GB. Run builds through `corpus/tools/guard.py`, which kills a process tree over a limit.
+The languages' readers are one provider, `hl.readers`, compiled once as a native reader artifact
+(`corpus/tools/readers.sh`, rebuilt only when the readers or the compiler change). Built from
+source instead, Coil compiles each reader into every build and keeps what each reading allocates
+until the build ends: the bundler took about 30 s and 8–9.8 GB. With the artifact it takes about
+7 s and 1.6 GB. Run builds through `corpus/tools/guard.py`, which kills a process tree over a limit.
 
 ## Running it
 
