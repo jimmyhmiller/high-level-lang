@@ -505,8 +505,7 @@ fn grafted(p: Parsed) -> Analysis = grafted-analysis(Analysed(analysis: p.analys
 
 fn grafted-analysis(a: Analysed) -> Analysis {
   let symbol-shift = sym.symbol-count(table)
-  var own = a.scopes
-  let scope-shift = sym.graft!(table, own, bundle-scope)
+  let scope-shift = sym.graft!(table, a.scopes, bundle-scope)
   a.analysis with { root: a.analysis.root + scope-shift, shift: symbol-shift }
 }
 
@@ -729,11 +728,8 @@ memo fn prepared-of(path: Text) -> Prepared {
   let raw = [t.body.kids for t in trees]
   let parts = [normalized-tree(t, base).body.kids for t in trees]
   let tree = Program(tree0.hashbang, List([s for part in parts for s in part]...))
-  var own = sym.table-new()
-  let top = sym.new-scope!(own, -1, true)
-  let root = sym.new-scope!(own, top, true)
-  sc.declare-program!(tree, own, root)
-  Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, raw: raw, scopes: own, root: root,
+  let own = scope.declared(tree)
+  Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, raw: raw, scopes: own.table, root: own.root,
            esm: early.program-has-module-syntax?(tree0), mentions: mentions-define?(sp.src),
            exportable: early.exportable-of(tree0))
 }
@@ -749,15 +745,12 @@ memo fn walked-of(item: Text) -> Walked {
   let what = text-after(item, "\n")
   let k = parse-int(what[1..len(what)])
   let pr = prepared-of(path)
-  var own = sym.table-under(pr.scopes, pr.root)
-  var bindings: {Int:Int} = {}
-  if k == 0 { sc.walk-part(pr.tree.hashbang, own, bindings) }
-  for s in pr.parts[k] { sc.walk-part(s, own, bindings) }
-  let defined = pr.mentions and (any s in pr.parts[k]: defines-apply?(s, bindings))
+  let own = scope.walked-under(pr.scopes, pr.root, (if k == 0 then [pr.tree.hashbang] else []) ++ pr.parts[k])
+  let defined = pr.mentions and (any s in pr.parts[k]: defines-apply?(s, own.bindings))
   # Checking the part finds what it loads, in its statements as parsed: normalising them keeps
   # every call, in order.
   let found = early.part-found(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
-  Walked(scopes: own, bindings: bindings, defined: defined, requires: found.requires, imports: found.imports,
+  Walked(scopes: own.table, bindings: own.bindings, defined: defined, requires: found.requires, imports: found.imports,
          problem: found.problem)
 }
 
@@ -781,39 +774,25 @@ fn finished-file(path: Text) -> Parsed {
   let sp = split-source(path)
   if not pr.whole { return targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true)))) }
   let p = from-of(path)
-  var targets: {Text:Text} = {}
-  for k in 0..len(sp.starts) {
-    let pt = piece-of(path ++ "\n" ++ int-text(k)).targets
-    for spec in keys(pt) { targets[spec] = pt[spec] ?? spec }
-  }
-  var own = sym.table-copy(pr.scopes)
-  var bindings: {Int:Int} = {}
-  var defined = false
-  var requires: [Text] = []
-  var imports: [Text] = []
-  var problem = early-of(path)
-  for k in 0..len(pr.parts) {
-    let w = walked-of(path ++ "\nw" ++ int-text(k))
-    if is-none(problem) { problem = w.problem }
-    if w.defined { defined = true }
-    requires ++= w.requires
-    imports ++= w.imports
-    let symbol-shift = sym.symbol-count(own)
-    var part = w.scopes
-    sym.graft!(own, part, pr.root)
-    for key in keys(w.bindings) {
-      let v = w.bindings[key] ?? 0
-      bindings[key] = if v < 0 then -1 - v else v + symbol-shift
-    }
-  }
+  let found = [piece-of(path ++ "\n" ++ int-text(k)).targets for k in 0..len(sp.starts)]
+  let targets = {spec: t for pt in found for spec in keys(pt) if let some(t) = pt[spec]}
+  let walks = [walked-of(path ++ "\nw" ++ int-text(k)) for k in 0..len(pr.parts)]
+  # A part's symbols move by how many the table holds before it is grafted.
+  let ends = scan n = sym.symbol-count(pr.scopes) for w in walks: n + sym.symbol-count(w.scopes)
+  let bindings = {key: if v < 0 then -1 - v else v + ends[k] - sym.symbol-count(walks[k].scopes)
+                  for k in 0..len(walks) for key in keys(walks[k].bindings) if let some(v) = walks[k].bindings[key]}
+  let own = sym.grafted(pr.scopes, [w.scopes for w in walks], pr.root)
+  let head = early-of(path)
+  let problem = if is-some(head) then head else first w in walks: w.problem
   if let some(at) = problem {
     panic "{}:{}:{}: {}", path, line-of(sp.src, at.at), col-of(sp.src, at.at), at.message
   }
   let cjs = not pr.esm and (sym.has-free?(own, "module") or sym.has-free?(own, "exports") or sym.has-free?(own, "require"))
-  if cjs or p.jsx-imports or defined { return analysed-file(p) with { targets: targets } }
+  if cjs or p.jsx-imports or (any w in walks: w.defined) { return analysed-file(p) with { targets: targets } }
   let real-free = [f for f in sym.free-names(own) if not (f in p.helpers)]
   let a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: real-free, cjs: false, shift: 0, defined: false)
-  p with { analysed: true, scopes: own, analysis: a, calls: requires ++ imports, targets: targets }
+  let calls = [r for w in walks for r in w.requires] ++ [r for w in walks for r in w.imports]
+  p with { analysed: true, scopes: own, analysis: a, calls: calls, targets: targets }
 }
 
 # Early errors, which `parse-file` checks of a file parsed whole.
@@ -953,12 +932,10 @@ fn load-file(path: Text, effects: Bool) -> Int {
 # its helpers.
 fn load-runtime(text: Text) -> Void {
   let tree = js.parse(text, "<runtime>")
-  var bindings: {Int:Int} = {}
-  sym.take-free!(table)
-  let root = sc.analyze(tree, table, bundle-scope, bindings)
-  let free-names = sym.free-names(table)
-  modules += blank-module(0, "<runtime>", Runtime, tree, root) with {
-    bindings: bindings, side-effects: false, base: "runtime", free: free-names, text: text
+  let s = scope.scoped(tree, [])
+  let a = grafted-analysis(Analysed(analysis: no-analysis() with { root: s.root, bindings: s.bindings }, scopes: s.table))
+  modules += blank-module(0, "<runtime>", Runtime, tree, a.root) with {
+    bindings: a.bindings, symbol-shift: a.shift, side-effects: false, base: "runtime", free: s.free, text: text
   }
   order += 0
 }
