@@ -8,7 +8,7 @@ import collections, glob, os, re, sys
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../poc/src/bundle")
 PATTERNS = collections.OrderedDict([
-    ("while",   re.compile(r"\bwhile\b")),
+    ("while",   re.compile(r"^\s*while\b[^\n]*\{\s*$", re.M)),
     ("var",     re.compile(r"^\s*var ", re.M)),
     ("kids[i]", re.compile(r"\.kids\[")),
     ("bytes",   re.compile(r"'\\?.'")),

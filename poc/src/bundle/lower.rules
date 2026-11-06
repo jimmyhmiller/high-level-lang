@@ -333,29 +333,16 @@ fn excluded-key(p: Node) -> Node = match p {
 # `const { a, ...r } = o` is `const _a = o, { a } = _a, r = __objRest(_a, ["a"])`.
 fn rest-declarators(pattern: Node, init: Node, at: Node) -> [Node] {
   let props = pattern.props.kids
-  var plain: [Node] = []
-  var keys: [Node] = []
-  var rest: Node = None()
-  for p in props {
-    match p {
-      PatPropRest(t) => { rest = t }
-      _ => {
-        if nested-rest?(p) { panic "object rest inside another pattern is not implemented for this target" }
-        plain += p
-        keys += excluded-key(p)
-      }
-    }
-  }
+  let plain = [p for p in props if not (p is PatPropRest(_))]
+  if any p in plain: nested-rest?(p) { panic "object rest inside another pattern is not implemented for this target" }
+  let keys = [excluded-key(p) for p in plain]
+  let rest = last PatPropRest(t) in props: some(t)
   let holder = fresh-name("_")
   let slots = [if i == len(keys) - 1 then ElemLast(keys[i]) else Elem(keys[i]) for i in 0..len(keys)]
   let excluded = ArrayLit(List(slots...))
-  var out = [Declarator(BindName(holder), init)]
-  if len(plain) > 0 {
-    let rebuilt = ObjectPattern(List(plain...))
-    out += Declarator(lowered(rebuilt), Ident(holder))
-  }
-  out += Declarator(rest, helper-call("__objRest", [Ident(holder), excluded]))
-  out
+  let rebuilt: [Node] = if len(plain) == 0 then [] else [Declarator(lowered(ObjectPattern(List(plain...))), Ident(holder))]
+  [Declarator(BindName(holder), init)] ++ rebuilt
+  ++ [Declarator(rest ?? None(), helper-call("__objRest", [Ident(holder), excluded]))]
 }
 
 # ---------------------------------------------------------------- functions
@@ -363,11 +350,7 @@ fn rest-declarators(pattern: Node, init: Node, at: Node) -> [Node] {
 fn with-temps(stmts: [Node], temps: [Text]) -> [Node] {
   if len(temps) == 0 { return stmts }
   let decls = [Declarator(BindName(t), None()) for t in temps]
-  var at = 0
-  var going = true
-  for s in stmts {
-    if going and s is ExprStmt(Str(_)) { at += 1 } else { going = false }
-  }
+  let at = directive-count(stmts)
   stmts[0..at] ++ [VarDecl(List(decls...))] ++ stmts[at..len(stmts)]
 }
 
@@ -736,18 +719,10 @@ fn scan-privates(members: [Node], outer: {Text:Private}, setup: mut [Node]) -> {
 }
 
 fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Text] {
-  var out: [Text] = []
-  for m in members {
-    if let some(name) = private-key(m) {
-      let is-static = m is StaticMethod(_)
-      let is-field = inner-member(m) is Field(...) | StaticField(...)
-      if not is-field and is-static == want-static {
-        let p = table[name] ?? panic "lost a private name"
-        if not (p.holder in out) { out += p.holder }
-      }
-    }
-  }
-  out
+  [(table[name] ?? panic "lost a private name").holder
+   for m in members if let some(name) = private-key(m)
+   if not (inner-member(m) is Field(...) | StaticField(...)) and (m is StaticMethod(_)) == want-static
+   distinct (table[name] ?? panic "lost a private name").holder]
 }
 
 fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> ClassParts {
@@ -900,12 +875,7 @@ fn class-expression(n: Node) -> Node = match n {
     let parts = lowered-class(body, not (heritage is None()), inner-name, holder)
     let plain = ClassExpr(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }
     if len(parts.before) == 0 and len(parts.after) == 0 and len(parts.statics) == 0 { return plain }
-    var items = parts.before
-    items += assign(holder, plain)
-    for s in parts.after { items += s.expr }
-    for s in parts.statics { items += s.expr }
-    items += holder
-    seq(items)
+    seq(parts.before ++ [assign(holder, plain)] ++ [s.expr for s in parts.after ++ parts.statics] ++ [holder])
   }
   _ => panic "expected a class expression"
 }
