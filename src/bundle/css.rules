@@ -5,6 +5,7 @@ use bundle.css as css
 use bundle.resolve as res
 use bundle.minhost as host
 use bundle.legal as legal
+use bundle.comments as cm
 
 # A file's place in the output, under the media queries of the imports that brought it in.
 record Placed { path: Text, media: [Node] }
@@ -12,9 +13,6 @@ record Placed { path: Text, media: [Node] }
 # A copied file: where it came from, and where it went.
 record Asset { from: Text, to: Text }
 
-state placed: [Placed] = []
-state charset: Bool = false
-state notes: [Text] = []
 state assets: [Asset] = []
 state loaders: {Text:Text} = {}
 
@@ -84,7 +82,6 @@ fn css-spec(spec: Text) -> Text =
 # A stylesheet after what it imports, those after theirs.
 fn visit(path: Text, media: [Node]) -> [Placed] {
   let sheet = tree-of(path)
-  if any item in items-of(sheet): charset-rule?(item) { charset = true }
   [imported(path, media, imp)... for item in leading-imports(sheet) if let some(imp) = import-of(item)
    if not external-url?(imp.spec)] ++ [Placed(path: path, media: media)]
 }
@@ -207,14 +204,13 @@ fn body-items(path: Text) -> [Node] {
 # The stylesheet for these entry files, written to `outfile`.
 fn bundle(entries: [Text], outfile: Text, minify: Bool, pretty: Bool, legal-mode: Text) -> Text {
   let out-dir = dir-of(outfile)
-  var items: [Node] = []
-  notes = []
-  for p in order-of(entries) {
-    let body = [without-notes(rewritten-urls(x, p.path, out-dir)) for x in body-items(p.path)]
-    items ++= wrapped-in-media(body, p.media)
-  }
-  var sheet = Sheet(List(items...))
-  if minify { sheet = minified(sheet, false) }
+  let order = order-of(entries)
+  let items = [i for p in order
+                 for i in wrapped-in-media([without-notes(rewritten-urls(x, p.path, out-dir)) for x in body-items(p.path)], p.media)]
+  let notes = [t for p in order for x in body-items(p.path) for t in notes-in(x)]
+  let whole = Sheet(List(items...))
+  let sheet = if minify then minified(whole, false) else whole
+  let charset = any p in order: any item in items-of(tree-of(p.path)): charset-rule?(item)
   let head = if charset then (if minify then "@charset \"UTF-8\";" else "@charset \"UTF-8\";\n") else ""
   let kept = if minify then legal.once-last(notes) else legal.once(notes)
   let placement = legal.placed(legal-mode, legal.notes-of(kept), outfile)
@@ -222,27 +218,24 @@ fn bundle(entries: [Text], outfile: Text, minify: Bool, pretty: Bool, legal-mode
   head ++ css.render(sheet, pretty and not minify) ++ "\n" ++ placement.tail
 }
 
+# Whitespace as comments and what is between them.
+fn spaced(t: Text) -> [cm.Node] = match cm.parse(t, "<comments>") {
+  cm.Scan(List(pieces...)) => pieces
+  _ => panic "whitespace scans to pieces"
+}
+
+fn legal-note?(p: cm.Node) -> Bool = p is cm.Comment(_) and legal.legal?(p.text)
+
 # Legal comments leave the space they were in, for the end of the file.
 everywhere fn without-notes(n: Node) -> Node = match n {
-  Ws(t) => {
-    if not legal.worth-looking?(t) { return n }
-    var b = buf-new()
-    var i = 0
-    while i < len(t) {
-      if at?(t, i, "/*") {
-        var j = i + 2
-        while j < len(t) and not at?(t, j, "*/") { j += 1 }
-        let comment = t[i..j + 2]
-        if legal.legal?(comment) { notes += comment } else { buf-add!(b, comment) }
-        i = j + 2
-      } else {
-        buf-byte!(b, t[i])
-        i += 1
-      }
-    }
-    let rest = buf-text(b)
+  Ws(t) if legal.worth-looking?(t) => {
+    let rest = join([p.text for p in spaced(t) if not legal-note?(p)], "")
     Ws(if len(rest) == 0 then " " else rest) with { lo: n.lo, hi: n.hi }
   }
+}
+
+everywhere fn notes-in(n: Node) -> [Text] = match n {
+  Ws(t) if legal.worth-looking?(t) => [p.text for p in spaced(t) if legal-note?(p)]
 }
 
 fn write-assets() -> Void {
@@ -251,8 +244,6 @@ fn write-assets() -> Void {
 
 fn reset(ls: {Text:Text}) -> Void {
   forget-memos!()
-  placed = []
-  charset = false
   assets = []
   loaders = ls
 }
