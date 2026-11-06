@@ -15,17 +15,17 @@ quote exp at 1 0 0 ;
 # `helpers`: runtime helpers the lowered code calls by name, for the linker to supply.
 record Lowered { tree: Node, pure-calls: {Int:Int}, helpers: [Text] }
 
-task state src: Text = ""
-task state next-offset: Int = -1000
-task state pure: {Int:Int} = {}
-task state aliases: {Int:Bool} = {}
-task state namespace-exports: {Text:[Text]} = {}
-# `useDefineForClassFields: false`: fields are assignments in the constructor, as TypeScript once did.
-task state assign-fields: Bool = false
-# `verbatimModuleSyntax`: an import is kept unless it says it is a type.
-task state keeping-imports: Bool = false
-task state experimental-decorators: Bool = false
-task state helpers-used: [Text] = []
+# What one file's lowering is told: its source, and its project's settings.
+# `assign-fields`: `useDefineForClassFields: false`, so fields are assignments in the constructor, as
+# TypeScript once did. `keeping-imports`: `verbatimModuleSyntax`, so an import is kept unless it says
+# it is a type. `decorators`: `experimentalDecorators`.
+record Settings { src: Text, assign-fields: Bool, keeping-imports: Bool, decorators: Bool }
+context settings: Settings = Settings(src: "", assign-fields: false, keeping-imports: false, decorators: false)
+# What lowering one file gathers: offsets for the names it makes, the calls it knows are pure, and
+# what each namespace has exported so far.
+context next-offset: Int = -1000
+context pure: {Int:Int} = {}
+context namespace-exports: {Text:[Text]} = {}
 context namespace-path: Text = ""
 # What the statement list being lowered declares already, so a namespace there need not.
 context declared: [Text] = []
@@ -47,7 +47,7 @@ fn bind(name: Text) -> Node {
 }
 
 # A name no code in this file can mean, for the parameter of an enum's or namespace's function.
-fn fresh-name(base: Text) -> Text = first n in 2..: if contains-text?(src, base ++ int-text(n)) then none else some(base ++ int-text(n))
+fn fresh-name(base: Text) -> Text = first n in 2..: if contains-text?(settings.src, base ++ int-text(n)) then none else some(base ++ int-text(n))
 
 fn string-node(text: Text) -> Node = Str(host.js-string(text))
 
@@ -464,10 +464,10 @@ fn prop-assignment(p: Node) -> Node {
 record Placed { kept: [Node], assigns: [Node] }
 
 fn member-placed(m: Node) -> Placed = match m {
-  Field(key, init) if assign-fields =>
+  Field(key, init) if settings.assign-fields =>
     Placed(kept: [Field(key, None()) with { lo: m.lo, hi: m.hi } if key is PrivateName(_)],
            assigns: [assigned(This(), key, lowered(init)) if not (init is None())])
-  StaticField(key, init) if assign-fields =>
+  StaticField(key, init) if settings.assign-fields =>
     Placed(kept: [StaticField(key, None()) with { lo: m.lo, hi: m.hi } if key is PrivateName(_)]
                  ++ [StaticBlock(FuncBody(List(assigned(This(), key, lowered(init))))) with { lo: m.lo, hi: m.hi }
                      if not (init is None())],
@@ -488,7 +488,7 @@ fn class-body(n: Node, derived: Bool) -> Node = match n {
   ClassBody(List(members...)) => {
     let props = [parameter-properties(m)... for m in members if constructor?(m)]
     let has-fields = any m in members: m is Field(...) | StaticField(...)
-    if len(props) == 0 and not (assign-fields and has-fields) { return n with { members: lowered(n.members) } }
+    if len(props) == 0 and not (settings.assign-fields and has-fields) { return n with { members: lowered(n.members) } }
     let from-props = [prop-assignment(p) for p in props]
     let each = [member-placed(m) for m in members]
     let assigns = from-props ++ [s for c in each for s in c.assigns]
@@ -496,7 +496,7 @@ fn class-body(n: Node, derived: Bool) -> Node = match n {
     let made = [constructor-with-assignments(existing ?? synthesized-constructor(derived), assigns)
                 if len(assigns) > 0 or is-some(existing)]
     let declared = [Field(PropName(p.target.text) with { lo: p.target.lo, hi: p.target.hi }, None()) with { lo: p.lo, hi: p.hi }
-                    for p in props if not assign-fields]
+                    for p in props if not settings.assign-fields]
     let out = made ++ declared ++ [k for c in each for k in c.kept]
     n with { members: List(out...) with { lo: n.members.lo, hi: n.members.hi } }
   }
@@ -505,9 +505,11 @@ fn class-body(n: Node, derived: Bool) -> Node = match n {
 
 # ---------------------------------------------------------------- decorators
 
-fn helper-ref(name: Text) -> Node {
-  if not (name in helpers-used) { helpers-used += name }
-  ident(name)
+fn helper-ref(name: Text) -> Node = ident(name)
+
+# The runtime helpers the lowered program calls: names this file made, not names it was written with.
+everywhere fn helpers-called(n: Node) -> [Text] = match n {
+  Ident(x) if n.lo < 0 and starts-with(x, "__decorate") => [x]
 }
 
 fn decorators-of(list: Node) -> [Node] = [lowered(d.expr) for d in list.kids]
@@ -578,7 +580,7 @@ fn decorate-call(decorators: [Node], target: Node, key: Node?, kind: Int) -> Nod
 # `class A { @d m() {} }` and `@c class A {}`, as TypeScript's experimentalDecorators runs them:
 # members first, instance before static, then the class, which the decorators may replace.
 fn decorated-class(class-decorators: [Node], cls: Node, exported: Bool) -> [Node] {
-  if not experimental-decorators {
+  if not settings.decorators {
     panic "JavaScript decorators are not implemented yet; set \"experimentalDecorators\": true in tsconfig.json for TypeScript's"
   }
   let name = cls.name.text
@@ -653,10 +655,8 @@ fn statement-lowered(x: Node) -> [Node] = match x {
     let d = List(Declarator(name, required) with { lo: x.lo, hi: x.hi })
     [if x is TsExportImport(_) then ExportLexical(ConstDecl(d)) else ConstDecl(d)]
   }
-  TsImportAlias(name, target) => {
-    aliases[name.lo] = true
+  TsImportAlias(name, target) =>
     [ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi })) with { lo: x.lo, hi: x.hi }]
-  }
   TsExportImport(TsImportAlias(name, target)) =>
     [ExportLexical(ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi }))) with { lo: x.lo, hi: x.hi }]
   TsExportAssign(e) => {
@@ -719,28 +719,34 @@ fn pruned-clause(c: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool},
   _ => some(c)
 }
 
-fn alias-unused?(s: Node, b: {Int:Int}, used: {Int:Bool}) -> Bool = match s {
+# `import x = a.b` not exported, by where its name is: it is dropped when nothing uses it.
+everywhere fn alias-names(n: Node) -> [Int] = match n {
+  TsImportAlias(name, _) => [name.lo]
+  TsExportImport(_) => []
+}
+
+fn alias-unused?(s: Node, b: {Int:Int}, used: {Int:Bool}, aliases: {Int:Bool}) -> Bool = match s {
   ConstDecl(List(Declarator(name, _))) => name.lo in aliases and not (b[name.lo] is some(_) and (b[name.lo] ?? -1) in used)
   _ => false
 }
 
 # Drop aliases nothing uses, at any depth: what they point at may be a type.
-everywhere fn without-aliases(n: Node, b: {Int:Int}, used: {Int:Bool}) -> Node = match n {
-  List(xs...) => n with { kids: [without-aliases(x, b, used) for x in xs if not alias-unused?(x, b, used)] }
+everywhere fn without-aliases(n: Node, b: {Int:Int}, used: {Int:Bool}, aliases: {Int:Bool}) -> Node = match n {
+  List(xs...) => n with { kids: [without-aliases(x, b, used, aliases) for x in xs if not alias-unused?(x, b, used, aliases)] }
 }
 
-fn pruned(tree: Node, keep: [Text]) -> Node {
+fn pruned(tree: Node, keep: [Text], aliases: {Int:Bool}) -> Node {
   let bindings = scope.scoped(tree, []).bindings
   let used = {s: true for s in value-mentions(tree, bindings)}
   let exported = {x: true for x in export-mentions(tree)}
-  let plain = without-aliases(tree.body, bindings, used)
+  let plain = without-aliases(tree.body, bindings, used, aliases)
   let declared = early.module-names(tree.body.kids)
   Program(tree.hashbang, List([pruned-statement(s, bindings, used, exported, keep, declared)... for s in plain.kids]...))
 }
 
 fn pruned-statement(s: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool}, keep: [Text], declared: [Text]) -> [Node] = match s {
   Import(clause, from) =>
-    if keeping-imports then [s] else [s with { kids: [c, from] } if let some(c) = pruned-clause(clause, b, used, exported, keep)]
+    if settings.keeping-imports then [s] else [s with { kids: [c, from] } if let some(c) = pruned-clause(clause, b, used, exported, keep)]
   # What is exported but not declared was a type.
   ExportNamed(List(specs...)) => {
     let left = [x for x in specs if x.local.text in declared]
@@ -752,16 +758,11 @@ fn pruned-statement(s: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Boo
 # ---------------------------------------------------------------- the whole file
 
 fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool, decorators: Bool) -> Lowered {
-  src = source
-  experimental-decorators = decorators
-  helpers-used = []
-  assign-fields = not define-fields
-  keeping-imports = keep-imports
-  next-offset = -1000
-  pure = {}
-  aliases = {}
-  namespace-exports = {}
-  let stmts = lowered-statements(tree.body.kids)
-  let whole = Program(tree.hashbang, List(stmts...))
-  Lowered(tree: pruned(whole, keep), pure-calls: pure, helpers: helpers-used)
+  let given = Settings(src: source, assign-fields: not define-fields, keeping-imports: keep-imports, decorators: decorators)
+  with settings = given, next-offset = -1000, pure = {}, namespace-exports = {} {
+    let stmts = lowered-statements(tree.body.kids)
+    let whole = Program(tree.hashbang, List(stmts...))
+    let helpers = if decorators then [h for h in helpers-called(whole) distinct h] else []
+    Lowered(tree: pruned(whole, keep, {lo: true for lo in alias-names(tree)}), pure-calls: pure, helpers: helpers)
+  }
 }
