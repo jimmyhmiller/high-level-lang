@@ -18,13 +18,14 @@ build.pipeline       stages, and plans of how many threads run them → plans, c
                      analysis, emit, renaming, source maps, the build
 ```
 
-Every language except `.syntax` is defined by a `.syntax` grammar in `poc/src/hl/grammars/`.
+Every language except `.syntax` is defined by a `.syntax` grammar in `poc/lang/languages/`.
 `.syntax` keeps a hand-written parser, because it is the bootstrap.
 
 ## The split
 
-There is no bundler logic in Coil. `poc/src/bundle/` and `poc/src/app/` contain no `.coil` file
-at all, and `poc/src/hl/` knows nothing about JavaScript or bundling: it is grammars, types,
+There is no bundler logic in Coil. Everything written in the languages is under `poc/lang/`, which
+holds no `.coil` file at all, and the Coil under `poc/compiler/` knows nothing about JavaScript or
+bundling: it is grammars, types,
 tables, Datalog and rewriting in general, plus a runtime of buffers, files and Unicode.
 
 | Language | Lines | What it says |
@@ -222,7 +223,7 @@ core took 76, 78, 24, 30, 42, 48 and 56 ms on those apps, and is faster still on
 
 ## Parallelism
 
-How the build divides its work is a language of its own. `poc/src/app/build.pipeline` names the
+How the build divides its work is a language of its own. `poc/lang/app/build.pipeline` names the
 stages that work on one file, module or part at a time, the functions each runs, and plans:
 
 ```
@@ -361,13 +362,16 @@ Being explicit, because "everything esbuild does" is a lot:
 
 ## Layout
 
-- `poc/src/hl/`: the languages. `syntax`, `rules`, `rewrite`, `facts`, `scopes`, `bundler` and
-  `pipeline` are readers; `rt` and `symtab` are their domain-free runtime.
-- `poc/src/hl/grammars/`: the grammars of those languages.
-- `poc/src/bundle/`: the bundler, in those languages.
-- `poc/src/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map` gives the serial answer, in `.rules`.
-- `poc/src/app/`: a demo spec with four targets, a format, a loader and plugins, and the pipeline.
-- `poc/src/boot/`: four `main` functions.
+Everything written in the languages is under `poc/lang/`; everything in Coil under `poc/compiler/`.
+
+- `poc/lang/languages/`: the grammars of the languages themselves, and the `.rules` prelude.
+- `poc/lang/bundle/`: the bundler, in those languages.
+- `poc/lang/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map` gives the serial answer, in `.rules`.
+- `poc/lang/app/`: a demo spec with four targets, a format, a loader and plugins, and the pipeline.
+- `poc/compiler/hl/`: the languages' compilers. `syntax`, `rules`, `rewrite`, `facts`, `scopes`,
+  `bundler` and `pipeline` are readers; `rt` and `symtab` are their domain-free runtime;
+  `grammars/` turns each grammar in `lang/languages/` into its parser.
+- `poc/compiler/boot/`: four `main` functions, because a package's entry must be plain Coil.
 - `corpus/`: test apps and oracles. `node_modules` and `vendor` are not checked in.
 - `experiments/`: small programs that established how Coil readers behave, and repros of Coil issues.
 

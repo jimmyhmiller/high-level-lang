@@ -3,10 +3,10 @@
 # variables updated in place, global state, children read by position, byte scanning. A
 # function counts as low-level if any of these appear in it. It is a measure of the
 # source, by pattern, not a proof; run it before and after a change to see the change.
-#   usage: altitude.py [--fns] [files...]   (default: poc/src/bundle/*.rules *.attrs)
+#   usage: altitude.py [--fns] [files...]   (default: poc/lang/bundle/*.rules *.attrs)
 import collections, glob, os, re, sys
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../poc/src/bundle")
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../poc/lang/bundle")
 PATTERNS = collections.OrderedDict([
     ("while",   re.compile(r"^\s*while\b[^\n]*\{\s*$", re.M)),
     ("var",     re.compile(r"^\s*var ", re.M)),
