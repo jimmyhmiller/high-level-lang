@@ -29,9 +29,9 @@ tables, Datalog and rewriting in general, plus a runtime of buffers, files and U
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 8,306 | Resolution, modules, JSX, TypeScript, tsconfig, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
-| `.attrs` | 1,054 | Early errors, and what a file loads: attribute grammars, computed in one traversal |
-| `.syntax` | 780 | JavaScript with JSX and TypeScript, CSS, literals, comments, package.json and tsconfig.json |
+| `.rules` | 5,645 | Resolution, modules, TypeScript, tsconfig, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
+| `.attrs` | 2,654 | Early errors, what a file loads, JSX, what each statement declares, emit's renaming: attribute grammars, computed in one traversal |
+| `.syntax` | 815 | JavaScript with JSX and TypeScript, CSS, literals, comments, where a big file can be cut, package.json and tsconfig.json |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
 | `.facts` | 114 | Linking, tree shaking, and which root reaches what for code splitting |
 | `.js` | 171 | The bundle's runtime helpers, and those lowering adds |
@@ -40,7 +40,8 @@ tables, Datalog and rewriting in general, plus a runtime of buffers, files and U
 | `.scopes` | 26 | Scoping |
 | `.coil` | 15 | Four `main` functions, because a package's entry must be plain Coil |
 
-The compilers for those languages are about 8,400 lines of Coil and 300 of grammars.
+The compilers for those languages are about 8,600 lines of Coil and 400 of grammars, with a runtime
+of 1,900 (text, paths, tables, threads).
 
 `.rules` is the least specific of these languages: a typed language over the grammar's nodes, with
 pattern matching, relations, dynamic scope and code templates written in JavaScript's own syntax:
@@ -52,18 +53,40 @@ program-plus(p, stmt`$call_me();`)
 
 A grammar names its nodes' children (`-> If(test, yes, no)`), so `.rules` reads `n.test` and
 writes `n with { body: b }`, never a child by position. Comprehensions take patterns, tests and
-other lists in any order, and make lists, joined lists and maps:
+other lists in any order, and make lists, joined lists and maps; `while` ends the loop before it at
+the first item that fails, and `distinct` lets each key through once. `fold` keeps a running value,
+`scan` every step of one, and `first`, `last`, `any`, `all`, `count` and `sum` search and add up:
 
 ```
 [name.text for FuncDecl(name, ...) | ClassDecl(name, ...) in stmts]
 {spec: t for spec in p.specs if let some(t) = unhooked-target(spec, p.path)}
 fn unique-name(name: Text) -> Text = untaken(name) ?? first i in 2..: untaken(name ++ int-text(i))
+fn directive-count(stmts: [Node]) -> Int = len([s for s in stmts while s is ExprStmt(Str(_))])
+let places = scan p = Place(at: 0, breaks: 0, col: 0) for k in mapped: advanced(text, p, base + k.out)
 ```
+
+A fixpoint is a recursive function, not a loop with a changed flag:
+
+```
+fn needed(names: [Text], definitions: {Text:Node}) -> [Text] {
+  let more = [x for n in names if let some(d) = definitions[n] for x in idents(d)
+              if starts-with(x, "__") and not (x in names) distinct x]
+  if len(more) == 0 then names else needed(names ++ more, definitions)
+}
+```
+
+Text and paths are a library (`split`, `join`, `replace-many`, `occurrences`, `span-of`,
+`trim-bytes`, `path-stem`, `path-ancestors`, …) rather than byte loops in each file. Memo functions
+remember by one or several arguments across all workers, so caches are declarations. A dynamically
+scoped `context` bound with `with` gathers what a scope produces (a function's temporaries, the
+helpers a program needs), and `with` gives its block's value. The compiler keeps these as fast as
+the loops they replaced: `join` over a comprehension writes each item's pieces into one buffer, a
+`++` chain allocates once, and an `everywhere fn` giving a list adds to one list as it walks.
 
 A walk over a tree says only where it does something. An `everywhere fn` is a match on its node,
 and wherever no case matches it is the same function of each child: the node rebuilt from them,
 shared when none changed; for `-> Void`, each child visited; for `-> Bool`, whether any child's is
-true. A guarded case is where a walk stops:
+true; for a list, the children's lists one after another. A guarded case is where a walk stops:
 
 ```
 everywhere fn super-through(n: Node, name: Text) -> Node = match n {
@@ -72,9 +95,15 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 }
 ```
 
-It is closer to a small ML than to a one-purpose language, and much of it is still written at a low
-level: `corpus/tools/altitude.py` counts 61% of the lines of `.rules` and `.attrs` in functions with
-loops over indices, variables updated in place, global state or byte scanning.
+It is closer to a small ML than to a one-purpose language, and some of it is still written at a low
+level: `corpus/tools/altitude.py` counts 41% of the lines of `.rules` and `.attrs` in functions with
+loops over indices, variables updated in place, global or context state written to, or byte
+scanning (67% on 2026-11-05). What is left is mostly the build's own sequencing, symbol tables
+passed by reference, naming, and printing.
+
+Where a big file can be cut for parsing in parallel is a grammar too (`coarse.syntax`), all of it
+fragments, so it builds one node for each stretch between cuts. It reads three.js's 1.5 MB file in
+3.9 ms where the hand-written scanner took 2.2.
 
 `.attrs` is an attribute grammar over a grammar's trees, compiled by the same compiler. Nothing in
 it walks a tree: it declares attributes, and `on` blocks give equations for the nodes a pattern
@@ -126,7 +155,9 @@ out/bin/spec                                              # the build build.bund
 ```
 
 `tools/same.py` compares a new build with a frozen one, byte for byte, across 189 outputs. That is
-how the code moved out of Coil without changing behaviour.
+how the code moved out of Coil without changing behaviour. It passes no `--target`, so
+`tools/same-lowered.py NEW BASE` compares lowered output (57 cases, TypeScript included), against
+the previous commit's build.
 
 ## Results
 
