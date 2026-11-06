@@ -91,7 +91,8 @@
    (in-on bool)                   ; compiling an `on` block of an attribute grammar
    (eq-slots (ArrayList EqSlot))  ; where its equations for children put their values
    (ovr-slots (ArrayList OvrSlot))
-   (givens (ArrayList Given))])
+   (givens (ArrayList Given))
+   (attrs-from (slice u8))])     ; the attribute grammar whose blocks are being read; "" for this one
 
 ;;; A `given` attribute and the value a child has when its parent's equations give it none.
 (defstruct Given [(attr (slice u8)) (default Code)])
@@ -568,7 +569,7 @@
     (set! (.path k) path)
     (when (> (len over) 0) (ensure-loaded! (mut k) over))
     (for d decls
-      (when (= (.kind d) (g/KUse)) (ensure-loaded! (mut k) (.text (kid d 0)))))
+      (when (or (= (.kind d) (g/KUse)) (= (.kind d) (g/KInclude))) (ensure-loaded! (mut k) (.text (kid d 0)))))
     (push! (mut (.mods k)) (mod-new name (SRules) over))
     (let [ix (- (len (.mods k)) 1)]
       (push! (mut (.aliases (elem (mut (.mods k)) ix))) (Alias :name "rt" :module "hl.rt"))
@@ -596,6 +597,11 @@
               (push! (mut (.quotes (elem (mut (.mods k)) ix)))
                      (QuoteDef :name (.text (kid d 0)) :path path-out))))
           (_ 0)))
+      ;; An attribute grammar's answer is a record its own functions may name, after the
+      ;; records written, whose fields are filled in by position.
+      (when (= (.kind tree) (g/KAttrsFile))
+        (push! (mut (.recs (elem (mut (.mods k)) ix)))
+               (RecDef :name "Attrs" :fields (ArrayList::new [FieldDef] (malloc-allocator)))))
       (for d decls
         (when (= (.kind d) (g/KForeign)) (add-foreign! (mut k) d name)))
       ;; add-foreign! may have added modules after this one, but never before it.
@@ -617,6 +623,7 @@
             (g/KInput [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
             (g/KCollect [] (attrs-only! (mut k) tree d) (add-global! (mut k) ix2 name d true))
             (g/KOn [] (attrs-only! (mut k) tree d))
+            (g/KInclude [] (attrs-only! (mut k) tree d))
             (g/KConst [] (add-global! (mut k) ix2 name d false))
             (g/KMemoFn [] (collect-fn! (mut k) ix2 name d))
             (g/KFn [] (collect-fn! (mut k) ix2 name d))
@@ -2412,11 +2419,33 @@
         (param (mut f) (.text (kid d 0)) (resolve-type (mut k) name (kid d 1)) false))
       (when (and (= (.kind d) (g/KFn)) (= (.text (kid d 0)) "run"))
         (die (mut k) d "an attribute grammar's `run` is its own")))
-    (push! (mut (.recs (elem (mut (.mods k)) ix2))) (RecDef :name "Attrs" :fields fields))
+    ;; An included grammar's equations run in this one's traversal, and what it collects is
+    ;; this one's answer too.
+    (for d decls
+      (when (= (.kind d) (g/KInclude))
+        (let [m (mod-at (mut k) (.text (kid d 0)))]
+          (unless (= (.over m) over)
+            (die (mut k) d (cat "an included attribute grammar is over the same grammar; this one is over " (.over m))))
+          (for x (.globals m)
+            (when (= (.attr x) 2)
+              (die (mut k) d (cat3 "an included attribute grammar takes no inputs, not yet: " (.name x) " is one")))
+            (when (= (.attr x) 3)
+              (for f2 fields
+                (when (= (.name f2) (.name x))
+                  (die (mut k) d (cat3 "two collected attributes are named " (.name x) ""))))
+              (push! (mut fields) (FieldDef :name (.name x) :ty (.ty x))))))))
+    (for i (range 0 (len (.recs (get (.mods k) ix2))))
+      (when (= (.name (get (.recs (get (.mods k) ix2)) i)) "Attrs")
+        (set! (.fields (elem (mut (.recs (elem (mut (.mods k)) ix2))) i)) fields)))
     (push! (mut (.funcs (elem (mut (.mods k)) ix2))) f)))
 
+;;; The attribute grammar whose attributes a block's names mean: this module's, or while an
+;;; included one's blocks are read, that one's.
+(defn attrs-mod [(k (mut Comp))] (-> Mod)
+  (if (= (len (.attrs-from k)) 0) (self-mod (mut k)) (mod-at (mut k) (.attrs-from k))))
+
 (defn attr-global [(k (mut Comp)) (name (slice u8)) (attr i64)] (-> (Option Global))
-  (match (find-global (self-mod (mut k)) name)
+  (match (find-global (attrs-mod (mut k)) name)
     (Some [x] (if (= (.attr x) attr) (Some x) (None [Global])))
     (None [] (None [Global]))))
 
@@ -2468,8 +2497,9 @@
 ;;; only tests and calls. A block that gives a collected attribute a node's whole value stays
 ;;; inline, since what it gives waits in the traversal's frame.
 (defstruct OnVar [(name (slice u8)) (ty (slice u8))])
+;;; `task` is the task state its attributes live in: this module's, or an included one's.
 (defstruct OnBlock [(body g/Node) (owner bool) (inline bool) (vars (ArrayList OnVar))
-                    (targets (ArrayList (slice u8))) (fname (slice u8))])
+                    (targets (ArrayList (slice u8))) (fname (slice u8)) (task Code)])
 
 (defn on-head [(a OnAlt)] (-> (slice u8))
   (match (.kind (.pat a))
@@ -2484,7 +2514,7 @@
        (inherited? (mut k) (.text (kid (kid s 0) 1)))))
 
 (defn inherited? [(k (mut Comp)) (name (slice u8))] (-> bool)
-  (match (find-global (self-mod (mut k)) name)
+  (match (find-global (attrs-mod (mut k)) name)
     (Some [x] (or (= (.attr x) 1) (= (.attr x) 4)))
     (None [] false)))
 
@@ -2500,7 +2530,7 @@
           (mut seen) false]
       (for e out (when (and (= (.target e) target) (= (.attr e) attr)) (set! seen true)))
       (unless seen
-        (match (find-global (self-mod (mut k)) attr)
+        (match (find-global (attrs-mod (mut k)) attr)
           (Some [x] (push! (mut out) (EqSlot :target target :attr attr :sym (fresh (mut k) "eq") :ty (.ty x))))
           (None [] 0)))))
   (for c (.kids n) (find-eqs! (mut k) c (mut out))))
@@ -2684,7 +2714,8 @@
               (when (.owner a0) (find-eqs! (mut k) (.body a0) (mut slots)))
               (push! (mut out) (OnBlock :body (.body a0) :owner (.owner a0) :inline (> (len ovrs) 0)
                                         :vars vars :targets (eq-targets slots)
-                                        :fname (cat "attrs-block-" (rt/num-text b)))))))))
+                                        :fname (cat "attrs-block-" (rt/num-text b))
+                                        :task `rules-task-here)))))))
     out))
 
 (defn on-block-fn [(k (mut Comp)) (b OnBlock) (subject Code) (node-coil Code) (task Code) (visit Code)] (-> Code)
@@ -2728,7 +2759,7 @@
                          (Some [l] (push! (mut args) (sym (.sym l))))
                          (None [] (die (mut k) (.pat a) (cat "this pattern does not bind " (.name v))))))
                      (for i indices (push! (mut args) i))
-                     (let [call `(~(sym (.fname b)) ~subject ~task ~@args)]
+                     (let [call `(~(sym (.fname b)) ~subject ~(.task b) ~@args)]
                        (if (.owner b) `(do ~call (return-from ~label 0)) call))))]
       (locals-reset! (mut k) mark)
       (wrap-steps steps 0 code))))
@@ -2751,6 +2782,60 @@
          (block ~label ~@owners ~(default-traverse (mut k) subject task visit) 0)
          0)))
 
+;;; The field of this grammar's task state that holds an included one's.
+(defn include-field [(m Mod)] (-> (slice u8)) (cat "attrs-in-" (alias-of (.name m))))
+
+;;; An included grammar's blocks, added to this traversal's: each alternative calls the block's
+;;; function in the included module, with that module's task state. Its blocks only add what
+;;; they collect; giving children attributes, or a collection a node's whole value, would need its
+;;; equations merged with this grammar's, which is not built yet.
+(defn included-blocks! [(k (mut Comp)) (d g/Node) (subject Code) (ty (slice u8)) (task Code)
+                        (alts (mut (ArrayList OnAlt))) (blocks (mut (ArrayList OnBlock)))
+                        (heads (mut (ArrayList (slice u8)))) (gr Mod) (over (slice u8))] (-> void)
+  (let [name (.text (kid d 0))
+        m (mod-at (mut k) name)
+        path (match (file-of (mut k) name)
+               (Some [p] p)
+               (None [] (die (mut k) d (cat "no file for " name))))
+        saved-src (.src k)
+        saved-path (.path k)
+        src (rt/read-all path)
+        mtree (parse-file (mut k) src path)
+        mdecls (list-kids (kid mtree 2))
+        offset (len blocks)
+        its (task-field (include-field m) task)
+        (mut count) 0]
+    (unless (= (.kind mtree) (g/KAttrsFile))
+      (die (mut k) d (cat name " is not an attribute grammar")))
+    (for x (.globals m)
+      (when (= (.attr x) 4)
+        (die (mut k) d (cat3 "an included attribute grammar gives no attributes, not yet: " (.name x) " is given"))))
+    (set! (.src k) src)
+    (set! (.path k) path)
+    (set! (.attrs-from k) name)
+    (for md mdecls (when (= (.kind md) (g/KOn)) (set! count (+ count 1))))
+    (let [malts (on-alts (mut k) mdecls)
+          mblocks (on-blocks (mut k) malts count subject ty)]
+      (for b mblocks
+        (when (or (.owner b) (.inline b))
+          (die (mut k) (.body b) "an included attribute grammar's blocks only add what they collect, not yet more"))
+        (push! (mut blocks)
+               (OnBlock :body (.body b) :owner false :inline false :vars (.vars b) :targets (.targets b)
+                        :fname (cat3 (alias-of (.name m)) "/" (.fname b)) :task its)))
+      (for a malts
+        (let [h (on-head a) (mut seen) (= (len h) 0)]
+          (for x heads (when (= x h) (set! seen true)))
+          (unless seen
+            (unless (match (find-kind gr h) (Some [_] true) (None [] false))
+              (die (mut k) (.pat a) (cat4 "the grammar " over " has no node named " h)))
+            (push! (mut heads) h)))
+        (push! (mut alts) (OnAlt :pat (.pat a) :as-name (.as-name a) :body (.body a) :owner false
+                                 :block (+ (.block a) offset)))))
+    (set! (.attrs-from k) "")
+    (set! (.src k) saved-src)
+    (set! (.path k) saved-path)
+    (clear! (mut (.locals k)))))
+
 ;;; The traversal, and `run`.
 (defn compile-attrs [(k (mut Comp)) (tree g/Node) (decls (ArrayList g/Node))] (-> Code)
   (let [over (.text (kid tree 1))
@@ -2760,7 +2845,7 @@
         visit (sym "attrs-visit")
         n (sym "attrs-node")
         task (sym "rules-task-here")
-        alts (on-alts (mut k) decls)
+        (mut alts) (on-alts (mut k) decls)
         (mut ovrs) (ArrayList::new [OvrSlot] (malloc-allocator))
         (mut heads) (text-list)]
     (for d decls (when (= (.kind d) (g/KOn)) (find-ovrs! (mut k) (kid d 1) (mut ovrs))))
@@ -2791,10 +2876,15 @@
           (mut fixups) (primitive/code-list-new)
           (mut count) 0]
       (for d decls (when (= (.kind d) (g/KOn)) (set! count (+ count 1))))
-      (let [blocks (on-blocks (mut k) alts count n ty)]
-        (for b blocks
+      (let [own-blocks (on-blocks (mut k) alts count n ty)
+            (mut blocks) (ArrayList::new [OnBlock] (malloc-allocator))]
+        (for b own-blocks
+          (push! (mut blocks) b)
           (unless (.inline b) (push! (mut block-fns) (on-block-fn (mut k) b n node-coil task visit))))
         (clear! (mut (.locals k)))
+        (for d decls
+          (when (= (.kind d) (g/KInclude))
+            (included-blocks! (mut k) d n ty task (mut alts) (mut blocks) (mut heads) gr over)))
         (for h heads
           (push! (mut arms) `(~(kind-code gr h) [] ~(on-arm-code (mut k) alts blocks h n ty task visit))))
       (let [wild (on-arm-code (mut k) alts blocks "" n ty task visit)]
@@ -2845,7 +2935,17 @@
                     x (match (attr-global (mut k) name 3) (Some [g] g) (None [] (die (mut k) d "this was not collected")))]
                 (push! (mut sets) `(set! ~(task-field name t) ~(default-of (mut k) d (.ty x))))
                 (push! (mut fields) (primitive/code-symbol ":" name))
-                (push! (mut fields) (task-field name t)))))
+                (push! (mut fields) (task-field name t))))
+            ;; An included grammar's task state, found once, and what it collects, from empty.
+            (when (= (.kind d) (g/KInclude))
+              (let [m (mod-at (mut k) (.text (kid d 0)))
+                    its (task-field (include-field m) t)]
+                (push! (mut sets) `(set! ~its (~(primitive/code-symbol (alias-of (.name m)) "/rules-task"))))
+                (for x (.globals m)
+                  (when (= (.attr x) 3)
+                    (push! (mut sets) `(set! ~(task-field (.name x) its) ~(default-of (mut k) d (.ty x))))
+                    (push! (mut fields) (primitive/code-symbol ":" (.name x)))
+                    (push! (mut fields) (task-field (.name x) its)))))))
           `(do
              ~@block-fns
              (defn ~visit [(~n ~node-coil) (~task (ptr RulesTask))] (-> void)
@@ -3029,6 +3129,10 @@
                   (None [] (die (mut k) d "this was not collected")))]
           (push! (mut out) (primitive/code-symbol ":" g-name))
           (push! (mut out) (global-init (mut k) d x))))
+      (when (= (.kind d) (g/KInclude))
+        (let [m (mod-at (mut k) (.text (kid d 0)))]
+          (push! (mut out) (primitive/code-symbol ":" (include-field m)))
+          (push! (mut out) `(cast (ptr ~(primitive/code-symbol (alias-of (.name m)) "/RulesTask")) 0))))
       (when (= (.kind d) (g/KMemoFn))
         (push! (mut out) (primitive/code-symbol ":" (memo-near (.text (kid d 0)))))
         (push! (mut out) (memo-new-map (mut k) d))
@@ -3057,7 +3161,8 @@
                       :in-on false
                       :eq-slots (ArrayList::new [EqSlot] (malloc-allocator))
                       :ovr-slots (ArrayList::new [OvrSlot] (malloc-allocator))
-                      :givens (ArrayList::new [Given] (malloc-allocator)))
+                      :givens (ArrayList::new [Given] (malloc-allocator))
+                      :attrs-from "")
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)
     (load-prelude! (mut k))
@@ -3113,6 +3218,11 @@
                     (do
                       (push! (mut state-fields) `(~(sym g-name) ~(coil-type (mut k) (.ty x))))
                       (push! (mut state-inits) `(set! (~(primitive/code-symbol "." g-name) s) ~v))))))
+            (when (= (.kind d) (g/KInclude))
+              (let [m (mod-at (mut k) (.text (kid d 0)))
+                    rt-ty `(ptr ~(primitive/code-symbol (alias-of (.name m)) "/RulesTask"))]
+                (push! (mut task-fields) `(~(sym (include-field m)) ~rt-ty))
+                (push! (mut task-inits) `(set! (~(primitive/code-symbol "." (include-field m)) s) (cast ~rt-ty 0)))))
             (when (= (.kind d) (g/KMemoFn))
               (push! (mut task-fields) (memo-near-field (mut k) d))
               (push! (mut task-fields) (memo-gen-field d))

@@ -315,19 +315,26 @@ fn substitute(n: Node, b: {Int:Int}) -> Node {
 
 # ---------------------------------------------------------------- loading
 
+# A parsed and checked file, and the `require`s and `import()`s the check's traversal found.
+record Checked { tree: Node, requires: [Text], imports: [Text] }
+
 # Parse and check a file. A file with import or export syntax is a module; anything else may be
 # CommonJS, whose top level is a function body.
-fn parse-file(src: Text, path: Text) -> Node {
+fn parse-file(src: Text, path: Text) -> Checked {
   let loader = loader-of(path)
   let syntax = (if loader == "jsx" or loader == "tsx" then js.flag-bit("jsx") else 0)
              + (if loader == "ts" or loader == "tsx" then js.flag-bit("ts") else 0)
   let tree = js.parse-tries(src, path, syntax, js.flag-bit("await"))
   let is-module = early.program-has-module-syntax?(tree)
-  match early.check(tree, is-module, not is-module, loader == "ts" or loader == "tsx") {
-    none => tree
+  let found = early.run(tree, is-module, not is-module, loader == "ts" or loader == "tsx", false, false, [])
+  match found.problem {
+    none => Checked(tree: tree, requires: found.requires, imports: found.imports)
     some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
   }
 }
+
+# Lowering JSX or TypeScript makes another tree of a file's.
+fn lowered-loader?(loader: Text) -> Bool = loader == "jsx" or loader == "tsx" or loader == "ts"
 
 # A project's JSX settings, unless the build gave its own.
 fn configured-jsx(o: jsx.Options, c: tsc.Config) -> jsx.Options {
@@ -592,14 +599,13 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
 fn parsed-file(item: Pending) -> Parsed {
   let path = item.path
   let src = if item.ready then item.text else module-text(read-file(path), path)
-  parsed-from(path, src, parse-file(src, path))
+  let checked = parse-file(src, path)
+  parsed-with(path, src, checked.tree, none, some(checked))
 }
 
-# Everything after parsing, for a file parsed whole or put together from its pieces.
-fn parsed-from(path: Text, src: Text, parsed: Node) -> Parsed = parsed-with(path, src, parsed, none)
-
-# The same, with the specifiers its imports name when they are known already.
-fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?) -> Parsed {
+# Everything after parsing, for a file parsed whole or put together from its pieces: with the
+# specifiers its imports name when they are known already, and what checking it found.
+fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Checked?) -> Parsed {
   let loader = loader-of(path)
   let config = tsc.for-file(path)
   let file-jsx = configured-jsx(jsx-options, config)
@@ -619,9 +625,18 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?) -> Parsed {
     }
     # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
     # file the build never uses, but never misses one it does.
-    let found = calls.run(typed.tree)
-    requires = found.requires
-    imports = found.imports
+    # The check found them already, in the tree a plain JavaScript file keeps.
+    match checked {
+      some(c) if not lowered-loader?(loader) => {
+        requires = c.requires
+        imports = c.imports
+      }
+      _ => {
+        let found = calls.run(typed.tree)
+        requires = found.requires
+        imports = found.imports
+      }
+    }
     specs ++= requires
     specs ++= imports
   }
@@ -834,15 +849,11 @@ memo fn walked-of(item: Text) -> Walked {
   if k == 0 { sc.walk-part(pr.tree.kids[0], own, bindings) }
   for s in pr.parts[k] { sc.walk-part(s, own, bindings) }
   let defined = pr.mentions and (any s in pr.parts[k]: defines-apply?(s, bindings))
-  var requires: [Text] = []
-  var imports: [Text] = []
-  for s in pr.parts[k] {
-    let found = calls.run(s)
-    requires ++= found.requires
-    imports ++= found.imports
-  }
-  let problem = early.check-part(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
-  Walked(scopes: own, bindings: bindings, defined: defined, requires: requires, imports: imports, problem: problem)
+  # Checking the part finds what it loads, in its statements as parsed: normalising them keeps
+  # every call, in order.
+  let found = early.part-found(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
+  Walked(scopes: own, bindings: bindings, defined: defined, requires: found.requires, imports: found.imports,
+         problem: found.problem)
 }
 
 # What parsing a file whole checks of its statements together, at once with the parts' walks,
@@ -855,7 +866,7 @@ memo fn early-of(path: Text) -> early.Problem? {
 memo fn from-of(path: Text) -> Parsed {
   var specs: [Text] = []
   for k in 0..len(split-source(path).starts) { specs ++= piece-of(path ++ "\n" ++ int-text(k)).specs }
-  parsed-with(path, split-source(path).src, prepared-of(path).tree0, some(specs))
+  parsed-with(path, split-source(path).src, prepared-of(path).tree0, some(specs), none)
 }
 
 # The big file, analysed: its parts' tables grafted in order, as one walk would have filled the
