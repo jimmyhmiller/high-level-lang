@@ -199,21 +199,26 @@ laptop shared with other work:
 
 | App | single | load-only | back-half | two | full | esbuild | full / esbuild |
 |---|---|---|---|---|---|---|---|
-| tree-shaken lodash-es | 48.3 | 30.9 | 47.0 | 35.5 | **24.2** | 27.1 | 0.89 |
-| all of lodash-es | 61.7 | 41.9 | 53.3 | 42.3 | **28.7** | 29.2 | 0.98 |
-| rxjs | 27.4 | 16.5 | 27.2 | 19.1 | **13.8** | 16.4 | 0.84 |
-| date-fns | 29.6 | 18.4 | 28.4 | 20.5 | **16.2** | 20.6 | 0.79 |
-| d3 | 58.5 | 27.2 | 56.2 | 38.6 | **19.7** | 17.3 | 1.13 |
-| zod | 80.5 | 55.2 | 62.0 | 50.5 | **24.0** | 16.6 | 1.45 |
+| tree-shaken lodash-es | 45.8 | 28.3 | 43.4 | 31.9 | **22.6** | 25.8 | 0.88 |
+| all of lodash-es | 55.9 | 38.6 | 49.7 | 38.7 | **26.0** | 27.5 | 0.95 |
+| rxjs | 25.4 | 14.9 | 24.5 | 17.5 | **12.6** | 15.5 | 0.81 |
+| date-fns | 27.8 | 17.2 | 26.9 | 19.8 | **15.0** | 19.6 | 0.77 |
+| d3 | 57.2 | 25.0 | 54.7 | 37.0 | **18.0** | 16.6 | 1.08 |
+| zod | 79.2 | 53.4 | 61.2 | 49.6 | **22.9** | 16.0 | 1.43 |
 
 Zod is not yet within 20% of esbuild, and what stands in the way is measured:
-- **Link is serial, about 4.6 ms:** the fact replay and the Datalog solve. Running long rule scans
+- **Link is serial, about 3.7 ms:** the fact replay and the Datalog solve. Running long rule scans
   in chunks on several threads, with the same rows in the same order, made it slower (6.0 ms):
   at this size, dispatching costs more than the joins.
 - **Memory.** Zod touches 115 MB to esbuild's 50. A tree node is about 88 bytes, and emit and the
   rewrite passes each build a new tree. Even exiting takes 2 ms, against 0.5 ms for a tiny build.
 - **Its biggest files sit at the end of an import chain:** about 6.5 ms of loading, even with
   those files parsed and analysed in parallel pieces.
+
+Also tried and taken out, because it was slower: keeping a node's children in the rewrite engine
+when none changed (a rule that reuses them walks them again; minify on lodash-es went from 3 to 10
+ms), resolving each import as an item of its own for files with few imports, and starting big
+files ahead of the queue (loading zod is limited by how much work there is, not by one path).
 
 In CPU time this bundler does about 2.6 times esbuild's work on zod (130 ms to 50). Going further
 means a compact tree rewritten in place, a faster Datalog engine, and fewer passes over the tree.
