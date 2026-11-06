@@ -3,6 +3,7 @@ rules bundle.modules over bundle.js
 use bundle.js as js
 use bundle.scopes as sc
 use bundle.link as link
+use bundle.scoped as scope
 use bundle.coarse as co
 use bundle.resolve as res
 use bundle.dce as dce
@@ -465,52 +466,39 @@ record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs:
 
 fn no-analysis() -> Analysis = Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, shift: 0, defined: false)
 
-# Scopes for one file, in `t`, under `scope`: the shared table on the linking thread, or a file's own.
-fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool,
-               helpers: [Text], t: mut sym.Table, scope: Int) -> Analysis {
+# A file's scopes, and the table they are in.
+record Analysed { analysis: Analysis, scopes: sym.Table }
+
+# What a file declares and uses, in a table of its own. Defines are substituted and the branches
+# they decide removed, then the result is analysed again, so what they kill is never seen by tree
+# shaking; CommonJS is analysed again inside its (exports, module) wrapper. A name free in any
+# of the analyses is free.
+fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed {
   let esm = early.program-has-module-syntax?(tree0)
   let tree = normalized-tree(tree0, base)
-  var bindings: {Int:Int} = {}
-  # Free names per module: this file's go to a fresh map for the moment.
-  sym.take-free!(t)
-  let first-root = sc.analyze(tree, t, scope, bindings)
-  let cjs = not esm and (sym.has-free?(t, "module") or sym.has-free?(t, "exports") or sym.has-free?(t, "require"))
-  if jsx-imports and not early.program-has-module-syntax?(parsed)
-     and (sym.has-free?(t, "module") or sym.has-free?(t, "exports")) {
+  let first = scope.scoped(tree, [])
+  let cjs = not esm and (any f in ["module", "exports", "require"]: f in first.free)
+  if jsx-imports and not early.program-has-module-syntax?(parsed) and ("module" in first.free or "exports" in first.free) {
     panic "{}: the automatic JSX runtime in a CommonJS module is not implemented yet", path
   }
-  # Defines are substituted and the branches they decide removed, then the result is analysed
-  # again, so what they kill is never seen by tree shaking.
-  let defined = mentions-define?(src) and defines-apply?(tree, bindings)
-  let final-tree = if defined then dce.run(substitute(tree, bindings)) else tree
-  var analysed-root = first-root
-  if defined {
-    sym.drop-last-child!(t, scope)
-    clear(bindings)
-    analysed-root = sc.analyze(final-tree, t, scope, bindings)
-  }
-  # CommonJS is analysed again inside its (exports, module) wrapper. The first attempt's scope is
-  # detached, so naming never sees it.
-  var root = analysed-root
-  if cjs {
-    sym.drop-last-child!(t, scope)
-    let wrapper = sym.new-scope!(t, scope, true)
-    sym.declare!(t, wrapper, "exports")
-    sym.declare!(t, wrapper, "module")
-    clear(bindings)
-    root = sc.analyze(final-tree, t, wrapper, bindings)
-  }
-  let free-names = sym.free-names(t)
-  let real-free = [f for f in free-names if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
-  Analysis(tree: final-tree, root: root, bindings: bindings, free: real-free, cjs: cjs, shift: 0, defined: defined)
+  let defined = mentions-define?(src) and defines-apply?(tree, first.bindings)
+  let final-tree = if defined then dce.run(substitute(tree, first.bindings)) else tree
+  let final = if cjs or defined then scope.scoped(final-tree, if cjs then ["exports", "module"] else []) else first
+  let free = first.free ++ [f for f in final.free if not (f in first.free)]
+  let real-free = [f for f in free if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
+  Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
+                              shift: 0, defined: defined),
+           scopes: final.table)
 }
 
 # A file analysed on its own, moved into the shared table: its ids move by where it lands.
-fn grafted(p: Parsed) -> Analysis {
+fn grafted(p: Parsed) -> Analysis = grafted-analysis(Analysed(analysis: p.analysis, scopes: p.scopes))
+
+fn grafted-analysis(a: Analysed) -> Analysis {
   let symbol-shift = sym.symbol-count(table)
-  var own = p.scopes
+  var own = a.scopes
   let scope-shift = sym.graft!(table, own, bundle-scope)
-  p.analysis with { root: p.analysis.root + scope-shift, shift: symbol-shift }
+  a.analysis with { root: a.analysis.root + scope-shift, shift: symbol-shift }
 }
 
 # A module's bindings in the shared table's numbering. Every module is moved at once, when all
@@ -600,12 +588,10 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
 # has to see the tree first.
 fn analysed-file(p: Parsed) -> Parsed {
   if has-transform { return p }
-  var own = sym.table-new()
-  let top = sym.new-scope!(own, -1, true)
-  let a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers, own, top)
+  let a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers)
   # The calls are the parsed tree's unless a define changed it, and those were found already.
-  let calls = if p.found and not a.defined then p.requires ++ p.imports else calls-in(a.tree)
-  p with { analysed: true, scopes: own, analysis: a, calls: calls }
+  let calls = if p.found and not a.analysis.defined then p.requires ++ p.imports else calls-in(a.analysis.tree)
+  p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls }
 }
 
 # A file found by walking: parsed, and its imports resolved, all on one worker.
@@ -931,7 +917,7 @@ fn load-file(path: Text, effects: Bool) -> Int {
   let base = base-name(path)
   let id = len(modules)
   let a = if ahead.analysed then grafted(ahead)
-          else analysis-of(tree0, parsed, src, path, base, ahead.jsx-imports, ahead.helpers, table, bundle-scope)
+          else grafted-analysis(analysis-of(tree0, parsed, src, path, base, ahead.jsx-imports, ahead.helpers))
   let final-tree = a.tree
   let cjs = a.cjs
   modules += blank-module(id, path, if cjs then Cjs else Esm, final-tree, a.root) with {
