@@ -781,8 +781,33 @@
       `(= (rt/peek (mut p)) ~(cast i64 (get s 0)))
       `(and (= (rt/peek (mut p)) ~(cast i64 (get s 0))) (rt/at-bytes? (mut p) ~s))))
 
-;;; A bool expression over bytes that advances on success and restores on failure.
+;;; The bytes a class matches, as ranges: a negated one's are the rest of 0 to 255.
+(defn class-ranges [(e PE)] (-> PE)
+  (if (not (.neg e))
+      e
+      (let [(mut out) e
+            (mut rs) (ArrayList::new [Range] (malloc-allocator))]
+        (for b (range 0 256)
+          (let [(mut in) false]
+            (for r (.ranges e) (when (and (>= b (.lo r)) (<= b (.hi r))) (set! in true)))
+            (unless in
+              (if (and (> (len rs) 0) (= (.hi (get rs (- (len rs) 1))) (- b 1)))
+                  (let [last (get rs (- (len rs) 1))]
+                    (set! (mut rs) (- (len rs) 1) (Range :lo (.lo last) :hi b)))
+                  (push! (mut rs) (Range :lo b :hi b))))))
+        (set! (.ranges out) rs)
+        (set! (.neg out) false)
+        out)))
+
+;;; A bool expression over bytes that advances on success and restores on failure. A class of
+;;; more than two ranges, or a negated one, is one test of a 256-bit set.
 (defn class-test [(e PE)] (-> Code)
+  (if (or (.neg e) (> (len (.ranges e)) 2))
+      (let [(mut f) (First :ranges (.ranges (class-ranges e)) :known true)]
+        (byte-test (bytes-of-first f)))
+      (class-test-ranges e)))
+
+(defn class-test-ranges [(e PE)] (-> Code)
   (let [(mut tests) (primitive/code-list-new)]
     (for r (.ranges e)
       (if (= (.lo r) (.hi r))
@@ -815,10 +840,19 @@
         (for k (.kids e) (push! (mut parts) (lex-code g (mut c) k)))
         `(let [s (.pos p)]
            (if (and ~@parts true) true (do (set! (.pos p) s) false)))))
+    ;; Each alternative is tried only if the byte here can begin it: the byte is read once, as
+    ;; a failing alternative leaves the position where it was.
     (OChoice []
       (let [(mut parts) (primitive/code-list-new)]
-        (for k (.kids e) (push! (mut parts) (lex-code g (mut c) k)))
-        `(or ~@parts)))
+        (for k (.kids e)
+          (let [code (lex-code g (mut c) k)
+                (mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+                empty (first-of! g k (mut f) 0)]
+            (push! (mut parts)
+                   (if (and (.known f) (not empty) (not (= (.op k) (OLit))) (not (= (.op k) (OClass))))
+                       `(and ~(byte-test (bytes-of-first f)) ~code)
+                       code))))
+        `(let [c (rt/peek (mut p))] (or ~@parts))))
     (OStar []
       `(let [(mut go) true]
          (while go
@@ -1578,9 +1612,7 @@
         (push! (mut (.ranges f)) (Range :lo b :hi b))
         false))
     (OClass []
-      (if (.neg e)
-          (do (set! (.known f) false) false)
-          (do (for r (.ranges e) (push! (mut (.ranges f)) r)) false)))
+      (do (for r (.ranges (class-ranges e)) (push! (mut (.ranges f)) r)) false))
     (OAny [] (set! (.known f) false) false)
     (ORef []
       (if (> depth 16)

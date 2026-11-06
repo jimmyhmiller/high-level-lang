@@ -3,6 +3,7 @@ rules bundle.modules over bundle.js
 use bundle.js as js
 use bundle.scopes as sc
 use bundle.link as link
+use bundle.coarse as co
 use bundle.resolve as res
 use bundle.dce as dce
 use bundle.early as early
@@ -883,116 +884,14 @@ fn checked-early(tree: Node, src: Text, path: Text) -> Node {
   }
 }
 
-fn declaration-at?(src: Text, i: Int) -> Bool =
-  starts-at?(src, i, "function ") or starts-at?(src, i, "function*") or starts-at?(src, i, "async function")
-  or starts-at?(src, i, "class ") or starts-at?(src, i, "export ") or starts-at?(src, i, "var ")
-  or starts-at?(src, i, "let ") or starts-at?(src, i, "const ")
-
-fn starts-at?(src: Text, i: Int, word: Text) -> Bool =
-  i + len(word) <= len(src) and src[i..i + len(word)] == word
-
-fn word-byte?(c: Int) -> Bool =
-  (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$' or c >= 128
-
-const regex-after-words: [Text] = ["return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
-                                  "throw", "case", "do", "else", "yield", "await"]
-
-# Whether a `/` at `i` begins a regular expression: what comes before it says.
-fn regex-at?(src: Text, i: Int) -> Bool {
-  var j = i - 1
-  while j >= 0 and (src[j] == ' ' or src[j] == '\t' or src[j] == '\n' or src[j] == '\r') { j = j - 1 }
-  if j < 0 { return true }
-  let c = src[j]
-  if c == ')' or c == ']' or c == '}' or c == '"' or c == '\'' or c == '`' { return false }
-  if not word-byte?(c) { return true }
-  var start = j
-  while start > 0 and word-byte?(src[start - 1]) { start = start - 1 }
-  src[start..j + 1] in regex-after-words
-}
-
-# Where a string from the quote at `i` ends: just past its closing quote, or at the line's end.
-fn string-end(src: Text, i: Int, quote: Int) -> Int {
-  var j = i + 1
-  while j < len(src) and src[j] != quote and src[j] != '\n' {
-    j = j + (if src[j] == '\\' then 2 else 1)
-  }
-  j + 1
-}
-
-fn regex-end(src: Text, i: Int) -> Int {
-  var j = i + 1
-  var in-class = false
-  while j < len(src) and src[j] != '\n' and (in-class or src[j] != '/') {
-    if src[j] == '\\' { j += 1 } else if src[j] == '[' { in-class = true } else if src[j] == ']' { in-class = false }
-    j += 1
-  }
-  j + 1
-}
-
-# Template text from `i`: where it ends, past the closing backquote; or, negated, just past a `${`.
-fn template-text-end(src: Text, i: Int) -> Int {
-  var j = i
-  while j < len(src) {
-    if src[j] == '\\' { j += 2 }
-    else if src[j] == '`' { return j + 1 }
-    else if src[j] == '$' and j + 1 < len(src) and src[j + 1] == '{' { return 0 - (j + 2) }
-    else { j += 1 }
-  }
-  j
-}
-
-fn piece-starts(src: Text) -> [Int] {
-  var out: [Int] = []
-  var depth = 0
-  var holes: [Int] = []  # the depth at each open `${`
-  var cut-at = 0
-  var i = 0
-  let n = len(src)
-  while i < n {
-    let c = src[i]
-    if c == '\n' {
-      i += 1
-      if depth == 0 and i - cut-at >= piece-bytes and n - i >= piece-bytes and declaration-at?(src, i) {
-        out += i
-        cut-at = i
-      }
-    } else if c == '/' and i + 1 < n and src[i + 1] == '/' {
-      while i < n and src[i] != '\n' { i += 1 }
-    } else if c == '/' and i + 1 < n and src[i + 1] == '*' {
-      i += 2
-      while i + 1 < n and not (src[i] == '*' and src[i + 1] == '/') { i += 1 }
-      i += 2
-    } else if c == '"' or c == '\'' {
-      i = string-end(src, i, c)
-    } else if c == '/' and regex-at?(src, i) {
-      i = regex-end(src, i)
-    } else if c == '`' {
-      let e = template-text-end(src, i + 1)
-      if e < 0 {
-        holes += depth
-        depth += 1
-        i = 0 - e
-      } else {
-        i = e
-      }
-    } else if c == '}' and len(holes) > 0 and last(holes) == depth - 1 {
-      depth = depth - 1
-      pop(holes)
-      let e = template-text-end(src, i + 1)
-      if e < 0 {
-        holes += depth
-        depth += 1
-        i = 0 - e
-      } else {
-        i = e
-      }
-    } else {
-      if c == '(' or c == '[' or c == '{' { depth += 1 }
-      if c == ')' or c == ']' or c == '}' { depth = depth - 1 }
-      i += 1
-    }
-  }
-  out
+# Where a large file is cut: where the coarse grammar finds a declaration starting a line at the
+# top level, at least a piece's size from the last cut and from the end. A file the coarse grammar
+# cannot read is not cut.
+fn piece-starts(src: Text) -> [Int] = match co.parse-opt(src, "<coarse>", 0) {
+  some(co.Coarse(List(items...))) =>
+    fold cuts = [] for co.Cut(_) as line in items if len(src) - line.hi >= piece-bytes:
+      if line.hi - (if len(cuts) == 0 then 0 else last(cuts)) >= piece-bytes then cuts ++ [line.hi] else cuts
+  _ => []
 }
 
 fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
