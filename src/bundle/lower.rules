@@ -398,30 +398,26 @@ fn wrapped-in-generator(params: Node, body: Node, self: Node, driver: Text, gene
 
 fn arrow-self(body: Node) -> Node = if mentions-this?(body) then This() else Null()
 
-fn rest-prologue(params: Node) -> Wrapped {
-  match params {
-    Params(List(ps...)) => {
-      var out: [Node] = []
-      var decls: [Node] = []
-      for p in ps {
-        match p {
-          Param(t, init) => {
-            if top-rest?(t) {
-              let name = fresh-name("_")
-              out += Param(BindName(name), init) with { lo: p.lo, hi: p.hi }
-              decls ++= rest-declarators(t, Ident(name), p)
-            } else {
-              out += p
-            }
-          }
-          _ => { out += p }
-        }
-      }
-      let stmts: [Node] = if len(decls) > 0 then [VarDecl(List(decls...))] else []
-      Wrapped(params: Params(List(out...)) with { lo: params.lo, hi: params.hi }, body: FuncBody(List(stmts...)))
-    }
-    _ => Wrapped(params: params, body: FuncBody(List()))
+fn rest-prologue(params: Node) -> Wrapped = match params {
+  Params(List(ps...)) => {
+    let each = [rest-taken(p) for p in ps]
+    let kept = [e.param for e in each]
+    let decls = [d for e in each for d in e.decls]
+    let stmts: [Node] = if len(decls) > 0 then [VarDecl(List(decls...))] else []
+    Wrapped(params: Params(List(kept...)) with { lo: params.lo, hi: params.hi }, body: FuncBody(List(stmts...)))
   }
+  _ => Wrapped(params: params, body: FuncBody(List()))
+}
+
+# A parameter that destructures a rest element takes a plain name, and declarations take it apart.
+record Taken { param: Node, decls: [Node] }
+
+fn rest-taken(p: Node) -> Taken = match p {
+  Param(t, init) if top-rest?(t) => {
+    let name = fresh-name("_")
+    Taken(param: Param(BindName(name), init) with { lo: p.lo, hi: p.hi }, decls: rest-declarators(t, Ident(name), p))
+  }
+  _ => Taken(param: p, decls: [])
 }
 
 fn arrow?(n: Node) -> Bool = n is Arrow(...) | AsyncArrow(...)
@@ -652,43 +648,37 @@ fn function-expr-of(m: Node) -> Node = match m {
 record Privates { table: {Text:Private}, setup: [Node] }
 
 fn scan-privates(members: [Node], outer: {Text:Private}) -> Privates {
-  var setup: [Node] = []
-  var out: {Text:Private} = {}
-  for k in keys(outer) { out[k] = outer[k] ?? panic "lost a private name" }
-  var instances = ""
-  var static-set = ""
-  for m in members {
-    if let some(name) = private-key(m) {
-      let plain = name[1..len(name)]
-      let is-static = m is StaticMethod(_) | StaticField(...)
-      match inner-member(m) {
-        Field(...) | StaticField(...) => {
-          let holder = temp()
-          let map-new = NewExpr(Ident("WeakMap"), Args(List()))
-          setup += assign(Ident(holder), map-new)
-          out[name] = Private(holder: holder, method: "", getter: "", setter: "")
-        }
-        _ => {
-          let set-name = if is-static then static-set else instances
-          let holder = if len(set-name) > 0 then set-name else {
-            let h = temp()
-            let set-new = NewExpr(Ident("WeakSet"), Args(List()))
-            setup += assign(Ident(h), set-new)
-            h
-          }
-          if is-static { static-set = holder } else { instances = holder }
-          let f = temp()
-          let known = out[name] ?? Private(holder: holder, method: "", getter: "", setter: "")
-          out[name] = match inner-member(m) {
-            Getter(...) => known with { getter: f }
-            Setter(...) => known with { setter: f }
-            _ => known with { method: f }
-          }
-        }
-      }
-    }
+  let s = fold s = Scanned(table: outer, setup: [], instances: "", statics: "")
+          for m in members if let some(name) = private-key(m): private-scanned(s, m, name)
+  Privates(table: s.table, setup: s.setup)
+}
+
+# The private names so far, and the sets the instance and the static methods are in once made.
+record Scanned { table: {Text:Private}, setup: [Node], instances: Text, statics: Text }
+
+# A private field is held in a WeakMap of its own. Private methods and accessors are functions, and
+# the instance ones are vouched for by one WeakSet, the static ones by another, made at the first.
+fn private-scanned(s: Scanned, m: Node, name: Text) -> Scanned = match inner-member(m) {
+  Field(...) | StaticField(...) => {
+    let holder = temp()
+    s with { setup: s.setup ++ [assign(Ident(holder), NewExpr(Ident("WeakMap"), Args(List())))],
+             table: s.table ++ {name: Private(holder: holder, method: "", getter: "", setter: "")} }
   }
-  Privates(table: out, setup: setup)
+  inner => {
+    let is-static = m is StaticMethod(_) | StaticField(...)
+    let existing = if is-static then s.statics else s.instances
+    let holder = if len(existing) > 0 then existing else temp()
+    let made: [Node] = if len(existing) > 0 then [] else [assign(Ident(holder), NewExpr(Ident("WeakSet"), Args(List())))]
+    let f = temp()
+    let known = s.table[name] ?? Private(holder: holder, method: "", getter: "", setter: "")
+    let p = match inner {
+      Getter(...) => known with { getter: f }
+      Setter(...) => known with { setter: f }
+      _ => known with { method: f }
+    }
+    s with { setup: s.setup ++ made, table: s.table ++ {name: p},
+             instances: if is-static then s.instances else holder, statics: if is-static then holder else s.statics }
+  }
 }
 
 fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Text] {

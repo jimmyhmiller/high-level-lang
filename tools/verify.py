@@ -314,6 +314,10 @@ old = sh(["node", "oracles/check-target.mjs", "../out/spec/old.js", "2017"], 30)
 ran = sh(["node", "../out/spec/old.js"], 30)[1].strip()
 check(old == "ok" and ran == "4 4", f"a spec's syntax target: {old}, {ran}")
 
+print("== the rules language")
+code, out = sh([os.path.join(os.path.dirname(ESB), "langtest")], 30)
+check(code == 0 and out.strip().endswith("all checks passed"), f"collection forms mean what they say: {out.strip().split(chr(10))[-1]}")
+
 print("== source maps")
 for a in ["named.js", "cjs.js", "features.js", "jsx/main.jsx"]:
     out = f"{SCRATCH}/{a.replace('/', '_')}.sm.js"

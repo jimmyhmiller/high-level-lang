@@ -2378,6 +2378,48 @@
       (locals-reset! (mut k) mark)
       (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~body ~(sym o)) ty))))
 
+;;; `{k: v, …}`: typed by what is wanted, or else by its first entry.
+(defn map-literal [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+  (let [entries (list-kids (kid n 0))
+        e0 (get entries 0)
+        ty (if (map? want)
+               want
+               (cat4 "{" (.ty (expr (mut k) (kid e0 0) "")) ":" (cat (.ty (expr (mut k) (kid e0 1) "")) "}")))
+        o (fresh (mut k) "out")]
+    (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~(map-extend-code (mut k) n (sym o) ty) ~(sym o)) ty)))
+
+;;; `m ++= e`, as a fold accumulating a map does it: a literal's entries, or a comprehension's, go
+;;; straight into `m`; the right of `a ++ b` wins.
+(defn map-extend-code [(k (mut Comp)) (e g/Node) (target Code) (t (slice u8))] (-> Code)
+  (match (.kind e)
+    (g/KMapLit []
+      (let [(mut sets) (primitive/code-list-new)]
+        (for x (list-kids (kid e 0))
+          (let [key (expect (mut k) (kid x 0) (expr (mut k) (kid x 0) (map-key t)) (map-key t))
+                val (expect (mut k) (kid x 1) (expr (mut k) (kid x 1) (map-val t)) (map-val t))]
+            (push! (mut sets) `(set! (mut ~target) ~(.code key) ~(.code val)))))
+        `(do ~@sets 0)))
+    (g/KConcat []
+      `(do ~(map-extend-code (mut k) (kid e 0) target t) ~(map-extend-code (mut k) (kid e 1) target t) 0))
+    (g/KMapComp []
+      (let [mark (locals-mark (mut k))
+            (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+        (for c (list-kids (kid e 2)) (push! (mut opened) (clause-open! (mut k) c)))
+        (let [key (expect (mut k) (kid e 0) (expr (mut k) (kid e 0) (map-key t)) (map-key t))
+              val (expect (mut k) (kid e 1) (expr (mut k) (kid e 1) (map-val t)) (map-val t))
+              body (clauses-code (mut k) (list-kids (kid e 2)) opened `(set! (mut ~target) ~(.code key) ~(.code val)))]
+          (locals-reset! (mut k) mark)
+          `(do ~body 0))))
+    (_ (let [v (expect (mut k) e (expr (mut k) e t) t)]
+         (map-copy-into (mut k) (.code v) target)))))
+
+(defn map-copy-into [(k (mut Comp)) (from Code) (target Code)] (-> Code)
+  (let [m (fresh (mut k) "m") x (fresh (mut k) "key") v (fresh (mut k) "v")]
+    `(let [~(sym m) ~from]
+       (for ~(sym x) ~(sym m)
+         (match (get ~(sym m) ~(sym x)) (Some [~(sym v)] (set! (mut ~target) ~(sym x) ~(sym v))) (None [] 0)))
+       0)))
+
 ;;; `join([a ++ b for …], ", ")`: each item's pieces go straight into one buffer, with no list and no
 ;;; text for each item. The separator is a literal, so nothing it does can move.
 (defn join-comprehension [(k (mut Comp)) (comp g/Node) (sep-node g/Node)] (-> TE)
@@ -2416,24 +2458,52 @@
 
 ;;; `fold acc = init for …: e`: `acc` starts as `init`, and each time round becomes `e`. With
 ;;; `scan`, the list of what it became each time.
+;;; Whether `more` can go into the accumulator `name` as it is made: when nothing in it reads the
+;;; accumulator, or it is one item, made whole before it goes in.
+(defn added-whole? [(more g/Node) (name (slice u8))] (-> bool)
+  (or (not (mentions-name? more name))
+      (and (or (= (.kind more) (g/KListLit)) (= (.kind more) (g/KMapLit)))
+           (= (len (list-kids (kid more 0))) 1)
+           (not (spread-arg? (kid (kid more 0) 0))))))
+
+(defn mentions-name? [(n g/Node) (name (slice u8))] (-> bool)
+  (if (and (= (.kind n) (g/KName)) (= (.text n) name))
+      true
+      (let [(mut found) false]
+        (for c (.kids n) (when (and (not found) (mentions-name? c name)) (set! found true)))
+        found)))
+
 (defn fold-expr [(k (mut Comp)) (n g/Node) (want (slice u8)) (scan bool)] (-> TE)
   (let [mark (locals-mark (mut k))
         init (expr (mut k) (kid n 1) (if scan (if (list? want) (elem-of want) "") want))
         ty (.ty init)
         acc (bind-local! (mut k) (.text (kid n 0)) ty false)
         o (fresh (mut k) "steps")
+        step-node (kid n 3)
+        ;; `fold xs = … : xs ++ more`: `more` goes into the accumulator, which is its own, as a
+        ;; `var`'s is, and the list or map is never copied.
+        in-place (and (not scan) (or (list? ty) (map? ty)) (= (.kind step-node) (g/KConcat))
+                      (= (.kind (kid step-node 0)) (g/KName)) (= (.text (kid step-node 0)) (.text (kid n 0)))
+                      (added-whole? (kid step-node 1) (.text (kid n 0))))
+        start (if (and in-place (match (.kind (kid n 1)) (g/KName [] true) (g/KFieldE [] true) (g/KIndex [] true) (_ false)))
+                  (list-copy (mut k) init)
+                  (.code init))
         (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
     (for c (list-kids (kid n 2)) (push! (mut opened) (clause-open! (mut k) c)))
-    (let [step (expect (mut k) (kid n 3) (expr (mut k) (kid n 3) ty) ty)
-          each (if scan
-                   `(do (set! ~(sym acc) ~(.code step)) (push! (mut ~(sym o)) ~(sym acc)))
-                   `(set! ~(sym acc) ~(.code step)))
+    (let [each (cond
+                 in-place (if (map? ty)
+                              (map-extend-code (mut k) (kid step-node 1) (sym acc) ty)
+                              (extend-code (mut k) (kid step-node 1) (sym acc) ty))
+                 scan (let [step (expect (mut k) step-node (expr (mut k) step-node ty) ty)]
+                        `(do (set! ~(sym acc) ~(.code step)) (push! (mut ~(sym o)) ~(sym acc))))
+                 :else (let [step (expect (mut k) step-node (expr (mut k) step-node ty) ty)]
+                         `(set! ~(sym acc) ~(.code step))))
           body (clauses-code (mut k) (list-kids (kid n 2)) opened each)]
       (locals-reset! (mut k) mark)
       (if scan
           (te `(let [(mut ~(sym acc)) ~(.code init) (mut ~(sym o)) ~(new-list (mut k) ty)] ~body ~(sym o))
               (cat3 "[" ty "]"))
-          (te `(let [(mut ~(sym acc)) ~(.code init)] ~body ~(sym acc)) ty)))))
+          (te `(let [(mut ~(sym acc)) ~start] ~body ~(sym acc)) ty)))))
 
 (defn loop-all [(k (mut Comp)) (n g/Node) (negate-empty bool)] (-> TE)
   (let [mark (locals-mark (mut k))
@@ -2553,6 +2623,7 @@
     (g/KComp [] (comprehension (mut k) n want false))
     (g/KCompSpread [] (comprehension (mut k) n want true))
     (g/KMapComp [] (map-comprehension (mut k) n want))
+    (g/KMapLit [] (map-literal (mut k) n want))
     (g/KFold [] (fold-expr (mut k) n want false))
     (g/KScan [] (fold-expr (mut k) n want true))
     (g/KSum []
@@ -2671,6 +2742,10 @@
     (g/KMod [] (binary-int (mut k) n `%))
     (g/KConcat []
       (let [first-ty (.ty (expr (mut k) (kid n 0) want))]
+        (if (map? first-ty)
+          (let [o (fresh (mut k) "out")]
+            (te `(let [(mut ~(sym o)) ~(new-map (mut k) first-ty)] ~(map-extend-code (mut k) n (sym o) first-ty) ~(sym o))
+                first-ty))
         (if (list? first-ty)
             (let [a (expr (mut k) (kid n 0) want)
                   b (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) first-ty) first-ty)
@@ -2698,7 +2773,7 @@
                      (reserve! (mut (.bytes ~(sym b))) (+ ~@lens 0))
                      ~@pushes
                      (finish! (mut ~(sym b))))
-                  "Text")))))
+                  "Text"))))))
     (g/KDefault []
       (let [a (expr (mut k) (kid n 0) (if (> (len want) 0) (if (opt? want) want (cat want "?")) ""))]
         (unless (opt? (.ty a)) (die (mut k) n (cat "`??` needs an option on its left, but this is " (.ty a))))
@@ -2847,13 +2922,17 @@
 
 ;; ---------------------------------------------------------------- statements
 
+;;; A list or a map of its own, for a `var` or an accumulator that will change in place.
 (defn list-copy [(k (mut Comp)) (e TE)] (-> Code)
+  (if (map? (.ty e))
+    (let [o (fresh (mut k) "out")]
+      `(let [(mut ~(sym o)) ~(new-map (mut k) (.ty e))] ~(map-copy-into (mut k) (.code e) (sym o)) ~(sym o)))
   (if (list? (.ty e))
       (let [o (fresh (mut k) "out") x (fresh (mut k) "x")]
         `(let [(mut ~(sym o)) ~(new-list (mut k) (elem-of (.ty e)))]
            (for (ref ~(sym x)) ~(.code e) (push! (mut ~(sym o)) ~(sym x)))
            ~(sym o)))
-      (.code e)))
+      (.code e))))
 
 (defn stmt [(k (mut Comp)) (s g/Node) (want (slice u8))] (-> TE)
   (match (.kind s)
