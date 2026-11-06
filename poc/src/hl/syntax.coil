@@ -817,7 +817,50 @@
         `(and (>= c 0) (not (or ~@tests)))
         `(or ~@tests))))
 
+;;; The bytes `e` matches when it always matches exactly one byte: a class, a one-byte literal, any
+;;; byte, or a choice of those, through fragments too.
+(defn byte-set-of [(g Grammar) (e PE) (depth i64)] (-> (Option Bytes))
+  (match (.op e)
+    (OClass []
+      (let [(mut f) (First :ranges (.ranges (class-ranges e)) :known true)]
+        (Some (bytes-of-first f))))
+    (OLit []
+      (if (= (len (.text e)) 1)
+          (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+                b (cast i64 (get (.text e) 0))]
+            (push! (mut (.ranges f)) (Range :lo b :hi b))
+            (Some (bytes-of-first f)))
+          (None [Bytes])))
+    (OAny [] (Some (Bytes :w0 -1 :w1 -1 :w2 -1 :w3 -1 :known true)))
+    (OChoice []
+      (let [(mut acc) (Some (bytes-none))]
+        (for k (.kids e)
+          (match acc
+            (Some [a]
+              (match (byte-set-of g k depth)
+                (Some [b] (set! acc (Some (bytes-union a b))))
+                (None [] (set! acc (None [Bytes])))))
+            (None [] 0)))
+        acc))
+    (ORef []
+      (if (> depth 8)
+          (None [Bytes])
+          (match (find-decl g (.text e))
+            (Some [d] (if (= (.kind d) (DFragment)) (byte-set-of g (.body d) (+ depth 1)) (None [Bytes])))
+            (None [] (None [Bytes])))))
+    (_ (None [Bytes]))))
+
+;;; A byte set's test of the byte here, and the step past it.
+(defn byte-step [(b Bytes)] (-> Code)
+  `(let [c (rt/peek (mut p))]
+     (if ~(byte-test b) (do (rt/advance! (mut p) 1) true) false)))
+
 (defn lex-code [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> Code)
+  (match (byte-set-of g e 0)
+    (Some [b] (if (or (= (.op e) (OLit)) (= (.op e) (OClass))) (lex-code-of g (mut c) e) (byte-step b)))
+    (None [] (lex-code-of g (mut c) e))))
+
+(defn lex-code-of [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> Code)
   (match (.op e)
     (OLit []
       `(if ~(bytes-test (.text e))
@@ -853,22 +896,35 @@
                        `(and ~(byte-test (bytes-of-first f)) ~code)
                        code))))
         `(let [c (rt/peek (mut p))] (or ~@parts))))
+    ;; A repetition of single bytes is a loop over bytes, with nothing to save and put back.
     (OStar []
-      `(let [(mut go) true]
-         (while go
-           (let [s (.pos p)]
-             (unless (and ~(lex-code g (mut c) (get (.kids e) 0)) (> (.pos p) s))
-               (set! go false))))
-         true))
-    (OPlus []
-      `(if ~(lex-code g (mut c) (get (.kids e) 0))
-           (let [(mut go) true]
+      (match (byte-set-of g (get (.kids e) 0) 0)
+        (Some [b]
+          `(do (while (let [c (rt/peek (mut p))] ~(byte-test b)) (rt/advance! (mut p) 1)) true))
+        (None []
+          `(let [(mut go) true]
              (while go
                (let [s (.pos p)]
                  (unless (and ~(lex-code g (mut c) (get (.kids e) 0)) (> (.pos p) s))
                    (set! go false))))
-             true)
-           false))
+             true))))
+    (OPlus []
+      (match (byte-set-of g (get (.kids e) 0) 0)
+        (Some [b]
+          `(if (let [c (rt/peek (mut p))] ~(byte-test b))
+               (do (rt/advance! (mut p) 1)
+                   (while (let [c (rt/peek (mut p))] ~(byte-test b)) (rt/advance! (mut p) 1))
+                   true)
+               false))
+        (None []
+          `(if ~(lex-code g (mut c) (get (.kids e) 0))
+               (let [(mut go) true]
+                 (while go
+                   (let [s (.pos p)]
+                     (unless (and ~(lex-code g (mut c) (get (.kids e) 0)) (> (.pos p) s))
+                       (set! go false))))
+                 true)
+               false))))
     (OOpt []
       `(do ~(lex-code g (mut c) (get (.kids e) 0)) true))
     (ONot []
@@ -1503,8 +1559,31 @@
               :else (set! (.w3 out) (| (.w3 out) bit)))))))
     out))
 
-;;; A bool over `c`, the byte: is it in the set?
+;;; A set's bytes as runs.
+(defn bytes-ranges [(b Bytes)] (-> (ArrayList Range))
+  (let [(mut out) (ArrayList::new [Range] (malloc-allocator))]
+    (for x (range 0 256)
+      (let [w (cond (< x 64) (.w0 b) (< x 128) (.w1 b) (< x 192) (.w2 b) :else (.w3 b))]
+        (when (!= (& (>> w (% x 64)) 1) 0)
+          (if (and (> (len out) 0) (= (.hi (get out (- (len out) 1))) (- x 1)))
+              (let [last (get out (- (len out) 1))]
+                (set! (mut out) (- (len out) 1) (Range :lo (.lo last) :hi x)))
+              (push! (mut out) (Range :lo x :hi x))))))
+    out))
+
+;;; A bool over `c`, the byte: is it in the set? A few runs are compared; more, looked up.
 (defn byte-test [(b Bytes)] (-> Code)
+  (let [rs (bytes-ranges b)]
+    (if (<= (len rs) 3)
+        (let [(mut tests) (primitive/code-list-new)]
+          (for r rs
+            (if (= (.lo r) (.hi r))
+                (push! (mut tests) `(= c ~(.lo r)))
+                (push! (mut tests) `(and (>= c ~(.lo r)) (<= c ~(.hi r))))))
+          `(or ~@tests false))
+        (byte-test-set b))))
+
+(defn byte-test-set [(b Bytes)] (-> Code)
   (let [w0 (.w0 b) w1 (.w1 b) w2 (.w2 b) w3 (.w3 b)]
     `(rt/byte-in? c ~w0 ~w1 ~w2 ~w3)))
 
