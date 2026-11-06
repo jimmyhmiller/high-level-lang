@@ -6,35 +6,26 @@ use bundle.modules as m
 const base64: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 const module-unit: Int = 4294967296
 
-fn vlq!(b: mut Buf, value: Int) -> Void {
-  var v = if value < 0 then (0 - value) * 2 + 1 else value * 2
-  var go = true
-  while go {
-    let digit = v % 32
-    v = v / 32
-    buf-byte!(b, base64[if v > 0 then digit + 32 else digit])
-    if v == 0 { go = false }
-  }
-}
+# A number as base-64 digits of five bits, the lowest first, the sign in the lowest bit.
+fn vlq(value: Int) -> Text = vlq-digits(if value < 0 then (0 - value) * 2 + 1 else value * 2)
 
-# JSON text, quoted.
-fn json-string!(b: mut Buf, s: Text) -> Void {
-  buf-add!(b, "\"")
-  for c in s {
-    if c == '"' { buf-add!(b, "\\\"") }
-    else if c == '\\' { buf-add!(b, "\\\\") }
-    else if c == '\n' { buf-add!(b, "\\n") }
-    else if c == '\r' { buf-add!(b, "\\r") }
-    else if c == '\t' { buf-add!(b, "\\t") }
-    else if c < 32 {
-      buf-add!(b, "\\u00")
-      buf-byte!(b, "0123456789abcdef"[c / 16])
-      buf-byte!(b, "0123456789abcdef"[c % 16])
-    }
-    else { buf-byte!(b, c) }
-  }
-  buf-add!(b, "\"")
-}
+fn vlq-digits(v: Int) -> Text =
+  if v < 32 then byte-text(base64[v]) else byte-text(base64[v % 32 + 32]) ++ vlq-digits(v / 32)
+
+# JSON text, quoted: quotes, backslashes and control bytes escaped.
+fn json-quoted(s: Text) -> Text =
+  "\"" ++ replace-many(s, [byte-text(c) for c in json-escaped], [json-escape(c) for c in json-escaped]) ++ "\""
+
+# The common ones first, as they are looked for in that order.
+const json-escaped: [Int] = ['\n', '"', '\\', '\t', '\r'] ++ [c for c in 0..32 if not (c == '\n' or c == '\t' or c == '\r')]
+
+fn json-escape(c: Int) -> Text =
+  if c == '"' then "\\\""
+  else if c == '\\' then "\\\\"
+  else if c == '\n' then "\\n"
+  else if c == '\r' then "\\r"
+  else if c == '\t' then "\\t"
+  else "\\u00" ++ byte-text("0123456789abcdef"[c / 16]) ++ byte-text("0123456789abcdef"[c % 16])
 
 # UTF-16 code units a UTF-8 lead byte stands for, 0 for a continuation byte.
 fn utf16-width(c: Int) -> Int =
@@ -58,73 +49,55 @@ fn column-in(src: Text, from: Int, to: Int) -> Int = sum i in from..to: utf16-wi
 # `../` for each directory of the output file, so paths resolve from the map.
 fn up-from(outfile: Text) -> Text = join(["../" for i in occurrences(outfile, ["/"])], "")
 
+# Where the printer is, each time it reaches a mark: how many line breaks it passed since the last,
+# and its column, in UTF-16 units as source maps count them.
+record Place { at: Int, breaks: Int, col: Int }
+
+fn advanced(text: Text, p: Place, to: Int) -> Place {
+  let at = max(p.at, to)
+  let breaks = count j in p.at..at: text[j] == '\n'
+  if breaks == 0 { return Place(at: at, breaks: 0, col: p.col + column-in(text, p.at, at)) }
+  let line = p.at + (last-index-of(text[p.at..at], "\n") ?? panic "a break counted and not found") + 1
+  Place(at: at, breaks: breaks, col: column-in(text, line, at))
+}
+
+# Where a mark came from: which of the map's sources, and the line and column there.
+record Origin { source: Int, line: Int, col: Int }
+
+fn mark-module(k: Mark) -> Int = k.src / module-unit - 1
+
+# Before each segment of `mappings`: `;` for each line passed, or `,` after a segment on this line.
+fn lead(places: [Place], i: Int) -> Text =
+  if places[i].breaks > 0 then join([";" for j in 0..places[i].breaks], "") else if i > 0 then "," else ""
+
+# Each number of a segment is the change from the one before; a new line starts its columns over.
+fn column-change(places: [Place], i: Int) -> Int =
+  places[i].col - (if i == 0 or places[i].breaks > 0 then 0 else places[i - 1].col)
+
+fn origin-before(origins: [Origin], i: Int) -> Origin = if i == 0 then Origin(source: 0, line: 0, col: 0) else origins[i - 1]
+
 # The map as JSON. `marks` are in output order, and `base` is where the printed body starts in `text`.
 fn build-map(text: Text, base: Int, marks: [Mark], outfile: Text) -> Text {
-  var b = buf-new()
-  var map = buf-new()
-  var sources: [Int] = []
-  var index-of = [-1 for i in 0..len(m.modules)]
-  var starts: [[Int]] = []
-  var pos = 0
-  var gen-col = 0
-  var prev-gen-col = 0
-  var prev-src = 0
-  var prev-line = 0
-  var prev-col = 0
-  var first-on-line = true
-  for mark in marks {
-    let at = base + mark.out
-    let module = mark.src / module-unit - 1
-    let offset = mark.src % module-unit
-    if module >= 0 {
-      if index-of[module] == -1 {
-        index-of[module] = len(sources)
-        sources += module
-        starts += line-starts(m.modules[module].text)
-      }
-      # Advance the generated position to this mark.
-      while pos < at {
-        let c = text[pos]
-        if c == '\n' {
-          buf-add!(map, ";")
-          gen-col = 0
-          prev-gen-col = 0
-          first-on-line = true
-        } else {
-          gen-col += utf16-width(c)
-        }
-        pos += 1
-      }
-      let source-index = index-of[module]
-      let src = m.modules[module].text
-      let table = starts[source-index]
-      let line = line-at(table, offset)
-      let col = column-in(src, table[line], offset)
-      if not first-on-line { buf-add!(map, ",") }
-      first-on-line = false
-      vlq!(map, gen-col - prev-gen-col)
-      vlq!(map, source-index - prev-src)
-      vlq!(map, line - prev-line)
-      vlq!(map, col - prev-col)
-      prev-gen-col = gen-col
-      prev-src = source-index
-      prev-line = line
-      prev-col = col
-    }
-  }
-  buf-add!(b, "{\"version\":3,\"sources\":[")
+  let mapped = [k for k in marks if mark-module(k) >= 0]
+  let sources = [mark-module(k) for k in mapped distinct mark-module(k)]
+  let index-of = {sources[i]: i for i in 0..len(sources)}
+  let tables = [line-starts(m.modules[s].text) for s in sources]
+  let places = scan p = Place(at: 0, breaks: 0, col: 0) for k in mapped: advanced(text, p, base + k.out)
+  let origins = [origin(k, (index-of[mark-module(k)] ?? panic "a mark from a module not among the sources"), tables)
+                 for k in mapped]
   let up = up-from(outfile)
-  for i in 0..len(sources) {
-    if i > 0 { buf-add!(b, ",") }
-    json-string!(b, up ++ m.modules[sources[i]].path)
-  }
-  buf-add!(b, "],\"sourcesContent\":[")
-  for i in 0..len(sources) {
-    if i > 0 { buf-add!(b, ",") }
-    json-string!(b, m.modules[sources[i]].text)
-  }
-  buf-add!(b, "],\"mappings\":")
-  json-string!(b, buf-text(map))
-  buf-add!(b, ",\"names\":[]}\n")
-  buf-text(b)
+  "{\"version\":3,\"sources\":[" ++ join([json-quoted(up ++ m.modules[s].path) for s in sources], ",")
+  ++ "],\"sourcesContent\":[" ++ join([json-quoted(m.modules[s].text) for s in sources], ",")
+  ++ "],\"mappings\":"
+  ++ json-quoted(join([lead(places, i) ++ vlq(column-change(places, i))
+                       ++ vlq(origins[i].source - origin-before(origins, i).source)
+                       ++ vlq(origins[i].line - origin-before(origins, i).line)
+                       ++ vlq(origins[i].col - origin-before(origins, i).col) for i in 0..len(mapped)], ""))
+  ++ ",\"names\":[]}\n"
+}
+
+fn origin(k: Mark, source: Int, tables: [[Int]]) -> Origin {
+  let offset = k.src % module-unit
+  let line = line-at(tables[source], offset)
+  Origin(source: source, line: line, col: column-in(m.modules[mark-module(k)].text, tables[source][line], offset))
 }

@@ -1090,18 +1090,22 @@
 ;;; Text and file paths, what every language here needs and none should spell out byte by byte.
 
 (defn index-of [(s (slice u8)) (what (slice u8))] (-> (Option i64))
-  (let [(mut at) -1 (mut i) 0 n (- (len s) (len what))]
-    (while (and (< at 0) (<= i n))
-      (when (at? s i what) (set! at i))
-      (set! i (+ i 1)))
-    (if (< at 0) (None [i64]) (Some at))))
+  (if (= (len what) 0)
+      (Some 0)
+      (let [(mut at) -1 (mut i) 0 n (- (len s) (len what)) first (get what 0)]
+        (while (and (< at 0) (<= i n))
+          (when (and (= (get s i) first) (at? s i what)) (set! at i))
+          (set! i (+ i 1)))
+        (if (< at 0) (None [i64]) (Some at)))))
 
 (defn last-index-of [(s (slice u8)) (what (slice u8))] (-> (Option i64))
-  (let [(mut at) -1 (mut i) (- (len s) (len what))]
-    (while (and (< at 0) (>= i 0))
-      (when (at? s i what) (set! at i))
-      (set! i (- i 1)))
-    (if (< at 0) (None [i64]) (Some at))))
+  (if (= (len what) 0)
+      (Some (len s))
+      (let [(mut at) -1 (mut i) (- (len s) (len what)) first (get what 0)]
+        (while (and (< at 0) (>= i 0))
+          (when (and (= (get s i) first) (at? s i what)) (set! at i))
+          (set! i (- i 1)))
+        (if (< at 0) (None [i64]) (Some at)))))
 
 ;;; What comes before the first `sep`, or all of `s` without one; and what comes after it, or nothing.
 (defn text-before [(s (slice u8)) (sep (slice u8))] (-> (slice u8))
@@ -1131,9 +1135,60 @@
       (push-str! (mut b) p))
     (finish! (mut b))))
 
+;;; `s` with each of `whats` replaced by the `bys` at its place, in one pass, the first that matches
+;;; winning. Nothing found, `s` itself.
+(defn replace-many [(s (slice u8)) (whats (ArrayList (slice u8))) (bys (ArrayList (slice u8)))] (-> (slice u8))
+  (unless (= (len whats) (len bys)) (panic "replace-many needs as many replacements as texts to replace"))
+  (let [(mut w0) 0 (mut w1) 0 (mut w2) 0 (mut w3) 0
+        (mut b) (str/StrBuf::new (malloc-allocator))
+        (mut start) 0
+        (mut i) 0
+        (mut any) false]
+    (for w whats
+      (when (= (len w) 0) (panic "replace-many needs text to look for"))
+      (let [x (cast i64 (get w 0))
+            bit (<< 1 (% x 64))]
+        (cond
+          (< x 64) (set! w0 (| w0 bit))
+          (< x 128) (set! w1 (| w1 bit))
+          (< x 192) (set! w2 (| w2 bit))
+          :else (set! w3 (| w3 bit)))))
+    (while (< i (len s))
+      (let [c (get s i)
+            (mut hit) -1]
+        (when (byte-in? (cast i64 c) w0 w1 w2 w3)
+          (let [(mut k) 0]
+            (while (and (< hit 0) (< k (len whats)))
+              (let [w (get whats k)]
+                (when (and (= (get w 0) c) (at? s i w)) (set! hit k)))
+              (set! k (+ k 1)))))
+        (if (< hit 0)
+            (set! i (+ i 1))
+            (do (unless any
+                  (set! any true)
+                  (reserve! (mut (.bytes b)) (+ (len s) 16)))
+                (push-str! (mut b) (subslice s start i))
+                (push-str! (mut b) (get bys hit))
+                (set! i (+ i (len (get whats hit))))
+                (set! start i)))))
+    (if any
+        (do (push-str! (mut b) (subslice s start (len s))) (finish! (mut b)))
+        s)))
+
 ;;; Every place in `s` where one of `whats` starts, in order, in one pass. Their first bytes are a
 ;;; 256-bit set in four words, so most bytes cost one test.
 (defn occurrences [(s (slice u8)) (whats (ArrayList (slice u8)))] (-> (ArrayList i64))
+  (if (and (= (len whats) 1) (= (len (get whats 0)) 1))
+      (byte-places s (get (get whats 0) 0))
+      (occurrences-of-many s whats)))
+
+;;; Every place byte `b` is in `s`.
+(defn byte-places [(s (slice u8)) (b u8)] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (tree-allocator))]
+    (for i (range 0 (len s)) (when (= (get s i) b) (push! (mut out) i)))
+    out))
+
+(defn occurrences-of-many [(s (slice u8)) (whats (ArrayList (slice u8)))] (-> (ArrayList i64))
   (let [(mut out) (ArrayList::new [i64] (tree-allocator))
         (mut w0) 0 (mut w1) 0 (mut w2) 0 (mut w3) 0]
     (for w whats
@@ -1148,8 +1203,11 @@
     (for i (range 0 (len s))
       (let [c (get s i)]
         (when (byte-in? (cast i64 c) w0 w1 w2 w3)
-          (let [(mut hit) false]
-            (for w whats (when (and (not hit) (= (get w 0) c) (at? s i w)) (set! hit true)))
+          (let [(mut hit) false (mut k) 0]
+            (while (and (not hit) (< k (len whats)))
+              (let [w (get whats k)]
+                (when (and (= (get w 0) c) (at? s i w)) (set! hit true)))
+              (set! k (+ k 1)))
             (when hit (push! (mut out) i))))))
     out))
 
@@ -1321,10 +1379,26 @@
 (defn buf-len [(b (mut Buf))] (-> i64) (len (.bytes b)))
 
 ;;; A one-element text from a byte.
+;;; Every byte in order, made once, so a one-byte text is a slice of it and costs nothing. The
+;;; ready word comes first, read and written atomically: whoever sees it set sees the bytes.
+(defstruct ByteTable [(ready i64) (bytes (slice u8))])
+
+(defn every-byte [] (-> (slice u8))
+  (let [t (primitive/alloc-static ByteTable)
+        ready (primitive/cast (ptr i64) t)]
+    (when (= (atomic/read ready) 0)
+      (init-lock!)
+      (when (= (atomic/read ready) 0)
+        (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+          (for i (range 0 256) (push! (mut b) (cast u8 i)))
+          (set! (.bytes t) (slice b))
+          (atomic/store ready 1)))
+      (init-unlock!))
+    (.bytes t)))
+
 (defn text-of-byte [(c i64)] (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
-    (push! (mut (.bytes b)) (cast u8 c))
-    (finish! (mut b))))
+  (when (or (< c 0) (> c 255)) (panic "byte-text of {}, which is no byte" c))
+  (subslice (every-byte) c (+ c 1)))
 
 (defn line-of [(src (slice u8)) (at i64)] (-> i64) (.line (line-col src at)))
 (defn col-of [(src (slice u8)) (at i64)] (-> i64) (.col (line-col src at)))

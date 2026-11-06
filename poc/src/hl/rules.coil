@@ -1821,7 +1821,11 @@
                           (fn-value-call (mut k) n `(~(primitive/code-symbol "." name) ~(storage-call (mut k) x)) (.ty x) args))
                         (None []
                           (match (find-func (mod-at (mut k) "hl.rt") name)
-                            (Some [f] (call-func (mut k) n "hl.rt" f args))
+                            (Some [f]
+                              (if (and (= name "join") (= (len args) 2)
+                                       (= (.kind (get args 0)) (g/KComp)) (= (.kind (get args 1)) (g/KStr)))
+                                  (join-comprehension (mut k) (get args 0) (get args 1))
+                                  (call-func (mut k) n "hl.rt" f args)))
                             (None [] (die (mut k) callee (cat "no function named " name))))))))))))))
       (g/KFieldE []
         (let [base (kid callee 0)
@@ -2190,18 +2194,51 @@
       (locals-reset! (mut k) mark)
       (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~body ~(sym o)) ty))))
 
-;;; `fold acc = init for …: e`: `acc` starts as `init`, and each time round becomes `e`.
-(defn fold-expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+;;; `join([a ++ b for …], ", ")`: each item's pieces go straight into one buffer, with no list and no
+;;; text for each item. The separator is a literal, so nothing it does can move.
+(defn join-comprehension [(k (mut Comp)) (comp g/Node) (sep-node g/Node)] (-> TE)
   (let [mark (locals-mark (mut k))
-        init (expr (mut k) (kid n 1) want)
+        b (fresh (mut k) "b")
+        first (fresh (mut k) "first")
+        sep (expect (mut k) sep-node (expr (mut k) sep-node "Text") "Text")
+        (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))
+        (mut parts) (ArrayList::new [g/Node] (malloc-allocator))
+        (mut pushes) (primitive/code-list-new)]
+    (for c (list-kids (kid comp 1)) (push! (mut opened) (clause-open! (mut k) c)))
+    (if (= (.kind (kid comp 0)) (g/KConcat))
+        (concat-operands! (kid comp 0) (mut parts))
+        (push! (mut parts) (kid comp 0)))
+    (for p parts
+      (let [x (expect (mut k) p (expr (mut k) p "Text") "Text")]
+        (push! (mut pushes) `(push-str! (mut ~(sym b)) ~(.code x)))))
+    (let [each `(do (unless ~(sym first) (push-str! (mut ~(sym b)) ~(.code sep))) (set! ~(sym first) false) ~@pushes)
+          body (clauses-code (mut k) (list-kids (kid comp 1)) opened each)]
+      (locals-reset! (mut k) mark)
+      (te `(let [(mut ~(sym b)) (str/StrBuf::new (malloc-allocator)) (mut ~(sym first)) true]
+             ~body
+             (finish! (mut ~(sym b))))
+          "Text"))))
+
+;;; `fold acc = init for …: e`: `acc` starts as `init`, and each time round becomes `e`. With
+;;; `scan`, the list of what it became each time.
+(defn fold-expr [(k (mut Comp)) (n g/Node) (want (slice u8)) (scan bool)] (-> TE)
+  (let [mark (locals-mark (mut k))
+        init (expr (mut k) (kid n 1) (if scan (if (list? want) (elem-of want) "") want))
         ty (.ty init)
         acc (bind-local! (mut k) (.text (kid n 0)) ty false)
+        o (fresh (mut k) "steps")
         (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
     (for c (list-kids (kid n 2)) (push! (mut opened) (clause-open! (mut k) c)))
     (let [step (expect (mut k) (kid n 3) (expr (mut k) (kid n 3) ty) ty)
-          body (clauses-code (mut k) (list-kids (kid n 2)) opened `(set! ~(sym acc) ~(.code step)))]
+          each (if scan
+                   `(do (set! ~(sym acc) ~(.code step)) (push! (mut ~(sym o)) ~(sym acc)))
+                   `(set! ~(sym acc) ~(.code step)))
+          body (clauses-code (mut k) (list-kids (kid n 2)) opened each)]
       (locals-reset! (mut k) mark)
-      (te `(let [(mut ~(sym acc)) ~(.code init)] ~body ~(sym acc)) ty))))
+      (if scan
+          (te `(let [(mut ~(sym acc)) ~(.code init) (mut ~(sym o)) ~(new-list (mut k) ty)] ~body ~(sym o))
+              (cat3 "[" ty "]"))
+          (te `(let [(mut ~(sym acc)) ~(.code init)] ~body ~(sym acc)) ty)))))
 
 (defn loop-all [(k (mut Comp)) (n g/Node) (negate-empty bool)] (-> TE)
   (let [mark (locals-mark (mut k))
@@ -2321,7 +2358,8 @@
     (g/KComp [] (comprehension (mut k) n want false))
     (g/KCompSpread [] (comprehension (mut k) n want true))
     (g/KMapComp [] (map-comprehension (mut k) n want))
-    (g/KFold [] (fold-expr (mut k) n want))
+    (g/KFold [] (fold-expr (mut k) n want false))
+    (g/KScan [] (fold-expr (mut k) n want true))
     (g/KSum []
       (let [_ (bounded! (mut k) (kid n 0))
             mark (locals-mark (mut k))
