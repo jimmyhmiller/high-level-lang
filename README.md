@@ -29,7 +29,8 @@ tables, Datalog and rewriting in general, plus a runtime of buffers, files and U
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 9,191 | Resolution, modules, JSX, TypeScript, tsconfig, early errors, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
+| `.rules` | 8,306 | Resolution, modules, JSX, TypeScript, tsconfig, analysis, emit, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
+| `.attrs` | 1,054 | Early errors, and what a file loads: attribute grammars, computed in one traversal |
 | `.syntax` | 780 | JavaScript with JSX and TypeScript, CSS, literals, comments, package.json and tsconfig.json |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
 | `.facts` | 114 | Linking, tree shaking, and which root reaches what for code splitting |
@@ -50,8 +51,25 @@ program-plus(p, stmt`$call_me();`)
 ```
 
 It is closer to a small ML than to a one-purpose language. Some of it is still byte loops, notably
-number spelling, VLQ and path normalising. `early.rules` (968 lines) is the largest file and mostly
-a translation of the specification's rules, so it is the best candidate for a language of its own.
+number spelling, VLQ and path normalising.
+
+`.attrs` is an attribute grammar over a grammar's trees, compiled by the same compiler. Nothing in
+it walks a tree: it declares attributes, and `on` blocks give equations for the nodes a pattern
+matches. An `inh` attribute is inherited, a child having its parent's value unless an equation says
+otherwise; a `given` one is inherited but not copied; a `collect` one is gathered in tree order;
+an `input` is the same everywhere. The compiler makes one traversal that computes them all, and an
+attribute grammar may `include` another, whose equations then run in the same traversal:
+
+```
+inh in-loop: Bool = false
+collect problem: Problem?
+on While(_, body) { body.in-loop = true }
+on Continue(_) as n { if not in-loop { report("continue is only valid in a loop", n) } }
+```
+
+Early errors (`early.attrs`, 1,045 lines) are written this way, and include what a file loads
+(`calls.attrs`), so a JavaScript file is checked and its `require` and `import()` calls found in one
+traversal.
 
 Compile time is the real cost: building the tools peaks at about 9 GB, of which the reader image
 is about 3.2 GB. Run builds through `corpus/tools/guard.py`, which kills a process tree over a limit.
@@ -214,13 +232,17 @@ stated; a big file's early errors are checked per part; a file's `require()` and
 are found once; minifying, ASCII and printing run as one pass per part; whitespace skipping costs
 one comparison when the space was skipped already; task state is one thread-specific lookup.
 
-Tried and taken out, because they were slower: keeping a node's children in the rewrite engine
-when none changed (a rule that reuses them walks them again; minify on lodash-es went from 3 to 10
-ms), data-parallel Datalog rule scans, resolving each import as an item of its own for files with
-few imports, starting big files ahead of the queue, and starting the worker pool from `main`.
+Tried and taken out, because they were slower: data-parallel Datalog rule scans, resolving each
+import as an item of its own for files with few imports, starting big files ahead of the queue, and
+starting the worker pool from `main`.
 
-Per core this bundler still does about twice esbuild's work. The rest of the gap is a more compact
-tree, rewritten in place, and fewer passes over it.
+Trees are immutable, and a pass shares what it does not change. The rewrite engine keeps a node
+none of whose children changed, and marks its copies of what a rule captured as normal for the
+pass, so they are not walked again; `n with { kids: [f(c) for c in n.kids] }` in `.rules` is `n`
+itself when every `f(c)` is `c`. Minifying got 11–20% faster.
+
+Per core this bundler still does about twice esbuild's work: most of the rest is the number of
+passes over a tree, about a dozen to esbuild's three. Attribute grammars are how they become fewer.
 
 ## What it does
 
