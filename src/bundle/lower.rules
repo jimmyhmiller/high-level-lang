@@ -138,86 +138,61 @@ fn read-link(base: Node, l: Link) -> Node = match l.kind {
 fn chain(n: Node, miss: Node, deleting: Bool) -> Node {
   let links = links-of(n)
   let root = chain-root(n)
-  var value = if root is Super() then root else lowered(root)
-  var self: Node? = none
-  var tests: [Node] = []
-  for i in 0..len(links) {
-    let l = links[i]
-    let next-called = i + 1 < len(links) and links[i + 1].kind == Called
-    match l.kind {
-      Called => {
-        let args = [lowered(a) for a in l.part.kids]
-        if l.optional {
-          match self {
-            some(s) => {
-              let f = Ident(temp())
-              tests += tested(assign(f, value))
-              let passed = [s] ++ args
-              value = CallExpr(Member(f, PropName("call")), Args(List(passed...)))
-            }
-            none => {
-              if repeatable?(value) {
-                tests += tested(value)
-              } else {
-                let f = Ident(temp())
-                tests += tested(assign(f, value))
-                value = f
-              }
-              value = CallExpr(value, Args(List(args...)))
-            }
-          }
-        } else {
-          match self {
-            some(s) => {
-              let passed = [s] ++ args
-              value = CallExpr(Member(value, PropName("call")), Args(List(passed...)))
-            }
-            none => { value = CallExpr(value, Args(List(args...))) }
-          }
-        }
-        self = none
+  let start = Walk(value: if root is Super() then root else lowered(root), self: none, tests: [])
+  let w = fold w = start for i in 0..len(links): link-walked(w, links, i)
+  fold out = (if deleting then Delete(w.value) else w.value) for t in reversed(w.tests): Cond(t, miss, out)
+}
+
+# Where a chain's lowering is, link by link: the value so far, the object a call through it needs as
+# `this`, and the `== null` tests met on the way, outermost first.
+record Walk { value: Node, self: Node?, tests: [Node] }
+
+fn link-walked(w: Walk, links: [Link], i: Int) -> Walk = match links[i].kind {
+  Called => called(w, links[i])
+  TaggedBy => Walk(value: Tagged(w.value, lowered(links[i].part)), self: none, tests: w.tests)
+  _ => read(w, links, i)
+}
+
+# An optional link tests its value for `== null`, holding it in a temporary first unless it can be
+# read twice.
+fn tested-once(w: Walk) -> Walk {
+  if repeatable?(w.value) { return Walk(value: w.value, self: w.self, tests: w.tests ++ [tested(w.value)]) }
+  let held = Ident(temp())
+  Walk(value: held, self: w.self, tests: w.tests ++ [tested(assign(held, w.value))])
+}
+
+# A call: through `.call` with the object kept from the link before, when there is one.
+fn called(w: Walk, l: Link) -> Walk {
+  let args = [lowered(a) for a in l.part.kids]
+  match w.self {
+    some(s) => {
+      if not l.optional {
+        return Walk(value: CallExpr(Member(w.value, PropName("call")), Args(List(([s] ++ args)...))), self: none, tests: w.tests)
       }
-      TaggedBy => {
-        value = Tagged(value, lowered(l.part))
-        self = none
-      }
-      _ => {
-        if l.optional {
-          if repeatable?(value) {
-            tests += tested(value)
-          } else {
-            let held = Ident(temp())
-            tests += tested(assign(held, value))
-            value = held
-          }
-        }
-        let private-link = l.part is PrivateName(_) and before?(2022)
-        if next-called and (links[i + 1].optional or private-link) {
-          if value is Super() {
-            self = some(This())
-            value = read-link(value, l)
-          } else if repeatable?(value) {
-            self = some(value)
-            value = read-link(value, l)
-          } else {
-            let held = Ident(temp())
-            self = some(held)
-            value = read-link(assign(held, value), l)
-          }
-        } else {
-          self = none
-          value = read-link(value, l)
-        }
-      }
+      let f = Ident(temp())
+      Walk(value: CallExpr(Member(f, PropName("call")), Args(List(([s] ++ args)...))), self: none,
+           tests: w.tests ++ [tested(assign(f, w.value))])
+    }
+    none => {
+      let g = if l.optional then tested-once(w) else w
+      Walk(value: CallExpr(g.value, Args(List(args...))), self: none, tests: g.tests)
     }
   }
-  var out = if deleting then Delete(value) else value
-  var at = len(tests)
-  while at > 0 {
-    at = at - 1
-    out = Cond(tests[at], miss, out)
+}
+
+# A member read. When a call that needs its `this` by hand comes next, the object is kept.
+fn read(w0: Walk, links: [Link], i: Int) -> Walk {
+  let l = links[i]
+  let w = if l.optional then tested-once(w0) else w0
+  let private-link = l.part is PrivateName(_) and before?(2022)
+  let next-called = i + 1 < len(links) and links[i + 1].kind == Called
+  if not (next-called and (links[i + 1].optional or private-link)) {
+    return Walk(value: read-link(w.value, l), self: none, tests: w.tests)
   }
-  out
+  if w.value is Super() { return Walk(value: read-link(w.value, l), self: some(This()), tests: w.tests) }
+  if repeatable?(w.value) { return Walk(value: read-link(w.value, l), self: some(w.value), tests: w.tests) }
+  let held = Ident(temp())
+  Walk(value: read-link(assign(held, w.value), l), self: some(held), tests: w.tests)
 }
 
 # ---------------------------------------------------------------- assignment operators
