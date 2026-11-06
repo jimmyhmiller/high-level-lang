@@ -106,7 +106,7 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 ```
 
 It is closer to a small ML than to a one-purpose language, and some of it is still written at a low
-level: `tools/altitude.py` counts 15% of the lines of `.rules` and `.attrs` in functions with
+level: `tools/altitude.py` counts 14% of the lines of `.rules` and `.attrs` in functions with
 loops over indices, variables updated in place, global or context state written to, or byte
 scanning (67% on 2026-11-05). What is left is mostly the registries a build fills as it loads and
 links (modules, parts, symbols), the supplies of fresh names, and byte-level spelling of numbers
