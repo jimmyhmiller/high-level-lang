@@ -61,24 +61,33 @@ state db: link.Db = link.new-db()
 state names: rt.Names = names-new()
 state entry: Int = -1
 state entries: [Int] = []
-state defines: [Define] = []
-state transform: Fn(Node)->Node = keep-as-is
-state aliases: [TextPair] = []
-state loaders: [TextPair] = []
-state on-resolve: [Fn(Text,Text)->Text?] = []
-state on-load: [Fn(Text)->Text?] = []
 state hook-answers: {Text:Text} = {}
-state jsx-options: jsx.Options = jsx.options-new()
-# Where the output goes, for the paths the file loader writes into modules.
-state out-dir: Text = "."
-# Files parsed ahead of the walk that links them, by path, and how many threads may do it.
+# Files parsed ahead of the walk that links them, by path.
 state parsed-ahead: {Text:Parsed} = {}
-state load-threads: Int = 1
-# A spec's transform runs before scopes are analysed; it is a function value, so while there is one
-# the analysis stays on the thread that links.
-state has-transform: Bool = false
-state packages-external: Bool = false
-state public-path: Text = ""
+
+# How the build loads, set once before it does.
+record Loading {
+  defines: [Define],
+  # A spec's transform runs before scopes are analysed; it is a function value, so while there is
+  # one the analysis stays on the thread that links.
+  transform: Fn(Node)->Node,
+  has-transform: Bool,
+  aliases: [TextPair],
+  loaders: [TextPair],
+  on-resolve: [Fn(Text,Text)->Text?],
+  on-load: [Fn(Text)->Text?],
+  jsx-options: jsx.Options,
+  # Where the output goes, for the paths the file loader writes into modules.
+  out-dir: Text,
+  # How many threads parse ahead.
+  load-threads: Int,
+  packages-external: Bool,
+  public-path: Text
+}
+
+state loading: Loading = Loading(defines: [], transform: keep-as-is, has-transform: false, aliases: [], loaders: [],
+                                 on-resolve: [], on-load: [], jsx-options: jsx.options-new(), out-dir: ".",
+                                 load-threads: 1, packages-external: false, public-path: "")
 
 fn keep-as-is(n: Node) -> Node = n
 
@@ -235,7 +244,7 @@ fn dotted-name(n: Node, b: {Int:Int}) -> Text? = match n {
 
 # Does this source mention the first name of any define? Most files do not, and they need no
 # substitution or second analysis.
-fn mentions-define?(src: Text) -> Bool = any d in defines: {
+fn mentions-define?(src: Text) -> Bool = any d in loading.defines: {
   var end = 0
   while end < len(d.key) and d.key[end] != '.' { end = end + 1 }
   contains-text?(src, d.key[0..end])
@@ -252,7 +261,7 @@ fn defines-apply?(n: Node, b: {Int:Int}) -> Bool {
   any k in n.kids: defines-apply?(k, b)
 }
 
-fn define-of(key: Text) -> Node? = last d in defines: if d.key == key then some(d.value) else none
+fn define-of(key: Text) -> Node? = last d in loading.defines: if d.key == key then some(d.value) else none
 
 # Replace defined names. This needs the scope analysis, because a local with the same name is not
 # the define.
@@ -328,7 +337,7 @@ fn external-module(spec: Text) -> Int {
 
 # An alias replaces a package name, and carries any subpath along.
 fn aliased(spec: Text) -> Text {
-  for a in aliases {
+  for a in loading.aliases {
     if spec == a.key { return a.value }
     if starts-with(spec, a.key ++ "/") { return a.value ++ spec[len(a.key)..len(spec)] }
   }
@@ -337,10 +346,10 @@ fn aliased(spec: Text) -> Text {
 
 # What a resolve hook says about this import. Asked once per place it could appear from.
 fn hook-path(spec: Text, importer: Text) -> Text? {
-  if len(on-resolve) == 0 { return none }
+  if len(loading.on-resolve) == 0 { return none }
   let key = dir-of(importer) ++ "\n" ++ spec
   if let some(p) = hook-answers[key] { return if len(p) == 0 then none else some(p) }
-  let answer = first hook in on-resolve: hook(spec, importer)
+  let answer = first hook in loading.on-resolve: hook(spec, importer)
   hook-answers[key] = answer ?? ""
   answer
 }
@@ -349,7 +358,7 @@ fn hook-path(spec: Text, importer: Text) -> Text? {
 # `--packages=external` so is every package.
 fn stays-external?(spec: Text, importer: Text) -> Bool =
   is-none(hook-path(aliased(spec), importer))
-  and (res.external?(aliased(spec)) or (packages-external and package-spec?(aliased(spec), importer)))
+  and (res.external?(aliased(spec)) or (loading.packages-external and package-spec?(aliased(spec), importer)))
 
 fn package-spec?(spec: Text, importer: Text) -> Bool =
   not (res.relative?(spec) or starts-with(spec, "/") or starts-with(spec, "#")) and is-none(configured-path(spec, importer))
@@ -393,7 +402,7 @@ fn dep-add(m: Int, spec: Text, path: Text) -> Int {
 }
 
 fn loader-of(path: Text) -> Text {
-  for l in loaders {
+  for l in loading.loaders {
     if ends-with(path, l.key) { return l.value }
   }
   default-loader(path)
@@ -410,11 +419,11 @@ fn default-loader(path: Text) -> Text =
 
 # A file's text as a module, by what its loader says it is.
 fn as-module(text: Text, path: Text) -> Text =
-  if loader-of(path) == "file" then "export default " ++ host.js-string(public-url(cssb.file-asset(path, out-dir, path))) ++ ";"
+  if loader-of(path) == "file" then "export default " ++ host.js-string(public-url(cssb.file-asset(path, loading.out-dir, path))) ++ ";"
   else module-text(text, path)
 
 # A load hook may supply a file's text, or the file does.
-fn source-of(path: Text) -> Text = (first hook in on-load: hook(path)) ?? read-file(path)
+fn source-of(path: Text) -> Text = (first hook in loading.on-load: hook(path)) ?? read-file(path)
 
 # The specifier a statement imports from, or nothing.
 fn import-spec-of(s: Node) -> Text? = match s {
@@ -510,7 +519,7 @@ fn rebased-bindings(id: Int) -> {Int:Int} {
 }
 
 fn rebase-all!() -> Void {
-  let moved = parallel-map(order, rebased-bindings, load-threads)
+  let moved = parallel-map(order, rebased-bindings, loading.load-threads)
   for i in 0..len(order) {
     let id = order[i]
     modules[id].bindings = moved[i]
@@ -545,7 +554,7 @@ fn parsed-file(item: Pending) -> Parsed {
 fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Checked?) -> Parsed {
   let loader = loader-of(path)
   let config = tsc.for-file(path)
-  let file-jsx = configured-jsx(jsx-options, config)
+  let file-jsx = configured-jsx(loading.jsx-options, config)
   let lowered = if loader == "jsx" or loader == "tsx" then jsx.lower(parsed, src, path, file-jsx)
                 else jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
   let typed = if loader == "ts" or loader == "tsx"
@@ -587,7 +596,7 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
 # The same, with scopes analysed too, in a table of the file's own. Not while a spec's transform
 # has to see the tree first.
 fn analysed-file(p: Parsed) -> Parsed {
-  if has-transform { return p }
+  if loading.has-transform { return p }
   let a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers)
   # The calls are the parsed tree's unless a define changed it, and those were found already.
   let calls = if p.found and not a.analysis.defined then p.requires ++ p.imports else calls-in(a.analysis.tree)
@@ -673,7 +682,7 @@ record Parts { src: Text, starts: [Int] }
 # A file's text, and where its pieces start: at 0 alone unless it is big plain JavaScript.
 memo fn split-source(path: Text) -> Parts {
   let src = module-text(read-file(path), path)
-  if has-transform or loader-of(path) != "js" or len(src) < 2 * piece-bytes { return Parts(src: src, starts: [0]) }
+  if loading.has-transform or loader-of(path) != "js" or len(src) < 2 * piece-bytes { return Parts(src: src, starts: [0]) }
   Parts(src: src, starts: [0] ++ piece-starts(src))
 }
 
@@ -830,7 +839,7 @@ fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
 
 # `ahead-target` without hooks, which only the thread that owns them may call.
 fn unhooked-target(spec: Text, importer: Text) -> Text? {
-  if res.external?(aliased(spec)) or (packages-external and package-spec?(aliased(spec), importer)) { return none }
+  if res.external?(aliased(spec)) or (loading.packages-external and package-spec?(aliased(spec), importer)) { return none }
   let wanted = aliased(spec)
   if let some(p) = configured-path(wanted, importer) { return some(p) }
   let from = if wanted != spec and res.relative?(wanted) then "alias" else importer
@@ -858,12 +867,12 @@ fn ahead-target(spec: Text, importer: Text) -> Text? {
 # Parse every file the entries can reach, a wave at a time: each wave's files are parsed at once,
 # and their imports are the next wave.
 fn parse-ahead!(paths: [Text]) -> Void {
-  if load-threads <= 1 { return }
+  if loading.load-threads <= 1 { return }
   # Without hooks, a worker can resolve what it parsed: a walk that never waits for a wave.
-  if len(on-load) == 0 and len(on-resolve) == 0 {
+  if len(loading.on-load) == 0 and len(loading.on-resolve) == 0 {
     let roots = [p for p in paths if ahead?(p)]
     var resolved: [Parsed] = []
-    for d in parallel-walk(roots, visit-file, next-files, first-files, load-threads) {
+    for d in parallel-walk(roots, visit-file, next-files, first-files, loading.load-threads) {
       match d.role {
         Whole => { parsed-ahead[d.path] = d }
         Resolved => { resolved += d }
@@ -889,9 +898,9 @@ fn parse-ahead!(paths: [Text]) -> Void {
     }
   }
   while len(wave) > 0 {
-    let hooked = len(on-load) > 0
+    let hooked = len(loading.on-load) > 0
     let items = [Pending(path: p, text: if hooked then module-text(source-of(p), p) else "", ready: hooked) for p in wave]
-    let done = parallel-map(items, parsed-file, load-threads)
+    let done = parallel-map(items, parsed-file, loading.load-threads)
     var next: [Text] = []
     for d in done {
       parsed-ahead[d.path] = d
@@ -913,6 +922,7 @@ fn load-file(path: Text, effects: Bool) -> Int {
   let ahead = parsed-ahead[path] ?? parsed-file(Pending(path: path, text: as-module(source-of(path), path), ready: true))
   let src = ahead.src
   let parsed = ahead.parsed
+  let transform = loading.transform
   let tree0 = if ahead.analysed then ahead.tree else transform(ahead.tree)
   let base = base-name(path)
   let id = len(modules)
@@ -954,8 +964,8 @@ fn load-runtime(text: Text) -> Void {
 }
 
 fn public-url(local: Text) -> Text =
-  if len(public-path) == 0 then local
-  else public-path ++ (if ends-with(public-path, "/") then "" else "/") ++ local[2..len(local)]
+  if len(loading.public-path) == 0 then local
+  else loading.public-path ++ (if ends-with(loading.public-path, "/") then "" else "/") ++ local[2..len(local)]
 
 # Stylesheets the program imports, in the order its modules run.
 fn css-imports() -> [Text] = [modules[id].path for id in order if loader-of(modules[id].path) == "css"]

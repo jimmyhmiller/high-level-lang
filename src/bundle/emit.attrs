@@ -10,14 +10,14 @@ use bundle.minhost as host
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
-state void-undefined: Bool = false
-state esm-output: Bool = false
-state sourcemap: Bool = false
+# How the build emits, set once before it does: `undefined` as `void 0`, external imports hoisted as
+# ES imports, nodes stamped for a source map, and how many threads emit modules.
+record Emitting { void-undefined: Bool, esm-output: Bool, sourcemap: Bool, emit-threads: Int }
+
+state emitting: Emitting = Emitting(void-undefined: false, esm-output: false, sourcemap: false, emit-threads: 1)
 state external-imports: [Text] = []
 # What the module being emitted needs hoisted, gathered on its own thread.
 task state found-externals: [Text] = []
-# How many threads emit modules.
-state emit-threads: Int = 1
 # Code splitting: the statements of the chunk being printed, and what to write for the path of the
 # chunk each root module starts.
 state in-chunk: Bool = false
@@ -280,7 +280,7 @@ rewrite Member(object, property) as n =>
   namespace-read(n) ?? Member(object.out, property) with { lo: object.out.lo, hi: property.hi }
 rewrite ImportCall(...) as n => match an.known-import-call-target(here, n) {
   some(t) => if m.modules[t].kind == External then n
-             else if an.splitting then import-chunk(m.modules[t])
+             else if an.linking.splitting then import-chunk(m.modules[t])
              else import-call(m.modules[t])
   none => n.out
 }
@@ -299,7 +299,7 @@ fn final-ident(n: Node, x: Text) -> Node = match cjs-import-of(n) {
     some(s) => dynamic-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
     # A free `undefined` is the shorter `void 0` under --minify-syntax.
     none => if x in here.helpers then Ident(helper-name(x)) with { lo: n.lo, hi: n.hi }
-            else if void-undefined and x == "undefined" then void-zero() else n
+            else if emitting.void-undefined and x == "undefined" then void-zero() else n
   }
 }
 
@@ -336,7 +336,7 @@ fn init-call(t: m.Module) -> Node? {
 # An external module, as an expression: `require("x")`, or in ES module output the namespace of an
 # `import * as` hoisted to the top of the file.
 fn external-object(t: m.Module) -> Node {
-  if esm-output {
+  if emitting.esm-output {
     let name = "__external_" ++ t.base
     let line = "import * as " ++ name ++ " from \"" ++ t.path ++ "\";"
     if not (line in found-externals) { found-externals += line }
@@ -405,7 +405,7 @@ fn stamp-tree(n: Node, base: Int) -> Node {
   if n.lo > 0 and n.lo < 4294967296 then stamped with { lo: n.lo + base } else stamped
 }
 
-fn stamped(n: Node) -> Node = if sourcemap then stamp-tree(n, (here.id + 1) * 4294967296) else n
+fn stamped(n: Node) -> Node = if emitting.sourcemap then stamp-tree(n, (here.id + 1) * 4294967296) else n
 
 fn param-of(s: Int) -> Node = Param(BindName(final-of(s)), None())
 
@@ -594,7 +594,7 @@ fn part-emitted(p: Int) -> Emitted = match an.part-stmt[p] {
 
 fn program() -> Node {
   units = units-of-order()
-  let emitted = parallel-map([i for i in 0..len(units)], unit-emitted, emit-threads)
+  let emitted = parallel-map([i for i in 0..len(units)], unit-emitted, emitting.emit-threads)
   external-imports ++= [line for em in emitted for line in em.externals if not (line in external-imports) distinct line]
   # The namespace objects go after the runtime's statements and before everything else.
   let runtime-units = (last i in 0..len(units): if units[i].module == 0 then some(i + 1) else none) ?? 0

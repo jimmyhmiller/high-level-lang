@@ -14,17 +14,23 @@ state cjs-imports: {Int:CjsImport} = {}
 state import-vars: {Int:Int} = {}
 state part-stmt: [Node] = []
 state part-module: [Int] = []
-state entry-namespace: Bool = false
-state keep-entry-exports: Bool = false
-state tree-shaking: Bool = true
 state any-dynamic: Bool = false
 state any-reexport: Bool = false
-# Code splitting: `import()` loads a chunk, so what it names runs when loaded, and needs no wrapper.
-state splitting: Bool = false
-# `--pure:NAME`: calls of these free names may go when nothing uses their value.
-state pure-names: [Text] = []
-# How many threads walk modules for their facts.
-state facts-threads: Int = 1
+# How the build links, set once before it does.
+record Linking {
+  entry-namespace: Bool,
+  keep-entry-exports: Bool,
+  tree-shaking: Bool,
+  # Code splitting: `import()` loads a chunk, so what it names runs when loaded, and needs no wrapper.
+  splitting: Bool,
+  # `--pure:NAME`: calls of these free names may go when nothing uses their value.
+  pure-names: [Text],
+  # How many threads walk modules for their facts.
+  facts-threads: Int
+}
+
+state linking: Linking = Linking(entry-namespace: false, keep-entry-exports: false, tree-shaking: true, splitting: false,
+                                 pure-names: [], facts-threads: 1)
 # Each `import * as` binding's module, as `ns-import` holds it, for a walk that must not query.
 state ns-imports: {Int:Int} = {}
 state dynamic-roots: [Int] = []
@@ -120,7 +126,7 @@ on Member(object, property) {
 on ImportCall(...) as n {
   if counting {
     if let some(from) = imported-str(n) {
-      mention(if splitting then Chunk else Whole, known-dep(here, from))
+      mention(if linking.splitting then Chunk else Whole, known-dep(here, from))
       kids.counting = false
     }
   }
@@ -142,7 +148,7 @@ fn mention(reach: Reach, id: Int) -> Void { mentions += Mention(reach: reach, id
 fn summary-of(n: Node, declares: Bool) -> Summary {
   let a = run(n, declares)
   Summary(declares: a.declares, mentions: once-each-symbol(a.mentions),
-          pure: declares and tree-shaking and pure-stmt?(n))
+          pure: declares and linking.tree-shaking and pure-stmt?(n))
 }
 
 # A symbol mentioned once is mentioned: the first mention of each stays, and the others go.
@@ -257,8 +263,8 @@ fn known-collection?(callee: Node) -> Bool = free-ident?(callee) and callee.text
 fn all-pure?(xs: [Node]) -> Bool = all x in xs: pure?(x)
 
 fn listed-pure?(callee: Node) -> Bool =
-  len(pure-names) > 0 and (match m.dotted-name(callee, here.bindings) {
-    some(name) => name in pure-names
+  len(linking.pure-names) > 0 and (match m.dotted-name(callee, here.bindings) {
+    some(name) => name in linking.pure-names
     none => false
   })
 
@@ -521,7 +527,7 @@ fn synthetic-parts() -> Void {
     assert m.db.declares(part, here.ns-sym)
     assert m.db.mentions(part, helper("__export"))
     # A format that exposes the entry as an object keeps its namespace.
-    if entry-namespace and here.id == m.entry {
+    if linking.entry-namespace and here.id == m.entry {
       assert m.db.root-part(part)
       assert m.db.mentions(part, helper("__toCommonJS"))
     }
@@ -596,7 +602,7 @@ fn on-demand-targets(mo: m.Module, calls: [Node]) -> Void {
   for n in calls {
     match n {
       ImportCall(...) => if let some(t) = import-call-target(mo, n) {
-        if splitting {
+        if linking.splitting {
           if m.modules[t].kind != External and not (t in dynamic-roots) { dynamic-roots += t }
         } else {
           wrap(t)
@@ -609,7 +615,7 @@ fn on-demand-targets(mo: m.Module, calls: [Node]) -> Void {
 }
 
 fn link() -> Void {
-  let calls = parallel-map(m.order, on-demand-calls, facts-threads)
+  let calls = parallel-map(m.order, on-demand-calls, linking.facts-threads)
   for i in 0..len(m.order) { on-demand-targets(m.modules[m.order[i]], calls[i]) }
   # A module's symbols exist before any module's facts mention them.
   for id in m.order {
@@ -625,7 +631,7 @@ fn link() -> Void {
       _ => {}
     }
   }
-  if splitting {
+  if linking.splitting {
     for r in m.entries ++ dynamic-roots {
       assert m.db.entry(r)
       assert m.db.chunk-root(r)
@@ -633,7 +639,7 @@ fn link() -> Void {
     }
   } else {
     assert m.db.entry(m.entry)
-    if entry-namespace or keep-entry-exports { assert m.db.keep-exports(m.entry) }
+    if linking.entry-namespace or linking.keep-entry-exports { assert m.db.keep-exports(m.entry) }
   }
   # Import bindings first, so a statement can tell `ns.x` from `obj.x` in any order.
   for id in m.order {
@@ -649,7 +655,7 @@ fn link() -> Void {
       }
     }
   }
-  let summaries = parallel-map(m.order, summaries-of, facts-threads)
+  let summaries = parallel-map(m.order, summaries-of, linking.facts-threads)
   # The facts about to be stated, counted: their relations are made big enough at once.
   link.reserve!(m.db, "mentions", sum ss in summaries: sum sm in ss: len(sm.mentions))
   link.reserve!(m.db, "declares", sum ss in summaries: sum sm in ss: len(sm.declares))

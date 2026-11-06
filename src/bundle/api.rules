@@ -445,6 +445,36 @@ fn named(f: Format, global-name: Text) -> Format =
 
 fn has-define?(o: Options, key: Text) -> Bool = any d in o.defines: d.key == key
 
+# A browser has no `process`, so the build decides. Node's programs decide when they run.
+fn with-node-env(o: Options) -> Options =
+  if has-define?(o, "process.env.NODE_ENV") or o.platform-node then o
+  else o with { defines: o.defines ++ [DefineText(key: "process.env.NODE_ENV",
+                                                  value: if o.minify-syntax then "\"production\"" else "\"development\"")] }
+
+# How the build loads, links and emits, as the modules that do it are told.
+fn loading-of(o: Options, out-dir: Text) -> m.Loading =
+  m.Loading(defines: [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines], transform: o.transform,
+            has-transform: o.has-transform, aliases: o.aliases, loaders: o.loaders, on-resolve: o.on-resolve,
+            on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir, load-threads: o.plan.load-threads,
+            packages-external: o.packages-external, public-path: o.public-path)
+
+fn linking-of(o: Options, entry-namespace: Bool, keep-entry-exports: Bool, splitting: Bool) -> an.Linking =
+  an.Linking(entry-namespace: entry-namespace, keep-entry-exports: keep-entry-exports, tree-shaking: o.tree-shaking,
+             splitting: splitting, pure-names: o.pure, facts-threads: o.plan.facts-threads)
+
+fn emitting-of(o: Options, esm-output: Bool) -> e.Emitting =
+  e.Emitting(void-undefined: o.minify-syntax, esm-output: esm-output, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
+
+# A new build: every module's state as it starts, and what it was told.
+fn configure!(o: Options, loading: m.Loading, linking: an.Linking, emitting: e.Emitting) -> Void {
+  reset-all(o)
+  cssb.reset(loader-map(o))
+  tsc.reset(o.tsconfig)
+  m.loading = loading
+  an.linking = linking
+  e.emitting = emitting
+}
+
 fn reset-all(o: Options) -> Void {
   m.reset-state!()
   m.forget-memos!()
@@ -514,41 +544,14 @@ fn build-css(o: Options) -> Void {
 
 fn build-one(options: Options) -> Void {
   if ends-with(options.entry, ".css") { return build-css(options) }
-  var o = options
-  reset-all(o)
-  cssb.reset(loader-map(o))
-  tsc.reset(o.tsconfig)
-  m.out-dir = dir-of(o.outfile)
-  m.load-threads = o.plan.load-threads
-  an.facts-threads = o.plan.facts-threads
-  e.emit-threads = o.plan.emit-threads
-  mangle.count-threads = o.plan.emit-threads
-  m.has-transform = o.has-transform
-  if o.pretty and o.jsx.runtime == jsx.Preserve {
+  if options.pretty and options.jsx.runtime == jsx.Preserve {
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
   }
-  lap(o, "startup")
-  # A browser has no `process`, so the build decides. Node's programs decide when they run.
-  if not has-define?(o, "process.env.NODE_ENV") and not o.platform-node {
-    define!(o, "process.env.NODE_ENV", if o.minify-syntax then "\"production\"" else "\"development\"")
-  }
-  m.defines = [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines]
+  let o = with-node-env(options)
   let f = if o.format.export-names or len(o.format.exports) > 0 then o.format else named(o.format, o.global-name)
-  m.aliases = o.aliases
-  m.loaders = o.loaders
-  m.packages-external = o.packages-external
-  m.public-path = o.public-path
-  an.pure-names = o.pure
-  m.jsx-options = o.jsx
-  m.on-resolve = o.on-resolve
-  m.on-load = o.on-load
-  an.tree-shaking = o.tree-shaking
-  e.void-undefined = o.minify-syntax
-  e.sourcemap = o.sourcemap
-  m.transform = o.transform
-  an.keep-entry-exports = f.export-names
-  e.esm-output = f.hoist-externals
-  an.entry-namespace = len(f.exports) > 0
+  configure!(o, loading-of(o, dir-of(o.outfile)), linking-of(o, len(f.exports) > 0, f.export-names, false),
+             emitting-of(o, f.hoist-externals))
+  lap(o, "startup")
   m.load-runtime(include-text("runtime.js"))
   m.parse-ahead!([o.entry])
   lap(o, "load: parse files ahead")
@@ -651,36 +654,10 @@ fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roo
 }
 
 fn build-split(options: Options) -> Void {
-  var o = options
-  if len(o.outdir) == 0 { panic "code splitting needs --outdir" }
-  if not o.format.export-names { panic "code splitting needs --format=esm" }
-  reset-all(o)
-  if not has-define?(o, "process.env.NODE_ENV") and not o.platform-node {
-    define!(o, "process.env.NODE_ENV", if o.minify-syntax then "\"production\"" else "\"development\"")
-  }
-  m.defines = [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines]
-  m.aliases = o.aliases
-  m.loaders = o.loaders
-  m.packages-external = o.packages-external
-  m.public-path = o.public-path
-  an.pure-names = o.pure
-  m.jsx-options = o.jsx
-  m.on-resolve = o.on-resolve
-  m.on-load = o.on-load
-  an.tree-shaking = o.tree-shaking
-  e.void-undefined = o.minify-syntax
-  e.sourcemap = o.sourcemap
-  m.transform = o.transform
-  an.keep-entry-exports = true
-  e.esm-output = true
-  an.splitting = true
-  cssb.reset(loader-map(o))
-  tsc.reset(o.tsconfig)
-  m.out-dir = o.outdir
-  m.load-threads = o.plan.load-threads
-  an.facts-threads = o.plan.facts-threads
-  e.emit-threads = o.plan.emit-threads
-  mangle.count-threads = o.plan.emit-threads
+  if len(options.outdir) == 0 { panic "code splitting needs --outdir" }
+  if not options.format.export-names { panic "code splitting needs --format=esm" }
+  let o = with-node-env(options)
+  configure!(o, loading-of(o, o.outdir), linking-of(o, false, true, true), emitting-of(o, true))
   m.load-runtime(include-text("runtime.js"))
   m.load-trees(o.entries)
   if len(m.css-imports()) > 0 { panic "stylesheets with --splitting are not implemented yet" }
