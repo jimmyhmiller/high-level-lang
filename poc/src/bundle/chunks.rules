@@ -5,6 +5,7 @@ use bundle.js as js
 use bundle.modules as m
 use bundle.analysis as an
 use bundle.emit as e
+use bundle.minhost as host
 
 record Chunk {
   id: Int,
@@ -26,14 +27,7 @@ fn chunk-new(key: Text, root: Int, roots: [Int]) -> Int {
   id
 }
 
-fn key-of(roots: [Int]) -> Text {
-  var b = buf-new()
-  for r in roots {
-    buf-add!(b, int-text(r))
-    buf-add!(b, ",")
-  }
-  buf-text(b)
-}
+fn key-of(roots: [Int]) -> Text = join([int-text(r) ++ "," for r in roots], "")
 
 # A file stays whole, as in esbuild: its live statements go where any of its roots can load them.
 fn roots-of(module: Int) -> [Int] {
@@ -142,94 +136,45 @@ fn placeholder(id: Int) -> Text = "./" ++ mark ++ int-text(id) ++ "__"
 # Each occurrence: where it starts, how long it is, and which chunk it names.
 record Hole { at: Int, size: Int, chunk: Int }
 
-fn holes-in(text: Text) -> [Hole] {
-  var out: [Hole] = []
-  var i = 0
-  while i < len(text) {
-    if text[i] == '.' and at?(text, i, "./" ++ mark) {
-      var j = i + 2 + len(mark)
-      var v = 0
-      while digit-byte?(text[j]) {
-        v = v * 10 + (text[j] - '0')
-        j += 1
-      }
-      out += Hole(at: i, size: j + 2 - i, chunk: v)
-      i = j + 2
-    } else {
-      i += 1
-    }
-  }
-  out
+fn holes-in(text: Text) -> [Hole] = [hole-at(text, i) for i in occurrences(text, ["./" ++ mark])]
+
+# `./__ESB_CHUNK_12__`: the chunk's number, and the two bytes after it.
+fn hole-at(text: Text, i: Int) -> Hole {
+  let digits = i + 2 + len(mark)
+  let n = span-of(text, digits, "0123456789")
+  Hole(at: i, size: 2 + len(mark) + n + 2, chunk: parse-int(text[digits..digits + n]))
 }
 
-# Not for security, only for telling versions of a file apart.
-fn hash-text!(state-word: mut [Int], text: Text) -> Void {
-  var a = state-word[0]
-  var b = state-word[1]
-  for c in text {
-    a = (a * 131 + c + 7) % 2147483647
-    b = (b * 65599 + c + 11) % 2147483629
-  }
-  state-word[0] = a
-  state-word[1] = b
-}
-
-const hash-letters: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-
-fn hash-name(a: Int, b: Int) -> Text {
-  var x = a
-  var y = b
-  var out = buf-new()
-  for i in 0..4 {
-    buf-byte!(out, hash-letters[x % 32])
-    x = x / 32
-    buf-byte!(out, hash-letters[y % 32])
-    y = y / 32
-  }
-  buf-text(out)
-}
 
 # A file's hash covers everything it loads, so that a change anywhere renames all who depend on it.
-fn closure!(id: Int, holes: [[Hole]], seen: mut {Int:Bool}) -> Void {
-  if id in seen { return }
-  seen[id] = true
-  for h in holes[id] { closure!(h.chunk, holes, seen) }
+# These chunks, and those their texts name, until none names one more.
+fn reached(found: [Int], holes: [[Hole]]) -> [Int] {
+  let more = [h.chunk for c in found for h in holes[c] if not (h.chunk in found) distinct h.chunk]
+  if len(more) == 0 then found else reached(found ++ more, holes)
 }
 
+# A chunk's hash covers what it imports, so a change anywhere it reaches renames it.
 fn content-hash(id: Int, texts: [Text], holes: [[Hole]]) -> Text {
-  var seen: {Int:Bool} = {}
-  closure!(id, holes, seen)
-  var word = [17, 31]
-  for other in 0..len(texts) {
-    if other in seen { hash-text!(word, texts[other]) }
-  }
-  hash-name(word[0], word[1])
+  let seen = reached([id], holes)
+  host.hash-name(fold h = host.hash-start() for other in 0..len(texts) if other in seen: host.hash-more(h, texts[other]))
 }
 
 # `[dir]/[name]-[hash]`, with an empty directory and the slash after it gone.
 fn pattern-path(pattern: Text, dir: Text, name: Text, hash: Text) -> Text {
-  let filled = replace-all(replace-all(replace-all(pattern, "[name]", name), "[hash]", hash), "[dir]", dir)
-  var out = filled
-  while starts-with(out, "./") or starts-with(out, "/") {
-    out = out[if out[0] == '.' then 2 else 1..len(out)]
-  }
-  out
+  without-leading-slashes(replace-all(replace-all(replace-all(pattern, "[name]", name), "[hash]", hash), "[dir]", dir))
 }
+
+fn without-leading-slashes(p: Text) -> Text =
+  if starts-with(p, "./") then without-leading-slashes(p[2..len(p)])
+  else if starts-with(p, "/") then without-leading-slashes(p[1..len(p)])
+  else p
 
 # `to` as an import written in the file `from`.
 fn relative-import(from: Text, to: Text) -> Text {
   let a = path-segments(dir-of(from))
   let b = path-segments(to)
-  var common = 0
-  while common < len(a) and common < len(b) - 1 and a[common] == b[common] { common += 1 }
-  var out = buf-new()
-  if common == len(a) { buf-add!(out, "./") }
-  for i in common..len(a) { buf-add!(out, "../") }
-  for i in common..len(b) {
-    buf-add!(out, b[i])
-    if i < len(b) - 1 { buf-add!(out, "/") }
-  }
-  buf-text(out)
+  let common = len([i for i in 0..min(len(a), len(b) - 1) while a[i] == b[i]])
+  (if common == len(a) then "./" else "") ++ join(["../" for i in common..len(a)], "") ++ join(b[common..len(b)], "/")
 }
 
 # The text with every placeholder replaced, and where it put what used to follow each one.

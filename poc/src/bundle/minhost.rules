@@ -59,13 +59,10 @@ const safe-limit: Int = 9007199254740992
 # A leading zero is a legacy octal literal in sloppy JavaScript, so `010` is 8 there. Those answer
 # nothing and stay unfolded rather than folding as decimal.
 fn safe-int(s: Text) -> Int? {
-  if len(s) == 0 or (len(s) > 1 and s[0] == '0') { return none }
-  var v = 0
-  for c in s {
-    if not digit-byte?(c) or v > (safe-limit - 10) / 10 { return none }
-    v = v * 10 + c - '0'
-  }
-  some(v)
+  if len(s) == 0 or (len(s) > 1 and s[0] == '0') or not (all c in s: digit-byte?(c)) { return none }
+  # Past the limit the sum stops at it, so it never overflows.
+  let v = fold v = 0 for c in s: if v > (safe-limit - 10) / 10 then safe-limit else v * 10 + c - '0'
+  if v >= safe-limit then none else some(v)
 }
 
 fn safe(v: Int) -> Int? = if v >= 0 and v < safe-limit then some(v) else none
@@ -111,52 +108,37 @@ fn hex-value(s: Text) -> Int? {
   if not (len(s) > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X') and len(s) < 16) {
     return none
   }
-  var v = 0
-  for i in 2..len(s) {
-    let d = digit-value(s[i])
-    if d < 0 { return none }
-    v = v * 16 + d
-  }
-  some(v)
+  if any c in s[2..len(s)]: digit-value(c) < 0 { return none }
+  some(fold v = 0 for c in s[2..len(s)]: v * 16 + digit-value(c))
 }
 
 # An integer's shortest decimal spelling: 1000 as 1e3.
 fn int-spelling(v: Int) -> Text {
   let text = int-text(v)
-  var zeros = 0
-  var i = len(text) - 1
-  while i > 0 and text[i] == '0' {
-    zeros += 1
-    i = i - 1
-  }
+  let zeros = min(span-back-of(text, "0"), len(text) - 1)
   if zeros >= 3 then text[0..len(text) - zeros] ++ "e" ++ int-text(zeros) else text
 }
 
 # `0.5` as `.5`, `1.50` as `1.5`, `2.0` as `2`, `1e+21` as `1e21`.
 fn float-spelling(s: Text) -> Text {
-  var mantissa = s
-  var exponent = ""
-  for i in 0..len(s) {
-    if len(exponent) == 0 and (s[i] == 'e' or s[i] == 'E') {
-      mantissa = s[0..i]
-      let rest = s[i + 1..len(s)]
-      exponent = if len(rest) > 0 and rest[0] == '+' then rest[1..len(rest)] else rest
-    }
+  let e = first i in 0..len(s): if s[i] == 'e' or s[i] == 'E' then some(i) else none
+  let whole = match e {
+    some(i) => s[0..i]
+    none => s
   }
-  var point = -1
-  for i in 0..len(mantissa) {
-    if mantissa[i] == '.' { point = i }
-  }
-  if point >= 0 {
-    var end = len(mantissa)
-    while mantissa[end - 1] == '0' { end = end - 1 }
-    if mantissa[end - 1] == '.' { end = end - 1 }
-    mantissa = mantissa[0..end]
-    if len(mantissa) > 1 and mantissa[0] == '0' and mantissa[1] == '.' {
-      mantissa = mantissa[1..len(mantissa)]
-    }
+  let mantissa = if has-byte?(whole, '.') then short-fraction(whole) else whole
+  let exponent = match e {
+    some(i) => if at?(s, i + 1, "+") then s[i + 2..len(s)] else s[i + 1..len(s)]
+    none => ""
   }
   if len(exponent) > 0 then mantissa ++ "e" ++ exponent else mantissa
+}
+
+# `1.50` is `1.5`, `2.0` is `2` and `0.5` is `.5`.
+fn short-fraction(m: Text) -> Text {
+  let digits = m[0..len(m) - span-back-of(m, "0")]
+  let kept = if ends-with(digits, ".") then digits[0..len(digits) - 1] else digits
+  if starts-with(kept, "0.") then kept[1..len(kept)] else kept
 }
 
 fn number-byte?(c: Int) -> Bool =
@@ -199,19 +181,10 @@ fn escaped(p: lit.Node) -> Int = p.text[1]
 fn to-double-quoted(raw: Text) -> Text {
   let content = unquote(raw)
   if raw[0] != '\'' { return content }
-  var b = buf-new()
-  for p in pieces(content) {
-    match p {
-      lit.Plain(t) => {
-        for c in t {
-          if c == '"' { buf-byte!(b, '\\') }
-          buf-byte!(b, c)
-        }
-      }
-      _ => if escaped(p) == '\'' { buf-byte!(b, '\'') } else { buf-add!(b, p.text) }
-    }
-  }
-  buf-text(b)
+  join([match p {
+          lit.Plain(t) => replace-all(t, "\"", "\\\"")
+          _ => if escaped(p) == '\'' then "'" else p.text
+        } for p in pieces(content)], "")
 }
 
 # Two string tokens as one.
@@ -221,21 +194,14 @@ fn quote-byte?(c: Int) -> Bool = c == '"' or c == '\''
 
 # The same string in the given quote, with its escapes adjusted.
 fn requote(raw: Text, quote: Int) -> Text {
-  var b = buf-new()
-  buf-byte!(b, quote)
-  for p in pieces(unquote(raw)) {
-    match p {
-      lit.Plain(t) => {
-        for c in t {
-          if c == quote { buf-byte!(b, '\\') }
-          buf-byte!(b, c)
-        }
-      }
-      _ => if quote-byte?(escaped(p)) and escaped(p) != quote { buf-byte!(b, escaped(p)) } else { buf-add!(b, p.text) }
-    }
-  }
-  buf-byte!(b, quote)
-  buf-text(b)
+  let q = if quote == '"' then "\"" else "'"
+  let content = unquote(raw)
+  # Most strings have no escape: only the quote itself needs one.
+  if escape-free?(content) { return q ++ replace-all(content, q, "\\" ++ q) ++ q }
+  q ++ join([match p {
+               lit.Plain(t) => replace-all(t, q, "\\" ++ q)
+               _ => if quote-byte?(escaped(p)) and escaped(p) != quote then byte-text(escaped(p)) else p.text
+             } for p in pieces(content)], "") ++ q
 }
 
 # Double quotes, unless single quotes are shorter.
@@ -268,45 +234,21 @@ fn same-ref(a: Node, b: Node) -> Bool = match a {
 
 # ---------------------------------------------------------------- template literals
 
-fn interpolation-at?(s: Text, i: Int) -> Bool = s[i] == '$' and i + 1 < len(s) and s[i + 1] == '{'
 
 # A string with raw newlines is shorter as a template: `\n` is two bytes, a line break one.
-fn template-gain(raw: Text) -> Int {
-  var gain = 0
-  for p in pieces(unquote(raw)) {
-    match p {
-      lit.Plain(t) => {
-        for i in 0..len(t) {
-          if t[i] == '`' or interpolation-at?(t, i) { gain = gain - 1 }
-        }
-      }
-      _ => if escaped(p) == 'n' or quote-byte?(escaped(p)) { gain += 1 }
-    }
+# Each escape of a quote or a line break is a byte less, and each backquote and `${` one more.
+fn template-gain(raw: Text) -> Int =
+  sum p in pieces(unquote(raw)): match p {
+    lit.Plain(t) => 0 - (count i in 0..len(t): at?(t, i, "`") or at?(t, i, "${"))
+    _ => if escaped(p) == 'n' or quote-byte?(escaped(p)) then 1 else 0
   }
-  gain
-}
 
 # A string's content as a template token.
-fn as-template(raw: Text) -> Text {
-  var b = buf-new()
-  buf-byte!(b, '`')
-  for p in pieces(unquote(raw)) {
-    match p {
-      lit.Plain(t) => {
-        for i in 0..len(t) {
-          if t[i] == '`' or interpolation-at?(t, i) { buf-byte!(b, '\\') }
-          buf-byte!(b, t[i])
-        }
-      }
-      _ =>
-        if escaped(p) == 'n' { buf-byte!(b, '\n') }
-        else if quote-byte?(escaped(p)) { buf-byte!(b, escaped(p)) }
-        else { buf-add!(b, p.text) }
-    }
-  }
-  buf-byte!(b, '`')
-  buf-text(b)
-}
+fn as-template(raw: Text) -> Text =
+  "`" ++ join([match p {
+                 lit.Plain(t) => replace-all(replace-all(t, "`", "\\`"), "${", "\\${")
+                 _ => if escaped(p) == 'n' then "\n" else if quote-byte?(escaped(p)) then byte-text(escaped(p)) else p.text
+               } for p in pieces(unquote(raw))], "") ++ "`"
 
 # A key or a directive cannot be a template, so this walk knows positions.
 fn key-first?(n: Node) -> Bool =
@@ -344,20 +286,8 @@ fn templated(n: Node) -> Node? = match n {
 
 # Any text as a double-quoted string.
 fn js-string(s: Text) -> Text {
-  var b = buf-new()
-  buf-add!(b, "\"")
-  for c in s {
-    match c {
-      '"' => buf-add!(b, "\\\"")
-      '\\' => buf-add!(b, "\\\\")
-      '\n' => buf-add!(b, "\\n")
-      '\r' => buf-add!(b, "\\r")
-      '\t' => buf-add!(b, "\\t")
-      _ => buf-byte!(b, c)
-    }
-  }
-  buf-add!(b, "\"")
-  buf-text(b)
+  let slashes = replace-all(s, "\\", "\\\\")
+  "\"" ++ replace-all(replace-all(replace-all(replace-all(slashes, "\"", "\\\""), "\n", "\\n"), "\r", "\\r"), "\t", "\\t") ++ "\""
 }
 
 const base64-digits: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -397,34 +327,29 @@ const mime-table: [Text] = [".css", "text/css;charset=utf-8", ".gif", "image/gif
   ".woff2", "font/woff2", ".ttf", "font/ttf", ".otf", "font/otf"]
 
 fn mime-of(path: Text) -> Text {
-  var i = 0
-  while i < len(mime-table) {
-    if ends-with(path, mime-table[i]) { return mime-table[i + 1] }
-    i += 2
-  }
-  "text/plain;charset=utf-8"
+  (first i in 0..len(mime-table) / 2: if ends-with(path, mime-table[2 * i]) then some(mime-table[2 * i + 1]) else none)
+  ?? "text/plain;charset=utf-8"
 }
 
 
 const hash-letters: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 
-# Eight letters that change when the bytes do. Not for security.
-fn content-hash(text: Text) -> Text {
-  var a = 17
-  var b = 31
-  for c in text {
-    a = (a * 131 + c + 7) % 2147483647
-    b = (b * 65599 + c + 11) % 2147483629
-  }
-  var out = buf-new()
-  for i in 0..4 {
-    buf-byte!(out, hash-letters[a % 32])
-    a = a / 32
-    buf-byte!(out, hash-letters[b % 32])
-    b = b / 32
-  }
-  buf-text(out)
-}
+# Two running sums over bytes, for telling versions of a text apart. Not for security.
+record Hash { a: Int, b: Int }
+
+fn hash-start() -> Hash = Hash(a: 17, b: 31)
+
+fn hash-more(h: Hash, text: Text) -> Hash =
+  Hash(a: fold a = h.a for c in text: (a * 131 + c + 7) % 2147483647,
+       b: fold b = h.b for c in text: (b * 65599 + c + 11) % 2147483629)
+
+# Eight letters, the two sums' base-32 digits from the lowest, in turn.
+fn hash-name(h: Hash) -> Text =
+  text-of-bytes([hash-letters[digit32(x, i)] for i in 0..4 for x in [h.a, h.b]])
+
+fn digit32(x: Int, i: Int) -> Int = if i == 0 then x % 32 else digit32(x / 32, i - 1)
+
+fn content-hash(text: Text) -> Text = hash-name(hash-more(hash-start(), text))
 
 # `0.50` is `.5`, and `-0.5px` is `-.5px`.
 fn css-number(t: Text) -> Text {
