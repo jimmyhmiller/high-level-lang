@@ -622,14 +622,16 @@ everywhere fn this-is(n: Node, ref: Node) -> Node = match n {
 # A function, arrows aside, has a `this` of its own.
 fn own-this?(n: Node) -> Bool = sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...))
 
-# A field's name is evaluated once, when the class is. So a computed one goes in a variable first.
-fn field-key(k: Node, setup: mut [Node]) -> Node = match k {
-  PropName(x) => string-of(x)
-  Str(_) | Num(_) => k
+# A field's name is evaluated once, when the class is. So a computed one goes in a variable first,
+# set by a statement before the class.
+record Keyed { key: Node, setup: [Node] }
+
+fn field-key(k: Node) -> Keyed = match k {
+  PropName(x) => Keyed(key: string-of(x), setup: [])
+  Str(_) | Num(_) => Keyed(key: k, setup: [])
   Computed(e) => {
     let held = Ident(temp())
-    setup += assign(held, lowered(e))
-    held
+    Keyed(key: held, setup: [assign(held, lowered(e))])
   }
   _ => panic "unexpected field name"
 }
@@ -646,7 +648,11 @@ fn function-expr-of(m: Node) -> Node = match m {
   _ => panic "expected a method"
 }
 
-fn scan-privates(members: [Node], outer: {Text:Private}, setup: mut [Node]) -> {Text:Private} {
+# A class's private names, its own over those outside, and the statements that make their holders.
+record Privates { table: {Text:Private}, setup: [Node] }
+
+fn scan-privates(members: [Node], outer: {Text:Private}) -> Privates {
+  var setup: [Node] = []
   var out: {Text:Private} = {}
   for k in keys(outer) { out[k] = outer[k] ?? panic "lost a private name" }
   var instances = ""
@@ -682,7 +688,7 @@ fn scan-privates(members: [Node], outer: {Text:Private}, setup: mut [Node]) -> {
       }
     }
   }
-  out
+  Privates(table: out, setup: setup)
 }
 
 fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Text] {
@@ -694,66 +700,68 @@ fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Te
 
 fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> ClassParts {
   let members = body.members.kids
-  var setup: [Node] = []
-  let table = scan-privates(members, privates, setup)
-  var after: [Node] = []
-  var statics: [Node] = []
-  var fields: [Node] = []
-  var kept: [Node] = []
-  var constructor: Node? = none
-  with privates = table {
-    for h in set-holders(members, table, false) {
-      fields += ExprStmt(helper-call("__privateAdd", [This(), Ident(h)]))
-    }
-    for h in set-holders(members, table, true) {
-      statics += ExprStmt(helper-call("__privateAdd", [ref, Ident(h)]))
-    }
-    for m in members {
-      match m {
-        ClassEmpty() => {}
-        Field(PrivateName(x), v) => {
-          let p = table[x] ?? panic "lost a private name"
-          fields += ExprStmt(helper-call("__privateAdd", [This(), Ident(p.holder), field-init(lowered(v))]))
+  let scanned = scan-privates(members, privates)
+  let table = scanned.table
+  let holders = [ExprStmt(helper-call("__privateAdd", [This(), Ident(h)])) for h in set-holders(members, table, false)]
+  let static-holders = [ExprStmt(helper-call("__privateAdd", [ref, Ident(h)])) for h in set-holders(members, table, true)]
+  let each = members-lowered(members, table, ref, inner-name)
+  let fields = holders ++ [s for l in each for s in l.fields]
+  let constructor = last l in each: l.constructor
+  let made: [Node] = if len(fields) > 0 or is-some(constructor) then [constructor-with-fields(constructor, fields, derived)] else []
+  ClassParts(body: body with { kids: [List((made ++ [s for l in each for s in l.kept])...)] },
+             before: scanned.setup ++ [s for l in each for s in l.setup], after: [s for l in each for s in l.after],
+             statics: static-holders ++ [s for l in each for s in l.statics])
+}
+
+# What one member becomes, wherever it goes: instance fields, static fields, statements after the
+# class, the members it keeps, its constructor, and statements before it all.
+record Lowered { fields: [Node], statics: [Node], after: [Node], kept: [Node], constructor: Node?, setup: [Node] }
+
+fn members-lowered(members: [Node], table: {Text:Private}, ref: Node, inner-name: Text) -> [Lowered] {
+  with privates = table { [member-lowered(m, table, ref, inner-name) for m in members] }
+}
+
+fn nothing-lowered() -> Lowered = Lowered(fields: [], statics: [], after: [], kept: [], constructor: none, setup: [])
+
+fn member-lowered(m: Node, table: {Text:Private}, ref: Node, inner-name: Text) -> Lowered = match m {
+  ClassEmpty() => nothing-lowered()
+  Field(PrivateName(x), v) => {
+    let p = table[x] ?? panic "lost a private name"
+    nothing-lowered() with { fields: [ExprStmt(helper-call("__privateAdd", [This(), Ident(p.holder), field-init(lowered(v))]))] }
+  }
+  Field(key, v) => {
+    let k = field-key(key)
+    nothing-lowered() with { fields: [ExprStmt(helper-call("__publicField", [This(), k.key, field-init(lowered(v))]))], setup: k.setup }
+  }
+  StaticField(PrivateName(x), v) => {
+    let p = table[x] ?? panic "lost a private name"
+    nothing-lowered() with { statics: [ExprStmt(helper-call("__privateAdd", [ref, Ident(p.holder), as-class(field-init(lowered(v)), ref, inner-name)]))] }
+  }
+  StaticField(key, v) => {
+    let k = field-key(key)
+    nothing-lowered() with { statics: [ExprStmt(helper-call("__publicField", [ref, k.key, as-class(field-init(lowered(v)), ref, inner-name)]))],
+                             setup: k.setup }
+  }
+  StaticBlock(b) => {
+    let f = Arrow(Params(List()), lowered-function-body(b))
+    nothing-lowered() with { statics: [ExprStmt(CallExpr(as-class(f, ref, inner-name), Args(List())))] }
+  }
+  _ => {
+    if constructor-method?(m) { return nothing-lowered() with { constructor: some(lowered(m)) } }
+    match private-key(m) {
+      some(name) => {
+        let p = table[name] ?? panic "lost a private name"
+        let inner = lowered(inner-member(m))
+        let slot = match inner-member(m) {
+          Getter(...) => p.getter
+          Setter(...) => p.setter
+          _ => p.method
         }
-        Field(key, v) => {
-          fields += ExprStmt(helper-call("__publicField", [This(), field-key(key, setup), field-init(lowered(v))]))
-        }
-        StaticField(PrivateName(x), v) => {
-          let p = table[x] ?? panic "lost a private name"
-          statics += ExprStmt(helper-call("__privateAdd", [ref, Ident(p.holder), as-class(field-init(lowered(v)), ref, inner-name)]))
-        }
-        StaticField(key, v) => {
-          statics += ExprStmt(helper-call("__publicField", [ref, field-key(key, setup), as-class(field-init(lowered(v)), ref, inner-name)]))
-        }
-        StaticBlock(b) => {
-          let f = Arrow(Params(List()), lowered-function-body(b))
-          statics += ExprStmt(CallExpr(as-class(f, ref, inner-name), Args(List())))
-        }
-        _ => {
-          if constructor-method?(m) {
-            constructor = some(lowered(m))
-          } else if let some(name) = private-key(m) {
-            let p = table[name] ?? panic "lost a private name"
-            let inner = lowered(inner-member(m))
-            let slot = match inner-member(m) {
-              Getter(...) => p.getter
-              Setter(...) => p.setter
-              _ => p.method
-            }
-            after += as-class-name(ExprStmt(assign(Ident(slot), function-expr-of(inner))), ref, inner-name)
-          } else {
-            kept += lowered(m)
-          }
-        }
+        nothing-lowered() with { after: [as-class-name(ExprStmt(assign(Ident(slot), function-expr-of(inner))), ref, inner-name)] }
       }
+      none => nothing-lowered() with { kept: [lowered(m)] }
     }
   }
-  var out: [Node] = []
-  if len(fields) > 0 or is-some(constructor) {
-    out += constructor-with-fields(constructor, fields, derived)
-  }
-  let whole = out ++ kept
-  ClassParts(body: body with { kids: [List(whole...)] }, before: setup, after: after, statics: statics)
 }
 
 everywhere fn as-class-name(n: Node, ref: Node, inner-name: Text) -> Node = match n {
