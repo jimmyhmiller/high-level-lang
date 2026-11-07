@@ -43,10 +43,9 @@ fn root-sym(mo: m.Module, name: Text) -> Int? = sym.scope-at(m.table, mo.root).n
 # A symbol of the runtime module, by name.
 fn helper(name: Text) -> Int = root-sym(m.modules[0], name) ?? panic "the runtime has no helper named {}", name
 
-fn dep-of(mo: m.Module, spec: Text) -> Int {
-  if m.stays-external?(spec, mo.path) { return m.external-module(m.aliased(spec)) }
-  let r = m.resolve-import(spec, mo.path)
-  m.by-path[r.path] ?? panic "{}: {} was not loaded", mo.path, spec
+fn dep-of(mo: m.Module, spec: Text) -> Int = match spec {
+  _ if m.stays-external?(spec, mo.path) => m.external-module(m.aliased(spec))
+  _ => m.by-path[m.resolve-import(spec, mo.path).path] ?? panic "{}: {} was not loaded", mo.path, spec
 }
 
 # Asked for every fact an import statement gives: so asked once per module and specifier.
@@ -101,55 +100,37 @@ on FuncDecl(name, ...) | GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGe
   kids.top = false
   name.top = top
 }
-on BindName(x) as n {
-  if declaring and top {
-    let s = here.bindings[n.lo] ?? panic "{}: no symbol for binding {}", here.path, x
-    if sym.symbol-at(m.table, s).scope == here.root { declares += s }
-  }
+on BindName(x) as n if declaring and top and (here.bindings[n.lo] ?? panic "{}: no symbol for binding {}", here.path, x) is s
+                       and sym.symbol-at(m.table, s).scope == here.root {
+  declares += s
 }
-on Ident(x) as n {
-  if counting {
-    match here.bindings[n.lo] {
-      some(s) => mention(Symbol, s)
-      none => if x in here.helpers { mention(Symbol, helper(x)) }
-    }
-  }
+on Ident(x) as n if counting and here.bindings[n.lo] is some(s) { mentions += mentioned(Symbol, s) }
+on Ident(x) as n if counting and here.bindings[n.lo] is none and x in here.helpers { mentions += mentioned(Symbol, helper(x)) }
+on Member(object, property) if counting and namespace-of(here, object) is some(target) {
+  mentions += Mention(reach: Member, id: target, name: property.text)
+  object.counting = false
 }
-on Member(object, property) {
-  if counting {
-    if let some(target) = namespace-of(here, object) {
-      mentions += Mention(reach: Member, id: target, name: property.text)
-      object.counting = false
-    }
-  }
+on ImportCall(...) as n if counting and imported-str(n) is some(from) {
+  mentions += mentioned(match linking.splitting {
+                          true => Chunk
+                          false => Whole
+                        }, known-dep(here, from))
+  kids.counting = false
 }
-on ImportCall(...) as n {
-  if counting {
-    if let some(from) = imported-str(n) {
-      mention(if linking.splitting then Chunk else Whole, known-dep(here, from))
-      kids.counting = false
-    }
-  }
-}
-on CallExpr(...) as n {
-  if counting {
-    if let some(from) = required-str(here, n) {
-      mention(Whole, known-dep(here, from))
-      kids.counting = false
-    }
-  }
+on CallExpr(...) as n if counting and required-str(here, n) is some(from) {
+  mentions += mentioned(Whole, known-dep(here, from))
+  kids.counting = false
 }
 
 # Any other scope: its names are its own. Last, so the blocks above own the nodes they match.
-on _ as n { if sc.opens?(n.kind) { kids.top = false } }
+on _ as n if sc.opens?(n.kind) { kids.top = false }
 
-fn mention(reach: Reach, id: Int) -> Void { mentions += Mention(reach: reach, id: id, name: "") }
+fn mentioned(reach: Reach, id: Int) -> Mention = Mention(reach: reach, id: id, name: "")
 
-fn summary-of(n: Node, declares: Bool) -> Summary {
-  let a = run(n, declares)
+fn summary-of(n: Node, declares: Bool) -> Summary =
   Summary(declares: a.declares, mentions: once-each-symbol(a.mentions),
           pure: declares and linking.tree-shaking and pure-stmt?(n))
-}
+  where a = run(n, declares)
 
 # A symbol mentioned once is mentioned: the first mention of each stays, and the others go.
 fn once-each-symbol(ms: [Mention]) -> [Mention] =
@@ -157,11 +138,16 @@ fn once-each-symbol(ms: [Mention]) -> [Mention] =
 
 # A module's summaries: CommonJS is one, of its whole tree; an ES module has one for each top-level
 # statement, empty for those whose facts come from what they import and export.
-fn summaries-of(id: Int) -> [Summary] {
-  with here = m.modules[id] {
-    if here.kind == Cjs then [summary-of(here.tree, false)]
-    else [if walked?(s) then summary-of(s, true) else no-summary() for s in here.tree.body.kids]
+fn summaries-of(id: Int) -> [Summary] = with here = m.modules[id] {
+  match here.kind {
+    Cjs => [summary-of(here.tree, false)]
+    _ => [statement-summary(s) for s in here.tree.body.kids]
   }
+}
+
+fn statement-summary(s: Node) -> Summary = match walked?(s) {
+  true => summary-of(s, true)
+  false => no-summary()
 }
 
 fn walked?(s: Node) -> Bool = match s {
@@ -199,8 +185,7 @@ fn imported-str(n: Node) -> Node? = match n {
 
 # `require("x")` with a literal path and a free `require`: the path.
 fn required-str(mo: m.Module, n: Node) -> Node? = match n {
-  CallExpr(Ident("require") as callee, Args(List(Str(_) as from))) =>
-    if callee.lo in mo.bindings then none else some(from)
+  CallExpr(Ident("require") as callee, Args(List(Str(_) as from))) if not (callee.lo in mo.bindings) => some(from)
   _ => none
 }
 
@@ -253,11 +238,7 @@ fn mention-chunk(part: Int, t: Int) -> Void {
 const known-globals: [Text] = ["undefined", "NaN", "Infinity"]
 const known-collections: [Text] = ["Map", "Set", "WeakMap", "WeakSet"]
 
-fn annotated?(n: Node) -> Bool {
-  if n.lo in here.pure-at { return true }
-  if let some(hi) = here.pure-calls[n.lo] { return hi == n.hi }
-  false
-}
+fn annotated?(n: Node) -> Bool = n.lo in here.pure-at or (any hi in here.pure-calls[n.lo]: hi == n.hi)
 fn free-ident?(n: Node) -> Bool = n is Ident(_) and not bound?(n)
 fn known-collection?(callee: Node) -> Bool = free-ident?(callee) and callee.text in known-collections
 fn all-pure?(xs: [Node]) -> Bool = all x in xs: pure?(x)
@@ -318,10 +299,8 @@ fn pure-member?(member: Node) -> Bool = match member {
 
 # A class with no heritage, computed keys or initialisers runs nothing. `extends` a pure expression
 # runs nothing either.
-fn pure-class?(n: Node) -> Bool {
-  let heritage = n.heritage
-  (heritage is None() or pure?(heritage.superclass)) and (all x in n.body.members.kids: pure-member?(x))
-}
+fn pure-class?(n: Node) -> Bool =
+  (n.heritage is None() or pure?(n.heritage.superclass)) and (all x in n.body.members.kids: pure-member?(x))
 
 fn pure-declarators?(list: Node) -> Bool =
   all d in list.kids: d.target is BindName(_) and pure?(d.init)
@@ -585,10 +564,10 @@ fn wrap(id: Int) -> Void {
 
 # Every `require("x")` and `import("x")` in a module, in the order a walk meets them. Finding
 # them is a walk of every tree, so modules are searched at once.
-fn on-demand-calls(id: Int) -> [Node] {
-  let mo = m.modules[id]
+fn on-demand-calls(id: Int) -> [Node] = match m.modules[id] {
   # What a module's tree calls was found when it was loaded: one with none has nothing to walk.
-  if mo.kind != Runtime and mo.calls then on-demand-calls-under(mo.tree, mo) else []
+  mo if mo.kind != Runtime and mo.calls => on-demand-calls-under(mo.tree, mo)
+  _ => []
 }
 
 # Calls inside these calls count too, after them.
