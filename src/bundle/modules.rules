@@ -39,7 +39,10 @@ record Module {
   legal: [Text],
   helpers: [Text],      # runtime helpers lowered code names, which are no global names
   # Whether its tree may `require` or `import()` anything: false when loading found no such call.
-  calls: Bool
+  calls: Bool,
+  # A script nothing requires or imports whole: it exports nothing, and a name imported from it is
+  # undefined, as esbuild has it.
+  script: Bool
 }
 
 record TextPair { key: Text, value: Text }
@@ -228,8 +231,6 @@ fn normalized(n: Node) -> [Node] = match n {
 # ---------------------------------------------------------------- dependencies
 
 # What a final tree loads at run time: its `require`s, then its `import()`s, in source order.
-fn calls-in(tree: Node) -> [Text] = found.requires ++ found.imports where found = calls.run(tree)
-
 fn loads-of(tree: Node) -> Checked = Checked(tree: tree, requires: found.requires, imports: found.imports)
   where found = calls.run(tree)
 
@@ -311,7 +312,7 @@ fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-
 fn blank-module(id: Int, path: Text, kind: ModuleKind, tree: Node, root: Int) -> Module =
   Module(id: id, path: path, kind: kind, tree: tree, root: root, bindings: {}, side-effects: true,
          deps: [], dep-ids: {}, symbol-shift: 0, base: base-name(path), source: [], free: [], text: "",
-         pure-at: {}, pure-calls: {}, legal: [], helpers: [], calls: true)
+         pure-at: {}, pure-calls: {}, legal: [], helpers: [], calls: true, script: false)
 
 # An alias replaces a package name, and carries any subpath along.
 fn aliased(spec: Text) -> Text = (first a in loading.aliases: alias-of(a, spec)) ?? spec
@@ -418,6 +419,7 @@ record Parsed {
   scopes: sym.Table,
   analysis: Analysis,
   calls: [Text],        # with the analysis: what its final tree `require`s, then `import()`s
+  required: [Text],     # with the analysis: what its final tree `require`s
   requires: [Text],     # what the tree as parsed `require`s, and `import()`s, when `found`
   imports: [Text],
   found: Bool,
@@ -432,57 +434,60 @@ enum Role { Whole, Split, Piece, Resolved, Prepare }
 # `shift`: how far the symbols `bindings` names moved when the file's own table joined the shared
 # one, which the bindings themselves catch up with once loading is done.
 # `defined`: whether a define changed the tree.
-record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs: Bool, shift: Int, defined: Bool }
+# `script`: no module syntax, and no `module` or `exports`; `wrapped`: analysed inside CommonJS's
+# wrapper, as a script must be to become CommonJS.
+record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs: Bool, script: Bool, wrapped: Bool, shift: Int,
+                  defined: Bool }
 
-fn no-analysis() -> Analysis = Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, shift: 0, defined: false)
+fn no-analysis() -> Analysis =
+  Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, script: false, wrapped: false, shift: 0, defined: false)
 
 # A file's scopes, and the table they are in.
 record Analysed { analysis: Analysis, scopes: sym.Table }
 
 # What a file declares and uses, in a table of its own. Defines are substituted and the branches
 # they decide removed, then the result is analysed again, so what they kill is never seen by tree
-# shaking; CommonJS is analysed inside its (exports, module) wrapper. A script that names those is
-# analysed inside the wrapper at once, and again without it only if it is not CommonJS after all
-# (or a define is about `module` or `exports`, which the wrapper would hide). A name free in any of
-# the analyses is free.
+# shaking. A file with no module syntax is analysed inside CommonJS's (exports, module) wrapper:
+# it is CommonJS when it names `module` or `exports`, and otherwise a script, which becomes
+# CommonJS only if it is required, or its default or namespace imported, as esbuild has it; which
+# the graph knows once every file is loaded. Not when a define is about `module` or `exports`,
+# which the wrapper would hide; such a script is analysed again inside it if it names them after
+# all. A name free in any of the analyses is free.
 fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed =
-  match jsx-imports and not early.program-has-module-syntax?(parsed) and names-module {
+  match jsx-imports and not early.program-has-module-syntax?(parsed) and cjs {
     true => panic "{}: the automatic JSX runtime in a CommonJS module is not implemented yet", path
     false => Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
-                                         shift: 0, defined: defined),
+                                         script: not esm and not cjs, wrapped: wrapped or cjs, shift: 0, defined: defined),
                       scopes: final.table)
   }
   where esm = early.program-has-module-syntax?(tree0),
         tree = normalized-tree(tree0, base),
-        maybe-cjs = not esm and (any name in cjs-names: contains-text?(src, name))
-                    and not (any d in loading.defines: text-before(d.key, ".") in ["module", "exports"]),
-        # CommonJS is analysed inside its (exports, module) wrapper at once, when it may be that.
-        wrapped = [sc.analysis(tree, ["exports", "module"]) for x in [maybe-cjs] if x],
-        wrapped-cjs = any w in wrapped: "require" in w.free or wrapper-names-module?(w),
-        first = (first w in wrapped if wrapped-cjs: w) ?? sc.analysis(tree, []),
-        cjs = wrapped-cjs or (not esm and (any f in cjs-names: f in first.free)),
+        wrapped = wrapper-wanted?(esm),
+        first = sc.analysis(tree, [x for x in ["exports", "module"] if wrapped]),
         # Whether it names `module` or `exports` without declaring them.
-        names-module = match wrapped-cjs {
+        cjs = match wrapped {
           true => wrapper-names-module?(first)
-          false => "module" in first.free or "exports" in first.free
+          false => not esm and ("module" in first.free or "exports" in first.free)
         },
         defined = mentions-define?(src) and defines-apply?(tree, first.bindings),
         final-tree = match defined {
           true => dce.run(substitute(tree, first.bindings))
           false => tree
         },
-        final = match defined or (cjs and not wrapped-cjs) {
-          true => sc.analysis(final-tree, [x for x in ["exports", "module"] if cjs])
+        final = match defined or (cjs and not wrapped) {
+          true => sc.analysis(final-tree, [x for x in ["exports", "module"] if wrapped or cjs])
           false => first
         },
         real-free = [f for f in first.free ++ [f for f in final.free if not (f in first.free)]
                      if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
 
+# A file with no module syntax is analysed inside CommonJS's wrapper, unless a define is about
+# `module` or `exports`, which the wrapper would hide.
+fn wrapper-wanted?(esm: Bool) -> Bool = not esm and not (any d in loading.defines: text-before(d.key, ".") in ["module", "exports"])
+
 # Whether code in CommonJS's wrapper reads `module` or `exports`.
 fn wrapper-names-module?(w: sym.Analysis) -> Bool =
   wrapper-used?(w.table, wrapper-of(w), "module") or wrapper-used?(w.table, wrapper-of(w), "exports")
-
-const cjs-names: [Text] = ["module", "exports", "require"]
 
 # The wrapper scope of an analysis made inside CommonJS's wrapper: the root's parent.
 fn wrapper-of(s: sym.Analysis) -> Int = sym.scope-at(s.table, s.root).parent
@@ -519,7 +524,7 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
          legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: found.requires, imports: found.imports,
          found: is-none(known),
-         analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], role: Whole, pieces: 1)
+         analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], required: [], role: Whole, pieces: 1)
   where loader = loader-of(path),
         config = tsc.for-file(path),
         file-jsx = configured-jsx(loading.jsx-options, config),
@@ -547,13 +552,14 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
 # has to see the tree first.
 fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
   true => p
-  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, specs: specs }
+  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, required: found.requires, specs: specs }
     where a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers),
           # The calls are the parsed tree's unless a define changed it, and those were found already.
-          calls = match p.found and not a.analysis.defined {
-            true => p.requires ++ p.imports
-            false => calls-in(a.analysis.tree)
+          found = match p.found and not a.analysis.defined {
+            true => Checked(tree: p.tree, requires: p.requires, imports: p.imports)
+            false => loads-of(a.analysis.tree)
           },
+          calls = found.requires ++ found.imports,
           # Once defines have removed code, what it loads is what is left: `require`s a define
           # removed, as of a development build, are not read ahead.
           specs = match a.analysis.defined {
@@ -637,7 +643,7 @@ fn after-files(p: Parsed) -> [Text] = match p.role {
 fn blank-parsed(path: Text) -> Parsed =
   Parsed(path: path, src: "", parsed: None(), tree: None(), pure-calls: {}, helpers: [], jsx-imports: false,
          pure-at: {}, legal: [], specs: [], targets: {}, analysed: false, scopes: sym.table-new(),
-         analysis: no-analysis(), calls: [], requires: [], imports: [], found: false, role: Whole, pieces: 1)
+         analysis: no-analysis(), calls: [], required: [], requires: [], imports: [], found: false, role: Whole, pieces: 1)
 
 # ---------------------------------------------------------------- big files, in pieces
 
@@ -810,7 +816,7 @@ memo fn prepared-of(path: Text) -> Prepared = match pieces {
           parts = [normalized-tree(t, base-name(path)).body.kids for t in trees],
           tree = Program(tree0.hashbang, List([s for part in parts for s in part]...)),
           esm = early.program-has-module-syntax?(tree0),
-          wrapped = not esm and (any name in ["module", "exports", "require"]: contains-text?(sp.src, name)),
+          wrapped = wrapper-wanted?(esm),
           own = sc.declarations(tree, [x for x in ["exports", "module"] if wrapped])
 } where sp = split-source(path),
         pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
@@ -870,10 +876,11 @@ fn finished-file(path: Text) -> Parsed = match prepared-of(path) {
 # the wrapper that turns out not to be CommonJS, or one prepared without it that is, is analysed
 # again whole, as is code a define changes.
 fn joined-file(path: Text, pr: Prepared) -> Parsed =
-  match early-of(path) ?? (first w in walks: w.problem), cjs != (pr.wrapper >= 0) or p.jsx-imports or (any w in walks: w.defined) {
+  match early-of(path) ?? (first w in walks: w.problem), (cjs and pr.wrapper < 0) or p.jsx-imports or (any w in walks: w.defined) {
     some(at), _ => panic "{}:{}:{}: {}", path, line-of(sp.src, at.at), col-of(sp.src, at.at), at.message
     none, true => q with { targets: {spec: t for spec in q.specs if let some(t) = targets[spec]} } where q = analysed-file(p)
-    none, false => p with { analysed: true, scopes: own, analysis: a, calls: calls, targets: targets }
+    none, false => p with { analysed: true, scopes: own, analysis: a, calls: calls, required: [r for w in walks for r in w.requires],
+                            targets: targets }
   }
   where sp = split-source(path),
         p = from-of(path),
@@ -885,9 +892,9 @@ fn joined-file(path: Text, pr: Prepared) -> Parsed =
         bindings = {key: rebound(v, ends[k] - sym.symbol-count(walks[k].scopes))
                     for k in 0..len(walks) for key in keys(walks[k].bindings) if let some(v) = walks[k].bindings[key]},
         own = sym.grafted(pr.scopes, [w.scopes for w in walks], pr.root),
-        cjs = not pr.esm and (sym.has-free?(own, "require") or names-module?(own, pr.wrapper)),
+        cjs = not pr.esm and names-module?(own, pr.wrapper),
         a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: [f for f in sym.free-names(own) if not (f in p.helpers)],
-                     cjs: cjs, shift: 0, defined: false),
+                     cjs: cjs, script: not pr.esm and not cjs, wrapped: pr.wrapper >= 0, shift: 0, defined: false),
         calls = [r for w in walks for r in w.requires] ++ [r for w in walks for r in w.imports]
 
 # A part's binding: a symbol of the part, moved by where the part lands, or one of the table it was
@@ -998,11 +1005,12 @@ record Lead { key: Text, effects: Bool }
 # defines, its scopes in a table of its own, what it imports and loads at run time, and where each
 # leads, in the order it names them.
 record Loaded { path: Text, parsed: Parsed, tree0: Node, analysis: Analysis, scopes: sym.Table, specs: [Text], calls: [Text],
-                leads: [Lead] }
+                leads: [Lead], whole: [Text] }
 
 memo fn loaded(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: tree0, analysis: a.analysis, scopes: a.scopes, specs: specs, calls: calls,
-         leads: [lead(spec, path) for spec in specs])
+         leads: [lead(spec, path) for spec in specs],
+         whole: [lead(spec, path).key for spec in required ++ [x for st in tree0.body.kids for x in wholly-imported(st)]])
   where p = ahead[path] ?? parsed-file(Pending(path: path, text: as-module(source-of(path), path), ready: true)),
         tree0 = match p.analysed {
           true => p.tree
@@ -1013,13 +1021,33 @@ memo fn loaded(path: Text) -> Loaded =
           false => analysis-of(tree0, p.parsed, p.src, path, base-name(path), p.jsx-imports, p.helpers)
         },
         # Imports in source order, then what it loads at run time. Statements `define` removed import nothing.
+        found = match p.analysed {
+          true => Checked(tree: p.tree, requires: p.required, imports: [])
+          false => loads-of(a.analysis.tree)
+        },
         calls = match p.analysed {
           true => p.calls
-          false => calls-in(a.analysis.tree)
+          false => found.requires ++ found.imports
         },
+        required = found.requires,
         specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls
 
 fn transformed(tree: Node) -> Node = transform(tree) where transform = loading.transform
+
+# What a statement imports as a whole, its default or namespace: what a script must be CommonJS for.
+fn wholly-imported(s: Node) -> [Text] = match s {
+  Import(clause, from) if whole-clause?(clause) => [module-of-str(from)]
+  ExportAllAs(_, from) => [module-of-str(from)]
+  ExportFrom(List(specs...), from) if any x in specs: (x is ExportName(...) or x is ExportAs(...)) and module-name(x.local) == "default" =>
+    [module-of-str(from)]
+  _ => []
+}
+
+fn whole-clause?(c: Node) -> Bool = match c {
+  ImportDefault(_) | ImportNamespace(_) | ImportDefaultAnd(...) => true
+  ImportNamed(List(specs...)) => any x in specs: x is ImportAs(...) and module-name(x.imported) == "default"
+  _ => false
+}
 
 fn lead(spec: Text, importer: Text) -> Lead = match stays-external?(spec, importer) {
   true => Lead(key: "external:" ++ aliased(spec), effects: false)
@@ -1039,12 +1067,14 @@ fn external?(key: Text) -> Bool = key is "external:" ++ _
 # each module after what it imports, as it runs in esbuild's output. Every module's symbols will join
 # one table in the order of their ids, and each module knows how far its own move.
 fn graph(runtime: Text, paths: [Text]) -> Graph =
-  Graph(modules: [runtime-module(rt-tree, rt, runtime, lay)] ++ [module-at(w, i, ids, lay, parts) for i in 0..len(w.pre)],
+  Graph(modules: [runtime-module(rt-tree, rt, runtime, lay)] ++ [module-at(w, i, ids, lay, parts, wholes) for i in 0..len(w.pre)],
         by-path: ids, order: [0] ++ [i + 1 for i in w.post if not external?(w.pre[i])],
         entries: [ids[p] ?? (panic "{} was not loaded", p) for p in paths], parts: tables, symbols: lay.symbols)
   where w = depth-first(paths, led-to),
         ids = {w.pre[i]: i + 1 for i in 0..len(w.pre)},
         files = [key for key in w.pre if not external?(key)],
+        # The files something requires, or imports the default or namespace of.
+        wholes = {key: true for f in files for key in loaded(f).whole},
         # Where each file's scopes are among the parts the table is made of: after the runtime's.
         parts = {files[k]: k + 1 for k in 0..len(files)},
         rt-tree = js.parse(runtime, "<runtime>"),
@@ -1060,9 +1090,9 @@ fn runtime-module(tree: Node, rt: sym.Analysis, text: Text, lay: sym.Layout) -> 
 
 # The module the walk reached `i`th: an outside import, or a file, with side effects as the import
 # that first reached it says, or as an entry has them.
-fn module-at(w: Walk, i: Int, ids: {Text:Int}, lay: sym.Layout, parts: {Text:Int}) -> Module = match w.pre[i] {
+fn module-at(w: Walk, i: Int, ids: {Text:Int}, lay: sym.Layout, parts: {Text:Int}, wholes: {Text:Bool}) -> Module = match w.pre[i] {
   "external:" ++ spec => blank-module(i + 1, spec, External, None(), bundle-scope)
-  path => file-module(i + 1, loaded(path), effects, lay.scope-shifts[part], lay.symbol-shifts[part], ids)
+  path => file-module(i + 1, loaded(path), effects, lay.scope-shifts[part], lay.symbol-shifts[part], ids, path in wholes)
     where part = parts[path] ?? (panic "{} has no scopes", path),
           effects = match w.parent[i] {
             p if p < 0 => true
@@ -1070,16 +1100,45 @@ fn module-at(w: Walk, i: Int, ids: {Text:Int}, lay: sym.Layout, parts: {Text:Int
           }
 }
 
-fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift: Int, ids: {Text:Int}) -> Module =
+fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift: Int, ids: {Text:Int}, whole: Bool) -> Module =
   blank-module(id, l.path, kind, l.analysis.tree, l.analysis.root + scope-shift) with {
     bindings: l.analysis.bindings, symbol-shift: symbol-shift, side-effects: effects, source: l.tree0.body.kids,
     free: l.analysis.free, text: l.parsed.src, pure-at: l.parsed.pure-at, pure-calls: l.parsed.pure-calls,
     legal: l.parsed.legal, helpers: l.parsed.helpers, deps: [led(ids, x.key) for x in l.leads],
-    dep-ids: {l.specs[k]: led(ids, l.leads[k].key) for k in 0..len(l.specs)}, calls: len(l.calls) > 0
-  } where kind = match l.analysis.cjs {
-    true => Cjs
-    false => Esm
+    dep-ids: {l.specs[k]: led(ids, l.leads[k].key) for k in 0..len(l.specs)}, calls: len(l.calls) > 0,
+    script: l.analysis.script and kind == Esm
+  } where kind = match l.analysis.cjs, l.analysis.script and whole {
+    true, _ => Cjs
+    false, true if not l.analysis.wrapped =>
+      panic "{}: a script that is required, while a define is about `module` or `exports`, is not implemented yet", l.path
+    false, true => Cjs
+    false, false => Esm
   }
+
+# ---------------------------------------------------------------- paths as the output shows them
+
+# A path from the root, as esbuild's resolver has it: links resolved where something is there.
+memo fn full-path(path: Text) -> Text = real-path(from-root(path))
+
+# A path from the root, as written: from the working directory when it is relative.
+fn from-root(path: Text) -> Text = match path {
+  "/" ++ _ => path-normalize(path)
+  _ => path-normalize(working-dir() ++ "/" ++ path)
+}
+
+# `to` as a path from the directory `from`, both from the root.
+fn relative-path(from: Text, to: Text) -> Text = match join([".." for i in common..len(a)] ++ b[common..len(b)], "/") {
+  "" => "."
+  p => p
+} where a = path-segments(from),
+        b = path-segments(to),
+        common = len([i for i in 0..min(len(a), len(b)) while a[i] == b[i]])
+
+# A module's path as the output shows it: from the working directory, as a relative path already is.
+memo fn shown-path(path: Text) -> Text = match path {
+  "/" ++ _ => relative-path(full-path("."), full-path(path))
+  _ => path
+}
 
 fn led(ids: {Text:Int}, key: Text) -> Int = ids[key] ?? panic "the walk never reached {}", key
 

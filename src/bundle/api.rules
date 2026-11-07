@@ -32,15 +32,18 @@ record Format {
   suffix: Text,
   exports: Text,
   export-names: Bool,
-  hoist-externals: Bool
+  hoist-externals: Bool,
+  # Whatever runs the output has `require`, as CommonJS does: an outside module is loaded with it
+  # directly, and otherwise through esbuild's `__require`, which says what is missing.
+  native-require: Bool
 }
 
 fn iife-format() -> Format =
-  Format(prefix: "(()=>{", suffix: "})();\n", exports: "", export-names: false, hoist-externals: false)
+  Format(prefix: "(()=>{", suffix: "})();\n", exports: "", export-names: false, hoist-externals: false, native-require: false)
 fn cjs-format() -> Format =
-  Format(prefix: "", suffix: "\n", exports: "module.exports=%;", export-names: false, hoist-externals: false)
+  Format(prefix: "", suffix: "\n", exports: "module.exports=%;", export-names: false, hoist-externals: false, native-require: true)
 fn esm-format() -> Format =
-  Format(prefix: "", suffix: "\n", exports: "", export-names: true, hoist-externals: true)
+  Format(prefix: "", suffix: "\n", exports: "", export-names: true, hoist-externals: true, native-require: false)
 
 record DefineText { key: Text, value: Text }
 
@@ -575,13 +578,14 @@ fn loading-of(o: Options, out-dir: Text) -> m.Loading =
             on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir, load-threads: o.plan.load-threads,
             packages-external: o.packages-external, public-path: o.public-path)
 
-fn linking-of(o: Options, entry-namespace: Bool, keep-entry-exports: Bool, splitting: Bool, esm-output: Bool) -> an.Linking =
+fn linking-of(o: Options, entry-namespace: Bool, keep-entry-exports: Bool, splitting: Bool, f: Format) -> an.Linking =
   an.Linking(entry-namespace: entry-namespace, keep-entry-exports: keep-entry-exports, tree-shaking: o.tree-shaking,
-             splitting: splitting, esm-output: esm-output, pure-names: o.pure, facts-threads: o.plan.facts-threads)
+             splitting: splitting, esm-output: f.hoist-externals, native-require: f.native-require, pure-names: o.pure,
+             facts-threads: o.plan.facts-threads)
 
-fn emitting-of(o: Options, esm-output: Bool) -> e.Emitting =
-  e.Emitting(void-undefined: o.minify-syntax, esm-output: esm-output, drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap,
-             emit-threads: o.plan.emit-threads)
+fn emitting-of(o: Options, f: Format) -> e.Emitting =
+  e.Emitting(void-undefined: o.minify-syntax, esm-output: f.hoist-externals, native-require: f.native-require,
+             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
 
 # The names esbuild gives output files: the entry's path below the entries' common directory.
 fn common-dir(paths: [Text]) -> Text = fold dir = dir-of(paths[0]) for p in paths: enclosing(dir, p)
@@ -699,8 +703,8 @@ fn one-built(options: Options) -> [Written] = match options.entry {
   _ ++ ".css" => css-built(options)
   _ if options.pretty and options.jsx.runtime == jsx.Preserve =>
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
-  _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, f.export-names, false, f.hoist-externals),
-            e.emitting = emitting-of(o, f.hoist-externals), e.chunk-parts = none, printing = printing-of(o), m.names = names-new() {
+  _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, f.export-names, false, f),
+            e.emitting = emitting-of(o, f), e.chunk-parts = none, printing = printing-of(o), m.names = names-new() {
          loaded-built(timed(o.timing, "startup", o), f)
        }
     where o = with-node-env(options),
@@ -727,13 +731,15 @@ fn graph-built(o: Options, f: Format, g: m.Graph) -> [Written] =
 fn linked-built(o: Options, f: Format, g: m.Graph) -> [Written] =
   with an.linked = an.link(g.symbols), m.table = an.linked-table(g.parts),
        m.db = timed(o.timing, "link: facts and Datalog", an.solved-facts()) {
-    with nm.finals = timed(o.timing, "naming", final-names(o)) { named-built(o, f) }
+    with e.units = e.units-of-order() {
+      with nm.finals = timed(o.timing, "naming", final-names(o)) { named-built(o, f) }
+    }
   }
 
 # Each symbol's name: minified, or as esbuild's number renamer gives them.
 fn final-names(o: Options) -> [Text] = match o.minify-identifiers {
   true => mangle.minified-names(o.plan.emit-threads)
-  false => nm.esbuild-names()
+  false => nm.esbuild-names(o.target < lower.no-lowering)
 }
 
 # The rest of a build, once every symbol has its name: the program, its legal comments and its map;
@@ -808,7 +814,7 @@ fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roo
 fn split-built(options: Options) -> [Written] = match options.outdir, options.format.export-names {
   "", _ => panic "code splitting needs --outdir"
   _, false => panic "code splitting needs --format=esm"
-  _, true => with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, true, true), e.emitting = emitting-of(o, true),
+  _, true => with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, true, esm-format()), e.emitting = emitting-of(o, esm-format()),
                   printing = printing-of(o), m.names = names-new() {
       with m.ahead = m.parsed-ahead(o.entries) { split-graph(o, m.graph(include-text("runtime.js"), o.entries)) }
     } where o = with-node-env(options)
@@ -822,7 +828,9 @@ fn split-graph(o: Options, g: m.Graph) -> [Written] =
 
 fn linked-split(o: Options, g: m.Graph) -> [Written] = match m.css-imports() {
   [] => with an.linked = an.link(g.symbols), m.table = an.linked-table(g.parts), m.db = an.solved-facts() {
-          with nm.finals = final-names(o) { named-split(o) }
+          with e.units = e.units-of-order() {
+            with nm.finals = final-names(o) { named-split(o) }
+          }
         }
   _ => panic "stylesheets with --splitting are not implemented yet"
 }

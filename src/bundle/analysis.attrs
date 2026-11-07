@@ -18,6 +18,8 @@ record Linking {
   splitting: Bool,
   # ES module output, where an import of an external module stays an import statement.
   esm-output: Bool,
+  # Output whose runner has `require`; otherwise an external module is loaded with `__require`.
+  native-require: Bool,
   # `--pure:NAME`: calls of these free names may go when nothing uses their value.
   pure-names: [Text],
   # How many threads walk modules for their facts.
@@ -102,10 +104,10 @@ fn wrapped?(mo: m.Module) -> Bool = mo.id in linked.wrapped
 # What one statement says, found by walking it. The walk is most of what facts cost, and it reads
 # only its module and what is known already, so modules are walked at once; the facts are then
 # asserted from these, in the order the walk met them.
-enum Reach { Symbol, Member, Whole, Chunk }
+enum Reach { Symbol, Member, Required, Whole, Chunk }
 
-# A symbol named; `ns.x` of an `import * as ns` (the module, and `x`); a module named as a whole,
-# by `require` or `import()`; a chunk `import()` loads.
+# A symbol named; `ns.x` of an `import * as ns` (the module, and `x`); a module `require`d, or
+# loaded whole by `import()`; a chunk `import()` loads.
 record Mention { reach: Reach, id: Int, name: Text }
 
 # `pure`: whether the statement can go when nothing uses it, which is a walk of it too.
@@ -135,7 +137,8 @@ on Member(object, property) if counting and namespace-of(here, object) is some(t
   mentions += Mention(reach: Member, id: target, name: property.text)
   object.counting = false
 }
-on ImportCall(...) as n if counting and imported-str(n) is some(from) {
+# `import()` of an outside module stays as it is, and needs nothing of the bundle.
+on ImportCall(...) as n if counting and imported-str(n) is some(from) and m.modules[known-dep(here, from)].kind != External {
   mentions += mentioned(match linking.splitting {
                           true => Chunk
                           false => Whole
@@ -143,7 +146,7 @@ on ImportCall(...) as n if counting and imported-str(n) is some(from) {
   kids.counting = false
 }
 on CallExpr(...) as n if counting and required-str(here, n) is some(from) {
-  mentions += mentioned(Whole, known-dep(here, from))
+  mentions += mentioned(Required, known-dep(here, from))
   kids.counting = false
 }
 
@@ -215,7 +218,52 @@ fn known-require-target(mo: m.Module, n: Node) -> Int? = first from in required-
 
 # ---------------------------------------------------------------- what can be removed
 
-const known-globals: [Text] = ["undefined", "NaN", "Infinity"]
+# Global names, and properties of them, that reading cannot run anyone's code: those esbuild
+# knows, as far as they have been measured against it (an unused `var v = X;` it removes).
+const known-globals: [Text] = [
+  "Array", "Boolean", "Function", "Math", "Number", "Object", "RegExp", "String", "Symbol", "Reflect", "JSON",
+  "Intl", "Promise", "Proxy", "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry",
+  "ArrayBuffer", "SharedArrayBuffer", "DataView", "Date", "Error", "EvalError", "RangeError",
+  "ReferenceError", "SyntaxError", "TypeError", "URIError", "AggregateError", "Int8Array", "Uint8Array",
+  "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array",
+  "Float64Array", "BigInt64Array", "BigUint64Array", "Float16Array", "BigInt", "Atomics", "WebAssembly",
+  "globalThis", "console", "isNaN", "isFinite", "parseFloat", "parseInt", "decodeURI", "decodeURIComponent",
+  "encodeURI", "encodeURIComponent", "escape", "unescape", "setTimeout", "clearTimeout", "setInterval",
+  "clearInterval", "queueMicrotask", "fetch", "AbortController", "AbortSignal", "Event", "EventTarget",
+  "MessageChannel", "MessageEvent", "MessagePort", "TextDecoder", "TextEncoder", "URL", "URLSearchParams",
+  "Blob", "File", "FormData", "Headers", "Request", "Response", "ReadableStream", "window", "document",
+  "navigator", "location", "self", "require", "performance", "history", "screen", "Node", "Element",
+  "HTMLElement", "HTMLDivElement", "Document", "DocumentFragment", "Text", "Comment", "CustomEvent",
+  "KeyboardEvent", "MouseEvent", "DOMParser", "XMLHttpRequest", "WebSocket", "Worker", "Image", "Audio",
+  "CSSStyleSheet", "CSSRule", "CSSStyleDeclaration", "MutationObserver", "ResizeObserver",
+  "IntersectionObserver", "requestAnimationFrame", "cancelAnimationFrame", "getComputedStyle", "matchMedia",
+  "alert", "NaN", "Infinity", "undefined", "Iterator"]
+const known-global-properties: [Text] = [
+  "Object.assign", "Object.create", "Object.defineProperties", "Object.defineProperty", "Object.entries",
+  "Object.freeze", "Object.fromEntries", "Object.getOwnPropertyDescriptor",
+  "Object.getOwnPropertyDescriptors", "Object.getOwnPropertyNames", "Object.getOwnPropertySymbols",
+  "Object.getPrototypeOf", "Object.is", "Object.isExtensible", "Object.isFrozen", "Object.isSealed",
+  "Object.keys", "Object.preventExtensions", "Object.seal", "Object.setPrototypeOf", "Object.values",
+  "Math.E", "Math.LN10", "Math.LN2", "Math.LOG10E", "Math.LOG2E", "Math.PI", "Math.SQRT1_2", "Math.SQRT2",
+  "Math.abs", "Math.acos", "Math.acosh", "Math.asin", "Math.asinh", "Math.atan", "Math.atan2", "Math.atanh",
+  "Math.cbrt", "Math.ceil", "Math.clz32", "Math.cos", "Math.cosh", "Math.exp", "Math.expm1", "Math.floor",
+  "Math.fround", "Math.hypot", "Math.imul", "Math.log", "Math.log10", "Math.log1p", "Math.log2", "Math.max",
+  "Math.min", "Math.pow", "Math.random", "Math.round", "Math.sign", "Math.sin", "Math.sinh", "Math.sqrt",
+  "Math.tan", "Math.tanh", "Math.trunc", "Reflect.apply", "Reflect.construct", "Reflect.defineProperty",
+  "Reflect.deleteProperty", "Reflect.get", "Reflect.getOwnPropertyDescriptor", "Reflect.getPrototypeOf",
+  "Reflect.has", "Reflect.isExtensible", "Reflect.ownKeys", "Reflect.preventExtensions", "Reflect.set",
+  "Reflect.setPrototypeOf", "Symbol.asyncDispose", "Symbol.asyncIterator", "Symbol.dispose",
+  "Symbol.hasInstance", "Symbol.isConcatSpreadable", "Symbol.iterator", "Symbol.match", "Symbol.matchAll",
+  "Symbol.replace", "Symbol.search", "Symbol.species", "Symbol.split", "Symbol.toPrimitive",
+  "Symbol.toStringTag", "Symbol.unscopables", "JSON.parse", "JSON.stringify", "console.assert",
+  "console.clear", "console.count", "console.countReset", "console.debug", "console.dir", "console.dirxml",
+  "console.error", "console.group", "console.groupCollapsed", "console.groupEnd", "console.info",
+  "console.log", "console.table", "console.time", "console.timeEnd", "console.timeLog", "console.trace",
+  "console.warn", "Array.isArray", "Array.from", "Array.of", "Object.prototype.__defineGetter__",
+  "Object.prototype.__defineSetter__", "Object.prototype.__lookupGetter__",
+  "Object.prototype.__lookupSetter__", "Object.prototype.hasOwnProperty", "Object.prototype.isPrototypeOf",
+  "Object.prototype.propertyIsEnumerable", "Object.prototype.toLocaleString", "Object.prototype.toString",
+  "Object.prototype.unwatch", "Object.prototype.valueOf", "Object.prototype.watch"]
 const known-collections: [Text] = ["Map", "Set", "WeakMap", "WeakSet"]
 
 fn annotated?(n: Node) -> Bool = n.lo in here.pure-at or (any hi in here.pure-calls[n.lo]: hi == n.hi)
@@ -243,7 +291,12 @@ fn pure?(n: Node) -> Bool = match n {
   Ident(x) => bound?(n) or x in known-globals
   Paren(x) | Not(x) | Void(x) | Shorthand(x) => pure?(x)
   TypeOf(x) => x is Ident(_) or pure?(x)
-  Or(...) | And(...) | Coalesce(...) | Cond(...) | Seq(...) | StrictEq(...) | StrictNe(...)
+  # A negative number literal, which esbuild reads as one number.
+  Neg(Num(_)) => true
+  Cond(test, yes, no) => pure?(test) and (guarded-read?(yes, test, true) or pure?(yes)) and (guarded-read?(no, test, false) or pure?(no))
+  # Comparing two primitives calls no `valueOf`.
+  Lt(a, b) | Gt(a, b) | Le(a, b) | Ge(a, b) | Eq(a, b) | Ne(a, b) => primitive?(a) and primitive?(b) and pure?(a) and pure?(b)
+  Or(...) | And(...) | Coalesce(...) | Seq(...) | StrictEq(...) | StrictNe(...)
     | Elem(...) | ElemLast(...) => all-pure?(n.kids)
   ArrayLit(List(xs...)) | ObjectLit(List(xs...)) => all-pure?(xs)
   Prop(key, v) => not (key is Computed(_)) and pure?(v)
@@ -252,9 +305,47 @@ fn pure?(n: Node) -> Bool = match n {
   CallExpr(...) => pure-call?(n)
   NewExpr(...) => pure-call?(n) or pure-new?(n)
   NewNoArgs(callee) => annotated?(n) or known-collection?(callee)
-  # Reading a property of `Math` cannot run code, unless someone replaced Math.
-  Member(o, _) => free-ident?(o) and o.text == "Math"
+  Member(...) => match m.dotted-name(n, here.bindings) {
+    some(name) => name in known-global-properties
+    none => false
+  }
   _ => false
+}
+
+# A value known to be a primitive, whatever it is.
+fn primitive?(n: Node) -> Bool = match n {
+  Str(_) | Num(_) | True() | False() | Null() | TypeOf(_) | Void(_) | TemplateFull(_) => true
+  Neg(Num(_)) => true
+  _ => false
+}
+
+# A free name read where a `typeof` test has found it is there, as esbuild allows:
+# `typeof x !== "undefined" ? x : …`, `typeof x === "function" ? x : …`, `typeof x < "u" ? x : …`.
+fn guarded-read?(value: Node, test: Node, yes: Bool) -> Bool = free-ident?(value) and (match test {
+  StrictEq(a, b) | Eq(a, b) => compared?(value.text, a, b, yes, false)
+  StrictNe(a, b) | Ne(a, b) => compared?(value.text, a, b, yes, true)
+  Lt(a, b) | Le(a, b) => ordered?(value.text, a, b, yes, true)
+  Gt(a, b) | Ge(a, b) => ordered?(value.text, a, b, yes, false)
+  _ => false
+})
+
+# `typeof x` against a string: `x` is there in the branch where the type is not "undefined".
+fn compared?(x: Text, a: Node, b: Node, yes: Bool, negated: Bool) -> Bool = match typeof-against(x, a, b) {
+  some(t) => ((t == "undefined") == yes) == negated
+  none => false
+}
+
+fn typeof-against(x: Text, a: Node, b: Node) -> Text? = match a, b {
+  TypeOf(Ident(y)), Str(s) if y == x => some(unquote(s))
+  Str(s), TypeOf(Ident(y)) if y == x => some(unquote(s))
+  _, _ => none
+}
+
+# `typeof x < "u"`, as minified code writes it: below "undefined", so there.
+fn ordered?(x: Text, a: Node, b: Node, yes: Bool, below: Bool) -> Bool = match a, b {
+  TypeOf(Ident(y)), Str(s) if y == x and unquote(s) == "u" => yes == below
+  Str(s), TypeOf(Ident(y)) if y == x and unquote(s) == "u" => yes != below
+  _, _ => false
 }
 
 # A computed class key runs `ToPropertyKey`, so only a literal or a well-known symbol is known to
@@ -557,17 +648,24 @@ fn summary-facts(mo: m.Module, part: Int, sm: Summary) -> [link.Fact] =
 fn mention-facts(mo: m.Module, part: Int, x: Mention) -> [link.Fact] = match x.reach {
   Symbol => [link.fact-mentions(part, x.id)]
   Member => [link.fact-ns-member(part, x.id, m.name-id(x.name))]
+  Required => required-module(mo, part, m.modules[x.id])
   Whole => whole-module(mo, part, m.modules[x.id])
   # What `import()` of a chunk needs here: only the helper that makes CommonJS look like a module.
   Chunk => [link.fact-mentions(part, helper("__toESM")) for t in [m.modules[x.id]] if t.kind == Cjs]
 }
 
-# What a run-time reference to a whole module needs: its wrapper, and the helpers.
-fn whole-module(mo: m.Module, part: Int, t: m.Module) -> [link.Fact] = match t.kind {
-  External => []
-  Cjs => [link.fact-imports(mo.id, t.id), link.fact-mentions(part, require-sym(t)), link.fact-mentions(part, helper("__toESM"))]
+# What `require` of a module needs: its wrapper, and an ES module made CommonJS.
+fn required-module(mo: m.Module, part: Int, t: m.Module) -> [link.Fact] = match t.kind {
+  External => required(part, t.id)
+  Cjs => [link.fact-imports(mo.id, t.id), link.fact-mentions(part, require-sym(t))]
   _ => [link.fact-imports(mo.id, t.id), link.fact-mentions(part, init-sym(t)), link.fact-mentions(part, ns-sym(t)),
         link.fact-mentions(part, helper("__toCommonJS"))]
+}
+
+# What `import()` of a module in this bundle needs: its wrapper, and CommonJS made an ES module.
+fn whole-module(mo: m.Module, part: Int, t: m.Module) -> [link.Fact] = match t.kind {
+  Cjs => [link.fact-imports(mo.id, t.id), link.fact-mentions(part, require-sym(t)), link.fact-mentions(part, helper("__toESM"))]
+  _ => [link.fact-imports(mo.id, t.id), link.fact-mentions(part, init-sym(t)), link.fact-mentions(part, ns-sym(t))]
 }
 
 fn export-local(mo: m.Module, exported: Text, local: Text) -> link.Fact =
@@ -596,7 +694,11 @@ fn initialised(part: Int, mo: m.Module) -> [link.Fact] = match wrapped?(mo) {
   false => []
 }
 
-fn required(part: Int, t: Int) -> [link.Fact] = [link.fact-mentions(part, require-sym(mo)) for mo in [m.modules[t]] if mo.kind == Cjs]
+fn required(part: Int, t: Int) -> [link.Fact] = match m.modules[t] {
+  m.Module(kind: m.Cjs, ...) as mo => [link.fact-mentions(part, require-sym(mo))]
+  m.Module(kind: m.External, ...) if not linking.native-require => [link.fact-mentions(part, helper("__require"))]
+  _ => []
+}
 
 # A statement that re-exports from CommonJS holds the import itself.
 fn reexport-import(mo: m.Module, part: Int, t: Int) -> [link.Fact] =

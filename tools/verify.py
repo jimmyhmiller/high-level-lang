@@ -67,7 +67,7 @@ for a in "named all cjs features three zod rx datefns preact immer react d3 reex
 
 print("== normalized identity with esbuild (unminified)")
 norm = "const e=require('esbuild'),fs=require('fs');const n=f=>e.transformSync(fs.readFileSync(f,'utf8'),{loader:'js',legalComments:'none',minifyWhitespace:true,logLevel:'silent'}).code;console.log(n(process.argv[1])===n(process.argv[2]))"
-for a in ["named", "all"]:
+for a in ["named", "all", "three", "datefns", "preact", "exdate", "exes"]:
     theirs, ours = f"{SCRATCH}/{a}.esb.js", f"{SCRATCH}/{a}.js"
     sh([E, f"apps/{a}.js", "--bundle", "--format=iife", f"--outfile={theirs}", "--log-level=silent"])
     sh([ESB, f"apps/{a}.js", f"--outfile={ours}"], 60)
@@ -419,6 +419,37 @@ for flag in ["--external:dep2", "--external:dep*"]:
 code, out = sh([ESB, f"{OUT}/a.js", f"--outdir={OUT}/nested/deeper", "--external:dep", "--external:dep2"])
 check(code == 0 and os.path.exists(f"{OUT}/nested/deeper/a.js"), "an output directory is made with the ones it is in")
 import shutil; shutil.rmtree(OUT, ignore_errors=True)
+
+print("== modules and the runtime against esbuild")
+# Small programs, each built by both and compared once normalised, then run: what is CommonJS and
+# what a script; the runtime's helpers, their order and the names they keep from the program; and
+# what can go when nothing uses it.
+MOD = tempfile.mkdtemp(prefix="esb-mod-")
+def mod(rel, text):
+    with open(f"{MOD}/{rel}", "w") as f: f.write(text)
+mod("plain.js", 'globalThis.ran = (globalThis.ran || 0) + 1\n')
+mod("other.js", 'globalThis.other = 1\n')
+mod("c.cjs", 'module.exports = { c: 1 }\n')
+mod("boom.js", 'export const a = 1\nif (!globalThis.boomed) { globalThis.boomed = 1; throw new Error("boom") }\n')
+mod("s-required.js", 'console.log(JSON.stringify(require("./plain.js")), globalThis.ran)\n')
+mod("s-imported.js", 'import d from "./plain.js"\nimport { y } from "./other.js"\nconsole.log(typeof d, y, globalThis.ran, globalThis.other)\n')
+mod("s-entry.js", 'const c = require("./c.cjs")\nconsole.log(c.c)\n')
+mod("s-esm-throws.js", 'for (const k of [1, 2]) { try { require("./boom.js"); console.log(k, "ok") } catch (e) { console.log(k, e.message) } }\n')
+mod("s-names.js", 'var Symbol = 1, Object = 2, Array = 3, Promise = 4\nconsole.log(Symbol, Object, Array, Promise, require("./c.cjs").c)\n')
+mod("s-names-alone.js", 'var Symbol = 1, Object = 2, Promise = 4, require = 5\nconsole.log(Symbol, Object, Promise, require)\n')
+mod("s-external.js", 'try { console.log(typeof require("node:os").EOL) } catch (e) { console.log(e.message) }\n')
+mod("s-pure.js", 'var a = typeof Foo === "function" ? Foo : null\nvar b = typeof Bar < "u" ? Bar : 0\nvar n = -90\n'
+                 'var t = { Int8Array, Uint8Array }\nvar c = Object.create\nclass M extends Map {}\nvar k = Symbol.iterator\nconsole.log("pure")\n')
+for name in ["s-required", "s-imported", "s-entry", "s-esm-throws", "s-names", "s-names-alone", "s-external", "s-pure"]:
+    for flags in [[], ["--minify"]]:
+        ours, theirs = f"{MOD}/{name}.o.js", f"{MOD}/{name}.e.js"
+        code, out = sh([ESB, f"{MOD}/{name}.js", f"--outfile={ours}", "--external:node:os"] + flags)
+        sh([E, f"{MOD}/{name}.js", "--bundle", f"--outfile={theirs}", "--external:node:os", "--log-level=error"] + flags)
+        ran = [sh(["node", f], 15)[1] for f in (ours, theirs)]
+        same = flags or sh(["node", "-e", norm, ours, theirs])[1].strip() == "true"
+        check(code == 0 and ran[0] == ran[1] and same,
+              f"{name} {' '.join(flags)}: {'runs' if flags else 'the same once normalised, and runs'} as esbuild's: {' / '.join(ran[0].strip().splitlines())[:60] if code == 0 else out.strip()[:100]}")
+shutil.rmtree(MOD, ignore_errors=True)
 
 print()
 print("FAILED:" if failures else "All checks passed.")

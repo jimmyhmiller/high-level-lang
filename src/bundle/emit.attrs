@@ -13,7 +13,8 @@ quote exp at 1 0 0 ;
 
 # How the build emits: `undefined` as `void 0`, ES module output, the names a kept import binds
 # that nothing reads left out, nodes stamped for a source map, and how many threads emit modules.
-record Emitting { void-undefined: Bool, esm-output: Bool, drop-unused-imports: Bool, sourcemap: Bool, emit-threads: Int }
+record Emitting { void-undefined: Bool, esm-output: Bool, native-require: Bool, drop-unused-imports: Bool, sourcemap: Bool,
+                  emit-threads: Int }
 
 setting emitting: Emitting
 # Code splitting: the statements of the chunk being printed, none when it is the whole program; and
@@ -34,10 +35,11 @@ fn target-of(s: Int) -> Int =
   ?? (first m.db.ns-import(s, ?target): an.ns-sym(m.modules[target]))
   ?? s
 
-# What an import of `n` from `d` means: its export, or with `export *` from CommonJS, itself.
+# What an import of `n` from `d` means: its export, or with `export *` from CommonJS, itself; or
+# from a script, which exports nothing, itself, read as `undefined`.
 fn import-target(s: Int, d: Int, n: Int) -> Int = match resolved-export(d, n) {
   some(t) => t
-  none if m.db.dynamic(d) => s
+  none if m.db.dynamic(d) or m.modules[d].script => s
   none => panic "No matching export in {} for import {}", m.modules[d].path, name-of(m.names, n)
 }
 
@@ -93,6 +95,9 @@ fn exported(target: Int, name: Text) -> Int? = match known-name(m.names, name) {
   id if id < 0 => none
   id => resolved-export(target, id)
 }
+
+# An import from a script, which exports nothing: `void 0`.
+fn script-read(s: Int) -> Node? = first m.db.import-of(s, ?d, _) if m.modules[d].script: void-zero()
 
 # An import of a name only `export *` from CommonJS can supply, known at run time.
 fn dynamic-read(s: Int) -> Node? =
@@ -153,6 +158,11 @@ rewrite Shorthand(old) as n if old.out is Ident(_) and old.out.text == old.text 
 rewrite Shorthand(old) => Prop(PropName(old.text), old.out)
 rewrite PatShort(old, init) => short-pattern(old, old.out, init.out)
 rewrite CallExpr(callee, _) as n => final-call(n, callee, n.out)
+# `require` of a wrapped ES module whose value goes unused only runs it, as esbuild writes it.
+rewrite ExprStmt(CallExpr(...) as call) as n => match an.known-require-target(here, call) {
+  some(t) if m.modules[t].kind == Esm and an.wrapped?(m.modules[t]) => stmt`$init();` where init = final-of(an.init-sym(m.modules[t]))
+  _ => n.out
+}
 rewrite Member(object, property) as n =>
   namespace-read(n) ?? Member(object.out, property) with { lo: object.out.lo, hi: property.hi }
 rewrite ImportCall(...) as n => match an.known-import-call-target(here, n) {
@@ -173,7 +183,7 @@ fn rewritten(s: Node) -> Node = run(s).tree
 fn final-ident(n: Node, x: Text) -> Node = match cjs-import-of(n) {
   some(ci) => cjs-read(ci)
   none => match m.symbol-of(here, n.lo) {
-    some(s) => dynamic-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
+    some(s) => dynamic-read(s) ?? script-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
     none if x in here.helpers => Ident(helper-name(x)) with { lo: n.lo, hi: n.hi }
     # A free `undefined` is the shorter `void 0` under --minify-syntax.
     none if emitting.void-undefined and x == "undefined" => void-zero()
@@ -196,7 +206,7 @@ fn final-call(n: Node, callee: Node, out: Node) -> Node = match an.known-require
 
 fn required(t: m.Module, out: Node) -> Node = match t.kind {
   Cjs => require-of(t)
-  External => out
+  External => external-required(t)
   _ => require-esm(t)
 }
 
@@ -217,8 +227,14 @@ fn init-call(t: m.Module) -> Node? = match an.wrapped?(t) {
 # `import * as` hoisted to the top of the file.
 fn external-object(t: m.Module) -> Node = match emitting.esm-output {
   true => Ident(external-name(t))
-  false => exp`require($path)` where path = Str(quote-text(t.path))
+  false => external-required(t)
 }
+
+# `require("x")` where the output's runner has `require`, and esbuild's `__require("x")` elsewhere.
+fn external-required(t: m.Module) -> Node = match emitting.native-require {
+  true => exp`require($path)`
+  false => exp`$load($path)` where load = helper-name("__require")
+} where path = Str(quote-text(t.path))
 
 fn external-name(t: m.Module) -> Text = "__external_" ++ t.base
 
@@ -364,7 +380,7 @@ fn cjs-part() -> Node = stmt`var $name = $wrap({ $path($$params) { $$body } });`
         body = [stamped(rewritten(s)) for s in here.tree.body.kids],
         name = final-of(an.require-sym(here)),
         wrap = helper-name("__commonJS"),
-        path = Str(quote-text(here.path)),
+        path = Str(quote-text(m.shown-path(here.path))),
         params = match sym.symbol-at(m.table, mo).uses > 0, sym.symbol-at(m.table, e).uses > 0 {
           true, _ => [param-of(e), param-of(mo)]
           false, true => [param-of(e)]
@@ -451,7 +467,7 @@ fn wrapped-module(outputs: [Node]) -> [Node] =
         body = [initializing(s)... for s in rest],
         name = final-of(an.init-sym(here)),
         wrap = helper-name("__esm"),
-        path = Str(quote-text(here.path))
+        path = Str(quote-text(m.shown-path(here.path)))
 
 # A wrapped module's variables are declared outside it and set inside it.
 fn declared-names(d: Node) -> [Node] = match d {
@@ -486,19 +502,77 @@ fn any-part-here?(id: Int) -> Bool = any p in parts-of(id): in-this-chunk?(p)
 # is emitted on its own: they read what linking and naming decided, and change nothing shared.
 record Emitted { body: [Node], namespace: [Node], externals: [Text] }
 
-# What is emitted, or counted for names, at once: a module, or a run of a big one's parts. Only a
-# plain ES module is cut, since a wrapped one's statements all go inside its wrapper.
-record Unit { module: Int, from: Int, to: Int }
+# What is emitted, or counted for names, at once: some of a module's parts. `first`: the unit that
+# counts for the module as a whole, once.
+record Unit { module: Int, parts: [Int], first: Bool }
 
 const unit-parts: Int = 64
 
-fn units-of-order() -> [Unit] = [module-units(id)... for id in m.order]
+# Where statements go, in the order they run, as esbuild has it: a module after what it imports;
+# and an import that runs code (a CommonJS module, an ES module's wrapper, an outside module) where
+# it stands among the imports, before the code of a module imported after it. Modules come in the
+# order the graph has them; only those imports move.
+record Piece { module: Int, parts: [Int] }
 
-fn module-units(id: Int) -> [Unit] = match m.modules[id] {
+# The units, in order, worked out once a build is linked: naming and emitting both go by them.
+setting units: [Unit]
+
+# The graph's walk again, with each import that runs code a node of its own among its module's
+# imports: the walk's order is the order statements go in.
+fn units-of-order() -> [Unit] = [piece-units(pc, first)... for i in 0..len(pieces) for pc in [pieces[i]]
+                                  for first in [(last-piece[pc.module] ?? -1) == i]]
+  where w = depth-first(["m:0"] ++ ["m:" ++ int-text(e) for e in m.entries], order-children),
+        pieces = [pc for i in w.post for pc in piece-at(w.pre[i])],
+        last-piece = {pieces[i].module: i for i in 0..len(pieces)}
+
+fn order-children(key: Text) -> [Text] = match key {
+  "m:" ++ id => module-children(m.modules[parse-int(id)])
+  _ => []
+}
+
+fn module-children(mo: m.Module) -> [Text] = match split?(mo) {
+  true => [k for p in imports-of(mo) for k in ["m:" ++ int-text(imported-module(mo, p))] ++ eager-node(mo, p)] ++ deps
+  false => deps
+} where deps = ["m:" ++ int-text(d) for d in mo.deps]
+
+fn eager-node(mo: m.Module, p: Int) -> [Text] =
+  ["p:" ++ int-text(mo.id) ++ ":" ++ int-text(p) for t in [m.modules[imported-module(mo, p)]] if runs-code?(t)]
+
+fn piece-at(key: Text) -> [Piece] = match key {
+  "m:" ++ id => [Piece(module: mo.id, parts: own-parts(mo)) for mo in [m.modules[parse-int(id)]] if mo.kind != m.External]
+  "p:" ++ id ++ ":" ++ part => [Piece(module: parse-int(id), parts: [parse-int(part)])]
+  _ => []
+}
+
+# A plain ES module is cut at its imports that run code; its other parts go together.
+fn split?(mo: m.Module) -> Bool = mo.kind == m.Esm and not an.wrapped?(mo)
+
+fn own-parts(mo: m.Module) -> [Int] = match split?(mo) {
+  true => [p for p in parts-of(mo.id) if not (p in early)]
+    where early = {p: true for p in imports-of(mo) if runs-code?(m.modules[imported-module(mo, p)])}
+  false => parts-of(mo.id)
+}
+
+fn imports-of(mo: m.Module) -> [Int] = [p for p in parts-of(mo.id) if is-some(import-from(an.linked.part-stmt[p]))]
+
+fn imported-module(mo: m.Module, p: Int) -> Int =
+  an.known-dep(mo, import-from(an.linked.part-stmt[p]) ?? panic "{}: part {} imports nothing", mo.path, p)
+
+fn import-from(s: Node) -> Node? = match s {
+  Import(_, from) | ImportBare(from) | ExportFrom(_, from) | ExportAllAs(_, from) | ExportAll(from) => some(from)
+  _ => none
+}
+
+# Whether importing this runs code at the import, rather than the module's own code coming before.
+fn runs-code?(t: m.Module) -> Bool = an.held?(t) or (t.kind == m.Esm and an.wrapped?(t))
+
+# A piece in units: a plain ES module's long run of parts cut, for emitting at once.
+fn piece-units(pc: Piece, first: Bool) -> [Unit] = match m.modules[pc.module] {
   m.Module(kind: m.Esm, ...) as mo if not an.wrapped?(mo) and n > 2 * unit-parts =>
-    [Unit(module: id, from: k * unit-parts, to: min(n, (k + 1) * unit-parts)) for k in 0..(n + unit-parts - 1) / unit-parts]
-  _ => [Unit(module: id, from: 0, to: n)]
-} where n = len(parts-of(id))
+    [Unit(module: pc.module, parts: pc.parts[k * unit-parts..min(n, (k + 1) * unit-parts)], first: first and k == 0)
+     for k in 0..(n + unit-parts - 1) / unit-parts]
+  _ => [Unit(module: pc.module, parts: pc.parts, first: first)]
+} where n = len(pc.parts)
 
 fn unit-emitted(u: Unit) -> Emitted = match included?(u.module) and any-part-here?(u.module) {
   false => Emitted(body: [], namespace: [], externals: [])
@@ -515,7 +589,7 @@ fn module-emitted(u: Unit) -> Emitted = match here.kind {
                      },
                namespace: [s for pc in pieces for s in pc.namespace],
                externals: [x for pc in pieces for x in pc.externals distinct x])
-    where pieces = [part-emitted(p) for p in parts-of(u.module)[u.from..u.to] if live?(p) and in-this-chunk?(p)],
+    where pieces = [part-emitted(p) for p in u.parts if live?(p) and in-this-chunk?(p)],
           outputs = [s for pc in pieces for s in pc.body]
 }
 
@@ -530,13 +604,12 @@ fn part-emitted(p: Int) -> Emitted = match an.linked.part-stmt[p] {
 # The program, and the imports to hoist above it, each once.
 record Emission { tree: Node, externals: [Text] }
 
-# Every live statement, in module order. The namespace objects go after the runtime's statements
+# Every live statement, in the units' order. The namespace objects go after the runtime's statements
 # and before everything else.
 fn program() -> Emission =
   Emission(tree: Program(None(), List((runtime ++ [s for em in emitted for s in em.namespace] ++ rest)...)),
            externals: [line for em in emitted for line in em.externals distinct line])
-  where units = units-of-order(),
-        emitted = parallel-map(units, unit-emitted, emitting.emit-threads),
+  where emitted = parallel-map(units, unit-emitted, emitting.emit-threads),
         runtime-units = (last i in 0..len(units) if units[i].module == 0: i + 1) ?? 0,
         runtime = [s for em in emitted[0..runtime-units] for s in em.body],
         rest = [s for em in emitted[runtime-units..len(emitted)] for s in em.body]
