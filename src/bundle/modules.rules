@@ -943,37 +943,32 @@ fn checked-early(tree: Node, src: Text, path: Text) -> Node = match early.check(
 fn piece-starts(src: Text) -> [Int] = match co.parse-opt(src, "<coarse>", 0) {
   some(co.Coarse(List(items...))) =>
     fold cuts = [] for co.Cut(_) as line in items if len(src) - line.hi >= piece-bytes:
-      if line.hi - (if len(cuts) == 0 then 0 else last(cuts)) >= piece-bytes then cuts ++ [line.hi] else cuts
+      cuts ++ [at for at in [line.hi] if at - ((last c in cuts: c) ?? 0) >= piece-bytes]
   _ => []
 }
 
 fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
 
 # `ahead-target` without hooks, which only the thread that owns them may call.
-fn unhooked-target(spec: Text, importer: Text) -> Text? {
-  if res.external?(aliased(spec)) or (loading.packages-external and package-spec?(aliased(spec), importer)) { return none }
-  let wanted = aliased(spec)
-  if let some(p) = configured-path(wanted, importer) { return some(p) }
-  let from = if wanted != spec and res.relative?(wanted) then "alias" else importer
-  match res.resolve-opt(wanted, from) {
-    some(r) => some(r.path)
-    none => none
-  }
-}
+fn unhooked-target(spec: Text, importer: Text) -> Text? = match wanted {
+  _ if res.external?(wanted) or (loading.packages-external and package-spec?(wanted, importer)) => none
+  _ => configured-path(wanted, importer) ?? searched(spec, wanted, importer)
+} where wanted = aliased(spec)
+
+# Where the search finds it. A relative alias is relative to where the build runs.
+fn searched(spec: Text, wanted: Text, importer: Text) -> Text? =
+  first r in res.resolve-opt(wanted, match wanted != spec and res.relative?(wanted) {
+    true => "alias"
+    false => importer
+  }): r.path
 
 fn ahead?(path: Text) -> Bool = loader-of(path) != "file"
 
 # Where an import would lead, or nothing if it leads nowhere or stays outside the bundle.
-fn ahead-target(spec: Text, importer: Text) -> Text? {
-  if stays-external?(spec, importer) { return none }
-  let wanted = aliased(spec)
-  if let some(p) = hook-path(wanted, importer) { return some(p) }
-  if let some(p) = configured-path(wanted, importer) { return some(p) }
-  let from = if wanted != spec and res.relative?(wanted) then "alias" else importer
-  match res.resolve-opt(wanted, from) {
-    some(r) => some(r.path)
-    none => none
-  }
+fn ahead-target(spec: Text, importer: Text) -> Text? = match spec {
+  _ if stays-external?(spec, importer) => none
+  _ => hook-path(wanted, importer) ?? configured-path(wanted, importer) ?? searched(spec, wanted, importer)
+    where wanted = aliased(spec)
 }
 
 # Parse every file the entries can reach, a wave at a time: each wave's files are parsed at once,
@@ -986,26 +981,30 @@ fn parse-ahead!(paths: [Text]) -> Void {
                  else {d.path: d for d in parsed-waves(roots, {p: true for p in roots})}
 }
 
-fn walked-ahead(roots: [Text]) -> {Text:Parsed} {
-  let walked = parallel-walk(roots, visit-file, next-files, first-files, loading.load-threads)
-  let resolved = {r.path ++ "\n" ++ s: t for r in walked if r.role is Resolved for s in keys(r.targets) if let some(t) = r.targets[s]}
-  {d.path: with-resolved(d, resolved) for d in walked if d.role is Whole}
-}
+fn walked-ahead(roots: [Text]) -> {Text:Parsed} = {d.path: with-resolved(d, resolved) for d in walked if d.role is Whole}
+  where walked = parallel-walk(roots, visit-file, next-files, first-files, loading.load-threads),
+        resolved = {r.path ++ "\n" ++ s: t for r in walked if r.role is Resolved for s in keys(r.targets) if let some(t) = r.targets[s]}
 
 # A file's targets, once those of its imports resolved as items of their own (see `first-files`) join it.
-fn with-resolved(p: Parsed, resolved: {Text:Text}) -> Parsed =
-  if len(keys(p.targets)) > 0 or len(p.specs) <= resolve-alone then p
-  else p with { targets: {s: t for s in p.specs if let some(t) = resolved[p.path ++ "\n" ++ s]} }
+fn with-resolved(p: Parsed, resolved: {Text:Text}) -> Parsed = match p {
+  _ if len(keys(p.targets)) > 0 or len(p.specs) <= resolve-alone => p
+  _ => p with { targets: {s: t for s in p.specs if let some(t) = resolved[p.path ++ "\n" ++ s]} }
+}
 
 # With hooks, which only this thread may call: a wave's files are parsed at once, and the files
 # their imports lead to that none has led to before are the next wave.
-fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] {
-  if len(wave) == 0 { return [] }
-  let hooked = len(loading.on-load) > 0
-  let items = [Pending(path: p, text: if hooked then module-text(source-of(p), p) else "", ready: hooked) for p in wave]
-  let done = parallel-map(items, parsed-file, loading.load-threads)
-  let next = [t for d in done for spec in d.specs if let some(t) = ahead-target(spec, d.path) if ahead?(t) and not (t in seen) distinct t]
-  done ++ parsed-waves(next, {p: true for ps in [keys(seen), next] for p in ps})
+fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] = match wave {
+  [] => []
+  _ => done ++ parsed-waves(next, {p: true for ps in [keys(seen), next] for p in ps})
+    where hooked = len(loading.on-load) > 0,
+          done = parallel-map([pending(p, hooked) for p in wave], parsed-file, loading.load-threads),
+          next = [t for d in done for spec in d.specs if let some(t) = ahead-target(spec, d.path) if ahead?(t) and not (t in seen) distinct t]
+}
+
+# A file to parse, its text read already when a load hook may supply it.
+fn pending(path: Text, hooked: Bool) -> Pending = match hooked {
+  true => Pending(path: path, text: module-text(source-of(path), path), ready: true)
+  false => Pending(path: path, text: "", ready: false)
 }
 
 fn load-file(path: Text, effects: Bool) -> Int {
@@ -1050,9 +1049,11 @@ fn load-runtime(text: Text) -> Void {
   order += 0
 }
 
-fn public-url(local: Text) -> Text =
-  if len(loading.public-path) == 0 then local
-  else loading.public-path ++ (if ends-with(loading.public-path, "/") then "" else "/") ++ local[2..len(local)]
+fn public-url(local: Text) -> Text = match loading.public-path {
+  "" => local
+  _ ++ "/" => loading.public-path ++ local[2..len(local)]
+  base => base ++ "/" ++ local[2..len(local)]
+}
 
 # Stylesheets the program imports, in the order its modules run.
 fn css-imports() -> [Text] = [modules[id].path for id in order if loader-of(modules[id].path) == "css"]
