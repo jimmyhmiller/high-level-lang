@@ -36,8 +36,10 @@ fn before?(year: Int) -> Bool = target < year
 const temp-letters: Text = "abcdefghijklmnopqrstuvwxyz"
 
 # The `n`th name: `_a` to `_z`, then `_a1` and on.
-fn spelled(prefix: Text, n: Int) -> Text =
-  prefix ++ byte-text(temp-letters[n % 26]) ++ (if n >= 26 then int-text(n / 26) else "")
+fn spelled(prefix: Text, n: Int) -> Text = prefix ++ byte-text(temp-letters[n % 26]) ++ match n {
+  _ if n >= 26 => int-text(n / 26)
+  _ => ""
+}
 
 fn fresh-name(prefix: Text) -> Text {
   let n = first i in next-temp..: if spelled(prefix, i) in taken then none else some(i)
@@ -71,11 +73,9 @@ fn repeatable?(n: Node) -> Bool = n is Ident(_) | This() | Str(_) | Num(_)
 
 # ---------------------------------------------------------------- ?? and ?.
 
-fn coalesced(a: Node, b: Node) -> Node {
-  if repeatable?(a) { return Cond(Ne(a, Null()), a, b) }
-  let t = temp()
-  let held = Ident(t)
-  Cond(Ne(assign(held, a), Null()), held, b)
+fn coalesced(a: Node, b: Node) -> Node = match a {
+  _ if repeatable?(a) => Cond(Ne(a, Null()), a, b)
+  _ => Cond(Ne(assign(held, a), Null()), held, b) where held = Ident(temp())
 }
 
 fn spine-optional?(n: Node) -> Bool = match n {
@@ -123,12 +123,15 @@ fn links-of(n: Node) -> [Link] = match link-of(n) {
   none => []
 }
 
-fn chain-root(n: Node) -> Node = if is-some(link-of(n)) then chain-root(chain-base(n)) else n
+fn chain-root(n: Node) -> Node = match link-of(n) {
+  some(_) => chain-root(chain-base(n))
+  none => n
+}
 
 fn read-link(base: Node, l: Link) -> Node = match l.kind {
   ByIndex => Index(base, lowered(l.part))
   _ => match l.part {
-    PrivateName(x) => if before?(2022) then private-get(base, x) else Member(base, l.part)
+    PrivateName(x) if before?(2022) => private-get(base, x)
     _ => Member(base, l.part)
   }
 }
@@ -136,13 +139,12 @@ fn read-link(base: Node, l: Link) -> Node = match l.kind {
 # `a?.b.c?.()` becomes `a == null ? void 0 : (_x = a.b.c) == null ? void 0 : _x.call(a.b)`. Walking up
 # the chain, each `?.` adds a test and leaves the value in hand somewhere it can be read twice. A
 # call that needs its `this` by hand has the object kept from the link before.
-fn chain(n: Node, miss: Node, deleting: Bool) -> Node {
-  let links = links-of(n)
-  let root = chain-root(n)
-  let start = Walk(value: if root is Super() then root else lowered(root), self: none, tests: [])
-  let w = fold w = start for i in 0..len(links): link-walked(w, links, i)
-  fold out = (if deleting then Delete(w.value) else w.value) for t in reversed(w.tests): Cond(t, miss, out)
-}
+fn chain(n: Node, miss: Node, deleting: Bool) -> Node =
+  fold out = (match deleting { true => Delete(w.value)  false => w.value }) for t in reversed(w.tests): Cond(t, miss, out)
+  where links = links-of(n),
+        root = chain-root(n),
+        start = Walk(value: match root { Super() => root  _ => lowered(root) }, self: none, tests: []),
+        w = fold walk = start for i in 0..len(links): link-walked(walk, links, i)
 
 # Where a chain's lowering is, link by link: the value so far, the object a call through it needs as
 # `this`, and the `== null` tests met on the way, outermost first.
@@ -156,45 +158,37 @@ fn link-walked(w: Walk, links: [Link], i: Int) -> Walk = match links[i].kind {
 
 # An optional link tests its value for `== null`, holding it in a temporary first unless it can be
 # read twice.
-fn tested-once(w: Walk) -> Walk {
-  if repeatable?(w.value) { return Walk(value: w.value, self: w.self, tests: w.tests ++ [tested(w.value)]) }
-  let held = Ident(temp())
-  Walk(value: held, self: w.self, tests: w.tests ++ [tested(assign(held, w.value))])
+fn tested-once(w: Walk) -> Walk = match w.value {
+  v if repeatable?(v) => Walk(value: v, self: w.self, tests: w.tests ++ [tested(v)])
+  v => Walk(value: held, self: w.self, tests: w.tests ++ [tested(assign(held, v))]) where held = Ident(temp())
 }
 
 # A call: through `.call` with the object kept from the link before, when there is one.
-fn called(w: Walk, l: Link) -> Walk {
-  let args = [lowered(a) for a in l.part.kids]
-  match w.self {
-    some(s) => {
-      if not l.optional {
-        return Walk(value: CallExpr(Member(w.value, PropName("call")), Args(List(([s] ++ args)...))), self: none, tests: w.tests)
-      }
-      let f = Ident(temp())
-      Walk(value: CallExpr(Member(f, PropName("call")), Args(List(([s] ++ args)...))), self: none,
-           tests: w.tests ++ [tested(assign(f, w.value))])
+fn called(w: Walk, l: Link) -> Walk = match w.self, l.optional {
+  some(s), false => Walk(value: CallExpr(Member(w.value, PropName("call")), Args(List(([s] ++ args)...))), self: none, tests: w.tests)
+  some(s), true => Walk(value: CallExpr(Member(f, PropName("call")), Args(List(([s] ++ args)...))), self: none,
+                        tests: w.tests ++ [tested(assign(f, w.value))])
+    where f = Ident(temp())
+  none, _ => Walk(value: CallExpr(g.value, Args(List(args...))), self: none, tests: g.tests)
+    where g = match l.optional {
+      true => tested-once(w)
+      false => w
     }
-    none => {
-      let g = if l.optional then tested-once(w) else w
-      Walk(value: CallExpr(g.value, Args(List(args...))), self: none, tests: g.tests)
-    }
-  }
-}
+} where args = [lowered(a) for a in l.part.kids]
 
 # A member read. When a call that needs its `this` by hand comes next, the object is kept.
-fn read(w0: Walk, links: [Link], i: Int) -> Walk {
-  let l = links[i]
-  let w = if l.optional then tested-once(w0) else w0
-  let private-link = l.part is PrivateName(_) and before?(2022)
-  let next-called = i + 1 < len(links) and links[i + 1].kind == Called
-  if not (next-called and (links[i + 1].optional or private-link)) {
-    return Walk(value: read-link(w.value, l), self: none, tests: w.tests)
-  }
-  if w.value is Super() { return Walk(value: read-link(w.value, l), self: some(This()), tests: w.tests) }
-  if repeatable?(w.value) { return Walk(value: read-link(w.value, l), self: some(w.value), tests: w.tests) }
-  let held = Ident(temp())
-  Walk(value: read-link(assign(held, w.value), l), self: some(held), tests: w.tests)
-}
+fn read(w0: Walk, links: [Link], i: Int) -> Walk = match w.value {
+  _ if not (next-called and (links[i + 1].optional or private-link)) => Walk(value: read-link(w.value, l), self: none, tests: w.tests)
+  Super() => Walk(value: read-link(w.value, l), self: some(This()), tests: w.tests)
+  v if repeatable?(v) => Walk(value: read-link(v, l), self: some(v), tests: w.tests)
+  v => Walk(value: read-link(assign(held, v), l), self: some(held), tests: w.tests) where held = Ident(temp())
+} where l = links[i],
+        w = match l.optional {
+          true => tested-once(w0)
+          false => w0
+        },
+        private-link = l.part is PrivateName(_) and before?(2022),
+        next-called = i + 1 < len(links) and links[i + 1].kind == Called
 
 # ---------------------------------------------------------------- assignment operators
 
@@ -202,26 +196,25 @@ record Target { read: Node, write: Node }
 
 # A target read and then written, evaluating what it is made of once.
 fn captured(t: Node) -> Target = match t {
-  Member(o, name) => {
-    let inner = lowered(o)
-    if repeatable?(inner) {
-      let same = Member(inner, name)
-      Target(read: same, write: same)
-    } else {
-      let held = Ident(temp())
-      Target(read: Member(assign(held, inner), name), write: Member(held, name))
-    }
+  Member(o, name) => match lowered(o) {
+    inner if repeatable?(inner) => Target(read: Member(inner, name), write: Member(inner, name))
+    inner => Target(read: Member(assign(held, inner), name), write: Member(held, name)) where held = Ident(temp())
   }
-  Index(o, key) => {
-    let inner = lowered(o)
-    let k = lowered(key)
-    let self = if repeatable?(inner) then inner else Ident(temp())
-    let first-self = if repeatable?(inner) then inner else assign(self, inner)
-    let index = if repeatable?(k) then k else Ident(temp())
-    let first-index = if repeatable?(k) then k else assign(index, k)
-    Target(read: Index(first-self, first-index), write: Index(self, index))
-  }
+  # Both lowered first, then held: the temporaries come in the order they did.
+  Index(o, key) => Target(read: Index(self.first, index.first), write: Index(self.after, index.after))
+    where inner = lowered(o),
+          k = lowered(key),
+          self = held-once(inner),
+          index = held-once(k)
   _ => Target(read: t, write: t)
+}
+
+# A value read twice: the first time, and every time after.
+record Twice { first: Node, after: Node }
+
+fn held-once(v: Node) -> Twice = match v {
+  _ if repeatable?(v) => Twice(first: v, after: v)
+  _ => Twice(first: assign(held, v), after: held) where held = Ident(temp())
 }
 
 fn pattern-with-rest?(n: Node) -> Bool = match n {
@@ -230,29 +223,24 @@ fn pattern-with-rest?(n: Node) -> Bool = match n {
   _ => false
 }
 
-fn assignment(n: Node, t: Node, op: Text, v: Node) -> Node {
-  if t is Member(_, PrivateName(_)) and before?(2022) { return private-assignment(t, op, v) }
-  if (t is ObjectLit(...) | ArrayLit(...)) and before?(2018) and pattern-with-rest?(t) {
+fn assignment(n: Node, t: Node, op: Text, v: Node) -> Node = match t, op {
+  Member(_, PrivateName(_)), _ if before?(2022) => private-assignment(t, op, v)
+  ObjectLit(...) | ArrayLit(...), _ if before?(2018) and pattern-with-rest?(t) =>
     panic "object rest in an assignment is not implemented for this target; use a declaration"
-  }
-  match op {
-    "||=" | "&&=" | "??=" => if before?(2021) {
-      let parts = captured(t)
-      let set-it = assign(parts.write, lowered(v))
-      return match op {
-        "||=" => Or(parts.read, set-it)
-        "&&=" => And(parts.read, set-it)
-        _ => if before?(2020) then coalesced(parts.read, set-it) else Coalesce(parts.read, set-it)
-      }
-    }
-    "**=" => if before?(2016) {
-      let parts = captured(t)
-      return assign(parts.write, CallExpr(Ident(helper("__pow")), Args(List(parts.read, lowered(v)))))
-    }
-    _ => {}
-  }
-  n with { target: if t is ObjectLit(...) | ArrayLit(...) then lowered-pattern-target(t) else lowered(t), value: lowered(v) }
+  _, "||=" | "&&=" | "??=" if before?(2021) => logical-assigned(op, captured(t), v)
+  _, "**=" if before?(2016) => assign(parts.write, CallExpr(Ident(helper("__pow")), Args(List(parts.read, lowered(v)))))
+    where parts = captured(t)
+  ObjectLit(...) | ArrayLit(...), _ => n with { target: lowered-pattern-target(t), value: lowered(v) }
+  _, _ => n with { target: lowered(t), value: lowered(v) }
 }
+
+# `a ||= b` and its like, before ES2021: the target read once, and set only if it has to be.
+fn logical-assigned(op: Text, parts: Target, v: Node) -> Node = match op {
+  "||=" => Or(parts.read, set-it)
+  "&&=" => And(parts.read, set-it)
+  _ if before?(2020) => coalesced(parts.read, set-it)
+  _ => Coalesce(parts.read, set-it)
+} where set-it = assign(parts.write, lowered(v))
 
 # A destructuring target's spreads are rest elements, already refused above.
 fn lowered-pattern-target(t: Node) -> Node = match t {
@@ -266,14 +254,11 @@ fn lowered-pattern-target(t: Node) -> Node = match t {
 # since the last of them.
 record Spreading { base: Node?, plain: [Node] }
 
-fn object-spread(items: [Node]) -> Node {
-  let s = fold s = Spreading(base: none, plain: []) for x in items: spread-step(s, x)
-  if len(s.plain) == 0 { return s.base ?? ObjectLit(List()) }
-  match s.base {
-    some(b) => helper-call("__spreadProps", [b, ObjectLit(List(s.plain...))])
-    none => ObjectLit(List(s.plain...))
-  }
-}
+fn object-spread(items: [Node]) -> Node = match s.plain, s.base {
+  [], _ => s.base ?? ObjectLit(List())
+  _, some(b) => helper-call("__spreadProps", [b, ObjectLit(List(s.plain...))])
+  _, none => ObjectLit(List(s.plain...))
+} where s = fold so-far = Spreading(base: none, plain: []) for x in items: spread-step(so-far, x)
 
 fn spread-step(s: Spreading, x: Node) -> Spreading = match x {
   SpreadProp(e) => Spreading(base: some(helper-call("__spreadValues", [spread-base(s.base, s.plain), lowered(e)])), plain: [])
@@ -281,7 +266,8 @@ fn spread-step(s: Spreading, x: Node) -> Spreading = match x {
 }
 
 fn spread-base(base: Node?, plain: [Node]) -> Node = match base {
-  some(b) => if len(plain) == 0 then b else helper-call("__spreadProps", [b, ObjectLit(List(plain...))])
+  some(b) if len(plain) == 0 => b
+  some(b) => helper-call("__spreadProps", [b, ObjectLit(List(plain...))])
   none => ObjectLit(List(plain...))
 }
 
@@ -306,45 +292,44 @@ fn excluded-key(p: Node) -> Node = match p {
 }
 
 # `const { a, ...r } = o` is `const _a = o, { a } = _a, r = __objRest(_a, ["a"])`.
-fn rest-declarators(pattern: Node, init: Node, at: Node) -> [Node] {
-  let props = pattern.props.kids
-  let plain = [p for p in props if not (p is PatPropRest(_))]
-  if any p in plain: nested-rest?(p) { panic "object rest inside another pattern is not implemented for this target" }
-  let keys = [excluded-key(p) for p in plain]
-  let rest = last PatPropRest(t) in props: some(t)
-  let holder = fresh-name("_")
-  let slots = [if i == len(keys) - 1 then ElemLast(keys[i]) else Elem(keys[i]) for i in 0..len(keys)]
-  let excluded = ArrayLit(List(slots...))
-  let rebuilt: [Node] = if len(plain) == 0 then [] else [Declarator(lowered(ObjectPattern(List(plain...))), Ident(holder))]
-  [Declarator(BindName(holder), init)] ++ rebuilt
-  ++ [Declarator(rest ?? None(), helper-call("__objRest", [Ident(holder), excluded]))]
-}
+fn rest-declarators(pattern: Node, init: Node, at: Node) -> [Node] = match plain {
+  _ if any p in plain: nested-rest?(p) => panic "object rest inside another pattern is not implemented for this target"
+  _ => [Declarator(BindName(holder), init)] ++ rebuilt
+       ++ [Declarator(rest ?? None(), helper-call("__objRest", [Ident(holder), excluded]))]
+    where keys = [excluded-key(p) for p in plain],
+          rest = last PatPropRest(t) in pattern.props.kids: some(t),
+          holder = fresh-name("_"),
+          excluded = match keys {
+            [init-keys..., k] => ArrayLit(List(([Elem(x) for x in init-keys] ++ [ElemLast(k)])...))
+            [] => ArrayLit(List())
+          },
+          rebuilt = [Declarator(lowered(ObjectPattern(List(plain...))), Ident(holder)) for x in [plain] if len(x) > 0]
+} where plain = [p for p in pattern.props.kids if not (p is PatPropRest(_))]
 
 # ---------------------------------------------------------------- functions
 
-fn with-temps(stmts: [Node], temps: [Text]) -> [Node] {
-  if len(temps) == 0 { return stmts }
-  let decls = [Declarator(BindName(t), None()) for t in temps]
-  let at = directive-count(stmts)
-  stmts[0..at] ++ [VarDecl(List(decls...))] ++ stmts[at..len(stmts)]
+fn with-temps(stmts: [Node], temps: [Text]) -> [Node] = match temps {
+  [] => stmts
+  _ => stmts[0..at] ++ [VarDecl(List([Declarator(BindName(t), None()) for t in temps]...))] ++ stmts[at..len(stmts)]
+    where at = directive-count(stmts)
 }
 
 fn mentions-this?(n: Node) -> Bool = match n {
   This() => true
-  _ => if sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...)) then false
-       else any k in n.kids: mentions-this?(k)
+  _ if own-this?(n) => false
+  _ => any k in n.kids: mentions-this?(k)
 }
 
 fn mentions-arguments?(n: Node) -> Bool = match n {
   Ident("arguments") => true
-  _ => if sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...)) then false
-       else any k in n.kids: mentions-arguments?(k)
+  _ if own-this?(n) => false
+  _ => any k in n.kids: mentions-arguments?(k)
 }
 
 fn mentions-super?(n: Node) -> Bool = match n {
   Super() => true
-  _ => if sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...)) then false
-       else any k in n.kids: mentions-super?(k)
+  _ if own-this?(n) => false
+  _ => any k in n.kids: mentions-super?(k)
 }
 
 fn simple-parameters?(params: Node) -> Bool = match params {
