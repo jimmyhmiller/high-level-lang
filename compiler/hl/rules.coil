@@ -3801,7 +3801,7 @@
 
 ;;; One rule at a node of kind `head`: on a match, its value goes where the node was.
 (defn rw-alt-code [(k (mut Comp)) (a RwAlt) (subject Code) (rebuilt Code) (ty (slice u8)) (head (slice u8))
-                   (label Code) (task Code)] (-> Code)
+                   (label Code) (task Code) (same Code)] (-> Code)
   (let [mark (locals-mark (mut k))
         (mut steps) (ArrayList::new [Step] (malloc-allocator))]
     (pat! (mut k) (.pat a) subject ty (mut steps) head)
@@ -3824,9 +3824,13 @@
           ;; `[…]` is the nodes that go in the node's place; anything else, the one node.
           v (expr (mut k) (.body a) (if (= (.kind (.body a)) (g/KListLit)) many ty))
           each (fresh (mut k) "each")
+          got (fresh (mut k) "got")
+          changed `(set! (.attrs-changes ~task) (+ (.attrs-changes ~task) 1))
           push (cond
-                 (= (.ty v) ty) `(push! (mut ~(results-field task)) ~(.code v))
-                 (= (.ty v) many) `(for (ref ~(sym each)) ~(.code v) (push! (mut ~(results-field task)) ~(sym each)))
+                 (= (.ty v) ty) `(let [~(sym got) ~(.code v)]
+                                   (unless (~same ~(sym got) ~subject) ~changed)
+                                   (push! (mut ~(results-field task)) ~(sym got)))
+                 (= (.ty v) many) `(do ~changed (for (ref ~(sym each)) ~(.code v) (push! (mut ~(results-field task)) ~(sym each))))
                  :else (die (mut k) (.body a) (cat4 "a rewrite gives a " ty " or a " (cat3 many ", not " (.ty v)))))]
       (set! (.in-on k) false)
       (clear! (mut (.outs k)))
@@ -3836,17 +3840,18 @@
 
 ;;; The rules for a node of kind `head`, then the node as rebuilt.
 (defn rw-arm-code [(k (mut Comp)) (alts (ArrayList RwAlt)) (head (slice u8)) (subject Code) (rebuilt Code)
-                   (ty (slice u8)) (task Code)] (-> Code)
+                   (ty (slice u8)) (task Code) (same Code)] (-> Code)
   (let [label (primitive/code-symbol ":" (fresh (mut k) "rw"))
         (mut tries) (primitive/code-list-new)]
     (for a alts
       (let [h (rw-head a)]
         (when (or (= h head) (= (len h) 0))
-          (push! (mut tries) (rw-alt-code (mut k) a subject rebuilt ty head label task)))))
+          (push! (mut tries) (rw-alt-code (mut k) a subject rebuilt ty head label task same)))))
     `(block ~label ~@tries (push! (mut ~(results-field task)) ~rebuilt) 0)))
 
 ;;; The traversal's rewriting: each visit leaves what its node became on `attrs-results`, so a
-;;; node finds its children's past `mark`. A node whose children all stayed is itself.
+;;; node finds its children's past `mark`. A node is itself when no rewrite under it changed
+;;; anything, which `attrs-changes` counts, so a node that stayed costs no comparing.
 (defn rewrite-fns [(k (mut Comp)) (decls (ArrayList g/Node)) (gr Mod) (over (slice u8)) (ty (slice u8))
                    (node-coil Code) (task Code)] (-> Code)
   (let [alts (rewrite-alts decls)
@@ -3870,31 +3875,25 @@
     (set! (.ret k) "Void")
     (set! (.in-fn k) true)
     (for h heads
-      (push! (mut arms) `(~(kind-code gr h) [] ~(rw-arm-code (mut k) alts h n rebuilt ty task))))
-    (let [wild (rw-arm-code (mut k) alts "" n rebuilt ty task)]
+      (push! (mut arms) `(~(kind-code gr h) [] ~(rw-arm-code (mut k) alts h n rebuilt ty task same))))
+    (let [wild (rw-arm-code (mut k) alts "" n rebuilt ty task same)]
       (set! (.in-fn k) false)
       (clear! (mut (.locals k)))
       `(do
-         (defn attrs-rebuilt [(~n ~node-coil) (~task (ptr RulesTask)) (mark i64)] (-> ~node-coil)
-           (let [kids (.kids ~n)
-                 got (- (len ~(results-field task)) mark)
-                 (mut same) (= got (len kids))]
-             (when same
-               (for i (range 0 got)
-                 (unless (~same (get ~(results-field task) (+ mark i)) (get kids i)) (set! same false))))
-             (if same
-                 ~n
-                 (do
-                   (unless (or (= (.kind ~n) (~(kind-code gr "List"))) (= got (len kids)))
-                     (panic "a rewrite gave {} nodes in place of one child of a {} node" got (~kind-name (.kind ~n))))
-                   (let [(mut x) ~n]
-                     (set! (.kids x) (~sublist ~(results-field task) mark (len ~(results-field task))))
-                     x)))))
+         (defn attrs-rebuilt [(~n ~node-coil) (~task (ptr RulesTask)) (mark i64) (before i64)] (-> ~node-coil)
+           (if (= (.attrs-changes ~task) before)
+               ~n
+               (let [got (- (len ~(results-field task)) mark)]
+                 (unless (or (= (.kind ~n) (~(kind-code gr "List"))) (= got (len (.kids ~n))))
+                   (panic "a rewrite gave {} nodes in place of one child of a {} node" got (~kind-name (.kind ~n))))
+                 (let [(mut x) ~n]
+                   (set! (.kids x) (~sublist ~(results-field task) mark (len ~(results-field task))))
+                   x))))
          (defn attrs-rewrite! [(~n ~node-coil) (~rebuilt ~node-coil) (~task (ptr RulesTask))] (-> void)
            (match (.kind ~n) ~@arms (_ ~wild))
            0)
          (defn attrs-truncate! [(~task (ptr RulesTask)) (mark i64)] (-> void)
-           (while (> (len ~(results-field task)) mark) (pop! (mut ~(results-field task))))
+           (set! (.len ~(results-field task)) mark)
            0)))))
 
 ;;; The traversal, and `run`.
@@ -4010,9 +4009,10 @@
           (let [rw (rewrites? decls)
                 rw-mark (sym "rw-mark")
                 rw-fns (if rw (rewrite-fns (mut k) decls gr over ty node-coil task) `(do))
-                visit-marks (if rw `(~@marks ~rw-mark (len ~(results-field task))) `(~@marks))
+                rw-before (sym "rw-before")
+                visit-marks (if rw `(~@marks ~rw-mark (len ~(results-field task)) ~rw-before (.attrs-changes ~task)) `(~@marks))
                 post (if rw
-                         `(let [rebuilt (attrs-rebuilt ~n ~task ~rw-mark)]
+                         `(let [rebuilt (attrs-rebuilt ~n ~task ~rw-mark ~rw-before)]
                             (attrs-truncate! ~task ~rw-mark)
                             (attrs-rewrite! ~n rebuilt ~task))
                          `0)
@@ -4246,7 +4246,9 @@
       (push! (mut out) `0))
     (when (rewrites? decls)
       (push! (mut out) `:attrs-results)
-      (push! (mut out) (new-list (mut k) (cat (.over self) ".Node"))))
+      (push! (mut out) (new-list (mut k) (cat (.over self) ".Node")))
+      (push! (mut out) `:attrs-changes)
+      (push! (mut out) `0))
     `(~@out)))
 
 (defn compile-module [(context Code)] (-> (slice u8))
@@ -4344,7 +4346,10 @@
           (when (and (= (.kind tree) (g/KAttrsFile)) (rewrites? decls))
             (let [lt (cat3 "[" (.text (kid tree 1)) ".Node]")]
               (push! (mut task-fields) `(attrs-results ~(coil-type (mut k) lt)))
-              (push! (mut task-inits) `(set! (.attrs-results s) ~(new-list (mut k) (elem-of lt))))))
+              (push! (mut task-inits) `(set! (.attrs-results s) ~(new-list (mut k) (elem-of lt))))
+              ;; How many nodes a rewrite has changed: a node whose children changed none is itself.
+              (push! (mut task-fields) `(attrs-changes i64))
+              (push! (mut task-inits) `(set! (.attrs-changes s) 0))))
           ;; Program state, set up by the first thread to use it while any other waits. The flag is
           ;; read and written atomically, so a thread that sees it ready sees what was set: 0 not
           ;; set up, 2 being set up by `rules-owner`, which may use what it has set so far, 1 ready.

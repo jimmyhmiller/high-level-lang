@@ -301,19 +301,19 @@ fn closed?(s: Node) -> Bool = match s {
   _ => false
 }
 
-# How much work a node is, near enough: its length in the source, or for a node the build made,
-# its children's.
-fn mass(n: Node) -> Int = if n.hi > n.lo then n.hi - n.lo else sum k in n.kids: mass(k)
+# How much work a statement is, near enough: its length in the source, or one when it was made.
+fn weight(s: Node) -> Int = if s.hi > s.lo then s.hi - s.lo else 1
 
-fn weight(s: Node) -> Int = max(1, mass(s))
+# The same for a node the build made around source, such as CommonJS's wrapper: its children's.
+fn mass(n: Node) -> Int = if n.hi > n.lo then n.hi - n.lo else sum k in n.kids: mass(k)
 
 # Statements cut into about `n` runs of about equal weight, each cut just after a declaration, so
 # the runs optimise as the whole list would. Fewer when there are not such places enough.
 fn runs-of(stmts: [Node], n: Int) -> [[Node]] {
   if n <= 1 or len(stmts) <= 1 { return [stmts] }
-  let total = sum s in stmts: weight(s)
   # `before[j]`: the weight of the first j statements.
   let before = [0] ++ (scan w = 0 for s in stmts: w + weight(s))
+  let total = last(before)
   # Each cut is the first after the last at which its share of the weight is reached, after a
   # statement that closes.
   let cuts: [Int] = fold cs = [0] for i in 1..n:
@@ -341,7 +341,7 @@ fn joined(p: Node, parts: [Node]) -> Node = p with { body: List([s for part in p
 # work is in a single function body. Such a body is taken out of its statement, which keeps a hole,
 # and cut into runs as a program is; the runs fill the hole again once they are done.
 record Hole { at: Int, stmts: [Node] }
-record Hollowed { shell: Node, holes: [Hole] }
+record Hollowed { shell: Node, holes: [Hole], total: Int }
 record Taken { node: Node, stmts: [Node] }
 
 # A hole's mark: an identifier no source can spell, which every pass leaves be and prints as it is.
@@ -349,14 +349,25 @@ fn hole-name(at: Int) -> Text = byte-text(1) ++ "hole" ++ int-text(at) ++ byte-t
 
 fn hole-mark(at: Int) -> Node = ExprStmt(Ident(hole-name(at)) with { lo: -1, hi: -1 }) with { lo: -1, hi: -1 }
 
-# Each statement heavier than a part's share gives up the body most of it is in.
+# Each statement heavier than a part's share gives up the body most of it is in, when that body
+# can be cut.
 fn hollowed(p: Node, n: Int) -> Hollowed {
   let stmts = p.body.kids
-  let total = sum s in stmts: weight(s)
-  let takes = [if weight(stmts[i]) * n > total then taken(stmts[i], hole-mark(i)) else none for i in 0..len(stmts)]
+  let weights = [max(1, mass(s)) for s in stmts]
+  let total = sum w in weights: w
+  let takes = [if weights[i] * n > total then cut-body(taken(stmts[i], hole-mark(i)), total, n) else none for i in 0..len(stmts)]
   let kept = [taken-or(takes[i], stmts[i]) for i in 0..len(stmts)]
-  Hollowed(shell: p with { body: List(kept...) }, holes: [Hole(at: i, stmts: t.stmts) for i in 0..len(stmts) if let some(t) = takes[i]])
+  Hollowed(shell: p with { body: List(kept...) }, holes: [Hole(at: i, stmts: t.stmts) for i in 0..len(stmts) if let some(t) = takes[i]],
+           total: total)
 }
+
+fn cut-body(t: Taken?, total: Int, n: Int) -> Taken? = match t {
+  some(x) if len(runs-of(x.stmts, share(x.stmts, total, n))) > 1 => t
+  _ => none
+}
+
+# How many parts a run of statements gets of `n` for all `total`.
+fn share(stmts: [Node], total: Int, n: Int) -> Int = max(1, n * (sum s in stmts: max(1, mass(s))) / total)
 
 fn taken-or(t: Taken?, s: Node) -> Node = match t {
   some(x) => x.node
@@ -391,7 +402,7 @@ everywhere fn filled(n: Node, bodies: {Text:[Node]}) -> Node = match n {
 
 # A body's runs, as many as its share of the work.
 fn body-parts(hole: Hole, total: Int, n: Int) -> [Node] =
-  [program-of(None(), r) for r in runs-of(hole.stmts, max(1, n * (sum s in hole.stmts: weight(s)) / total))]
+  [program-of(None(), r) for r in runs-of(hole.stmts, share(hole.stmts, total, n))]
 
 # Where each body's parts start among all the parts, the shell's first; and where the last ends.
 fn body-starts(shell-parts: Int, bodies: [[Node]]) -> [Int] = [shell-parts] ++ (scan at = shell-parts for b in bodies: at + len(b))
@@ -414,17 +425,16 @@ fn end-changed?(es: [Ends]) -> Bool =
 # minifies and a body's end would have changed, all of it is done in top-level parts instead.
 fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) -> Node {
   let h = hollowed(p, n)
-  let total = sum s in p.body.kids: weight(s)
+  if len(h.holes) == 0 { return joined(p, heaviest-first(parts-of(p, n), f, threads)) }
   let shell-parts = parts-of(h.shell, n)
-  let bodies = [body-parts(hole, total, n) for hole in h.holes]
+  let bodies = [body-parts(hole, h.total, n) for hole in h.holes]
   let done = heaviest-first(shell-parts ++ [x for b in bodies for x in b], f, threads)
   let starts = body-starts(len(shell-parts), bodies)
   let made = [[s for d in done[starts[k]..starts[k + 1]] for s in d.body.kids] for k in 0..len(bodies)]
   if minifying and (any b in made: end-changed?([ends-of(b)])) {
     return joined(p, heaviest-first(parts-of(p, n), f, threads))
   }
-  let shell = joined(h.shell, done[0..len(shell-parts)])
-  if len(made) == 0 then shell else filled(shell, {hole-name(h.holes[k].at): made[k] for k in 0..len(made)})
+  filled(joined(h.shell, done[0..len(shell-parts)]), {hole-name(h.holes[k].at): made[k] for k in 0..len(made)})
 }
 
 # The optimiser on each part at once. Parts end after declarations, which nothing merges with
@@ -508,32 +518,38 @@ fn rendered-in-parts(o: Options, p: Node) -> Rendered {
 # minifies and a body's end would have changed, all of it is done in top-level parts instead.
 fn rendered-pieces(o: Options, p: Node, n: Int, threads: Int, f: Fn(Node)->Piece, minifying: Bool) -> Rendered {
   let h = hollowed(p, n)
-  let total = sum s in p.body.kids: weight(s)
+  if len(h.holes) == 0 { return pieces-joined(o, [d.rendered for d in heaviest-pieces(parts-of(p, n), f, threads)]) }
   let shell-parts = parts-of(h.shell, n)
-  let bodies = [body-parts(hole, total, n) for hole in h.holes]
+  let bodies = [body-parts(hole, h.total, n) for hole in h.holes]
   let done = heaviest-pieces(shell-parts ++ [x for b in bodies for x in b], f, threads)
   let starts = body-starts(len(shell-parts), bodies)
   let changed = minifying and (any k in 0..len(bodies): end-changed?([d.ends for d in done[starts[k]..starts[k + 1]]]))
   let shell = pieces-joined(o, [d.rendered for d in done[0..len(shell-parts)]])
   let texts = [pieces-joined(o, [d.rendered for d in done[starts[k]..starts[k + 1]]]) for k in 0..len(bodies)]
-  let whole: Rendered? = if changed then none
-                         else fold r = some(shell) for k in 0..len(bodies): spliced(r, hole-name(h.holes[k].at), texts[k])
+  let whole: Rendered? = if changed then none else spliced(shell, [hole-name(hole.at) for hole in h.holes], texts)
   whole ?? pieces-joined(o, [d.rendered for d in heaviest-pieces(parts-of(p, n), f, threads)])
 }
 
-# `body` where `name` printed, if it printed once.
-fn spliced(into: Rendered?, name: Text, body: Rendered) -> Rendered? = match into {
-  some(r) => match index-of(r.text, name) {
-    some(at) if (last-index-of(r.text, name) ?? -1) == at => {
-      let after = at + len(name)
-      some(Rendered(text: r.text[0..at] ++ body.text ++ r.text[after..len(r.text)],
-                    marks: [mk for mk in r.marks if mk.out <= at] ++ [Mark(out: mk.out + at, src: mk.src) for mk in body.marks]
-                           ++ [Mark(out: mk.out + len(body.text) - len(name), src: mk.src) for mk in r.marks if mk.out >= after],
-                    open: r.open))
-    }
-    _ => none
-  }
-  none => none
+# Each body where its hole printed, in one pass: the shell's text between holes and the bodies'
+# texts written out in turn, and each mark moved by what the holes before it grew by. Nothing when
+# the holes did not print once each, in order.
+fn spliced(shell: Rendered, names: [Text], bodies: [Rendered]) -> Rendered? {
+  let at = occurrences(shell.text, [byte-text(1) ++ "hole"])
+  if len(at) != len(names) or not (all k in 0..len(at): at?(shell.text, at[k], names[k])) { return none }
+  # `grown[k]`: how much longer the text is before hole k than the shell's; `from[k]`: where the
+  # shell's text after hole k - 1 starts.
+  let grown = [0] ++ (scan d = 0 for k in 0..len(at): d + len(bodies[k].text) - len(names[k]))
+  let from = [0] ++ [at[k] + len(names[k]) for k in 0..len(at)]
+  let upto = at ++ [len(shell.text)]
+  # The shell's marks after hole k - 1 up to hole k, a mark on the hole itself being the first of
+  # the body's tokens, then body k's.
+  let outs = [mk.out for mk in shell.marks]
+  let cut = [0] ++ [bisect(outs, a) for a in at] ++ [len(outs)]
+  let marks = [mk for k in 0..len(at) + 1
+                  for mk in [Mark(out: m.out + grown[k], src: m.src) for m in shell.marks[cut[k]..cut[k + 1]]]
+                            ++ (if k < len(at) then [Mark(out: m.out + at[k] + grown[k], src: m.src) for m in bodies[k].marks] else [])]
+  some(Rendered(text: join([shell.text[from[k]..upto[k]] ++ (if k < len(at) then bodies[k].text else "") for k in 0..len(at) + 1], ""),
+                marks: marks, open: shell.open))
 }
 
 # Rendered pieces one after another, a `;` between two where the first left a statement open, and
