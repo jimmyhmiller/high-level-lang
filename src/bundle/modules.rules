@@ -471,33 +471,42 @@ record Analysed { analysis: Analysis, scopes: sym.Table }
 # analysed inside the wrapper at once, and again without it only if it is not CommonJS after all
 # (or a define is about `module` or `exports`, which the wrapper would hide). A name free in any of
 # the analyses is free.
-fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed {
-  let esm = early.program-has-module-syntax?(tree0)
-  let tree = normalized-tree(tree0, base)
-  let maybe-cjs = not esm and (any name in cjs-names: contains-text?(src, name))
-                  and not (any d in loading.defines: text-before(d.key, ".") in ["module", "exports"])
-  let wrapped: sym.Analysis? = if maybe-cjs then some(sc.analysis(tree, ["exports", "module"])) else none
-  let wrapped-cjs = match wrapped {
-    some(w) => "require" in w.free or wrapper-used?(w.table, wrapper-of(w), "module") or wrapper-used?(w.table, wrapper-of(w), "exports")
-    none => false
+fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed =
+  match jsx-imports and not early.program-has-module-syntax?(parsed) and names-module {
+    true => panic "{}: the automatic JSX runtime in a CommonJS module is not implemented yet", path
+    false => Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
+                                         shift: 0, defined: defined),
+                      scopes: final.table)
   }
-  let first = if wrapped-cjs then wrapped ?? panic "lost the wrapped analysis" else sc.analysis(tree, [])
-  let cjs = wrapped-cjs or (not esm and (any f in cjs-names: f in first.free))
-  # Whether it names `module` or `exports` without declaring them.
-  let names-module = if wrapped-cjs then wrapper-used?(first.table, wrapper-of(first), "module") or wrapper-used?(first.table, wrapper-of(first), "exports")
-                     else "module" in first.free or "exports" in first.free
-  if jsx-imports and not early.program-has-module-syntax?(parsed) and names-module {
-    panic "{}: the automatic JSX runtime in a CommonJS module is not implemented yet", path
-  }
-  let defined = mentions-define?(src) and defines-apply?(tree, first.bindings)
-  let final-tree = if defined then dce.run(substitute(tree, first.bindings)) else tree
-  let final = if defined or (cjs and not wrapped-cjs) then sc.analysis(final-tree, if cjs then ["exports", "module"] else []) else first
-  let free = first.free ++ [f for f in final.free if not (f in first.free)]
-  let real-free = [f for f in free if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
-  Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
-                              shift: 0, defined: defined),
-           scopes: final.table)
-}
+  where esm = early.program-has-module-syntax?(tree0),
+        tree = normalized-tree(tree0, base),
+        maybe-cjs = not esm and (any name in cjs-names: contains-text?(src, name))
+                    and not (any d in loading.defines: text-before(d.key, ".") in ["module", "exports"]),
+        # CommonJS is analysed inside its (exports, module) wrapper at once, when it may be that.
+        wrapped = [sc.analysis(tree, ["exports", "module"]) for x in [maybe-cjs] if x],
+        wrapped-cjs = any w in wrapped: "require" in w.free or wrapper-names-module?(w),
+        first = (first w in wrapped if wrapped-cjs: w) ?? sc.analysis(tree, []),
+        cjs = wrapped-cjs or (not esm and (any f in cjs-names: f in first.free)),
+        # Whether it names `module` or `exports` without declaring them.
+        names-module = match wrapped-cjs {
+          true => wrapper-names-module?(first)
+          false => "module" in first.free or "exports" in first.free
+        },
+        defined = mentions-define?(src) and defines-apply?(tree, first.bindings),
+        final-tree = match defined {
+          true => dce.run(substitute(tree, first.bindings))
+          false => tree
+        },
+        final = match defined or (cjs and not wrapped-cjs) {
+          true => sc.analysis(final-tree, [x for x in ["exports", "module"] if cjs])
+          false => first
+        },
+        real-free = [f for f in first.free ++ [f for f in final.free if not (f in first.free)]
+                     if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
+
+# Whether code in CommonJS's wrapper reads `module` or `exports`.
+fn wrapper-names-module?(w: sym.Analysis) -> Bool =
+  wrapper-used?(w.table, wrapper-of(w), "module") or wrapper-used?(w.table, wrapper-of(w), "exports")
 
 const cjs-names: [Text] = ["module", "exports", "require"]
 
@@ -515,10 +524,9 @@ fn grafted-analysis(a: Analysed) -> Analysis {
 
 # A module's bindings in the shared table's numbering. Every module is moved at once, when all
 # are loaded.
-fn rebased-bindings(id: Int) -> {Int:Int} {
-  let mo = modules[id]
-  if mo.symbol-shift == 0 { return mo.bindings }
-  {k: s + mo.symbol-shift for k in keys(mo.bindings) if let some(s) = mo.bindings[k]}
+fn rebased-bindings(id: Int) -> {Int:Int} = match modules[id] {
+  Module(symbol-shift: 0, ...) as mo => mo.bindings
+  mo => {k: s + mo.symbol-shift for k in keys(mo.bindings) if let some(s) = mo.bindings[k]}
 }
 
 fn rebase-all!() -> Void {
@@ -545,51 +553,61 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
 
 # What one file's own text says: parsed, checked, its JSX and TypeScript lowered, its comments read,
 # and every specifier it might import. Touches only task state, so any number can run at once.
-fn parsed-file(item: Pending) -> Parsed {
-  let path = item.path
-  let src = if item.ready then item.text else module-text(read-file(path), path)
-  let checked = parse-file(src, path)
-  parsed-with(path, src, checked.tree, none, some(checked))
-}
+fn parsed-file(item: Pending) -> Parsed = parsed-with(item.path, src, checked.tree, none, some(checked))
+  where src = match item.ready {
+          true => item.text
+          false => module-text(read-file(item.path), item.path)
+        },
+        checked = parse-file(src, item.path)
 
 # Everything after parsing, for a file parsed whole or put together from its pieces: with the
 # specifiers its imports name when they are known already, and what checking it found.
-fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Checked?) -> Parsed {
-  let loader = loader-of(path)
-  let config = tsc.for-file(path)
-  let file-jsx = configured-jsx(loading.jsx-options, config)
-  let lowered = if loader == "jsx" or loader == "tsx" then jsx.lower(parsed, src, path, file-jsx)
-                else jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
-  let typed = if loader == "ts" or loader == "tsx"
-              then ts.lower(lowered.tree, src, jsx.kept-names(src, path, file-jsx), tsc.define-fields?(config), config.verbatim, config.decorators)
-              else ts.Lowered(tree: lowered.tree, pure-calls: {}, helpers: [])
-  let pure-calls = {k: v for m in [lowered.pure-calls, typed.pure-calls] for k in keys(m) if let some(v) = m[k]}
-  # Every `require` and `import()`, even in code a define will remove: looking ahead may read a
-  # file the build never uses, but never misses one it does. The check found them already, in the
-  # tree a plain JavaScript file keeps. A file put together from pieces knows its specifiers.
-  let found = if is-some(known) then Checked(tree: typed.tree, requires: [], imports: []) else match checked {
-    some(c) if not lowered-loader?(loader) => c
-    _ => loads-of(typed.tree)
-  }
-  let specs = known ?? (imported-specs(typed.tree) ++ found.requires ++ found.imports)
+fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Checked?) -> Parsed =
   Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
          legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: found.requires, imports: found.imports,
          found: is-none(known),
          analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], role: Whole, pieces: 1)
-}
+  where loader = loader-of(path),
+        config = tsc.for-file(path),
+        file-jsx = configured-jsx(loading.jsx-options, config),
+        lowered = match loader {
+          "jsx" | "tsx" => jsx.lower(parsed, src, path, file-jsx)
+          _ => jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
+        },
+        typed = match loader {
+          "ts" | "tsx" => ts.lower(lowered.tree, src, jsx.kept-names(src, path, file-jsx), tsc.define-fields?(config),
+                                   config.verbatim, config.decorators)
+          _ => ts.Lowered(tree: lowered.tree, pure-calls: {}, helpers: [])
+        },
+        pure-calls = {k: v for m in [lowered.pure-calls, typed.pure-calls] for k in keys(m) if let some(v) = m[k]},
+        # Every `require` and `import()`, even in code a define will remove: looking ahead may read
+        # a file the build never uses, but never misses one it does. The check found them already, in
+        # the tree a plain JavaScript file keeps. A file put together from pieces knows its specifiers.
+        found = match known, checked {
+          some(_), _ => Checked(tree: typed.tree, requires: [], imports: [])
+          none, some(c) if not lowered-loader?(loader) => c
+          _, _ => loads-of(typed.tree)
+        },
+        specs = known ?? (imported-specs(typed.tree) ++ found.requires ++ found.imports)
 
 # The same, with scopes analysed too, in a table of the file's own. Not while a spec's transform
 # has to see the tree first.
-fn analysed-file(p: Parsed) -> Parsed {
-  if loading.has-transform { return p }
-  let a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers)
-  # The calls are the parsed tree's unless a define changed it, and those were found already.
-  let calls = if p.found and not a.analysis.defined then p.requires ++ p.imports else calls-in(a.analysis.tree)
-  # Once defines have removed code, what it loads is what is left: `require`s a define removed, as
-  # of a development build, are not read ahead.
-  let specs = if a.analysis.defined then imported-specs(p.tree) ++ calls else p.specs
-  p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, specs: specs }
+fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
+  true => p
+  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, specs: specs }
+    where a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers),
+          # The calls are the parsed tree's unless a define changed it, and those were found already.
+          calls = match p.found and not a.analysis.defined {
+            true => p.requires ++ p.imports
+            false => calls-in(a.analysis.tree)
+          },
+          # Once defines have removed code, what it loads is what is left: `require`s a define
+          # removed, as of a development build, are not read ahead.
+          specs = match a.analysis.defined {
+            true => imported-specs(p.tree) ++ calls
+            false => p.specs
+          }
 }
 
 fn imported-specs(tree: Node) -> [Text] = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)]
