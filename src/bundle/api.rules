@@ -220,16 +220,21 @@ fn define-value(text: Text) -> Node = js.parse(text ++ ";", "<define>").body.kid
 
 fn program-plus(p: Node, s: Node) -> Node = p with { body: List(p.body.kids ++ [s]...) }
 
-# An entry that is itself wrapped only runs if something calls it.
-fn run-entry(p: Node) -> Node = match m.modules[m.entry] {
-  m.Module(kind: m.Cjs, ...) as mo => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(mo.require-sym)
-  m.Module(wrapped: true, ...) as mo => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(mo.init-sym)
+# An entry that is itself wrapped only runs if something calls it. A format that exports the entry
+# calls CommonJS for the value it exports.
+fn run-entry(p: Node, f: Format) -> Node = match m.modules[m.entry] {
+  m.Module(kind: m.Cjs, ...) if f.exports != "" => p
+  m.Module(kind: m.Cjs, ...) as mo => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(an.require-sym(mo))
+  mo if an.wrapped?(mo) => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(an.init-sym(mo))
   _ => p
 }
 
-fn to-common-js() -> Node = exp`$to_cjs($ns)`
-  where to-cjs = e.helper-name("__toCommonJS"),
-        ns = e.final-of(m.modules[m.entry].ns-sym)
+# The entry as a format exports it: an ES module's namespace made CommonJS, or what running a
+# CommonJS module gives, as esbuild has it.
+fn entry-value() -> Node = match m.modules[m.entry] {
+  m.Module(kind: m.Cjs, ...) as mo => exp`$call_me()` where call-me = e.final-of(an.require-sym(mo))
+  mo => exp`$to_cjs($ns)` where to-cjs = e.helper-name("__toCommonJS"), ns = e.final-of(an.ns-sym(mo))
+}
 
 # `export { a, b as c };` for the entry's names, and `var` statements for those a local name can't
 # hold, which come first.
@@ -545,7 +550,7 @@ fn fill-in(template: Text, value: Text) -> Text = replace-all(template, "%", val
 fn export-statements(f: Format) -> [Node] = match f {
   Format(export-names: true, ...) => esm-exports()
   Format(exports: "", ...) => []
-  _ => [js.parse(fill-in(f.exports, js.render(to-common-js(), false)), "<format>").body.kids[0]]
+  _ => [js.parse(fill-in(f.exports, js.render(entry-value(), false)), "<format>").body.kids[0]]
 }
 
 fn wrap-format(o: Options, f: Format, p: Node) -> Printed =
@@ -584,10 +589,9 @@ fn emitting-of(o: Options, esm-output: Bool) -> e.Emitting =
   e.Emitting(void-undefined: o.minify-syntax, esm-output: esm-output, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
 
 # A new build: every module's state as it starts, and what it was told.
-fn configure!(o: Options, loading: m.Loading, linking: an.Linking) -> Void {
+fn configure!(o: Options, loading: m.Loading) -> Void {
   reset-all(o)
   m.loading = loading
-  an.linking = linking
   printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii)
 }
 
@@ -679,8 +683,11 @@ fn build-one(options: Options) -> Void {
   }
   let o = with-node-env(options)
   let f = if o.format.export-names or len(o.format.exports) > 0 then o.format else named(o.format, o.global-name)
-  configure!(o, loading-of(o, dir-of(o.outfile)), linking-of(o, len(f.exports) > 0, f.export-names, false))
-  with e.emitting = emitting-of(o, f.hoist-externals), e.chunk-parts = none { loaded-build(o, f) }
+  configure!(o, loading-of(o, dir-of(o.outfile)))
+  with an.linking = linking-of(o, len(f.exports) > 0, f.export-names, false), e.emitting = emitting-of(o, f.hoist-externals),
+       e.chunk-parts = none {
+    loaded-build(o, f)
+  }
 }
 
 # A build once it is set up: load, link, name, and the rest.
@@ -691,9 +698,10 @@ fn loaded-build(o: Options, f: Format) -> Void {
   lap(o, "load: parse files ahead")
   m.load-tree(o.entry)
   lap(o, "load: resolve, scopes, the graph")
-  an.link()
-  lap(o, "link: facts and Datalog")
-  with nm.finals = final-names(o) { named-build(o, f) }
+  with an.linked = an.link() {
+    lap(o, "link: facts and Datalog")
+    with nm.finals = final-names(o) { named-build(o, f) }
+  }
 }
 
 # Each symbol's name: minified, or as esbuild's number renamer gives them.
@@ -706,7 +714,7 @@ fn final-names(o: Options) -> [Text] = match o.minify-identifiers {
 fn named-build(o: Options, f: Format) -> Void {
   lap(o, "naming")
   let emission = e.program()
-  let emitted = run-entry(emission.tree)
+  let emitted = run-entry(emission.tree, f)
   lap(o, "emit: rewrite identifiers")
   let fused = fusable?(o)
   let p = if fused then emitted else for-target(o, if o.minify-syntax then optimized(o, emitted) else folded(o, emitted))
@@ -753,15 +761,10 @@ fn in-output?(chunk: chunks.Chunk?, id: Int) -> Bool = match chunk {
 }
 
 # What running this chunk's entry looks like at its end.
-fn root-statements(root: Int) -> [Node] {
-  let mo = m.modules[root]
-  if mo.kind == m.Cjs {
-    let call-me = e.final-of(mo.require-sym)
-    return [stmt`export default $call_me();`]
-  }
-  if not mo.wrapped { return exports-of-root(root) }
-  let call-me = e.final-of(mo.init-sym)
-  [stmt`$call_me();`] ++ exports-of-root(root)
+fn root-statements(root: Int) -> [Node] = match m.modules[root] {
+  m.Module(kind: m.Cjs, ...) as mo => [stmt`export default $call_me();`] where call-me = e.final-of(an.require-sym(mo))
+  mo if an.wrapped?(mo) => [stmt`$call_me();`] ++ exports-of-root(root) where call-me = e.final-of(an.init-sym(mo))
+  _ => exports-of-root(root)
 }
 
 # The body of one chunk, as text with placeholders in it.
@@ -788,8 +791,8 @@ fn build-split(options: Options) -> Void {
   if len(options.outdir) == 0 { panic "code splitting needs --outdir" }
   if not options.format.export-names { panic "code splitting needs --format=esm" }
   let o = with-node-env(options)
-  configure!(o, loading-of(o, o.outdir), linking-of(o, false, true, true))
-  with e.emitting = emitting-of(o, true) { loaded-split(o) }
+  configure!(o, loading-of(o, o.outdir))
+  with an.linking = linking-of(o, false, true, true), e.emitting = emitting-of(o, true) { loaded-split(o) }
 }
 
 # A split build once it is set up.
@@ -797,13 +800,14 @@ fn loaded-split(o: Options) -> Void {
   m.load-runtime(include-text("runtime.js"))
   m.load-trees(o.entries)
   if len(m.css-imports()) > 0 { panic "stylesheets with --splitting are not implemented yet" }
-  an.link()
-  with nm.finals = final-names(o) { named-split(o) }
+  with an.linked = an.link() {
+    with nm.finals = final-names(o) { named-split(o) }
+  }
 }
 
 # The rest of a split build, once every symbol has its name.
 fn named-split(o: Options) -> Void {
-  let roots = m.entries ++ an.dynamic-roots
+  let roots = m.entries ++ an.linked.dynamic-roots
   let all = chunks.chunks-of(roots)
   chunk-of-root = {c.root: c.id for c in all if c.root >= 0}
   with e.chunk-paths = {root: path-of-root(root) for root in roots} { written-chunks(o, all) }

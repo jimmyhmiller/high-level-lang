@@ -9,14 +9,7 @@ use bundle.modules as m
 # An import from a CommonJS module, which turns into a property read.
 record CjsImport { importer: Int, import-var: Int, name: Text, namespace: Bool }
 
-state next-part: Int = 0
-state cjs-imports: {Int:CjsImport} = {}
-state import-vars: {Int:Int} = {}
-state part-stmt: [Node] = []
-state part-module: [Int] = []
-state any-dynamic: Bool = false
-state any-reexport: Bool = false
-# How the build links, set once before it does.
+# How the build links, given before it does.
 record Linking {
   entry-namespace: Bool,
   keep-entry-exports: Bool,
@@ -29,11 +22,30 @@ record Linking {
   facts-threads: Int
 }
 
-state linking: Linking = Linking(entry-namespace: false, keep-entry-exports: false, tree-shaking: true, splitting: false,
-                                 pure-names: [], facts-threads: 1)
-# Each `import * as` binding's module, as `ns-import` holds it, for a walk that must not query.
-state ns-imports: {Int:Int} = {}
-state dynamic-roots: [Int] = []
+setting linking: Linking
+
+# A symbol linking makes, which no source names: what it is for, the scope it is in, and its name.
+record Made { key: Text, scope: Int, name: Text }
+
+# What linking works out, for the facts and for naming and emitting after them: the modules that are
+# `__esm` wrapped; those `import()` makes the roots of chunks; the symbols it makes, numbered from
+# `first-made`, by what each is for; the imports that become property reads, and those of ES
+# namespaces; each part's statement; and whether any module re-exports names only known at run time,
+# or re-exports from CommonJS.
+record Linked {
+  wrapped: {Int:Bool},
+  dynamic-roots: [Int],
+  made: [Made],
+  first-made: Int,
+  symbols: {Text:Int},
+  cjs-imports: {Int:CjsImport},
+  ns-imports: {Int:Int},
+  part-stmt: [Node],
+  any-dynamic: Bool,
+  any-reexport: Bool
+}
+
+setting linked: Linked
 
 # The module the current analysis is looking at.
 context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
@@ -43,33 +55,26 @@ fn root-sym(mo: m.Module, name: Text) -> Int? = sym.scope-at(m.table, mo.root).n
 # A symbol of the runtime module, by name.
 fn helper(name: Text) -> Int = root-sym(m.modules[0], name) ?? panic "the runtime has no helper named {}", name
 
-fn dep-of(mo: m.Module, spec: Text) -> Int = match spec {
-  _ if m.stays-external?(spec, mo.path) => m.external-module(m.aliased(spec))
-  _ => m.by-path[m.resolve-import(spec, mo.path).path] ?? panic "{}: {} was not loaded", mo.path, spec
-}
-
-# Asked for every fact an import statement gives: so asked once per module and specifier.
-state deps-known: {Text:Int} = {}
-
-fn dep-of-str(mo: m.Module, from: Node) -> Int {
-  if let some(d) = mo.dep-ids[m.module-of-str(from)] { return d }
-  let key = int-text(mo.id) ++ "\n" ++ from.text
-  if let some(d) = deps-known[key] { return d }
-  let d = dep-of(mo, m.module-of-str(from))
-  deps-known[key] = d
-  d
-}
-
-# A specifier `dep-of-str` has answered already. The walk for facts runs on many threads and may
-# not resolve, so whatever it meets was resolved before it, by `on-demand-targets`.
+# The module a specifier of an import, `require` or `import()` led to when its module was loaded.
 fn known-dep(mo: m.Module, from: Node) -> Int =
-  mo.dep-ids[m.module-of-str(from)] ?? deps-known[int-text(mo.id) ++ "\n" ++ from.text]
-    ?? panic "{}: {} was not resolved before its facts", mo.path, from.text
+  mo.dep-ids[m.module-of-str(from)] ?? panic "{}: {} was not loaded", mo.path, from.text
 
 # Imported as an opaque object at run time, rather than linked by name.
 fn opaque?(t: m.Module) -> Bool = t.kind == Cjs or t.kind == External
 
 fn bound?(n: Node) -> Bool = n.lo in here.bindings
+
+# The symbols linking made: a module's `require_x`, `x_exports` and `init_x`, its import variable
+# for a module it imports opaquely, and a name it re-exports from one.
+fn symbol-in(symbols: {Text:Int}, key: Text) -> Int = symbols[key] ?? panic "linking made no symbol for {}", key
+fn made-symbol(key: Text) -> Int = symbol-in(linked.symbols, key)
+fn require-sym(mo: m.Module) -> Int = made-symbol("require " ++ int-text(mo.id))
+fn ns-sym(mo: m.Module) -> Int = made-symbol("exports " ++ int-text(mo.id))
+fn init-sym(mo: m.Module) -> Int = made-symbol("init " ++ int-text(mo.id))
+fn known-import-var(mo: m.Module, target: Int) -> Int = made-symbol(import-key(mo, target))
+fn import-key(mo: m.Module, target: Int) -> Text = "import " ++ int-text(mo.id) ++ " " ++ int-text(target)
+fn reexport-key(mo: m.Module, exported: Text) -> Text = "reexport " ++ int-text(mo.id) ++ " " ++ exported
+fn wrapped?(mo: m.Module) -> Bool = mo.id in linked.wrapped
 
 # ---------------------------------------------------------------- what statements say
 
@@ -161,23 +166,10 @@ fn walked?(s: Node) -> Bool = match s {
   _ => true
 }
 
-# The facts a summary stands for, in `part`.
-fn assert-summary(part: Int, sm: Summary) -> Void {
-  for s in sm.declares { assert m.db.declares(part, s) }
-  for x in sm.mentions {
-    match x.reach {
-      Symbol => { assert m.db.mentions(part, x.id) }
-      Member => { assert m.db.ns-member(part, x.id, m.name-id(x.name)) }
-      Whole => mention-module(part, x.id)
-      Chunk => mention-chunk(part, x.id)
-    }
-  }
-}
-
 # The module an identifier names when it is `import * as` of an ES module.
 fn namespace-of(mo: m.Module, n: Node) -> Int? = match n {
   Ident(_) => match mo.bindings[n.lo] {
-    some(s) => ns-imports[s]
+    some(s) => linked.ns-imports[s]
     none => none
   }
   _ => none
@@ -195,49 +187,10 @@ fn required-str(mo: m.Module, n: Node) -> Node? = match n {
   _ => none
 }
 
-# The modules those name.
-fn import-call-target(mo: m.Module, n: Node) -> Int? = match imported-str(n) {
-  some(from) => some(dep-of-str(mo, from))
-  none => none
-}
+# The modules those name, once everything is resolved: these only look up, so many threads may ask.
+fn known-import-call-target(mo: m.Module, n: Node) -> Int? = first from in imported-str(n): known-dep(mo, from)
 
-fn require-target(mo: m.Module, n: Node) -> Int? = match required-str(mo, n) {
-  some(from) => some(dep-of-str(mo, from))
-  none => none
-}
-
-# The same, once everything is resolved: these only look up, so many threads may ask.
-fn known-import-call-target(mo: m.Module, n: Node) -> Int? = match imported-str(n) {
-  some(from) => some(known-dep(mo, from))
-  none => none
-}
-
-fn known-require-target(mo: m.Module, n: Node) -> Int? = match required-str(mo, n) {
-  some(from) => some(known-dep(mo, from))
-  none => none
-}
-
-# What a run-time reference to a whole module needs: its wrapper, and the helpers.
-fn mention-module(part: Int, t: Int) -> Void {
-  let target = m.modules[t]
-  if target.kind != External {
-    assert m.db.imports(part-module[part], t)
-    if target.kind == Cjs {
-      assert m.db.mentions(part, target.require-sym)
-      assert m.db.mentions(part, helper("__toESM"))
-    } else {
-      assert m.db.mentions(part, target.init-sym)
-      assert m.db.mentions(part, target.ns-sym)
-      assert m.db.mentions(part, helper("__toCommonJS"))
-    }
-  }
-}
-
-# What `import()` of a chunk needs here: only the helper that makes CommonJS look like a module.
-fn mention-chunk(part: Int, t: Int) -> Void {
-  if m.modules[t].kind == Cjs { assert m.db.mentions(part, helper("__toESM")) }
-}
-
+fn known-require-target(mo: m.Module, n: Node) -> Int? = first from in required-str(mo, n): known-dep(mo, from)
 
 # ---------------------------------------------------------------- what can be removed
 
@@ -320,252 +273,15 @@ fn pure-stmt?(s: Node) -> Bool = match s {
   _ => false
 }
 
-# ---------------------------------------------------------------- imports and exports
+# ---------------------------------------------------------------- what linking works out
 
-fn export-local(exported: Text, local: Text) -> Void {
-  let s = root-sym(here, local) ?? panic "{}: export of {} which is not declared", here.path, local
-  assert m.db.local-export(here.id, m.name-id(exported), s)
-}
+# What an `import()` or a `require` loads, and which of the two it is.
+record Load { target: Int, by-import: Bool }
 
-# Only what a declaration binds is exported: never a name inside its value, such as a class's own.
-everywhere fn exports-under(n: Node) -> Void = match n {
-  BindName(x) => export-local(x, x)
-  Declarator(target, _) => exports-under(target)
-  _ if sc.function?(n.kind) => {}
-}
-
-fn import-var-of(mo: m.Module, target: Int) -> Int {
-  let key = mo.id * 100000 + target
-  if let some(v) = import-vars[key] { return v }
-  let v = sym.generated-symbol!(m.table, mo.root, "import_" ++ m.modules[target].base)
-  import-vars[key] = v
-  v
-}
-
-# The same once linking has made them all: a lookup, for the threads that emit.
-fn known-import-var(mo: m.Module, target: Int) -> Int =
-  import-vars[mo.id * 100000 + target] ?? panic "{}: no import variable for {}", mo.path, m.modules[target].path
-
-fn bind-import(target: Int, name: Text, bind: Node, namespace: Bool) -> Void {
-  let s = here.bindings[bind.lo] ?? panic "{}: no symbol for import {}", here.path, bind.text
-  if opaque?(m.modules[target]) {
-    cjs-imports[s] = CjsImport(importer: here.id, import-var: import-var-of(here, target), name: name, namespace: namespace)
-  } else if namespace {
-    assert m.db.ns-import(s, target)
-    ns-imports[s] = target
-  } else {
-    assert m.db.import-of(s, target, m.name-id(name))
-  }
-}
-
-fn import-spec(target: Int, spec: Node) -> Void = match spec {
-  ImportDefault(b) => bind-import(target, "default", b, false)
-  ImportAs(name, b) => bind-import(target, m.module-name(name), b, false)
-  ImportName(b) => bind-import(target, b.text, b, false)
-  ImportNamespace(b) => bind-import(target, "*", b, true)
-  ImportDefaultAnd(b, rest) => {
-    bind-import(target, "default", b, false)
-    import-spec(target, rest)
-  }
-  ImportNamed(List(specs...)) => {
-    for s in specs { import-spec(target, s) }
-  }
-  _ => panic "{}: unexpected import form {}", here.path, js.kind-name(spec.kind)
-}
-
-# ---------------------------------------------------------------- parts
-
-# An import of a wrapped module has to run its initialiser where the import stood.
-fn needs-init(part: Int, target: Int) -> Void {
-  let t = m.modules[target]
-  if t.wrapped {
-    assert m.db.mentions(part, t.init-sym)
-    assert m.db.effect(part)
-  }
-}
-
-fn new-part(marker: Node) -> Int {
-  let part = next-part
-  next-part = part + 1
-  part-stmt += marker
-  part-module += here.id
-  assert m.db.part-of(part, here.id)
-  part
-}
-
-# A statement that re-exports from CommonJS holds the import itself.
-fn reexport-import(part: Int, target: Int) -> Void {
-  assert m.db.declares(part, import-var-of(here, target))
-  if m.modules[target].kind == Cjs { assert m.db.mentions(part, m.modules[target].require-sym) }
-  assert m.db.mentions(part, helper("__toESM"))
-  assert m.db.effect(part)
-}
-
-# A name this module exports that is really a property of the import variable.
-fn reexport-symbol(part: Int, target: Int, name: Text, namespace: Bool, exported: Text) -> Void {
-  let s = sym.generated-symbol!(m.table, here.root, "reexport_" ++ exported)
-  cjs-imports[s] = CjsImport(importer: here.id, import-var: import-var-of(here, target), name: name, namespace: namespace)
-  assert m.db.local-export(here.id, m.name-id(exported), s)
-  assert m.db.cjs-binding(s, part)
-  any-reexport = true
-}
-
-fn export-spec-names(spec: Node) -> Text = match spec {
-  ExportAs(_, to) => m.module-name(to)
-  _ => m.module-name(spec.local)
-}
-
-# One top-level statement of an ES module becomes one part.
-fn add-part(s: Node, sm: Summary) -> Void {
-  let part = new-part(s)
-  let mid = here.id
-  match s {
-    Import(_, from) => {
-      let target = dep-of-str(here, from)
-      assert m.db.imports(mid, target)
-      needs-init(part, target)
-      if opaque?(m.modules[target]) {
-        assert m.db.declares(part, import-var-of(here, target))
-        if m.modules[target].kind == Cjs { assert m.db.mentions(part, m.modules[target].require-sym) }
-        assert m.db.effect(part)
-      }
-    }
-    ImportBare(from) => {
-      let target = dep-of-str(here, from)
-      assert m.db.imports(mid, target)
-      needs-init(part, target)
-      if opaque?(m.modules[target]) {
-        if m.modules[target].kind == Cjs { assert m.db.mentions(part, m.modules[target].require-sym) }
-        assert m.db.effect(part)
-      }
-    }
-    ExportAll(from) => {
-      let target = dep-of-str(here, from)
-      assert m.db.imports(mid, target)
-      needs-init(part, target)
-      if opaque?(m.modules[target]) {
-        reexport-import(part, target)
-        assert m.db.dyn-star(mid, target)
-        assert m.db.mentions(part, helper("__reExport"))
-        assert m.db.mentions(part, here.ns-sym)
-        any-dynamic = true
-      } else {
-        assert m.db.star(mid, target)
-      }
-    }
-    ExportAllAs(name, from) => {
-      let target = dep-of-str(here, from)
-      assert m.db.imports(mid, target)
-      needs-init(part, target)
-      if opaque?(m.modules[target]) {
-        reexport-import(part, target)
-        reexport-symbol(part, target, "*", true, m.module-name(name))
-      } else {
-        assert m.db.local-export(mid, m.name-id(m.module-name(name)), m.modules[target].ns-sym)
-      }
-    }
-    ExportFrom(List(specs...), from) => {
-      let target = dep-of-str(here, from)
-      assert m.db.imports(mid, target)
-      needs-init(part, target)
-      if opaque?(m.modules[target]) {
-        reexport-import(part, target)
-        for spec in specs {
-          reexport-symbol(part, target, m.module-name(spec.local), false, export-spec-names(spec))
-        }
-      } else {
-        for spec in specs {
-          assert m.db.reexport(mid, m.name-id(export-spec-names(spec)), target, m.name-id(m.module-name(spec.local)))
-        }
-      }
-    }
-    ExportNamed(List(specs...)) => {
-      for spec in specs {
-        let local = m.module-name(spec.local)
-        let s2 = root-sym(here, local) ?? panic "{}: export of {} which is not declared", here.path, local
-        assert m.db.local-export(mid, m.name-id(export-spec-names(spec)), s2)
-      }
-    }
-    _ => {
-      assert-summary(part, sm)
-      match s {
-        ExportVar(...) => exports-under(s)
-        ExportLexical(d) => exports-under(d)
-        ExportFunction(d) => exports-under(d.name)
-        _ => {}
-      }
-      # The runtime's statements are only ever live through a mention, and every statement of a
-      # wrapped module runs when its initialiser does.
-      let droppable = here.kind == Runtime or sm.pure
-      if here.wrapped or not droppable { assert m.db.effect(part) }
-    }
-  }
-}
-
-# Parts with no source statement: `None` is the namespace object, `Flag` the `__esm` wrapper's
-# `init_x`, which brings the whole module with it.
-fn synthetic-parts() -> Void {
-  if here.ns-sym >= 0 {
-    let part = new-part(None())
-    assert m.db.ns-part(part, here.id)
-    assert m.db.ns-symbol(here.id, here.ns-sym)
-    assert m.db.declares(part, here.ns-sym)
-    assert m.db.mentions(part, helper("__export"))
-    # A format that exposes the entry as an object keeps its namespace.
-    if linking.entry-namespace and here.id == m.entry {
-      assert m.db.root-part(part)
-      assert m.db.mentions(part, helper("__toCommonJS"))
-    }
-  }
-  if here.wrapped {
-    let part = new-part(Flag())
-    assert m.db.declares(part, here.init-sym)
-    assert m.db.mentions(part, helper("__esm"))
-  }
-}
-
-# Facts for one module. CommonJS is one opaque part with effects, whose only symbol is its
-# `require_x`; its dependencies are whatever it `require`s.
-fn module-facts(summaries: [Summary]) -> Void {
-  if here.side-effects { assert m.db.module-effects(here.id) }
-  if here.kind == Cjs {
-    let part = new-part(here.tree)
-    assert m.db.effect(part)
-    assert m.db.declares(part, here.require-sym)
-    assert m.db.mentions(part, helper("__commonJS"))
-    assert-summary(part, summaries[0])
-  } else {
-    synthetic-parts()
-    let stmts = here.tree.body.kids
-    for i in 0..len(stmts) {
-      let s = stmts[i]
-      add-part(s, summaries[i])
-      match s {
-        Import(_, from) =>
-          if opaque?(m.modules[dep-of-str(here, from)]) {
-            assert m.db.mentions(next-part - 1, helper("__toESM"))
-          }
-        _ => {}
-      }
-    }
-    for s in here.source {
-      if let some(name) = m.default-of(s) {
-        export-local("default", if len(name) == 0 then here.base ++ "_default" else name)
-      }
-    }
-  }
-}
-
-# ---------------------------------------------------------------- linking
-
-# Which ES modules must be `__esm` wrapped: anything `require`d or `import()`ed runs on demand, and
-# so must whatever it imports.
-fn wrap(id: Int) -> Void {
-  let mo = m.modules[id]
-  if mo.kind == Esm and not mo.wrapped {
-    m.modules[id].wrapped = true
-    for d in mo.deps { wrap(d) }
-  }
+fn loads-of(mo: m.Module, n: Node) -> [Load] = match n {
+  ImportCall(...) => [Load(target: known-dep(mo, from), by-import: true) for from in imported-str(n)]
+  CallExpr(...) => [Load(target: known-dep(mo, from), by-import: false) for from in required-str(mo, n)]
+  _ => []
 }
 
 # Every `require("x")` and `import("x")` in a module, in the order a walk meets them. Finding
@@ -582,71 +298,321 @@ everywhere fn on-demand-calls-under(n: Node, mo: m.Module) -> [Node] = match n {
   CallExpr(...) if required-str(mo, n) is some(_) => [n] ++ [on-demand-calls-under(k, mo)... for k in n.kids]
 }
 
-# What those calls load runs on demand: wrapped, or with splitting, a root of its own.
-fn on-demand-targets(mo: m.Module, calls: [Node]) -> Void {
-  for n in calls {
-    match n {
-      ImportCall(...) => if let some(t) = import-call-target(mo, n) {
-        if linking.splitting {
-          if m.modules[t].kind != External and not (t in dynamic-roots) { dynamic-roots += t }
-        } else {
-          wrap(t)
-        }
-      }
-      CallExpr(...) => if let some(t) = require-target(mo, n) { wrap(t) }
-      _ => {}
-    }
-  }
+# Which ES modules are `__esm` wrapped: anything loaded on demand runs when it is, and so must
+# whatever it imports.
+fn wrapping(id: Int, wrapped: {Int:Bool}) -> {Int:Bool} = match m.modules[id] {
+  mo if mo.kind == Esm and not (id in wrapped) => fold w = wrapped ++ {id: true} for d in mo.deps: wrapping(d, w)
+  _ => wrapped
 }
 
-fn link() -> Void {
-  let calls = parallel-map(m.order, on-demand-calls, linking.facts-threads)
-  for i in 0..len(m.order) { on-demand-targets(m.modules[m.order[i]], calls[i]) }
-  # A module's symbols exist before any module's facts mention them.
-  for id in m.order {
-    let mo = m.modules[id]
-    match mo.kind {
-      Cjs => { m.modules[id].require-sym = sym.generated-symbol!(m.table, m.bundle-scope, "require_" ++ mo.base) }
-      Esm => {
-        m.modules[id].ns-sym = sym.generated-symbol!(m.table, m.bundle-scope, mo.base ++ "_exports")
-        if mo.wrapped {
-          m.modules[id].init-sym = sym.generated-symbol!(m.table, m.bundle-scope, "init_" ++ mo.base)
-        }
-      }
-      _ => {}
-    }
-  }
-  if linking.splitting {
-    for r in m.entries ++ dynamic-roots {
-      assert m.db.entry(r)
-      assert m.db.chunk-root(r)
-      if m.modules[r].kind == Esm { assert m.db.keep-exports(r) }
-    }
-  } else {
-    assert m.db.entry(m.entry)
-    if linking.entry-namespace or linking.keep-entry-exports { assert m.db.keep-exports(m.entry) }
-  }
-  # Import bindings first, so a statement can tell `ns.x` from `obj.x` in any order.
-  for id in m.order {
-    let mo = m.modules[id]
-    if mo.kind == Esm {
-      with here = mo {
-        for s in mo.tree.body.kids {
-          match s {
-            Import(clause, from) => import-spec(dep-of-str(mo, from), clause)
-            _ => {}
-          }
-        }
-      }
-    }
-  }
-  let summaries = parallel-map(m.order, summaries-of, linking.facts-threads)
-  # The facts about to be stated, counted: their relations are made big enough at once.
-  link.reserve!(m.db, "mentions", sum ss in summaries: sum sm in ss: len(sm.mentions))
-  link.reserve!(m.db, "declares", sum ss in summaries: sum sm in ss: len(sm.declares))
-  link.reserve!(m.db, "part-of", (sum ss in summaries: len(ss)) + 2 * len(m.order))
-  for i in 0..len(m.order) {
-    with here = m.modules[m.order[i]] { module-facts(summaries[i]) }
+fn none-wrapped() -> {Int:Bool} = {}
+
+# A name an import statement binds: its symbol, the module it is from, and its name there.
+record Bound { symbol: Int, target: Int, name: Text, namespace: Bool }
+
+fn import-bindings(mo: m.Module) -> [Bound] = match mo.kind {
+  Esm => [b for s in mo.tree.body.kids for b in statement-bindings(mo, s)]
+  _ => []
+}
+
+fn statement-bindings(mo: m.Module, s: Node) -> [Bound] = match s {
+  Import(clause, from) => clause-bindings(mo, known-dep(mo, from), clause)
+  _ => []
+}
+
+fn clause-bindings(mo: m.Module, t: Int, spec: Node) -> [Bound] = match spec {
+  ImportDefault(b) => [bound(mo, t, "default", b, false)]
+  ImportAs(name, b) => [bound(mo, t, m.module-name(name), b, false)]
+  ImportName(b) => [bound(mo, t, b.text, b, false)]
+  ImportNamespace(b) => [bound(mo, t, "*", b, true)]
+  ImportDefaultAnd(b, rest) => [bound(mo, t, "default", b, false)] ++ clause-bindings(mo, t, rest)
+  ImportNamed(List(specs...)) => [x for s in specs for x in clause-bindings(mo, t, s)]
+  _ => panic "{}: unexpected import form {}", mo.path, js.kind-name(spec.kind)
+}
+
+fn bound(mo: m.Module, t: Int, name: Text, b: Node, namespace: Bool) -> Bound =
+  Bound(symbol: mo.bindings[b.lo] ?? (panic "{}: no symbol for import {}", mo.path, b.text), target: t, name: name, namespace: namespace)
+
+# A name a module re-exports from CommonJS: a property of its import variable.
+record Reexport { target: Int, name: Text, namespace: Bool, exported: Text }
+
+fn statement-reexports(mo: m.Module, s: Node) -> [Reexport] = match s {
+  ExportAllAs(name, from) => [Reexport(target: t, name: "*", namespace: true, exported: m.module-name(name))
+                              for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
+  ExportFrom(List(specs...), from) =>
+    [Reexport(target: t, name: m.module-name(spec.local), namespace: false, exported: export-spec-names(spec))
+     for t in [known-dep(mo, from)] if opaque?(m.modules[t]) for spec in specs]
+  _ => []
+}
+
+fn export-spec-names(spec: Node) -> Text = match spec {
+  ExportAs(_, to) => m.module-name(to)
+  _ => m.module-name(spec.local)
+}
+
+# The statements of a module that are not CommonJS, whose import statements stand for themselves.
+fn linked-statements(mo: m.Module) -> [Node] = match mo.kind {
+  Cjs => []
+  _ => mo.tree.body.kids
+}
+
+# The symbols a module needs made for it: CommonJS's `require_x`, an ES module's `x_exports`, and a
+# wrapped one's `init_x`.
+fn module-made(mo: m.Module, wrapped: {Int:Bool}) -> [Made] = match mo.kind {
+  Cjs => [Made(key: "require " ++ int-text(mo.id), scope: m.bundle-scope, name: "require_" ++ mo.base)]
+  Esm => [Made(key: "exports " ++ int-text(mo.id), scope: m.bundle-scope, name: mo.base ++ "_exports")]
+         ++ [Made(key: "init " ++ int-text(mo.id), scope: m.bundle-scope, name: "init_" ++ mo.base) for id in [mo.id] if id in wrapped]
+  _ => []
+}
+
+fn import-made(mo: m.Module, t: Int) -> Made =
+  Made(key: import-key(mo, t), scope: mo.root, name: "import_" ++ m.modules[t].base)
+
+# What a statement needs made: the variable an opaque import is held in, and the names re-exported
+# from it.
+fn statement-made(mo: m.Module, s: Node) -> [Made] = match s {
+  Import(_, from) | ExportAll(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
+  ExportAllAs(_, from) | ExportFrom(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
+    ++ [Made(key: reexport-key(mo, r.exported), scope: mo.root, name: "reexport_" ++ r.exported) for r in statement-reexports(mo, s)]
+  _ => []
+}
+
+# A module's parts, each standing for a statement: CommonJS is one, its whole tree. An ES module's
+# first are `None`, its namespace object, and `Flag`, the `__esm` wrapper's `init_x`, which brings
+# the whole module with it.
+fn module-parts(mo: m.Module, wrapped: {Int:Bool}) -> [Node] = match mo.kind {
+  Cjs => [mo.tree]
+  _ => synthetic(mo, wrapped) ++ mo.tree.body.kids
+}
+
+fn part-count(mo: m.Module, wrapped: {Int:Bool}) -> Int = match mo.kind {
+  Cjs => 1
+  _ => len(synthetic(mo, wrapped)) + len(mo.tree.body.kids)
+}
+
+fn synthetic(mo: m.Module, wrapped: {Int:Bool}) -> [Node] = match mo.kind, mo.id in wrapped {
+  Esm, true => [None(), Flag()]
+  Esm, false => [None()]
+  _, _ => []
+}
+
+# `export * from` CommonJS: names only known at run time.
+fn dynamic-star?(mo: m.Module, s: Node) -> Bool = s is ExportAll(from) and opaque?(m.modules[known-dep(mo, from)])
+
+# What linking works out, from each module's `import()` and `require` calls, before any fact. What a
+# module loads on demand is wrapped, or with splitting, the root of a chunk of its own. The symbols
+# linking makes are numbered from `first`: the modules' own, then the import statements' variables,
+# then what the other statements need, each import variable made once.
+fn linked-of(calls: [[Node]], first: Int) -> Linked =
+  Linked(wrapped: wrapped, dynamic-roots: roots, made: made, first-made: first, symbols: symbols,
+         cjs-imports: {b.symbol: CjsImport(importer: id, import-var: symbol-in(symbols, import-key(m.modules[id], b.target)),
+                                           name: b.name, namespace: b.namespace)
+                       for i in 0..len(m.order) for id in [m.order[i]] for b in bindings[i] if opaque?(m.modules[b.target])}
+                      ++ {symbol-in(symbols, reexport-key(mo, r.exported)):
+                            CjsImport(importer: mo.id, import-var: symbol-in(symbols, import-key(mo, r.target)), name: r.name,
+                                      namespace: r.namespace)
+                          for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for r in statement-reexports(mo, s)},
+         ns-imports: {b.symbol: b.target for bs in bindings for b in bs if b.namespace and not opaque?(m.modules[b.target])},
+         part-stmt: [module-parts(m.modules[id], wrapped)... for id in m.order],
+         any-dynamic: any id in m.order for mo in [m.modules[id]] for s in linked-statements(mo): dynamic-star?(mo, s),
+         any-reexport: any x in made: x.key is "reexport " ++ _)
+  where loads = [loads-of(m.modules[m.order[i]], n)... for i in 0..len(m.order) for n in calls[i]],
+        roots = [l.target for l in loads if linking.splitting and l.by-import and m.modules[l.target].kind != External distinct l.target],
+        seeds = [l.target for l in loads if not (linking.splitting and l.by-import)],
+        wrapped = fold w = none-wrapped() for t in seeds: wrapping(t, w),
+        bindings = [import-bindings(m.modules[id]) for id in m.order],
+        made = [x for x in [x for id in m.order for x in module-made(m.modules[id], wrapped)]
+                           ++ [import-made(m.modules[m.order[i]], b.target) for i in 0..len(m.order) for b in bindings[i]
+                               if opaque?(m.modules[b.target])]
+                           ++ [x for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for x in statement-made(mo, s)]
+                distinct x.key],
+        symbols = {made[i].key: first + i for i in 0..len(made)}
+
+# ---------------------------------------------------------------- the facts
+
+# Every fact linking states. Each relation's rows are in the order the walk of the modules meets them.
+fn facts(summaries: [[Summary]]) -> [link.Fact] =
+  entry-facts()
+  ++ [binding-facts(b)... for id in m.order for b in import-bindings(m.modules[id])]
+  ++ [facts-of(m.order[i], summaries[i], starts[i])... for i in 0..len(m.order)]
+  where starts = (fold s = Starts(next: 0, at: []) for id in m.order:
+                    s with { next: s.next + part-count(m.modules[id], linked.wrapped), at: s.at ++ [s.next] }).at
+
+# Where each module's parts start: they are numbered in module order.
+record Starts { next: Int, at: [Int] }
+
+fn entry-facts() -> [link.Fact] = match linking.splitting {
+  true => [chunk-root(r)... for r in m.entries ++ linked.dynamic-roots]
+  false => [link.fact-entry(m.entry)] ++ kept(m.entry, linking.entry-namespace or linking.keep-entry-exports)
+}
+
+fn chunk-root(r: Int) -> [link.Fact] = [link.fact-entry(r), link.fact-chunk-root(r)] ++ kept(r, m.modules[r].kind == Esm)
+
+fn kept(id: Int, keep: Bool) -> [link.Fact] = match keep {
+  true => [link.fact-keep-exports(id)]
+  false => []
+}
+
+# An import binding of an ES module: the name it imports, or the namespace.
+fn binding-facts(b: Bound) -> [link.Fact] = match opaque?(m.modules[b.target]), b.namespace {
+  true, _ => []
+  false, true => [link.fact-ns-import(b.symbol, b.target)]
+  false, false => [link.fact-import-of(b.symbol, b.target, m.name-id(b.name))]
+}
+
+fn facts-of(id: Int, summaries: [Summary], start: Int) -> [link.Fact] = with here = m.modules[id] { module-facts(summaries, start) }
+
+# Facts for one module, its parts numbered from `start`. CommonJS is one opaque part with effects,
+# whose only symbol is its `require_x`; its dependencies are whatever it `require`s.
+fn module-facts(summaries: [Summary], start: Int) -> [link.Fact] =
+  [link.fact-module-effects(id) for id in [here.id] if here.side-effects] ++ parts-facts(summaries, start)
+
+fn parts-facts(summaries: [Summary], start: Int) -> [link.Fact] = match here.kind {
+  Cjs => [link.fact-part-of(start, here.id), link.fact-effect(start), link.fact-declares(start, require-sym(here)),
+          link.fact-mentions(start, helper("__commonJS"))] ++ summary-facts(start, summaries[0])
+  _ => synthetic-facts(start) ++ [part-facts(stmts[i], summaries[i], first + i)... for i in 0..len(stmts)]
+       ++ [export-local("default", default-name(name)) for s in here.source if let some(name) = m.default-of(s)]
+    where stmts = here.tree.body.kids,
+          first = start + len(synthetic(here, linked.wrapped))
+}
+
+fn default-name(name: Text) -> Text = match name {
+  "" => here.base ++ "_default"
+  _ => name
+}
+
+# The parts with no statement: the namespace object, which a format that exposes the entry as an
+# object keeps; and the wrapper's `init_x`.
+fn synthetic-facts(start: Int) -> [link.Fact] = match here.kind, wrapped?(here) {
+  Esm, true => namespace-part(start) ++ [link.fact-part-of(start + 1, here.id), link.fact-declares(start + 1, init-sym(here)),
+                                         link.fact-mentions(start + 1, helper("__esm"))]
+  Esm, false => namespace-part(start)
+  _, _ => []
+}
+
+fn namespace-part(part: Int) -> [link.Fact] =
+  [link.fact-part-of(part, here.id), link.fact-ns-part(part, here.id), link.fact-ns-symbol(here.id, ns-sym(here)),
+   link.fact-declares(part, ns-sym(here)), link.fact-mentions(part, helper("__export"))]
+  ++ entry-namespace(part)
+
+fn entry-namespace(part: Int) -> [link.Fact] = match linking.entry-namespace and here.id == m.entry {
+  true => [link.fact-root-part(part), link.fact-mentions(part, helper("__toCommonJS"))]
+  false => []
+}
+
+# The facts a summary stands for, in `part`.
+fn summary-facts(part: Int, sm: Summary) -> [link.Fact] =
+  [link.fact-declares(part, s) for s in sm.declares] ++ [mention-facts(part, x)... for x in sm.mentions]
+
+fn mention-facts(part: Int, x: Mention) -> [link.Fact] = match x.reach {
+  Symbol => [link.fact-mentions(part, x.id)]
+  Member => [link.fact-ns-member(part, x.id, m.name-id(x.name))]
+  Whole => whole-module(part, m.modules[x.id])
+  # What `import()` of a chunk needs here: only the helper that makes CommonJS look like a module.
+  Chunk => [link.fact-mentions(part, helper("__toESM")) for t in [m.modules[x.id]] if t.kind == Cjs]
+}
+
+# What a run-time reference to a whole module needs: its wrapper, and the helpers.
+fn whole-module(part: Int, t: m.Module) -> [link.Fact] = match t.kind {
+  External => []
+  Cjs => [link.fact-imports(here.id, t.id), link.fact-mentions(part, require-sym(t)), link.fact-mentions(part, helper("__toESM"))]
+  _ => [link.fact-imports(here.id, t.id), link.fact-mentions(part, init-sym(t)), link.fact-mentions(part, ns-sym(t)),
+        link.fact-mentions(part, helper("__toCommonJS"))]
+}
+
+fn export-local(exported: Text, local: Text) -> link.Fact =
+  link.fact-local-export(here.id, m.name-id(exported),
+                         root-sym(here, local) ?? panic "{}: export of {} which is not declared", here.path, local)
+
+# Only what a declaration binds is exported: never a name inside its value, such as a class's own.
+everywhere fn exports-under(n: Node) -> [link.Fact] = match n {
+  BindName(x) => [export-local(x, x)]
+  Declarator(target, _) => exports-under(target)
+  _ if sc.function?(n.kind) => []
+}
+
+fn exported-by(s: Node) -> [link.Fact] = match s {
+  ExportVar(...) => exports-under(s)
+  ExportLexical(d) => exports-under(d)
+  ExportFunction(d) => exports-under(d.name)
+  _ => []
+}
+
+# An import of a module: and of a wrapped one, its initialiser run where the import stood.
+fn imported(part: Int, t: Int) -> [link.Fact] = [link.fact-imports(here.id, t)] ++ initialised(part, m.modules[t])
+
+fn initialised(part: Int, mo: m.Module) -> [link.Fact] = match wrapped?(mo) {
+  true => [link.fact-mentions(part, init-sym(mo)), link.fact-effect(part)]
+  false => []
+}
+
+fn required(part: Int, t: Int) -> [link.Fact] = [link.fact-mentions(part, require-sym(mo)) for mo in [m.modules[t]] if mo.kind == Cjs]
+
+# A statement that re-exports from CommonJS holds the import itself.
+fn reexport-import(part: Int, t: Int) -> [link.Fact] =
+  [link.fact-declares(part, known-import-var(here, t))] ++ required(part, t)
+  ++ [link.fact-mentions(part, helper("__toESM")), link.fact-effect(part)]
+
+# A name this module exports that is really a property of the import variable.
+fn reexported(part: Int, exported: Text) -> [link.Fact] =
+  [link.fact-local-export(here.id, m.name-id(exported), s), link.fact-cjs-binding(s, part)]
+  where s = made-symbol(reexport-key(here, exported))
+
+# One top-level statement of an ES module is one part.
+fn part-facts(s: Node, sm: Summary, part: Int) -> [link.Fact] = [link.fact-part-of(part, here.id)] ++ statement-facts(s, sm, part)
+
+fn statement-facts(s: Node, sm: Summary, part: Int) -> [link.Fact] = match s {
+  Import(_, from) => imported(part, t) ++ import-facts(part, t) where t = known-dep(here, from)
+  ImportBare(from) => imported(part, t) ++ bare-import-facts(part, t) where t = known-dep(here, from)
+  ExportAll(from) => imported(part, t) ++ star-facts(part, t) where t = known-dep(here, from)
+  ExportAllAs(name, from) => imported(part, t) ++ star-as-facts(part, t, m.module-name(name)) where t = known-dep(here, from)
+  ExportFrom(List(specs...), from) => imported(part, t) ++ export-from-facts(part, t, specs) where t = known-dep(here, from)
+  ExportNamed(List(specs...)) => [export-local(export-spec-names(spec), m.module-name(spec.local)) for spec in specs]
+  # The runtime's statements are only ever live through a mention, and every statement of a wrapped
+  # module runs when its initialiser does.
+  _ => summary-facts(part, sm) ++ exported-by(s)
+       ++ [link.fact-effect(part) for p in [part] if wrapped?(here) or not (here.kind == Runtime or sm.pure)]
+}
+
+# An import of an opaque module holds it in a variable, made an ES module.
+fn import-facts(part: Int, t: Int) -> [link.Fact] = match opaque?(m.modules[t]) {
+  true => [link.fact-declares(part, known-import-var(here, t))] ++ required(part, t)
+          ++ [link.fact-effect(part), link.fact-mentions(part, helper("__toESM"))]
+  false => []
+}
+
+fn bare-import-facts(part: Int, t: Int) -> [link.Fact] = match opaque?(m.modules[t]) {
+  true => required(part, t) ++ [link.fact-effect(part)]
+  false => []
+}
+
+# `export *`: from CommonJS, copied at run time onto the namespace object.
+fn star-facts(part: Int, t: Int) -> [link.Fact] = match opaque?(m.modules[t]) {
+  true => reexport-import(part, t) ++ [link.fact-dyn-star(here.id, t), link.fact-mentions(part, helper("__reExport")),
+                                       link.fact-mentions(part, ns-sym(here))]
+  false => [link.fact-star(here.id, t)]
+}
+
+fn star-as-facts(part: Int, t: Int, exported: Text) -> [link.Fact] = match opaque?(m.modules[t]) {
+  true => reexport-import(part, t) ++ reexported(part, exported)
+  false => [link.fact-local-export(here.id, m.name-id(exported), ns-sym(m.modules[t]))]
+}
+
+fn export-from-facts(part: Int, t: Int, specs: [Node]) -> [link.Fact] = match opaque?(m.modules[t]) {
+  true => reexport-import(part, t) ++ [reexported(part, export-spec-names(spec))... for spec in specs]
+  false => [link.fact-reexport(here.id, m.name-id(export-spec-names(spec)), t, m.name-id(m.module-name(spec.local)))
+            for spec in specs]
+}
+
+# ---------------------------------------------------------------- linking
+
+# Linking: what it works out, the symbols it makes made, and its facts stated and solved.
+fn link() -> Linked {
+  let l = linked-of(parallel-map(m.order, on-demand-calls, linking.facts-threads), sym.symbol-count(m.table))
+  sym.generated-symbols!(m.table, l.first-made, [x.scope for x in l.made], [x.name for x in l.made])
+  with linked = l {
+    link.add-facts!(m.db, facts(parallel-map(m.order, summaries-of, linking.facts-threads)))
   }
   link.solve!(m.db)
+  l
 }
