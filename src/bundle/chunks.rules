@@ -16,114 +16,79 @@ record Chunk {
   needs: {Int:[Text]} # from which other chunk, which names
 }
 
-state chunks: [Chunk] = []
-state by-key: {Text:Int} = {}
-state part-chunk: {Int:Int} = {}
-
-fn chunk-new(key: Text, root: Int, roots: [Int]) -> Int {
-  let id = len(chunks)
-  chunks += Chunk(id: id, key: key, root: root, roots: roots, parts: {}, needs: {})
-  by-key[key] = id
-  id
-}
-
 fn key-of(roots: [Int]) -> Text = join([int-text(r) ++ "," for r in roots], "")
 
 # A file stays whole, as in esbuild: its live statements go where any of its roots can load them.
-fn roots-of(module: Int) -> [Int] {
-  let found = [r for m.db.entered(?r, module)]
-  sort r in found by r
+fn roots-of(module: Int) -> [Int] = sort r in [r for m.db.entered(?r, module)] by r
+
+fn reaching(module: Int) -> [Int] = match roots-of(module) {
+  [] => panic "{}: a live statement no entry reaches", m.modules[module].path
+  found => found
 }
 
-# Every root's own chunk first, even an empty one: it is still a file someone asked for.
-fn assign!(roots: [Int]) -> Void {
-  chunks = []
-  by-key = {}
-  part-chunk = {}
-  for r in roots { chunk-new(key-of([r]), r, [r]) }
-  for id in m.order {
-    if e.included?(id) {
-      for p in e.parts-of(id) {
-        if e.live?(p) {
-          let reached = roots-of(id)
-          if len(reached) == 0 { panic "{}: a live statement no entry reaches", m.modules[id].path }
-          let key = key-of(reached)
-          let c = by-key[key] ?? chunk-new(key, -1, reached)
-          chunks[c].parts[p] = true
-          part-chunk[p] = c
-        }
-      }
-    }
-  }
+# A live statement, and the roots that reach its file.
+record Live { part: Int, roots: [Int], key: Text }
+
+# Every root's own chunk first, even an empty one: it is still a file someone asked for. Then one for
+# each other set of roots that reaches live statements, in the order the statements come. A set
+# named twice has its statements in the last chunk of that set. Each chunk knows which names it
+# reads from which other.
+fn chunks-of(roots: [Int]) -> [Chunk] = [c with { needs: needs-of(c, homes) } for c in placed]
+  where live = [Live(part: p, roots: reaching(id), key: key-of(reaching(id)))
+                for id in m.order if e.included?(id) for p in e.parts-of(id) if e.live?(p)],
+        own-keys = {key-of([r]): true for r in roots},
+        groups = [[r] for r in roots] ++ [l.roots for l in live if not (l.key in own-keys) distinct l.key],
+        owner = {key-of(groups[i]): i for i in 0..len(groups)},
+        placed = [Chunk(id: i, key: key-of(groups[i]), root: root-at(roots, i), roots: groups[i],
+                        parts: {l.part: true for l in live if (owner[l.key] ?? -1) == i}, needs: {})
+                  for i in 0..len(groups)],
+        homes = {p: c.id for c in placed for p in keys(c.parts)}
+
+fn root-at(roots: [Int], i: Int) -> Int = match i {
+  _ if i < len(roots) => roots[i]
+  _ => -1
 }
 
-# The live statement declaring a symbol, and so the chunk it is in.
-fn home-of(s: Int) -> Int? {
-  for m.db.declares(?p, s) {
-    if let some(c) = part-chunk[p] { return some(c) }
-  }
-  none
-}
+# A name a chunk reads, and the chunk it lives in.
+record Need { home: Int, name: Text }
 
-fn need!(c: Int, s: Int) -> Void {
-  if let some(home) = home-of(s) {
-    if home != c {
-      let name = e.final-of(s)
-      var names = chunks[c].needs[home] ?? []
-      if not (name in names) {
-        names += name
-        chunks[c].needs[home] = names
-      }
-    }
-  }
-}
+# From which other chunk, which names: whatever its statements mention or use, and for a root, what
+# it exports, each as the chunk reads it.
+fn needs-of(c: Chunk, homes: {Int:Int}) -> {Int:[Text]} =
+  {h: [n.name for n in needed if n.home == h distinct n.name] for h in [n.home for n in needed distinct n.home]}
+  where needed = [Need(home: h, name: e.final-of(t))
+                  for s in read-symbols(c) for t in [read-as(s)] for h in home-of(t, homes) if h != c.id]
 
-# A symbol as this chunk reads it: what an import resolves to, and the variable of a CommonJS import.
-fn need-symbol!(c: Int, s: Int) -> Void {
-  let t = e.target-of(s)
-  match an.cjs-imports[t] {
-    some(ci) => need!(c, ci.import-var)
-    none => need!(c, t)
-  }
-}
+fn read-symbols(c: Chunk) -> [Int] =
+  [s for p in keys(c.parts) for s in [x for m.db.mentions(p, ?x)] ++ [x for m.db.uses(p, ?x)]]
+  ++ [best for r in [c.root] if r >= 0 for m.db.resolved(r, ?n, ?x) if let some(best) = e.resolved-export(r, n)]
 
-fn link-chunks!() -> Void {
-  for ch in chunks {
-    for p in keys(ch.parts) {
-      for m.db.mentions(p, ?s) { need-symbol!(ch.id, s) }
-      for m.db.uses(p, ?s) { need-symbol!(ch.id, s) }
-    }
-    if ch.root >= 0 {
-      for m.db.resolved(ch.root, ?n, ?s) {
-        if let some(best) = e.resolved-export(ch.root, n) { need-symbol!(ch.id, best) }
-      }
-    }
-  }
-}
+# A symbol as a chunk reads it: what an import resolves to, and the variable of a CommonJS import.
+fn read-as(s: Int) -> Int = (first ci in an.cjs-imports[t]: ci.import-var) ?? t
+  where t = e.target-of(s)
 
-fn import-names(names: [Text], from: Text) -> Node {
-  let sorted = sort n in names by n
-  let specs = [ImportName(BindName(n)) for n in sorted]
-  Import(ImportNamed(List(specs...)), Str(quote-text(from)))
-}
+# The chunk of the live statement declaring a symbol.
+fn home-of(s: Int, homes: {Int:Int}) -> Int? = first m.db.declares(?p, s): homes[p]
+
+fn import-names(names: [Text], from: Text) -> Node =
+  Import(ImportNamed(List([ImportName(BindName(n)) for n in sort n in names by n]...)), Str(quote-text(from)))
 
 # What this chunk says at its top. A root imports every chunk it needs, for its effects if nothing
 # else; a shared chunk imports only what it reads.
-fn imports-of(ch: Chunk) -> [Node] = [x for other in chunks if other.id != ch.id if let some(x) = import-from(ch, other)]
+fn imports-of(ch: Chunk, all: [Chunk]) -> [Node] = [x for other in all if other.id != ch.id if let some(x) = import-from(ch, other)]
 
 fn import-from(ch: Chunk, other: Chunk) -> Node? = match ch.needs[other.id] {
   some(names) => some(import-names(names, placeholder(other.id)))
-  none => if ch.root >= 0 and ch.root in other.roots then some(ImportBare(Str(quote-text(placeholder(other.id))))) else none
+  none if ch.root >= 0 and ch.root in other.roots => some(ImportBare(Str(quote-text(placeholder(other.id)))))
+  none => none
 }
 
 # Names other chunks read from this one.
-fn exports-of(ch: Chunk) -> [Node] {
-  let names = [n for other in chunks if let some(ns) = other.needs[ch.id] for n in ns distinct n]
-  if len(names) == 0 { return [] }
-  let sorted = sort n in names by n
-  let specs = [ExportName(PropName(n)) for n in sorted]
-  [ExportNamed(List(specs...))]
-}
+fn exports-of(ch: Chunk, all: [Chunk]) -> [Node] =
+  match sort n in [n for other in all if let some(ns) = other.needs[ch.id] for n in ns distinct n] by n {
+    [] => []
+    sorted => [ExportNamed(List([ExportName(PropName(n)) for n in sorted]...))]
+  }
 
 # ---------------------------------------------------------------- file names
 
@@ -139,57 +104,62 @@ record Hole { at: Int, size: Int, chunk: Int }
 fn holes-in(text: Text) -> [Hole] = [hole-at(text, i) for i in occurrences(text, ["./" ++ mark])]
 
 # `./__ESB_CHUNK_12__`: the chunk's number, and the two bytes after it.
-fn hole-at(text: Text, i: Int) -> Hole {
-  let digits = i + 2 + len(mark)
-  let n = span-of(text, digits, "0123456789")
-  Hole(at: i, size: 2 + len(mark) + n + 2, chunk: parse-int(text[digits..digits + n]))
-}
+fn hole-at(text: Text, i: Int) -> Hole = Hole(at: i, size: 2 + len(mark) + n + 2, chunk: parse-int(text[digits..digits + n]))
+  where digits = i + 2 + len(mark),
+        n = span-of(text, digits, "0123456789")
 
 
 # A file's hash covers everything it loads, so that a change anywhere renames all who depend on it.
 # These chunks, and those their texts name, until none names one more.
-fn reached(found: [Int], holes: [[Hole]]) -> [Int] {
-  let more = [h.chunk for c in found for h in holes[c] if not (h.chunk in found) distinct h.chunk]
-  if len(more) == 0 then found else reached(found ++ more, holes)
+fn reached(found: [Int], holes: [[Hole]]) -> [Int] = match [h.chunk for c in found for h in holes[c] if not (h.chunk in found) distinct h.chunk] {
+  [] => found
+  more => reached(found ++ more, holes)
 }
 
 # A chunk's hash covers what it imports, so a change anywhere it reaches renames it.
-fn content-hash(id: Int, texts: [Text], holes: [[Hole]]) -> Text {
-  let seen = reached([id], holes)
+fn content-hash(id: Int, texts: [Text], holes: [[Hole]]) -> Text =
   host.hash-name(fold h = host.hash-start() for other in 0..len(texts) if other in seen: host.hash-more(h, texts[other]))
-}
+  where seen = reached([id], holes)
 
 # `[dir]/[name]-[hash]`, with an empty directory and the slash after it gone.
-fn pattern-path(pattern: Text, dir: Text, name: Text, hash: Text) -> Text {
+fn pattern-path(pattern: Text, dir: Text, name: Text, hash: Text) -> Text =
   without-leading-slashes(replace-all(replace-all(replace-all(pattern, "[name]", name), "[hash]", hash), "[dir]", dir))
-}
 
-fn without-leading-slashes(p: Text) -> Text =
-  if starts-with(p, "./") then without-leading-slashes(p[2..len(p)])
-  else if starts-with(p, "/") then without-leading-slashes(p[1..len(p)])
-  else p
+fn without-leading-slashes(p: Text) -> Text = match p {
+  "./" ++ rest | "/" ++ rest => without-leading-slashes(rest)
+  _ => p
+}
 
 # `to` as an import written in the file `from`.
-fn relative-import(from: Text, to: Text) -> Text {
-  let a = path-segments(dir-of(from))
-  let b = path-segments(to)
-  let common = len([i for i in 0..min(len(a), len(b) - 1) while a[i] == b[i]])
-  (if common == len(a) then "./" else "") ++ join(["../" for i in common..len(a)], "") ++ join(b[common..len(b)], "/")
-}
+fn relative-import(from: Text, to: Text) -> Text =
+  here ++ join(["../" for i in common..len(a)], "") ++ join(b[common..len(b)], "/")
+  where a = path-segments(dir-of(from)),
+        b = path-segments(to),
+        common = len([i for i in 0..min(len(a), len(b) - 1) while a[i] == b[i]]),
+        here = match common {
+          _ if common == len(a) => "./"
+          _ => ""
+        }
 
 # The text with every placeholder replaced, and where it put what used to follow each one.
 record Filled { text: Text, marks: [Mark] }
 
 # A mark moves by how much the placeholders before it grew or shrank.
-fn filled(text: Text, base: Int, marks: [Mark], holes: [Hole], self-path: Text, paths: [Text]) -> Filled {
-  let replacements = [relative-import(self-path, paths[h.chunk]) for h in holes]
-  let grown = scan d = 0 for i in 0..len(holes): d + len(replacements[i]) - holes[i].size
-  let ats = [h.at for h in holes]
-  let rest = if len(holes) == 0 then 0 else last(holes).at + last(holes).size
-  Filled(text: join([text[hole-end(holes, i)..holes[i].at] ++ replacements[i] for i in 0..len(holes)], "") ++ text[rest..len(text)],
+fn filled(text: Text, base: Int, marks: [Mark], holes: [Hole], self-path: Text, paths: [Text]) -> Filled =
+  Filled(text: join([text[hole-end(holes, i)..holes[i].at] ++ replacements[i] for i in 0..len(holes)], "")
+               ++ text[hole-end(holes, len(holes))..len(text)],
          marks: [Mark(out: k.out + shift-before(grown, bisect(ats, k.out + base - 1)), src: k.src) for k in marks])
+  where replacements = [relative-import(self-path, paths[h.chunk]) for h in holes],
+        grown = scan d = 0 for i in 0..len(holes): d + len(replacements[i]) - holes[i].size,
+        ats = [h.at for h in holes]
+
+# Where the text after the hole before `i` starts.
+fn hole-end(holes: [Hole], i: Int) -> Int = match i {
+  0 => 0
+  _ => holes[i - 1].at + holes[i - 1].size
 }
 
-fn hole-end(holes: [Hole], i: Int) -> Int = if i == 0 then 0 else holes[i - 1].at + holes[i - 1].size
-
-fn shift-before(grown: [Int], passed: Int) -> Int = if passed == 0 then 0 else grown[passed - 1]
+fn shift-before(grown: [Int], passed: Int) -> Int = match passed {
+  0 => 0
+  _ => grown[passed - 1]
+}
