@@ -809,19 +809,14 @@ fn filled-body(n: Node, lo: Int, hi: Int, stmts: [Node], pieces: [Node]) -> Node
 record PieceTree { tree: Node?, specs: [Text], targets: {Text:Text} }
 
 # One piece: its statements, parsed as a program of their own, and where what they import leads.
-memo fn piece-of(item: Text) -> PieceTree {
-  let path = text-before(item, "\n")
-  let k = parse-int(text-after(item, "\n"))
-  let sp = split-source(path)
-  match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
+memo fn piece-of(item: Text) -> PieceTree = match item {
+  path ++ "\n" ++ number => match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
     none => PieceTree(tree: none, specs: [], targets: {})
-    some(tree) => {
-      let imported = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)]
-      let found = calls.run(tree)
-      let specs = imported ++ found.requires ++ found.imports
-      PieceTree(tree: some(tree), specs: specs, targets: {spec: t for spec in specs if let some(t) = unhooked-target(spec, path)})
-    }
-  }
+    some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {spec: t for spec in specs if let some(t) = unhooked-target(spec, path)})
+      where found = calls.run(tree),
+            specs = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)] ++ found.requires ++ found.imports
+  } where k = parse-int(number),
+          sp = split-source(path)
 }
 
 # A big file put together from its pieces, ready for its parts to be analysed at once: the program as
@@ -833,30 +828,28 @@ memo fn piece-of(item: Text) -> PieceTree {
 record Prepared { whole: Bool, tree0: Node, tree: Node, parts: [[Node]], raw: [[Node]], scopes: sym.Table, root: Int,
                   esm: Bool, mentions: Bool, exportable: [Text], wrapper: Int }
 
-memo fn prepared-of(path: Text) -> Prepared {
-  let sp = split-source(path)
-  let pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
+memo fn prepared-of(path: Text) -> Prepared = match pieces {
   # A function's body is put together and analysed whole.
-  if sp.open >= 0 or (any t in pieces: is-none(t)) {
-    return Prepared(whole: false, tree0: None(), tree: None(), parts: [], raw: [], scopes: sym.table-new(), root: -1,
-                    esm: false, mentions: false, exportable: [], wrapper: -1)
-  }
-  let trees = [t for some(t) in pieces]
-  let stmts = [s for t in trees for s in t.body.kids]
-  let first = trees[0]
-  let final = trees[len(trees) - 1]
-  let tree0 = first with { body: first.body with { kids: stmts, hi: final.body.hi }, hi: final.hi }
-  let base = base-name(path)
-  let raw = [t.body.kids for t in trees]
-  let parts = [normalized-tree(t, base).body.kids for t in trees]
-  let tree = Program(tree0.hashbang, List([s for part in parts for s in part]...))
-  let esm = early.program-has-module-syntax?(tree0)
-  let wrapped = not esm and (any name in ["module", "exports", "require"]: contains-text?(sp.src, name))
-  let own = sc.declarations(tree, if wrapped then ["exports", "module"] else [])
-  Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, raw: raw, scopes: own.table, root: own.root,
-           esm: esm, mentions: mentions-define?(sp.src), exportable: early.exportable-of(tree0),
-           wrapper: if wrapped then sym.scope-at(own.table, own.root).parent else -1)
-}
+  _ if sp.open >= 0 or (any t in pieces: is-none(t)) =>
+    Prepared(whole: false, tree0: None(), tree: None(), parts: [], raw: [], scopes: sym.table-new(), root: -1,
+             esm: false, mentions: false, exportable: [], wrapper: -1)
+  _ => Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, raw: [t.body.kids for t in trees], scopes: own.table, root: own.root,
+                esm: esm, mentions: mentions-define?(sp.src), exportable: early.exportable-of(tree0),
+                wrapper: match wrapped {
+                  true => sym.scope-at(own.table, own.root).parent
+                  false => -1
+                })
+    where trees = [t for some(t) in pieces],
+          head = trees[0],
+          tree0 = head with { body: head.body with { kids: [s for t in trees for s in t.body.kids], hi: last(trees).body.hi },
+                              hi: last(trees).hi },
+          parts = [normalized-tree(t, base-name(path)).body.kids for t in trees],
+          tree = Program(tree0.hashbang, List([s for part in parts for s in part]...)),
+          esm = early.program-has-module-syntax?(tree0),
+          wrapped = not esm and (any name in ["module", "exports", "require"]: contains-text?(sp.src, name)),
+          own = sc.declarations(tree, [x for x in ["exports", "module"] if wrapped])
+} where sp = split-source(path),
+        pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
 
 # One part's walk, in a table of its own under the program's scope.
 # `defined`: whether a define applies in the part, which only its own bindings can tell. Its
@@ -864,53 +857,43 @@ memo fn prepared-of(path: Text) -> Prepared {
 record Walked { scopes: sym.Table, bindings: {Int:Int}, defined: Bool, requires: [Text], imports: [Text],
                 problem: early.Problem? }
 
-memo fn walked-of(item: Text) -> Walked {
-  let path = text-before(item, "\n")
-  let what = text-after(item, "\n")
-  let k = parse-int(what[1..len(what)])
-  let pr = prepared-of(path)
-  let own = sc.part-analysis(pr.scopes, pr.root, (if k == 0 then [pr.tree.hashbang] else []) ++ pr.parts[k])
-  let defined = pr.mentions and (any s in pr.parts[k]: defines-apply?(s, own.bindings))
-  # Checking the part finds what it loads, in its statements as parsed: normalising them keeps
-  # every call, in order.
-  let found = early.part-found(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
-  Walked(scopes: own.table, bindings: own.bindings, defined: defined, requires: found.requires, imports: found.imports,
-         problem: found.problem)
+memo fn walked-of(item: Text) -> Walked = match item {
+  path ++ "\nw" ++ number =>
+    Walked(scopes: own.table, bindings: own.bindings, defined: pr.mentions and (any s in pr.parts[k]: defines-apply?(s, own.bindings)),
+           requires: found.requires, imports: found.imports, problem: found.problem)
+    where k = parse-int(number),
+          pr = prepared-of(path),
+          own = sc.part-analysis(pr.scopes, pr.root, [pr.tree.hashbang for x in [k] if x == 0] ++ pr.parts[k]),
+          # Checking the part finds what it loads, in its statements as parsed: normalising them
+          # keeps every call, in order.
+          found = early.part-found(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
 }
 
 # What parsing a file whole checks of its statements together, at once with the parts' walks,
 # which check each part's.
-memo fn early-of(path: Text) -> early.Problem? {
-  let pr = prepared-of(path)
-  early.check-head(pr.tree0, pr.esm, not pr.esm, false)
-}
+memo fn early-of(path: Text) -> early.Problem? = early.check-head(pr.tree0, pr.esm, not pr.esm, false) where pr = prepared-of(path)
 
-memo fn from-of(path: Text) -> Parsed {
-  let specs = [s for k in 0..len(split-source(path).starts) for s in piece-of(path ++ "\n" ++ int-text(k)).specs]
-  parsed-with(path, split-source(path).src, prepared-of(path).tree0, some(specs), none)
-}
+memo fn from-of(path: Text) -> Parsed =
+  parsed-with(path, split-source(path).src, prepared-of(path).tree0,
+              some([s for k in 0..len(split-source(path).starts) for s in piece-of(path ++ "\n" ++ int-text(k)).specs]), none)
 
 # The big file, analysed: its parts' tables grafted in order, as one walk would have filled the
 # table, ids and all. CommonJS, and code a define changes, are analysed again whole, as
 # `analysis-of` does.
 # A library inside one function, its body parsed in pieces and put together, then checked as the
 # whole file would be.
-fn nested-file(path: Text) -> Parsed? {
-  let sp = split-source(path)
-  if sp.open < 0 { return none }
-  let pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
-  if any t in pieces: is-none(t) { return none }
-  match assembled(sp, path, [t for some(t) in pieces]) {
-    some(tree) => {
-      let found = early.run(tree, false, true, false, false, false, [])
-      match found.problem {
-        none => some(parsed-with(path, sp.src, tree, none, some(Checked(tree: tree, requires: found.requires, imports: found.imports))))
-        some(p) => panic "{}:{}:{}: {}", path, line-of(sp.src, p.at), col-of(sp.src, p.at), p.message
-      }
-    }
-    none => none
-  }
-}
+fn nested-file(path: Text) -> Parsed? = match sp.open {
+  open if open < 0 => none
+  _ => first pieces in [[piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]]
+             if all t in pieces: is-some(t)
+             for tree in assembled(sp, path, [t for some(t) in pieces]):
+         nested-checked(path, sp.src, tree)
+} where sp = split-source(path)
+
+fn nested-checked(path: Text, src: Text, tree: Node) -> Parsed = match found.problem {
+  none => parsed-with(path, src, tree, none, some(Checked(tree: tree, requires: found.requires, imports: found.imports)))
+  some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
+} where found = early.run(tree, false, true, false, false, false, [])
 
 fn finished-file(path: Text) -> Parsed {
   let pr = prepared-of(path)
@@ -946,19 +929,13 @@ fn finished-file(path: Text) -> Parsed {
   p with { analysed: true, scopes: own, analysis: a, calls: calls, targets: targets }
 }
 
-fn wrapper-used?(t: sym.Table, wrapper: Int, name: Text) -> Bool = match sym.scope-at(t, wrapper).names[name] {
-  some(s) => sym.symbol-at(t, s).uses > 0
-  none => false
-}
+fn wrapper-used?(t: sym.Table, wrapper: Int, name: Text) -> Bool = any s in sym.scope-at(t, wrapper).names[name]: sym.symbol-at(t, s).uses > 0
 
 # Early errors, which `parse-file` checks of a file parsed whole.
-fn checked-early(tree: Node, src: Text, path: Text) -> Node {
-  let is-module = early.program-has-module-syntax?(tree)
-  match early.check(tree, is-module, not is-module, false) {
-    none => tree
-    some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
-  }
-}
+fn checked-early(tree: Node, src: Text, path: Text) -> Node = match early.check(tree, is-module, not is-module, false) {
+  none => tree
+  some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
+} where is-module = early.program-has-module-syntax?(tree)
 
 # Where a large file is cut: where the coarse grammar finds a declaration starting a line at the
 # top level, at least a piece's size from the last cut and from the end. A file the coarse grammar
