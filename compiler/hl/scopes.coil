@@ -1,25 +1,30 @@
-;;; `.scopes`: the binding-structure language. A table saying which nodes open scopes
-;;; and where bindings land compiles to a resolver: a walker generated for one
-;;; grammar's node types, recording which symbol each identifier leaf means.
+;;; `.scopes`: the binding-structure language. Tables saying which nodes open scopes, of
+;;; which kind, and where bindings land compile to a resolver: a walker generated for one
+;;; grammar's node types, recording which symbol each identifier leaf means. Every kind of scope
+;;; is the file's own; nothing here knows any language's.
 ;;;
-;;;   scopes bundle.js          # the grammar
-;;;   ref Ident ;               # leaves that refer to a name
-;;;   bind BindName ;           # leaves that introduce one
-;;;   function FuncDecl Arrow ; # open a function scope
-;;;   block Block For ;         # open a block scope
-;;;   var VarDecl ;             # names beneath hoist to the function scope
-;;;   lexical LetDecl Import ;  # names beneath land in the current block scope
-;;;   param Params ;            # names beneath land in the function's own scope
-;;;   hoist-name FuncDecl ;     # the node's first child: function scope
-;;;   block-name ClassDecl ;    # the node's first child: current block scope
-;;;   self-name FuncExpr Arrow ;# the node's first child: its own new scope
-;;;   key-first Method ;        # the node's first child resolves outside its scope
-;;;   inside Let name body ;    # of a node that opens a scope, the children in it: the
-;;;                             # others resolve in the scope around it (ML's `let`)
-;;;   sequential LetStmt ;      # a node whose scope also holds the siblings after it
-;;;                             # (`let` in a block, where each one shadows the last)
-;;;   dynamic-kind With ;       # names in and around this cannot be renamed
-;;;   dynamic-name eval ;       # nor around a reference to this name
+;;;   scopes bundle.js                  # the grammar
+;;;   ref Ident ;                       # leaves that refer to a name
+;;;   bind BindName ;                   # leaves that introduce one
+;;;   scope function FuncDecl Arrow ;   # nodes that open a scope, and its kind
+;;;   scope block Block For ;
+;;;   program function ;                # the kind of scope a whole program is
+;;;   names VarDecl Params in function ;# every binding beneath the node, up to anything that
+;;;                                     # opens a scope, lands in the nearest scope around of a
+;;;                                     # kind named: here through blocks, to the function's
+;;;   names LetDecl in block function ; # here in whatever scope is nearest
+;;;   name FuncDecl in function ;       # the node's first child, so
+;;;   name FuncExpr in own ;            # `own`: the scope the node opens itself
+;;;   outside name of FuncDecl ;        # children of a node that opens a scope that resolve
+;;;                                     # in the scope around it (ML's `let`'s value)
+;;;   sequential LetStmt ;              # a node whose scope also holds the siblings after it
+;;;                                     # (`let` in a block, where each one shadows the last)
+;;;   dynamic With ;                    # names in and around this cannot be renamed
+;;;   dynamic-name eval ;               # nor around a reference to this name
+;;;
+;;; A scope's names are declared when it opens: the node's own (`in own`), then, for each set of
+;;; kinds the placements name in the order they first do, those landing in it, in the order they
+;;; are written.
 ;;;
 ;;; Generated: `analyze TREE TABLE SCOPE BINDINGS`, where BINDINGS maps a leaf's start
 ;;; offset to its symbol. Free names go to the table.
@@ -72,34 +77,79 @@
     (Some [file] (syntax/grammar-table (rt/read-all file) file))
     (None [] (fail-on src path at (dsl/join3 "the manifest names no module " (.text at) "")))))
 
-;;; `inside KIND CHILD… ;`: the arm saying which of a KIND node's children are in its scope.
-(defn inside-arm [(kinds (ArrayList syntax/KindEntry))
-                  (src (slice u8))
-                  (path (slice u8))
-                  (table g/Node)
-                  (opening (ArrayList (slice u8)))] (-> Code)
-  (let [names (.kids (get (.kids table) 1))]
-    (when (= (len names) 0)
-      (fail-on src path table "inside names a node and the children of it in its scope"))
-    (let [kind (get names 0)
-          entry
-            (match (kind-entry kinds (.text kind))
-              (Some [e] e)
-              (None [] (fail-on src path kind (dsl/join2 "the grammar has no node named " (.text kind)))))
-          (mut tests) (primitive/code-list-new)]
-      (unless (has-name? opening (.text kind))
-        (fail-on src path kind
-                 (dsl/join3 (.text kind) " opens no scope: name it under block or function" "")))
-      (for i (range 1 (len names))
-        (let [child (get names i)
-              (mut at) -1]
-          (for j (range 0 (len (.fields entry)))
-            (when (= (get (.fields entry) j) (.text child)) (set! at j)))
-          (when (< at 0)
-            (fail-on src path child
-                     (dsl/join3 (.text kind) " has no child named " (.text child))))
-          (push! (mut tests) `(= i ~at))))
-      `(~(kind-sym (.text kind)) [] (or false ~@tests)))))
+;;; The texts of a list of names.
+(defn texts [(list g/Node)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (for n (.kids list) (push! (mut out) (.text n)))
+    out))
+
+;;; Every name of a list is a node of the grammar.
+(defn check-nodes! [(kinds (ArrayList syntax/KindEntry))
+                    (src (slice u8))
+                    (path (slice u8))
+                    (grammar (slice u8))
+                    (list g/Node)] (-> void)
+  (for n (.kids list)
+    (match (kind-entry kinds (.text n))
+      (Some [_] 0)
+      (None []
+            (fail-on src path n
+                     (dsl/join3 "the grammar " grammar (dsl/join2 " has no node named " (.text n))))))))
+
+;;; Every name of a list is a node that opens a scope.
+(defn check-opens! [(src (slice u8))
+                    (path (slice u8))
+                    (opener (ArrayList (slice u8)))
+                    (list g/Node)] (-> void)
+  (for n (.kids list)
+    (unless (has-name? opener (.text n))
+      (fail-on src path n
+               (dsl/join3 (.text n) " opens no scope: name it under scope" "")))))
+
+;;; The kinds a placement names, in the order the file declares them, one space between: the
+;;; same for the same set, in whatever order it was written.
+(defn group-key [(declared (ArrayList (slice u8))) (named (ArrayList (slice u8)))] (-> (slice u8))
+  (let [(mut out) ""]
+    (for k declared
+      (when (has-name? named k)
+        (set! out (if (= (len out) 0) k (dsl/join3 out " " k)))))
+    out))
+
+(defn index-of-name [(names (ArrayList (slice u8))) (name (slice u8))] (-> i64)
+  (let [(mut at) -1]
+    (for i (range 0 (len names)) (when (and (< at 0) (= (get names i) name)) (set! at i)))
+    at))
+
+(defn group-sym [(what (slice u8)) (g i64) (end (slice u8))] (-> Code)
+  (primitive/code-symbol what (dsl/join2 (rt/num-text g) end)))
+
+;;; `outside CHILD… of NODE… ;`: the arm saying which of one NODE's children are in its scope.
+(defn outside-arm [(kinds (ArrayList syntax/KindEntry))
+                   (src (slice u8))
+                   (path (slice u8))
+                   (children g/Node)
+                   (node g/Node)] (-> Code)
+  (let [entry
+          (match (kind-entry kinds (.text node))
+            (Some [e] e)
+            (None [] (fail-on src path node (dsl/join2 "the grammar has no node named " (.text node)))))
+        (mut tests) (primitive/code-list-new)]
+    (for child (.kids children)
+      (let [(mut at) -1]
+        (for j (range 0 (len (.fields entry)))
+          (when (= (get (.fields entry) j) (.text child)) (set! at j)))
+        (when (< at 0)
+          (fail-on src path child
+                   (dsl/join3 (.text node) " has no child named " (.text child))))
+        (push! (mut tests) `(= i ~at))))
+    `(~(kind-sym (.text node)) [] (not (or false ~@tests)))))
+
+;;; (match k (syn/KA [] "a") … (_ ""))
+(defn text-of-kind [(nodes (ArrayList (slice u8))) (texts (ArrayList (slice u8)))] (-> Code)
+  (let [(mut arms) (primitive/code-list-new)]
+    (for i (range 0 (len nodes))
+      (push! (mut arms) `(~(kind-sym (get nodes i)) [] ~(get texts i))))
+    `(match k ~@arms (_ ""))))
 
 (defn module-text [(context Code)] (-> (slice u8))
   (let [src (dsl/source-of context)
@@ -113,68 +163,162 @@
                               (.col e)
                               (dsl/join2 "expected " (.want e)))))
         grammar (.text (get (.kids tree) 0))
+        tables (.kids (get (.kids tree) 1))
+        kinds (grammar-kinds context src path (get (.kids tree) 0))
         (mut ref) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut bind) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut function) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut block) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut var) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut lexical) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut param) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut hoist-name) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut block-name) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut self-name) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut key-first) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut dynamic-kind) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut dynamic-name) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut insides) (ArrayList::new [g/Node] (malloc-allocator))
         (mut sequential) (ArrayList::new [(slice u8)] (malloc-allocator))
-        (mut sequential-nodes) (ArrayList::new [g/Node] (malloc-allocator))
-        kinds (grammar-kinds context src path (get (.kids tree) 0))]
-    (for table (.kids (get (.kids tree) 1))
-      (let [t (get (.kids table) 0)
-            w (.text t)
-            (mut names) (ArrayList::new [(slice u8)] (malloc-allocator))]
-        (for n (.kids (get (.kids table) 1)) (push! (mut names) (.text n)))
-        ;; Every table but `dynamic-name` and `inside` lists the grammar's nodes.
-        (unless (or (= w "dynamic-name") (= w "inside"))
-          (for n (.kids (get (.kids table) 1))
-            (match (kind-entry kinds (.text n))
-              (Some [_] 0)
-              (None []
-                    (fail-on src path n
-                             (dsl/join3 "the grammar " grammar (dsl/join2 " has no node named " (.text n))))))))
-        (cond (= w "inside") (push! (mut insides) table)
-              (= w "sequential")
-                (do (set! sequential names)
-                    (for n (.kids (get (.kids table) 1)) (push! (mut sequential-nodes) n)))
-              (= w "ref") (set! ref names)
-              (= w "bind") (set! bind names)
-              (= w "function") (set! function names)
-              (= w "block") (set! block names)
-              (= w "var") (set! var names)
-              (= w "lexical") (set! lexical names)
-              (= w "param") (set! param names)
-              (= w "hoist-name") (set! hoist-name names)
-              (= w "block-name") (set! block-name names)
-              (= w "self-name") (set! self-name names)
-              (= w "key-first") (set! key-first names)
-              (= w "dynamic-kind") (set! dynamic-kind names)
-              (= w "dynamic-name") (set! dynamic-name names)
-              :else
-                (let [at (rt/line-col src (.lo t))]
-                  (dsl/fail-at path
-                               (.line at)
-                               (.col at)
-                               (dsl/join2 "unknown table: " w))))))
-    (let [(mut opening) (ArrayList::new [(slice u8)] (malloc-allocator))
-          (mut inside-arms) (primitive/code-list-new)]
-      (for n function (push! (mut opening) n))
-      (for n block (push! (mut opening) n))
-      (for t insides (push! (mut inside-arms) (inside-arm kinds src path t opening)))
-      (for n sequential-nodes
-        (unless (has-name? opening (.text n))
-          (fail-on src path n
-                   (dsl/join3 (.text n) " opens no scope: name it under block or function" ""))))
+        (mut dynamic) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut dynamic-name) (ArrayList::new [(slice u8)] (malloc-allocator))
+        ;; Nodes that open a scope, and the kind of each; the kinds, in the order declared.
+        (mut opener) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut opener-kind) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut declared) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut program) ""
+        ;; Placements: the node, whether its first child or every binding beneath it, and the
+        ;; group of kinds it lands in, -1 for its own scope.
+        (mut place-node) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut place-first) (ArrayList::new [bool] (malloc-allocator))
+        (mut place-group) (ArrayList::new [i64] (malloc-allocator))
+        (mut groups) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut beneath-node) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut beneath-text) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut outside-seen) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut inside-arms) (primitive/code-list-new)]
+    ;; First the scopes, which the other tables name.
+    (for table tables
+      (cond (= (.kind table) (g/KOpens))
+              (let [kind (.text (get (.kids table) 0))
+                    nodes (get (.kids table) 1)]
+                (check-nodes! kinds src path grammar nodes)
+                (when (= kind "own")
+                  (fail-on src path (get (.kids table) 0) "own is the scope a node opens itself, not a kind"))
+                (unless (has-name? declared kind) (push! (mut declared) kind))
+                (for n (.kids nodes)
+                  (when (has-name? opener (.text n))
+                    (fail-on src path n (dsl/join2 "a second scope for " (.text n))))
+                  (push! (mut opener) (.text n))
+                  (push! (mut opener-kind) kind)))
+            (= (.kind table) (g/KProgram))
+              (do (when (> (len program) 0)
+                    (fail-on src path table "a second program table"))
+                  (set! program (.text (get (.kids table) 0)))
+                  (unless (has-name? declared program) (push! (mut declared) program))
+                  0)
+            :else 0))
+    (when (= (len program) 0)
+      (fail-on src path tree "say which kind of scope a whole program is: program KIND ;"))
+    (for table tables
+      (let [k (.kind table)]
+        (cond (= k (g/KRefs))
+                (do (check-nodes! kinds src path grammar (get (.kids table) 0))
+                    (for n (texts (get (.kids table) 0)) (push! (mut ref) n))
+                    0)
+              (= k (g/KBinds))
+                (do (check-nodes! kinds src path grammar (get (.kids table) 0))
+                    (for n (texts (get (.kids table) 0)) (push! (mut bind) n))
+                    0)
+              (= k (g/KSequential))
+                (do (check-nodes! kinds src path grammar (get (.kids table) 0))
+                    (check-opens! src path opener (get (.kids table) 0))
+                    (for n (texts (get (.kids table) 0)) (push! (mut sequential) n))
+                    0)
+              (= k (g/KDynamic))
+                (do (check-nodes! kinds src path grammar (get (.kids table) 0))
+                    (for n (texts (get (.kids table) 0)) (push! (mut dynamic) n))
+                    0)
+              (= k (g/KDynamicName))
+                (do (for n (texts (get (.kids table) 0)) (push! (mut dynamic-name) n))
+                    0)
+              (= k (g/KOutside))
+                (do (check-opens! src path opener (get (.kids table) 1))
+                    (for node (.kids (get (.kids table) 1))
+                      (when (has-name? outside-seen (.text node))
+                        (fail-on src path node (dsl/join2 "a second outside table for " (.text node))))
+                      (push! (mut outside-seen) (.text node))
+                      (push! (mut inside-arms) (outside-arm kinds src path (get (.kids table) 0) node)))
+                    0)
+              (or (= k (g/KBeneath)) (= k (g/KFirst)))
+                (let [nodes (get (.kids table) 0)
+                      named (texts (get (.kids table) 1))
+                      first? (= k (g/KFirst))]
+                  (check-nodes! kinds src path grammar nodes)
+                  (for n (.kids (get (.kids table) 1))
+                    (unless (or (= (.text n) "own") (has-name? declared (.text n)))
+                      (fail-on src path n
+                               (dsl/join3 "no scope is of the kind " (.text n) ": declare it with scope or program"))))
+                  (let [own? (has-name? named "own")
+                        key (group-key declared named)]
+                    (when (and own? (> (len named) 1))
+                      (fail-on src path (get (.kids table) 1) "own is a scope of its own: name no kind beside it"))
+                    (when own? (check-opens! src path opener nodes))
+                    (let [group
+                            (if own?
+                                -1
+                                (let [at (index-of-name groups key)]
+                                  (if (>= at 0)
+                                      at
+                                      (do (push! (mut groups) key) (- (len groups) 1)))))]
+                      (for n (.kids nodes)
+                        (when (has-name? place-node (.text n))
+                          (fail-on src path n (dsl/join2 "a second placement for " (.text n))))
+                        (push! (mut place-node) (.text n))
+                        (push! (mut place-first) first?)
+                        (push! (mut place-group) group)
+                        (unless first?
+                          (push! (mut beneath-node) (.text n))
+                          (push! (mut beneath-text) (if own? "own" key))))))
+                  0)
+              :else 0)))
+    (let [(mut own-first) (ArrayList::new [(slice u8)] (malloc-allocator))
+          (mut own-beneath) (ArrayList::new [(slice u8)] (malloc-allocator))
+          (mut group-fns) (primitive/code-list-new)
+          (mut group-scans) (primitive/code-list-new)
+          (mut program-scans) (primitive/code-list-new)]
+      (for i (range 0 (len place-node))
+        (when (< (get place-group i) 0)
+          (if (get place-first i)
+              (push! (mut own-first) (get place-node i))
+              (push! (mut own-beneath) (get place-node i)))))
+      (for g (range 0 (len groups))
+        (let [in-group (dsl/words (get groups g))
+              (mut beneath) (ArrayList::new [(slice u8)] (malloc-allocator))
+              (mut firsts) (ArrayList::new [(slice u8)] (malloc-allocator))
+              (mut stops) (ArrayList::new [(slice u8)] (malloc-allocator))
+              beneath? (group-sym "beneath-" g "?")
+              first? (group-sym "first-" g "?")
+              stops? (group-sym "stops-" g "?")
+              scan! (group-sym "scan-" g "!")
+              scan-kid! (group-sym "scan-kid-" g "!")]
+          (for i (range 0 (len place-node))
+            (when (= (get place-group i) g)
+              (if (get place-first i)
+                  (push! (mut firsts) (get place-node i))
+                  (push! (mut beneath) (get place-node i)))))
+          (for i (range 0 (len opener))
+            (when (has-name? in-group (get opener-kind i)) (push! (mut stops) (get opener i))))
+          (push! (mut group-fns)
+                 `(defn ~beneath? [(k syn/Kind)] (-> bool) ~(kind-test beneath)))
+          (push! (mut group-fns)
+                 `(defn ~first? [(k syn/Kind)] (-> bool) ~(kind-test firsts)))
+          ;; A node that opens a scope of a kind of the group, which the names beneath land in.
+          (push! (mut group-fns)
+                 `(defn ~stops? [(k syn/Kind)] (-> bool) ~(kind-test stops)))
+          (push! (mut group-fns)
+                 `(defn ~scan! [(n syn/Node) (t (mut sym/Table)) (scope i64)] (-> void)
+                    (for (ref k) (.kids n) (~scan-kid! k (mut t) scope))))
+          (push! (mut group-fns)
+                 `(defn ~scan-kid! [(k syn/Node) (t (mut sym/Table)) (scope i64)] (-> void)
+                    (cond (~beneath? (.kind k)) (declare-beneath! k (mut t) scope)
+                          (~first? (.kind k)) (declare-first! k (mut t) scope)
+                          (~stops? (.kind k)) 0
+                          :else (~scan! k (mut t) scope))))
+          (push! (mut group-scans)
+                 `(when (~stops? k)
+                    (for i (range 0 count)
+                      (when (inside? k i) (~scan-kid! (get (.kids n) i) (mut t) inner)))))
+          (when (has-name? in-group program)
+            (push! (mut program-scans) `(~scan! tree (mut t) root)))))
       (dsl/render `(do
                      (import "hl.symtab" :as sym)
                      (import "coil.hashmap" :use [HashMap i64-keyops])
@@ -186,36 +330,28 @@
                        ~(kind-test ref))
                      (defn bind? [(k syn/Kind)] (-> bool)
                        ~(kind-test bind))
-                     (defn function? [(k syn/Kind)] (-> bool)
-                       ~(kind-test function))
-                     (defn block? [(k syn/Kind)] (-> bool)
-                       ~(kind-test block))
-                     (defn var? [(k syn/Kind)] (-> bool)
-                       ~(kind-test var))
-                     (defn lexical? [(k syn/Kind)] (-> bool)
-                       ~(kind-test lexical))
-                     (defn param? [(k syn/Kind)] (-> bool)
-                       ~(kind-test param))
-                     (defn hoist-name? [(k syn/Kind)] (-> bool)
-                       ~(kind-test hoist-name))
-                     (defn block-name? [(k syn/Kind)] (-> bool)
-                       ~(kind-test block-name))
-                     (defn self-name? [(k syn/Kind)] (-> bool)
-                       ~(kind-test self-name))
-                     (defn key-first? [(k syn/Kind)] (-> bool)
-                       ~(kind-test key-first))
-                     (defn dynamic-kind? [(k syn/Kind)] (-> bool)
-                       ~(kind-test dynamic-kind))
+                     (defn opens? [(k syn/Kind)] (-> bool)
+                       ~(kind-test opener))
+                     ;;; The kind of scope a node opens, or "".
+                     (defn scope-kind [(k syn/Kind)] (-> (slice u8))
+                       ~(text-of-kind opener opener-kind))
+                     ;;; Where every binding beneath a node lands: the kinds of scope, one space
+                     ;;; between, in the order the file declares them; "own"; or "".
+                     (defn names-in [(k syn/Kind)] (-> (slice u8))
+                       ~(text-of-kind beneath-node beneath-text))
+                     (defn sequential? [(k syn/Kind)] (-> bool)
+                       ~(kind-test sequential))
+                     (defn dynamic? [(k syn/Kind)] (-> bool)
+                       ~(kind-test dynamic))
                      (defn dynamic-name? [(name (slice u8))] (-> bool)
                        ~(name-test dynamic-name))
+                     (defn own-first? [(k syn/Kind)] (-> bool)
+                       ~(kind-test own-first))
+                     (defn own-beneath? [(k syn/Kind)] (-> bool)
+                       ~(kind-test own-beneath))
                      ;;; Whether child `i` of a node of kind `k` that opens a scope is in that scope.
                      (defn inside? [(k syn/Kind) (i i64)] (-> bool)
                        (match k ~@inside-arms (_ true)))
-                     (defn sequential? [(k syn/Kind)] (-> bool)
-                       ~(kind-test sequential))
-
-                     (defn opens? [(k syn/Kind)] (-> bool)
-                       (or (function? k) (block? k)))
 
                      ;;; Declare every binding beneath `n`, stopping at anything with its own scope.
                      (defn declare-beneath! [(n syn/Node)
@@ -236,53 +372,23 @@
                              (sym/declare! (mut t) scope (.text first))
                              0))))
 
-                     ;;; `var`s and hoisted names, through nested blocks but not nested functions.
-                     (defn hoist-scan! [(n syn/Node)
-                                        (t (mut sym/Table))
-                                        (scope i64)] (-> void)
-                       (for (ref k) (.kids n) (hoist-kid! k (mut t) scope)))
+                     ;; For each group of kinds the placements name: a scan declaring what lands in
+                     ;; the nearest scope of one, through scopes of other kinds.
+                     ~@group-fns
 
-                     (defn hoist-kid! [(k syn/Node)
-                                       (t (mut sym/Table))
-                                       (scope i64)] (-> void)
-                       (cond (var? (.kind k)) (declare-beneath! k (mut t) scope)
-                             (hoist-name? (.kind k))
-                               (declare-first! k (mut t) scope)
-                             (function? (.kind k)) 0
-                             :else (hoist-scan! k (mut t) scope)))
-
-                     ;;; Lexical names of this block, not of blocks inside it.
-                     (defn lexical-scan! [(n syn/Node)
-                                          (t (mut sym/Table))
-                                          (scope i64)] (-> void)
-                       (for (ref k) (.kids n) (lexical-kid! k (mut t) scope)))
-
-                     (defn lexical-kid! [(k syn/Node)
-                                         (t (mut sym/Table))
-                                         (scope i64)] (-> void)
-                       (cond (lexical? (.kind k))
-                               (declare-beneath! k (mut t) scope)
-                             (block-name? (.kind k))
-                               (declare-first! k (mut t) scope)
-                             (opens? (.kind k)) 0
-                             :else (lexical-scan! k (mut t) scope)))
-
-                     ;;; What a node that opens a scope declares in it, from the children in it: a
-                     ;;; function's parameters, then what hoists to it, then each scope's lexical names.
+                     ;;; What a node that opens a scope declares in it, from the children in it: its
+                     ;;; own names, then each group's that the scope's kind is in.
                      (defn scope-scan! [(n syn/Node)
                                         (t (mut sym/Table))
                                         (inner i64)] (-> void)
                        (let [k (.kind n)
                              count (len (.kids n))]
-                         (when (function? k)
+                         (when (own-first? k) (declare-first! n (mut t) inner))
+                         (when (own-beneath? k)
                            (for i (range 0 count)
-                             (let [c (get (.kids n) i)]
-                               (when (and (inside? k i) (param? (.kind c)))
-                                 (declare-beneath! c (mut t) inner))))
-                           (for i (range 0 count)
-                             (when (inside? k i) (hoist-kid! (get (.kids n) i) (mut t) inner))))
-                         (for i (range 0 count)
-                           (when (inside? k i) (lexical-kid! (get (.kids n) i) (mut t) inner)))))
+                             (when (inside? k i) (declare-beneath! (get (.kids n) i) (mut t) inner))))
+                         ~@group-scans
+                         0))
 
                      ;;; Walk a node; the scope it opened, or -1.
                      (defn walk [(n syn/Node)
@@ -311,28 +417,15 @@
                                                   (.text n))))
                                    -1)
                                (opens? k)
-                                 (let [inner
-                                         (sym/new-scope! (mut t)
-                                                         scope
-                                                         (function? k))
-                                       (mut start) 0]
-                                   (when (dynamic-kind? k)
+                                 (let [inner (sym/new-scope! (mut t) scope)]
+                                   (when (dynamic? k)
                                      (sym/mark-dynamic! (mut t) inner))
-                                   (when (self-name? k)
-                                     (declare-first! n (mut t) inner))
                                    (scope-scan! n (mut t) inner)
-                                   ;; A declaration's own name belongs to the enclosing scope, even when
-                                   ;; its body declares the same name again.
-                                   (when (or (key-first? k) (hoist-name? k))
-                                     (walk (get (.kids n) 0)
-                                           (mut t)
-                                           scope
-                                           (mut b))
-                                     (set! start 1))
-                                   ;; A sequential child's scope holds the siblings after it, on its side.
+                                   ;; A child outside the scope resolves in the scope around, and a
+                                   ;; sequential child's scope holds the siblings after it, on its side.
                                    (let [(mut in) inner
                                          (mut out) scope]
-                                     (for i (range start (len (.kids n)))
+                                     (for i (range 0 (len (.kids n)))
                                        (let [kid (get (.kids n) i)
                                              opened (walk kid (mut t) (if (inside? k i) in out) (mut b))]
                                          (when (and (sequential? (.kind kid)) (>= opened 0))
@@ -342,21 +435,30 @@
                                    inner)
                                :else
                                  (do
-                                   (when (dynamic-kind? k)
+                                   (when (dynamic? k)
                                      (sym/mark-dynamic! (mut t) scope))
-                                   (let [(mut cur) scope]
-                                     (for (ref child) (.kids n)
-                                       (let [opened (walk child (mut t) cur (mut b))]
-                                         (when (and (sequential? (.kind child)) (>= opened 0))
-                                           (set! cur opened)))))
+                                   (walk-all! n (mut t) scope (mut b))
                                    -1))))
 
-                     ;;; Analyse a whole program in its own new function-level scope.
+                     ;;; Walk a node's children, or a program's parts, in turn from `scope`: a
+                     ;;; sequential one's scope holds those after it. The scope the last are in.
+                     (defn walk-all! [(n syn/Node)
+                                      (t (mut sym/Table))
+                                      (scope i64)
+                                      (b (mut (HashMap i64 i64)))] (-> i64)
+                       (let [(mut cur) scope]
+                         (for (ref child) (.kids n)
+                           (let [opened (walk child (mut t) cur (mut b))]
+                             (when (and (sequential? (.kind child)) (>= opened 0))
+                               (set! cur opened))))
+                         cur))
+
+                     ;;; Analyse a whole program in its own new scope.
                      (defn analyze [(tree syn/Node)
                                     (t (mut sym/Table))
                                     (parent i64)
                                     (b (mut (HashMap i64 i64)))] (-> i64)
-                       (let [root (sym/new-scope! (mut t) parent true)]
+                       (let [root (sym/new-scope! (mut t) parent)]
                          (declare-program! tree (mut t) root)
                          ;; The program itself may open a scope: a `let` can be a whole program.
                          (walk tree (mut t) root (mut b))
@@ -366,28 +468,17 @@
                      (defn declare-program! [(tree syn/Node)
                                              (t (mut sym/Table))
                                              (root i64)] (-> void)
-                       (hoist-scan! tree (mut t) root)
-                       (lexical-scan! tree (mut t) root))
-
-                     ;;; What it then does for each part of the program, in a table whose scope 0 stands for
-                     ;;; the program's (`table-under`): so parts can be walked at once, and grafted in order.
-                     ;;; A sequential part's scope would hold the parts after it, which are walked apart.
-                     (defn walk-part [(n syn/Node)
-                                      (t (mut sym/Table))
-                                      (b (mut (HashMap i64 i64)))] (-> void)
-                       (when (sequential? (.kind n))
-                         (panic "a sequential statement at the top level needs the program analysed whole, not in parts"))
-                       (walk n (mut t) 0 (mut b))
+                       ~@program-scans
                        0)
 
-                     ;;; Under a function scope, and with `outer` names, under one more function scope that
-                     ;;; declares them: a wrapper's parameters, say.
+                     ;;; Under a scope, and with `outer` names, under one more that declares them: a
+                     ;;; wrapper's parameters, say.
                      (defn outer-scope! [(t (mut sym/Table))
                                          (outer (ArrayList (slice u8)))] (-> i64)
-                       (let [top (sym/new-scope! (mut t) -1 true)]
+                       (let [top (sym/new-scope! (mut t) -1)]
                          (if (= (len outer) 0)
                              top
-                             (let [w (sym/new-scope! (mut t) top true)]
+                             (let [w (sym/new-scope! (mut t) top)]
                                (for (ref name) outer
                                  (sym/declare! (mut t) w name))
                                w))))
@@ -416,8 +507,7 @@
                        (let [(mut t) (sym/table-new)
                              root
                                (sym/new-scope! (mut t)
-                                               (outer-scope! (mut t) outer)
-                                               true)]
+                                               (outer-scope! (mut t) outer))]
                          (declare-program! tree (mut t) root)
                          (sym/Analysis
                            :table t
@@ -425,20 +515,28 @@
                            :bindings (no-bindings)
                            :free (ArrayList::new [(slice u8)] (malloc-allocator)))))
 
-                     ;;; Parts of a program walked in a table of their own under `scope` of `t` (`table-under`),
-                     ;;; at once with others walked the same way; `grafted` puts the tables back.
+                     ;;; Parts of a program walked in turn in a table of their own under `scope` of `t`
+                     ;;; (`table-under`), whose scope 0 stands for the program's, at once with others
+                     ;;; walked the same way; `grafted` puts the tables back in order. A sequential
+                     ;;; part's scope holds the parts after it, so those must be in the same call:
+                     ;;; `sequential?` says which parts are.
                      (defn part-analysis [(t sym/Table)
                                           (scope i64)
                                           (parts (ArrayList syn/Node))]
                        (-> sym/Analysis)
                        (let [(mut own) (sym/table-under t scope)
-                             (mut b) (no-bindings)]
-                         (for (ref part) parts (walk-part part (mut own) (mut b)))
+                             (mut b) (no-bindings)
+                             (mut cur) 0]
+                         (for (ref part) parts
+                           (let [opened (walk part (mut own) cur (mut b))]
+                             (when (and (sequential? (.kind part)) (>= opened 0))
+                               (set! cur opened))))
                          (sym/Analysis
                            :table own
                            :root 0
                            :bindings b
                            :free (ArrayList::new [(slice u8)] (malloc-allocator))))))))))
+
 
 (defn read-scopes [(context Code)] (-> Code)
   (primitive/code-read (module-text context) `(reader-config)))

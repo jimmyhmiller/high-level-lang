@@ -27,11 +27,15 @@ There is no bundler logic in Coil. Everything written in the languages is under 
 holds no `.coil` file at all, and the Coil under `compiler/` knows nothing about bundling and
 names no JavaScript node: it is grammars, types, tables, Datalog and rewriting in general, plus a
 runtime of buffers, files and Unicode. `.scopes` takes node names as parameters, checked against
-the grammar. Its tables cover JavaScript's binding forms (`var` hoisting, `let`, named function
-expressions, `with` and `eval`) and rules JavaScript lacks: `inside Let name body` puts only those
-children of a `let` in its scope, so ML's `let x = x + 1 in …` reads the outer `x`; `sequential
-LetStmt` gives a block's `let` a scope that holds what follows it, so `{ let y = 1; let y = y + 1; y }`
-shadows as Rust does (`src/tools/letlang.scopes`, checked by langtest). The grammar language's
+the grammar, and fixes no kind of scope: a file declares its own (`scope function …`, `scope block
+…`), and says where names land by naming them: `names VarDecl Params in function` puts every binding
+beneath those nodes in the nearest function scope, through blocks, and `name FuncExpr in own` puts a
+node's first child in the scope it opens. That covers JavaScript's binding forms (`var` hoisting,
+`let`, named function expressions, `with` and `eval`) and rules JavaScript lacks: `outside init of
+Let` resolves a `let`'s value in the scope around it, so ML's `let x = x + 1 in …` reads the outer
+`x`; `sequential LetStmt` gives a block's `let` a scope that holds what follows it, so
+`{ let y = 1; let y = y + 1; y }` shadows as Rust does, also when the statements are a program's
+parts analysed at once (`src/tools/letlang.scopes`, checked by langtest). The grammar language's
 printer directives (`nomix`, `keepforbid`, soft tokens) are general, each declared by the grammar,
 though each exists for one of JavaScript's quirks.
 
@@ -51,7 +55,7 @@ that name in the spec. `out/bin/spec FILE` builds any spec with those steps.
 | `.js` | 171 | The runtime's helpers, the bundle's and lowering's, in esbuild's order |
 | `.bundler` | 64 | A demo build: data, read with `spec.syntax` |
 | `.pipeline` | 48 | Which stages may run in parallel, and five plans for running them |
-| `.scopes` | 38 | Scoping, for JavaScript and for a small language with ML's and Rust's `let` |
+| `.scopes` | 48 | Scoping, for JavaScript and for a small language with ML's and Rust's `let` |
 | `.coil` | 15 | Four `main` functions, because a package's entry must be plain Coil |
 
 The compilers for those languages are about 12,200 lines of Coil and 240 of grammars, with a runtime
