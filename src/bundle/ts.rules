@@ -288,10 +288,7 @@ fn declarator-name(d: Node) -> Text = match d {
   _ => panic "destructuring in `export` inside a namespace is not implemented yet"
 }
 
-fn assign-out(param: Text, name: Text, value: Node) -> Node {
-  let ns = ident(param)
-  stmt`$ns.$name = $value;`
-}
+fn assign-out(param: Text, name: Text, value: Node) -> Node = stmt`$ns.$name = $value;` where ns = ident(param)
 
 # One statement of a namespace's body, with its `export` turned into an assignment.
 fn namespace-statement(s: Node, param: Text) -> [Node] = match s {
@@ -312,15 +309,15 @@ fn namespace-statement(s: Node, param: Text) -> [Node] = match s {
   }
   TsExportNamespace(TsNamespace(name, body)) => nested-namespace(name.text, body, param)
   TsExportImport(TsImportAlias(name, target)) => [assign-out(param, name.text, target)]
-  TsExportImport(TsImportRequire(name, from)) => {
-    let req = ident("require")
-    let required = exp`$req($from)`
-    [assign-out(param, name.text, required)]
-  }
+  TsExportImport(TsImportRequire(name, from)) => [assign-out(param, name.text, exp`$req($from)`)] where req = ident("require")
   ExportNamed(List(specs...)) =>
-    [assign-out(param, (if spec is ExportAs(...) then spec.exported else spec.local).text, ident(spec.local.text))
-     for spec in specs if spec is ExportName(_) | ExportAs(_, _)]
+    [assign-out(param, exported-as(spec).text, ident(spec.local.text)) for spec in specs if spec is ExportName(_) | ExportAs(_, _)]
   _ => lowered-statements([s])
+}
+
+fn exported-as(spec: Node) -> Node = match spec {
+  ExportAs(_, to) => to
+  _ => spec.local
 }
 
 fn pure-off(n: Node) -> Void {
@@ -329,21 +326,16 @@ fn pure-off(n: Node) -> Void {
   }
 }
 
-fn export-declarators(ds: [Node], param: Text) -> [Node] {
-  if any d in ds: not (d is Declarator(BindName(_), _)) {
-    panic "destructuring in `export` inside a namespace is not implemented yet"
-  }
-  [assign-out(param, x, lowered(init)) for Declarator(BindName(x), init) in ds if not (init is None())]
+fn export-declarators(ds: [Node], param: Text) -> [Node] = match ds {
+  _ if any d in ds: not (d is Declarator(BindName(_), _)) => panic "destructuring in `export` inside a namespace is not implemented yet"
+  _ => [assign-out(param, x, lowered(init)) for Declarator(BindName(x), init) in ds if not (init is None())]
 }
 
 # The function a namespace's body becomes, or nothing if the body held only types.
-fn namespace-call(name: Text, body: Node, outer: Node) -> Node? {
-  let param = fresh-name(name)
-  let stmts = namespace-body(namespace-path ++ "." ++ name, body, param)
-  if len(stmts) == 0 { return none }
-  let p = bind(param)
-  some(exp`(($p) => { $$stmts })($outer)`)
-}
+fn namespace-call(name: Text, body: Node, outer: Node) -> Node? = match namespace-body(namespace-path ++ "." ++ name, body, param) {
+  [] => none
+  stmts => some(exp`(($p) => { $$stmts })($outer)`) where p = bind(param)
+} where param = fresh-name(name)
 
 # What the namespace at `path` holds, as statements of the function its body becomes. Every body of
 # one namespace exports into the same object: what earlier ones exported is read through it.
@@ -362,19 +354,13 @@ fn namespace-body(path: Text, body: Node, param: Text) -> [Node] {
 }
 
 # `let M; ((M2) => { … })(M = N2.M || (N2.M = {}));`
-fn nested-namespace(name: Text, body: Node, param: Text) -> [Node] {
-  let ns1 = ident(param)
-  let ns2 = ident(param)
-  let local = ident(name)
-  let outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
-  match namespace-call(name, body, outer) {
-    some(call) => {
-      let holder = bind(name)
-      [stmt`let $holder;`, ExprStmt(call)]
-    }
-    none => []
-  }
-}
+fn nested-namespace(name: Text, body: Node, param: Text) -> [Node] = match namespace-call(name, body, outer) {
+  some(call) => [stmt`let $holder;`, ExprStmt(call)] where holder = bind(name)
+  none => []
+} where ns1 = ident(param),
+        ns2 = ident(param),
+        local = ident(name),
+        outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
 
 # `var N; ((N2) => { … })(N || (N = {}));`, without the `var` if something already declares N.
 fn namespace-statements(n: Node, exported: Bool) -> [Node] = match n {
@@ -403,23 +389,16 @@ fn param-of(p: Node) -> Node = match p {
 }
 
 # Directives stay first, and in a derived class `this` is only there after `super()`.
-fn assignments-at(stmts: [Node]) -> Int {
-  match first i in 0..len(stmts): if stmts[i] is ExprStmt(CallExpr(Super(), _)) then some(i + 1) else none {
-    some(at) => at
-    none => len([s for s in stmts while s is ExprStmt(Str(_))])
-  }
-}
+fn assignments-at(stmts: [Node]) -> Int =
+  (first i in 0..len(stmts) if stmts[i] is ExprStmt(CallExpr(Super(), _)): i + 1) ?? len([s for s in stmts while s is ExprStmt(Str(_))])
 
 # The constructor, with what it now sets right after `super()`: parameter properties, then fields.
 fn constructor-with-assignments(m: Node, assigns: [Node]) -> Node = match m {
-  Method(key, Params(List(ps...)), FuncBody(List(ss...))) => {
-    let body = lowered-statements(ss)
-    let at = assignments-at(body)
-    let out = body[0..at] ++ assigns ++ body[at..len(body)]
-    let params = [param-of(p) for p in ps]
-    m with { params: Params(List(params...)) with { lo: m.params.lo, hi: m.params.hi },
-             body: FuncBody(List(out...)) with { lo: m.body.lo, hi: m.body.hi } }
-  }
+  Method(key, Params(List(ps...)), FuncBody(List(ss...))) =>
+    m with { params: Params(List([param-of(p) for p in ps]...)) with { lo: m.params.lo, hi: m.params.hi },
+             body: FuncBody(List((body[0..at] ++ assigns ++ body[at..len(body)])...)) with { lo: m.body.lo, hi: m.body.hi } }
+    where body = lowered-statements(ss),
+          at = assignments-at(body)
   _ => panic "expected a constructor"
 }
 
@@ -431,20 +410,16 @@ fn parameter-properties(m: Node) -> [Node] = match m {
 }
 
 # `this.x = v`, `this["a b"] = v`, `this.#x = v`.
-fn assigned(target: Node, key: Node, value: Node) -> Node {
-  let place = match key {
+fn assigned(target: Node, key: Node, value: Node) -> Node = ExprStmt(Assignment(place, AssignOp("="), value))
+  where place = match key {
     PropName(_) | PrivateName(_) => Member(target, key)
     Str(_) | Num(_) => Index(target, key)
     _ => panic "a computed field name with useDefineForClassFields false is not implemented yet"
   }
-  ExprStmt(Assignment(place, AssignOp("="), value))
-}
 
-fn prop-assignment(p: Node) -> Node {
-  let name = p.target.text
-  let value = ident(name)
-  stmt`this.$name = $value;`
-}
+fn prop-assignment(p: Node) -> Node = stmt`this.$name = $value;`
+  where name = p.target.text,
+        value = ident(name)
 
 # Where a member goes: kept in the class, or set by the constructor.
 record Placed { kept: [Node], assigns: [Node] }
@@ -462,30 +437,25 @@ fn member-placed(m: Node) -> Placed = match m {
   _ => Placed(kept: [lowered(m) if not constructor?(m)], assigns: [])
 }
 
-fn synthesized-constructor(derived: Bool) -> Node {
-  let calls: [Node] = if derived then [stmt`super(...arguments);`] else []
-  Method(PropName("constructor"), Params(List()), FuncBody(List(calls...)))
-}
+fn synthesized-constructor(derived: Bool) -> Node = Method(PropName("constructor"), Params(List()), FuncBody(List(calls...)))
+  where calls = [stmt`super(...arguments);` for d in [derived] if d]
 
 # A parameter property is a field, declared ahead of the others, set by the constructor. Without
 # define semantics a field is an assignment there too, and a static one an assignment in a static
 # block where it stood. A private field stays declared, since only the class can declare it.
 fn class-body(n: Node, derived: Bool) -> Node = match n {
-  ClassBody(List(members...)) => {
-    let props = [parameter-properties(m)... for m in members if constructor?(m)]
-    let has-fields = any m in members: m is Field(...) | StaticField(...)
-    if len(props) == 0 and not (settings.assign-fields and has-fields) { return n with { members: lowered(n.members) } }
-    let from-props = [prop-assignment(p) for p in props]
-    let each = [member-placed(m) for m in members]
-    let assigns = from-props ++ [s for c in each for s in c.assigns]
-    let existing = first m in members: if constructor?(m) then some(m) else none
-    let made = [constructor-with-assignments(existing ?? synthesized-constructor(derived), assigns)
-                if len(assigns) > 0 or is-some(existing)]
-    let declared = [Field(PropName(p.target.text) with { lo: p.target.lo, hi: p.target.hi }, None()) with { lo: p.lo, hi: p.hi }
-                    for p in props if not settings.assign-fields]
-    let out = made ++ declared ++ [k for c in each for k in c.kept]
-    n with { members: List(out...) with { lo: n.members.lo, hi: n.members.hi } }
-  }
+  ClassBody(List(members...)) => match props {
+    [] if not (settings.assign-fields and (any m in members: m is Field(...) | StaticField(...))) => n with { members: lowered(n.members) }
+    _ => n with { members: List((made ++ declared ++ [k for c in each for k in c.kept])...) with { lo: n.members.lo, hi: n.members.hi } }
+      where from-props = [prop-assignment(p) for p in props],
+            each = [member-placed(m) for m in members],
+            assigns = from-props ++ [s for c in each for s in c.assigns],
+            existing = first m in members if constructor?(m): m,
+            made = [constructor-with-assignments(existing ?? synthesized-constructor(derived), assigns)
+                    for x in [assigns] if len(x) > 0 or is-some(existing)],
+            declared = [Field(PropName(p.target.text) with { lo: p.target.lo, hi: p.target.hi }, None()) with { lo: p.lo, hi: p.hi }
+                        for p in props if not settings.assign-fields]
+  } where props = [parameter-properties(m)... for m in members if constructor?(m)]
   _ => panic "expected a class body"
 }
 
