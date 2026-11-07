@@ -560,7 +560,7 @@
     (when (= (.kind body) (g/KBlock))
       (let [all (.kids (kid body 0))]
         (for i (range 0 (- (len all) 1)) (push! (mut stmts) (get all i)))))
-    (push! (mut stmts) (g/node2 (g/KExtend) (name-node acc answer) answer))
+    (push! (mut stmts) (pushed-extend acc answer))
     (push! (mut into-kids) (name-node into fname))
     (push! (mut into-kids) (list-node into-params (kid d 1)))
     (push! (mut into-kids) (g/none-node))
@@ -576,6 +576,32 @@
     (push! (mut wrap-kids) (g/mk (g/KBlock) (one (list-node wrap-stmts body)) (.lo body) (.hi body)))
     (push! (mut out) (g/mk (g/KFn) wrap-kids (.lo d) (.hi d)))
     out))
+
+;;; `acc ++= e`, pushed into `e`'s matches and through its `where`s, so that each arm adds what it
+;;; makes as it makes it: an arm that recurses adds through its own accumulator, and nothing is
+;;; built only to be copied.
+(defn pushed-extend [(acc (slice u8)) (e g/Node)] (-> g/Node)
+  (match (.kind e)
+    (g/KMatch []
+      (let [(mut arms) (g/new-kids)]
+        (for a (list-kids (kid e 1))
+          (let [(mut t) a (mut ks) (g/new-kids)]
+            (push! (mut ks) (kid a 0)) (push! (mut ks) (kid a 1)) (push! (mut ks) (pushed-extend acc (kid a 2)))
+            (set! (.kids t) ks)
+            (push! (mut arms) t)))
+        (g/node2 (g/KMatch) (kid e 0) (list-node arms (kid e 1)))))
+    (g/KMatchN []
+      (let [(mut arms) (g/new-kids)]
+        (for a (list-kids (kid e 2))
+          (let [(mut t) a (mut ks) (g/new-kids)]
+            (push! (mut ks) (kid a 0)) (push! (mut ks) (kid a 1)) (push! (mut ks) (kid a 2)) (push! (mut ks) (pushed-extend acc (kid a 3)))
+            (set! (.kids t) ks)
+            (push! (mut arms) t)))
+        (g/mk (g/KMatchN) (three (kid e 0) (kid e 1) (list-node arms (kid e 2))) (.lo e) (.hi e))))
+    (g/KWhereE [] (g/node2 (g/KWhereE) (pushed-extend acc (kid e 0)) (kid e 1)))
+    (g/KGroup [] (pushed-extend acc (kid e 0)))
+    (g/KPanic [] e)
+    (_ (g/node2 (g/KExtend) (name-node acc e) e))))
 
 ;;; `"bundle.js" = "src/bundle/js.syntax"` lines under [modules].
 (defn read-manifest! [(k (mut Comp)) (manifest (slice u8))] (-> void)
@@ -1513,12 +1539,19 @@
 ;;; `e where x = …, y = …`: each name an equation, which may use the others in any order but not
 ;;; itself; each is worked out once, before `e`, in an order where what it uses comes first.
 (defn where-code [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+  (let [mark (locals-mark (mut k))
+        lets (where-open! (mut k) n)
+        body (stmt (mut k) (kid n 0) want)]
+    (locals-reset! (mut k) mark)
+    (te `(let [~@lets] ~(.code body)) (.ty body))))
+
+;;; A `where`'s equations, bound for what follows, as the bindings of a `let`.
+(defn where-open! [(k (mut Comp)) (n g/Node)] (-> Code)
   (let [inits (list-kids (kid n 1))
         count (len inits)
         (mut names) (text-list)
         (mut done) (ArrayList::new [bool] (malloc-allocator))
-        (mut order) (ArrayList::new [i64] (malloc-allocator))
-        mark (locals-mark (mut k))]
+        (mut order) (ArrayList::new [i64] (malloc-allocator))]
     (for i inits
       (let [nm (.text (kid i 0))]
         (for x names (when (= x nm) (die (mut k) i (cat3 "`" nm "` is defined twice here"))))
@@ -1554,9 +1587,7 @@
                 s (bind-local! (mut k) (get names j) (.ty v) false)]
             (push! (mut lets) (sym s))
             (push! (mut lets) (.code v))))
-        (let [body (expr (mut k) (kid n 0) want)]
-          (locals-reset! (mut k) mark)
-          (te `(let [~@lets] ~(.code body)) (.ty body)))))))
+        `(~@lets)))))
 
 ;;; Every name an expression mentions, whatever it means there: not a field's name, `p.at`'s `at`
 ;;; or the `at:` of `Place(at: …)`.
@@ -2007,6 +2038,52 @@
                     "Int")))
 ;; `tally(keys)`: how many times each key is in the list. `tally(keys, weights)`: the sum of the
       ;; weights at each key's places.
+;; `updated(xs, {k: v for …})`: `xs` with each value at its key's place, as the comprehension
+      ;; makes them, a later one over an earlier one; no map is made.
+      (and (= name "updated") (= count 2) (= (.kind (get args 1)) (g/KMapComp)))
+        (let [xs (expr (mut k) (get args 0) "")
+              _ (unless (list? (.ty xs)) (die (mut k) n (cat "updated takes a list, not " (.ty xs))))
+              comp (get args 1)
+              o (fresh (mut k) "out")
+              key-v (fresh (mut k) "key")
+              mark (locals-mark (mut k))
+              (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))
+              _ (for c (list-kids (kid comp 2)) (push! (mut opened) (clause-open! (mut k) c)))
+              key (expect (mut k) (kid comp 0) (expr (mut k) (kid comp 0) "Int") "Int")
+              val (expect (mut k) (kid comp 1) (expr (mut k) (kid comp 1) (elem-of (.ty xs))) (elem-of (.ty xs)))
+              body (clauses-code (mut k) (list-kids (kid comp 2)) opened
+                                 `(let [~(sym key-v) ~(.code key)]
+                                    (when (or (< ~(sym key-v) 0) (>= ~(sym key-v) (len ~(sym o))))
+                                      (panic "updated: key {} is outside 0 to {}" ~(sym key-v) (len ~(sym o))))
+                                    (set! (mut ~(sym o)) ~(sym key-v) ~(.code val))))]
+          (locals-reset! (mut k) mark)
+          (Some (te `(let [(mut ~(sym o)) ~(if (match (.kind (get args 0)) (g/KName [] true) (g/KFieldE [] true) (g/KIndex [] true) (_ false))
+                                               (list-copy (mut k) xs)
+                                               (.code xs))]
+                       ~body ~(sym o))
+                    (.ty xs))))
+;; `updated(xs, keys, values)`: `xs` with each value at its key's place, a later one over an
+      ;; earlier one at the same place: a list with some of its items replaced.
+      (and (= name "updated") (= count 3))
+        (let [xs (expr (mut k) (get args 0) "")
+              _ (unless (list? (.ty xs)) (die (mut k) n (cat "updated takes a list, not " (.ty xs))))
+              ks (expect (mut k) (get args 1) (expr (mut k) (get args 1) "[Int]") "[Int]")
+              vs (expect (mut k) (get args 2) (expr (mut k) (get args 2) (.ty xs)) (.ty xs))
+              o (fresh (mut k) "out") kv (fresh (mut k) "keys") vv (fresh (mut k) "values") i (fresh (mut k) "i")
+              key-v (fresh (mut k) "key")]
+          (Some (te `(let [(mut ~(sym o)) ~(if (match (.kind (get args 0)) (g/KName [] true) (g/KFieldE [] true) (g/KIndex [] true) (_ false))
+                                               (list-copy (mut k) xs)
+                                               (.code xs))
+                           ~(sym kv) ~(.code ks)
+                           ~(sym vv) ~(.code vs)]
+                       (unless (= (len ~(sym kv)) (len ~(sym vv))) (panic "updated needs a value for each key"))
+                       (for ~(sym i) (range 0 (len ~(sym kv)))
+                         (let [~(sym key-v) (get ~(sym kv) ~(sym i))]
+                           (when (or (< ~(sym key-v) 0) (>= ~(sym key-v) (len ~(sym o))))
+                             (panic "updated: key {} is outside 0 to {}" ~(sym key-v) (len ~(sym o))))
+                           (set! (mut ~(sym o)) ~(sym key-v) (get ~(sym vv) ~(sym i)))))
+                       ~(sym o))
+                    (.ty xs))))
 ;; `histogram(n, keys)`: for keys from 0 below `n`, how many times each is in the list, as a list
       ;; of `n`; `histogram(n, keys, weights)` adds up the weights instead. Over a comprehension of
       ;; keys, each is counted as it is made.
@@ -2805,6 +2882,70 @@
         (g/KCall [] false)
         (_ true))))
 
+;;; A record accumulator's first value, its own: a list or map field that came from a name is copied,
+;;; so changing it in place changes nothing else.
+(defn record-start [(k (mut Comp)) (init-node g/Node) (init TE)] (-> Code)
+  (let [r (fresh (mut k) "start")
+        rec (match (find-rec (mod-at (mut k) (type-module (.ty init))) (type-name (.ty init))) (Some [x] x) (None [] (die (mut k) init-node "no such record")))
+        (mut copies) (primitive/code-list-new)]
+    (for f (.fields rec)
+      (when (and (or (list? (.ty f)) (map? (.ty f))) (record-field-shared? init-node (.name f)))
+        (let [field `(~(primitive/code-symbol "." (.name f)) ~(sym r))]
+          (push! (mut copies) `(set! ~field ~(list-copy (mut k) (te field (.ty f))))))))
+    `(let [(mut ~(sym r)) ~(.code init)] ~@copies ~(sym r))))
+
+;;; Whether a constructor's field may share its list or map with something else: anything but a
+;;; constructor whose argument for the field makes a new one.
+(defn record-field-shared? [(init g/Node) (field (slice u8))] (-> bool)
+  (if (not (= (.kind init) (g/KCtor)))
+      true
+      (let [(mut shared) true]
+        (for a (list-kids (kid init 1))
+          (when (and (= (.kind a) (g/KNamed)) (= (.text (kid a 0)) field))
+            (set! shared (match (.kind (kid a 1)) (g/KName [] true) (g/KFieldE [] true) (g/KIndex [] true) (_ false)))))
+        shared)))
+
+;;; One step of a record fold: every new value worked out from the accumulator as it stands, then
+;;; each field changed. `acc.f ++ more` adds to the field in place: `more` worked out first when it is
+;;; one entry or item, or in place when it does not read the accumulator; any other value replaces.
+(defn record-step [(k (mut Comp)) (step g/Node) (acc Code) (acc-name (slice u8)) (ty (slice u8))] (-> Code)
+  (let [(mut lets) (primitive/code-list-new)
+        (mut applies) (primitive/code-list-new)]
+    (for fi (list-kids (kid step 1))
+      (let [field (.text (kid fi 0))
+            v (kid fi 1)
+            fty (field-type (mut k) fi ty field)
+            target `(~(primitive/code-symbol "." field) ~acc)
+            extends (and (or (list? fty) (map? fty)) (= (.kind v) (g/KConcat))
+                         (= (.kind (kid v 0)) (g/KFieldE)) (= (.kind (kid (kid v 0) 0)) (g/KName))
+                         (= (.text (kid (kid v 0) 0)) acc-name) (= (.text (kid (kid v 0) 1)) field))
+            more (if extends (kid v 1) v)
+            reads (mentions-name? more acc-name)]
+        (cond
+          (and extends (map? fty) (= (.kind more) (g/KMapLit)) (= (len (list-kids (kid more 0))) 1))
+            (let [entry (get (list-kids (kid more 0)) 0)
+                  key (expect (mut k) (kid entry 0) (expr (mut k) (kid entry 0) (map-key fty)) (map-key fty))
+                  val (expect (mut k) (kid entry 1) (expr (mut k) (kid entry 1) (map-val fty)) (map-val fty))
+                  tk (fresh (mut k) "key") tv (fresh (mut k) "val")]
+              (push! (mut lets) (sym tk)) (push! (mut lets) (.code key))
+              (push! (mut lets) (sym tv)) (push! (mut lets) (.code val))
+              (push! (mut applies) `(set! (mut ~target) ~(sym tk) ~(sym tv))))
+          (and extends (list? fty) (= (.kind more) (g/KListLit)) (= (len (list-kids (kid more 0))) 1)
+               (not (spread-arg? (get (list-kids (kid more 0)) 0))))
+            (let [item (get (list-kids (kid more 0)) 0)
+                  x (expect (mut k) item (expr (mut k) item (elem-of fty)) (elem-of fty))
+                  tx (fresh (mut k) "item")]
+              (push! (mut lets) (sym tx)) (push! (mut lets) (.code x))
+              (push! (mut applies) `(push! (mut ~target) ~(sym tx))))
+          (and extends (not reads))
+            (push! (mut applies) (if (map? fty) (map-extend-code (mut k) more target fty) (extend-code (mut k) more target fty)))
+          :else
+            (let [x (expect (mut k) v (expr (mut k) v fty) fty)
+                  t (fresh (mut k) "new")]
+              (push! (mut lets) (sym t)) (push! (mut lets) (.code x))
+              (push! (mut applies) `(set! ~target ~(sym t)))))))
+    `(let [~@lets] ~@applies 0)))
+
 (defn mentions-name? [(n g/Node) (name (slice u8))] (-> bool)
   (if (and (= (.kind n) (g/KName)) (= (.text n) name))
       true
@@ -2824,12 +2965,28 @@
         in-place (and (not scan) (or (list? ty) (map? ty)) (= (.kind step-node) (g/KConcat))
                       (= (.kind (kid step-node 0)) (g/KName)) (= (.text (kid step-node 0)) (.text (kid n 0)))
                       (added-whole? (kid step-node 1) (.text (kid n 0))))
-        start (if (and in-place (match (.kind (kid n 1)) (g/KName [] true) (g/KFieldE [] true) (g/KIndex [] true) (_ false)))
+        ;; `fold r = R(…) …: r with { names: r.names ++ more, count: r.count + 1 }`: a record's
+        ;; fields changed where they are, each new value worked out before any changes.
+        ;; Also `(r with { … } where x = …)`: the equations are worked out first, from `r` as it stands.
+        step-where (if (and (= (.kind step-node) (g/KGroup)) (= (.kind (kid step-node 0)) (g/KWhereE)))
+                       (Some (kid step-node 0))
+                       (None [g/Node]))
+        with-node (match step-where (Some [w] (kid w 0)) (None [] step-node))
+        in-record (and (not scan) (not in-place) (record-type? (mut k) ty) (= (.kind with-node) (g/KWithE))
+                       (= (.kind (kid with-node 0)) (g/KName)) (= (.text (kid with-node 0)) (.text (kid n 0))))
+        start (cond
+                (and in-place (match (.kind (kid n 1)) (g/KName [] true) (g/KFieldE [] true) (g/KIndex [] true) (_ false)))
                   (list-copy (mut k) init)
-                  (.code init))
+                in-record (record-start (mut k) (kid n 1) init)
+                :else (.code init))
         (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
     (for c (list-kids (kid n 2)) (push! (mut opened) (clause-open! (mut k) c)))
     (let [each (cond
+                 in-record (match step-where
+                             (Some [w]
+                               (let [lets (where-open! (mut k) w)]
+                                 `(let [~@lets] ~(record-step (mut k) with-node (sym acc) (.text (kid n 0)) ty))))
+                             (None [] (record-step (mut k) with-node (sym acc) (.text (kid n 0)) ty)))
                  in-place (if (map? ty)
                               (map-extend-code (mut k) (kid step-node 1) (sym acc) ty)
                               (extend-code (mut k) (kid step-node 1) (sym acc) ty))
@@ -3441,6 +3598,14 @@
             (locals-reset! (mut k) mark)
             `(do ~body 0))))
       (g/KCall [] (spread-into (mut k) e target t))
+      ;; `e where x = …`: the equations, then `e` goes in.
+      (g/KWhereE []
+        (let [mark (locals-mark (mut k))
+              lets (where-open! (mut k) e)
+              inner (extend-code (mut k) (kid e 0) target t)]
+          (locals-reset! (mut k) mark)
+          `(let [~@lets] ~inner 0)))
+      (g/KGroup [] (extend-code (mut k) (kid e 0) target t))
       (_ (extend-whole (mut k) e target t)))))
 
 (defn extend-whole [(k (mut Comp)) (e g/Node) (target Code) (t (slice u8))] (-> Code)

@@ -6,6 +6,7 @@ use bundle.scopes as sc
 use bundle.modules as m
 use bundle.analysis as an
 use bundle.minhost as host
+use bundle.naming as nm
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -27,35 +28,9 @@ state chunk-paths: {Int:Text} = {}
 fn chunk-path(root: Int) -> Text =
   chunk-paths[root] ?? panic "{} starts no chunk in this build", m.modules[root].path
 
-# Name-collision state: every name taken at the bundle's top level or reserved, plus a stack of
-# names taken in the nested scopes around the current one.
-state used: {Text:Int} = {}
-state stack: [{Text:Int}] = []
-
 context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
 
-fn taken?(name: Text) -> Bool = name in used or (any frame in stack: name in frame)
-
-fn reserve(name: Text) -> Void {
-  used[name] = 1
-}
-
-# `name`, or `name2`, `name3`… as esbuild's number renamer does.
-fn unique-name(name: Text) -> Text = untaken(name) ?? first i in 2..: untaken(name ++ int-text(i))
-
-fn untaken(name: Text) -> Text? = if taken?(name) then none else some(name)
-
-const keywords: [Text] = ["arguments", "await", "break", "case", "catch", "class", "const", "continue",
-  "debugger", "default", "delete", "do", "else", "enum", "eval", "export", "extends", "false", "finally",
-  "for", "function", "if", "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
-  "package", "private", "protected", "public", "return", "static", "super", "switch", "this", "throw",
-  "true", "try", "typeof", "var", "void", "while", "with", "yield"]
-
-# Globals esbuild's full runtime refers to, which our smaller one need not. Reserving them only
-# keeps generated names the same as esbuild's.
-const esbuild-runtime-globals: [Text] = ["Math", "Object", "Array", "Error", "Proxy", "TypeError", "Reflect", "require"]
-
-fn import-symbol?(s: Int) -> Bool = m.db.import-of(s, _, _) or m.db.ns-import(s, _)
+fn import-symbol?(s: Int) -> Bool = nm.import-symbol?(s)
 
 # What a symbol finally means: an import means whatever it resolves to.
 fn target-of(s: Int) -> Int {
@@ -70,82 +45,11 @@ fn target-of(s: Int) -> Int {
   s
 }
 
-fn included?(id: Int) -> Bool = m.db.included(id)
-fn live?(p: Int) -> Bool = m.db.live(p)
-fn parts-of(id: Int) -> [Int] = [p for m.db.part-of(?p, id)]
+fn included?(id: Int) -> Bool = nm.included?(id)
+fn live?(p: Int) -> Bool = nm.live?(p)
+fn parts-of(id: Int) -> [Int] = nm.parts-of(id)
 
-# Nested names: a nested symbol must not shadow anything in scope above it. A scope code can reach
-# by name at run time keeps its names.
-fn name-nested(scope: Int) -> Void {
-  let now = sym.scope-at(m.table, scope)
-  stack += {}
-  for s in now.symbols {
-    let name = sym.symbol-at(m.table, s).name
-    let chosen = if now.dynamic then name else unique-name(name)
-    sym.set-final!(m.table, s, chosen)
-    stack[len(stack) - 1][chosen] = 1
-  }
-  for child in now.children { name-nested(child) }
-  pop(stack)
-}
-
-# An import from CommonJS is rewritten to a property read, but its own name stays taken at the top
-# level, as in esbuild.
-fn reserve-cjs-imports(s: Node, mo: m.Module) -> Void = match s {
-  BindName(x) => if let some(symbol) = mo.bindings[s.lo] {
-    if symbol in an.cjs-imports { reserve(unique-name(x)) }
-  }
-  Import(...) | ImportDefault(...) | ImportDefaultAnd(...) | ImportNamespace(...) | ImportNamed(...)
-    | ImportAs(...) | ImportName(...) | List(...) => {
-    for k in s.kids { reserve-cjs-imports(k, mo) }
-  }
-  _ => {}
-}
-
-# Assign final names, in esbuild's order: reserved words and the free names of live modules first,
-# then top-level symbols of live statements, then nested scopes.
-fn assign-names() -> Void {
-  used = {}
-  stack = []
-  for w in keywords { reserve(w) }
-  for w in esbuild-runtime-globals { reserve(w) }
-  # The runtime is part of every bundle, even when no helper of it survives.
-  for id in m.order {
-    if id == 0 or included?(id) {
-      for f in m.modules[id].free { reserve(f) }
-    }
-  }
-  for id in m.order {
-    if included?(id) {
-      for p in parts-of(id) {
-        if live?(p) {
-          reserve-cjs-imports(an.part-stmt[p], m.modules[id])
-          for m.db.declares(p, ?s) {
-            if not import-symbol?(s) {
-              let name = unique-name(sym.symbol-at(m.table, s).name)
-              reserve(name)
-              sym.set-final!(m.table, s, name)
-            }
-          }
-        }
-      }
-    }
-  }
-  for id in m.order {
-    if included?(id) {
-      let mo = m.modules[id]
-      let root = sym.scope-at(m.table, mo.root)
-      if mo.kind == Cjs {
-        # The wrapper's own (exports, module) scope, then the file's.
-        name-nested(root.parent)
-      } else {
-        for child in root.children { name-nested(child) }
-      }
-    }
-  }
-}
-
-fn final-of(s: Int) -> Text = sym.symbol-at(m.table, s).final
+fn final-of(s: Int) -> Text = nm.final-of(s)
 
 fn helper-name(name: Text) -> Text = final-of(an.helper(name))
 
@@ -566,10 +470,7 @@ fn module-units(id: Int) -> [Unit] {
   [Unit(module: id, from: k * unit-parts, to: min(n, (k + 1) * unit-parts)) for k in 0..(n + unit-parts - 1) / unit-parts]
 }
 
-state units: [Unit] = []
-
-fn unit-emitted(i: Int) -> Emitted {
-  let u = units[i]
+fn unit-emitted(u: Unit) -> Emitted {
   found-externals = []
   if not (included?(u.module) and any-part-here?(u.module)) { return Emitted(body: [], namespace: [], externals: []) }
   with here = m.modules[u.module] {
@@ -593,8 +494,8 @@ fn part-emitted(p: Int) -> Emitted = match an.part-stmt[p] {
 }
 
 fn program() -> Node {
-  units = units-of-order()
-  let emitted = parallel-map([i for i in 0..len(units)], unit-emitted, emitting.emit-threads)
+  let units = units-of-order()
+  let emitted = parallel-map(units, unit-emitted, emitting.emit-threads)
   external-imports ++= [line for em in emitted for line in em.externals if not (line in external-imports) distinct line]
   # The namespace objects go after the runtime's statements and before everything else.
   let runtime-units = (last i in 0..len(units): if units[i].module == 0 then some(i + 1) else none) ?? 0

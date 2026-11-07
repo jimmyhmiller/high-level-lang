@@ -1,0 +1,110 @@
+# Every symbol's name in the output, as esbuild's number renamer gives them: reserved words and the
+# free names of the output's modules first, then each top-level claim in the program's order, the
+# first of `x`, `x2`, `x3`… that nothing has; then each nested scope's symbols, clear of the top
+# level's names and of the scopes around them. What the build chose, emitting reads: `finals` has a
+# name for each symbol.
+rules bundle.naming over bundle.js
+use bundle.modules as m
+use bundle.analysis as an
+
+input finals: [Text]
+
+fn final-of(s: Int) -> Text = finals[s]
+
+const keywords: [Text] = ["arguments", "await", "break", "case", "catch", "class", "const", "continue",
+  "debugger", "default", "delete", "do", "else", "enum", "eval", "export", "extends", "false", "finally",
+  "for", "function", "if", "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
+  "package", "private", "protected", "public", "return", "static", "super", "switch", "this", "throw",
+  "true", "try", "typeof", "var", "void", "while", "with", "yield"]
+
+# Globals esbuild's full runtime refers to, which our smaller one need not. Reserving them only
+# keeps generated names the same as esbuild's.
+const esbuild-runtime-globals: [Text] = ["Math", "Object", "Array", "Error", "Proxy", "TypeError", "Reflect", "require"]
+
+fn included?(id: Int) -> Bool = m.db.included(id)
+fn live?(p: Int) -> Bool = m.db.live(p)
+fn parts-of(id: Int) -> [Int] = [p for m.db.part-of(?p, id)]
+fn import-symbol?(s: Int) -> Bool = m.db.import-of(s, _, _) or m.db.ns-import(s, _)
+
+# Names nothing may take: reserved words, and the free names of the modules in the output. The
+# runtime is part of every bundle, even when no helper of it survives.
+fn reserved(extra: [Text]) -> {Text:Int} =
+  {w: -1 for w in keywords ++ extra ++ [f for id in m.order if id == 0 or included?(id) for f in m.modules[id].free]}
+
+# A name a statement takes at the top level: a symbol's, or one only kept from use, as -1.
+record Claim { symbol: Int, name: Text }
+
+# The top level's claims in order: each live statement's own symbols, and before them its imports
+# from CommonJS, which are rewritten to property reads but whose names stay taken, as in esbuild.
+fn claims() -> [Claim] =
+  [c for id in m.order if included?(id) for p in parts-of(id) if live?(p)
+     for c in cjs-claims(an.part-stmt[p], m.modules[id])
+              ++ [Claim(symbol: s, name: sym.symbol-at(m.table, s).name) for m.db.declares(p, ?s) if not import-symbol?(s)]]
+
+fn cjs-claims(s: Node, mo: m.Module) -> [Claim] = match s {
+  BindName(x) => [Claim(symbol: -1, name: x) for symbol in mo.bindings[s.lo] if symbol in an.cjs-imports]
+  Import(...) | ImportDefault(...) | ImportDefaultAnd(...) | ImportNamespace(...) | ImportNamed(...)
+    | ImportAs(...) | ImportName(...) | List(...) => [c for k in s.kids for c in cjs-claims(k, mo)]
+  _ => []
+}
+
+# `name`, or `name2`, `name3`… the first not taken: at the top level, in a scope around, or before
+# it in its own scope.
+fn unique(name: Text, top: {Text:Int}, frames: [{Text:Int}], frame: {Text:Int}) -> Text =
+  first i in 1.. if free?(spelled(name, i), top, frames, frame): spelled(name, i)
+
+fn spelled(name: Text, i: Int) -> Text = match i {
+  1 => name
+  _ => name ++ int-text(i)
+}
+
+fn free?(c: Text, top: {Text:Int}, frames: [{Text:Int}], frame: {Text:Int}) -> Bool =
+  not (c in top) and not (c in frame) and not (any f in frames: c in f)
+
+# A symbol and the name it has.
+record Named { symbol: Int, name: Text }
+
+# The names taken at the top level, and which symbol took each; and the claims' names, in order.
+record TopLevel { taken: {Text:Int}, names: [Named] }
+
+fn top-level(reserved: {Text:Int}) -> TopLevel =
+  fold t = TopLevel(taken: reserved, names: []) for c in claims():
+    (t with { taken: t.taken ++ {name: c.symbol}, names: t.names ++ [Named(symbol: c.symbol, name: name)] }
+     where name = first i in 1.. if not (spelled(c.name, i) in t.taken): spelled(c.name, i))
+
+# A scope's names, chosen in order: what they are, and which symbol has each.
+record Frame { taken: {Text:Int}, named: [Named] }
+
+# A scope code can reach by name at run time keeps its names.
+fn scope-frame(now: sym.Scope, top: {Text:Int}, frames: [{Text:Int}]) -> Frame = match now.dynamic {
+  true => Frame(taken: {sym.symbol-at(m.table, s).name: s for s in now.symbols}, named: [])
+  false => fold f = Frame(taken: {}, named: []) for s in now.symbols:
+    (f with { taken: f.taken ++ {name: s}, named: f.named ++ [Named(symbol: s, name: name)] }
+     where name = unique(sym.symbol-at(m.table, s).name, top, frames, f.taken))
+}
+
+# A scope's names and those of every scope inside it, each clear of the scopes around it. A scope
+# that declares nothing adds nothing for those inside it to stay clear of.
+fn nested(scope: Int, top: {Text:Int}, frames: [{Text:Int}]) -> [Named] = match now.symbols {
+  [] => [nested(child, top, frames)... for child in now.children]
+  _ => frame.named ++ [nested(child, top, inside)... for child in now.children]
+    where frame = scope-frame(now, top, frames),
+          inside = frames ++ [frame.taken]
+} where now = sym.scope-at(m.table, scope)
+
+# A module's nested scopes: CommonJS's start with its wrapper's own (exports, module) scope.
+fn module-nested(mo: m.Module, top: {Text:Int}) -> [Named] = match mo.kind {
+  m.Cjs => nested(sym.scope-at(m.table, mo.root).parent, top, [])
+  _ => [nested(child, top, [])... for child in sym.scope-at(m.table, mo.root).children]
+}
+
+# esbuild's names for every symbol: the top level's, then the nested scopes'.
+fn esbuild-names() -> [Text] =
+  updated(updated(own-names(), {x.symbol: x.name for x in top.names if x.symbol >= 0}),
+          {x.symbol: x.name for id in m.order if included?(id) for x in module-nested(m.modules[id], top.taken)})
+  where top = top-level(reserved(esbuild-runtime-globals))
+
+fn own-names() -> [Text] = [sym.symbol-at(m.table, s).name for s in 0..sym.symbol-count(m.table)]
+
+# A name for each symbol: the last one given it, or its own.
+fn named-table(named: [Named]) -> [Text] = updated(own-names(), {x.symbol: x.name for x in named})

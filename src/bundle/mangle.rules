@@ -6,6 +6,7 @@ rules bundle.mangle over bundle.js
 use bundle.modules as m
 use bundle.emit as e
 use bundle.analysis as an
+use bundle.naming as nm
 
 # The symbols live code uses, once for each use, an import counted as what it resolves to.
 everywhere fn uses-in(n: Node, mo: m.Module) -> [Int] = match n {
@@ -24,34 +25,32 @@ fn jsx-file?(path: Text) -> Bool = m.loader-of(path) == "jsx" or m.loader-of(pat
 # the sums do not depend on the order they are added in.
 record Usage { used: [Int], tags: [Int], freq: [Int], toplevel: [Int] }
 
-fn unit-usage(i: Int) -> Usage {
-  let u = e.units[i]
-  if not e.included?(u.module) { return Usage(used: [], tags: [], freq: [], toplevel: []) }
-  let mo = m.modules[u.module]
-  let live = [p for p in e.parts-of(u.module)[u.from..u.to] if e.live?(p)]
-  Usage(used: [x for p in live for x in uses-in(an.part-stmt[p], mo)],
-        tags: if jsx-file?(mo.path) then [x for p in live for x in tags-in(an.part-stmt[p], mo)] else [],
-        freq: if u.from == 0 then byte-counts(mo.text) else [],
-        toplevel: [s for p in live for m.db.declares(p, ?s) if not e.import-symbol?(s)])
-}
+fn unit-usage(u: e.Unit) -> Usage = match nm.included?(u.module) {
+  false => Usage(used: [], tags: [], freq: [], toplevel: [])
+  true => Usage(used: [x for p in live for x in uses-in(an.part-stmt[p], mo)],
+                tags: [x for p in live if jsx-file?(mo.path) for x in tags-in(an.part-stmt[p], mo)],
+                freq: match u.from {
+                  0 => byte-counts(mo.text)
+                  _ => []
+                },
+                toplevel: [s for p in live for m.db.declares(p, ?s) if not nm.import-symbol?(s)])
+} where mo = m.modules[u.module],
+        live = [p for p in nm.parts-of(u.module)[u.from..u.to] if nm.live?(p)]
 
 # A symbol's slot.
 record Slotted { symbol: Int, at: Int }
 
 # Nested symbols: each scope's symbols take slots from `from` on, and its children from where they
 # stopped, so siblings share.
-fn nested-slots(scope: Int, from: Int) -> [Slotted] {
-  let now = sym.scope-at(m.table, scope)
-  let own: [Slotted] = if now.dynamic then [] else [Slotted(symbol: now.symbols[i], at: from + i) for i in 0..len(now.symbols)]
-  own ++ [nested-slots(child, from + len(own))... for child in now.children]
-}
+fn nested-slots(scope: Int, from: Int) -> [Slotted] = own ++ [nested-slots(child, from + len(own))... for child in now.children]
+  where now = sym.scope-at(m.table, scope),
+        own = [Slotted(symbol: now.symbols[i], at: from + i) for i in 0..len(now.symbols) if not now.dynamic]
 
 # A module's nested symbols: CommonJS is inside its wrapper's scope.
-fn module-slots(id: Int) -> [Slotted] {
-  let mo = m.modules[id]
-  let root = sym.scope-at(m.table, mo.root)
-  if mo.kind == Cjs then nested-slots(root.parent, 0) else [nested-slots(child, 0)... for child in root.children]
-}
+fn module-slots(id: Int) -> [Slotted] = match m.modules[id].kind {
+  m.Cjs => nested-slots(root.parent, 0)
+  _ => [nested-slots(child, 0)... for child in root.children]
+} where root = sym.scope-at(m.table, m.modules[id].root)
 
 # Name characters, commonest first, so frequent symbols compress well.
 fn sorted-chars(candidates: Text, freq: [Int]) -> [Int] = sort c in [c for c in candidates] by freq[c] desc
@@ -60,59 +59,49 @@ fn sorted-chars(candidates: Text, freq: [Int]) -> [Int] = sort c in [c for c in 
 fn minified-name(head: [Int], tail: [Int], index: Int) -> Text =
   byte-text(head[index % len(head)]) ++ name-rest(tail, index / len(head))
 
-fn name-rest(tail: [Int], i: Int) -> Text =
-  if i == 0 then "" else byte-text(tail[(i - 1) % len(tail)]) ++ name-rest(tail, (i - 1) / len(tail))
+fn name-rest(tail: [Int], i: Int) -> Text = match i {
+  0 => ""
+  _ => byte-text(tail[(i - 1) % len(tail)]) ++ name-rest(tail, (i - 1) / len(tail))
+}
 
-fn free-name?(name: Text, given: {Text:Bool}) -> Bool = not e.taken?(name) and not (name in given)
+# The alphabets: what a name starts with, what follows, and the capitals a JSX tag's starts with.
+record Alphabets { head: [Int], tail: [Int], capitals: [Int] }
+
+# Which names are given, which of each alphabet comes next, and each slot's.
+record Slotting { given: {Text:Bool}, plain: Int, capital: Int, names: {Int:Text} }
 
 # Each slot's name, the commonest slot first: the next name of its alphabet that nothing has. A slot
 # holding a kept JSX tag's symbol gets a capital, or `<Foo/>` would become an element called `a`.
-fn slot-names(order: [Int], capital: {Int:Bool}, head: [Int], tail: [Int], capitals: [Int]) -> {Int:Text} {
-  var given: {Text:Bool} = {}
-  var names: {Int:Text} = {}
-  var next-plain = 0
-  var next-capital = 0
-  for at in order {
-    let caps = at in capital
-    let alphabet = if caps then capitals else head
-    let i = first i in (if caps then next-capital else next-plain)..: if free-name?(minified-name(alphabet, tail, i), given) then some(i) else none
-    if caps { next-capital = i + 1 } else { next-plain = i + 1 }
-    let name = minified-name(alphabet, tail, i)
-    given[name] = true
-    names[at] = name
-  }
-  names
-}
+fn slot-names(order: [Int], capital: {Int:Bool}, abc: Alphabets, reserved: {Text:Int}) -> {Int:Text} =
+  (fold st = Slotting(given: {}, plain: 0, capital: 0, names: {}) for at in order:
+     (st with { given: st.given ++ {name: true}, names: st.names ++ {at: name},
+                plain: match caps { true => st.plain  false => i + 1 },
+                capital: match caps { true => i + 1  false => st.capital } }
+      where caps = at in capital,
+            alphabet = match caps { true => abc.capitals  false => abc.head },
+            from = match caps { true => st.capital  false => st.plain },
+            i = first j in from.. if not (minified-name(alphabet, abc.tail, j) in reserved or minified-name(alphabet, abc.tail, j) in st.given): j,
+            name = minified-name(alphabet, abc.tail, i))).names
 
-fn assign-minified() -> Void {
-  e.used = {}
-  e.stack = []
-  for w in e.keywords { e.reserve(w) }
-  for id in m.order {
-    if id == 0 or e.included?(id) {
-      for f in m.modules[id].free { e.reserve(f) }
-    }
-  }
-  # Live code: uses, character frequency, and the top-level symbols in order.
-  e.units = e.units-of-order()
-  let usages = parallel-map([i for i in 0..len(e.units)], unit-usage, e.emitting.emit-threads)
-  let uses = histogram(sym.symbol-count(m.table), [s for u in usages for s in u.used])
-  let tagged = {s: true for u in usages for s in u.tags}
-  let freq = [sum u in usages: if len(u.freq) > 0 then u.freq[c] else 0 for c in 0..256]
-  # Nested slots first, so top-level symbols never collide with them.
-  let nested = [module-slots(id)... for id in m.order if e.included?(id)]
-  let first-top = fold top = 0 for x in nested: max(top, x.at + 1)
-  let toplevel = [s for u in usages for s in u.toplevel]
-  let slotted = nested ++ [Slotted(symbol: toplevel[i], at: first-top + i) for i in 0..len(toplevel)]
-  let slots = first-top + len(toplevel)
-  let counts = histogram(slots, [x.at for x in slotted], [uses[x.symbol] for x in slotted])
-  let capital = {x.at: true for x in slotted if x.symbol in tagged}
-  let head = sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$", freq)
-  let tail = sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$0123456789", freq)
-  let capitals = sorted-chars("ABCDEFGHIJKLMNOPQRSTUVWXYZ", freq)
-  # Slot numbers, by descending use; ties keep slot order.
-  let order = sort i in [i for i in 0..slots] by counts[i] desc
-  let names = slot-names(order, capital, head, tail, capitals)
-  # Every slotted symbol named, the last slot it took deciding; a dynamic scope's keep theirs.
-  for x in slotted { sym.set-final!(m.table, x.symbol, names[x.at] ?? panic "a slot with no name") }
-}
+# Every symbol's minified name: live code counted for uses and character frequency, nested slots
+# first, so top-level symbols never collide with them, each slotted symbol named by the last slot it
+# took; a dynamic scope's keep theirs.
+fn minified-names(threads: Int) -> [Text] =
+  nm.named-table([nm.Named(symbol: x.symbol, name: names[x.at] ?? panic "a slot with no name") for x in slotted])
+  where usages = parallel-map(e.units-of-order(), unit-usage, threads),
+        uses = histogram(sym.symbol-count(m.table), [s for u in usages for s in u.used]),
+        tagged = {s: true for u in usages for s in u.tags},
+        freq = [sum u in usages if len(u.freq) > 0: u.freq[c] for c in 0..256],
+        nested = [module-slots(id)... for id in m.order if nm.included?(id)],
+        first-top = fold top = 0 for x in nested: max(top, x.at + 1),
+        toplevel = [s for u in usages for s in u.toplevel],
+        slotted = nested ++ [Slotted(symbol: toplevel[i], at: first-top + i) for i in 0..len(toplevel)],
+        slots = first-top + len(toplevel),
+        counts = histogram(slots, [x.at for x in slotted], [uses[x.symbol] for x in slotted]),
+        capital = {x.at: true for x in slotted if x.symbol in tagged},
+        abc = Alphabets(head: sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$", freq),
+                        tail: sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$0123456789", freq),
+                        capitals: sorted-chars("ABCDEFGHIJKLMNOPQRSTUVWXYZ", freq)),
+        # Slot numbers, by descending use; ties keep slot order.
+        order = sort i in [i for i in 0..slots] by counts[i] desc,
+        names = slot-names(order, capital, abc, nm.reserved([]))

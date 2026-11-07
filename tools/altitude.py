@@ -17,10 +17,13 @@ IMPERATIVE = collections.OrderedDict([
     ("block",  re.compile(r"^(?:everywhere |memo )?fn [^=\n]*\{\s*$", re.M)),
     ("let",    re.compile(r"^\s+let ", re.M)),
     ("var",    re.compile(r"^\s*var ", re.M)),
-    ("if",     re.compile(r"\bif\b")),
+    # A conditional: `if c then a else b`, or `if c { … }`. An `if` that is neither is a guard: a
+    # comprehension's or quantifier's clause, or a match arm's.
+    ("if",     re.compile(r"(?<![\w\-?!])if(?![\w\-?!])(?:(?!=>)[^\n])*?(?<![\w\-])then(?![\w\-])"
+                          r"|(?:^\s*|\belse\s+|\{\s*|=>\s*)if(?![\w\-?!])(?:(?!=>)[^\n])*\{", re.M)),
     ("for",    re.compile(r"^\s*for [^\n]*\{\s*$", re.M)),
-    ("while",  re.compile(r"^\s*while\b", re.M)),
-    ("return", re.compile(r"\breturn\b")),
+    ("while",  re.compile(r"^\s*while\b[^\n]*\{\s*$", re.M)),
+    ("return", re.compile(r"(?<![\w\-])return(?![\w\-?!])")),
     ("assign", re.compile(r"^\s*[a-z][\w\-?!.\[\]]*\s*(?:=|\+=|\+\+=)\s", re.M)),
     ("effect", re.compile(r"^\s*(?:assert |[a-z][\w.\-]*!\()", re.M)),
 ])
