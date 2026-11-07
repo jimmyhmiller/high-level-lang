@@ -483,7 +483,10 @@ fn member-inner(m: Node) -> Node = match member-core(m) {
 }
 
 # esbuild's kinds: 1 for a method or accessor, 2 for a field.
-fn member-kind(m: Node) -> Int = if member-inner(m) is Field(...) | StaticField(...) then 2 else 1
+fn member-kind(m: Node) -> Int = match member-inner(m) {
+  Field(...) | StaticField(...) => 2
+  _ => 1
+}
 
 fn decorated-key(m: Node) -> Node = match member-inner(m).key {
   PropName(x) => string-node(x)
@@ -503,12 +506,10 @@ fn params-of-member(m: Node) -> [Node] = match member-inner(m) {
 fn param-decorators(ps: [Node]) -> [Node] =
   [decorate-param(i, d) for i in 0..len(ps) if let TsDecoratedParam(List(ds...), _) = ps[i] for d in ds]
 
-fn decorate-param(i: Int, d: Node) -> Node {
-  let index = Num(int-text(i))
-  let f = helper-ref("__decorateParam")
-  let dec = lowered(d.expr)
-  exp`$f($index, $dec)`
-}
+fn decorate-param(i: Int, d: Node) -> Node = exp`$f($index, $dec)`
+  where index = Num(int-text(i)),
+        f = helper-ref("__decorateParam"),
+        dec = lowered(d.expr)
 
 # The class without its decorators: they become calls after it.
 everywhere fn undecorated(n: Node) -> Node = match n {
@@ -520,59 +521,59 @@ everywhere fn decorated-anything?(n: Node) -> Bool = match n {
   TsDecoratedMember(...) | TsDecoratedParam(...) => true
 }
 
-fn decorate-call(decorators: [Node], target: Node, key: Node?, kind: Int) -> Node {
-  let f = helper-ref("__decorateClass")
-  let slots = [if i == len(decorators) - 1 then ElemLast(decorators[i]) else Elem(decorators[i]) for i in 0..len(decorators)]
-  let list = ArrayLit(List(slots...))
-  match key {
-    some(k) => {
-      let kind-node = Num(int-text(kind))
-      exp`$f($list, $target, $k, $kind_node)`
-    }
-    none => exp`$f($list, $target)`
-  }
-}
+fn decorate-call(decorators: [Node], target: Node, key: Node?, kind: Int) -> Node = match key {
+  some(k) => exp`$f($list, $target, $k, $kind_node)` where kind-node = Num(int-text(kind))
+  none => exp`$f($list, $target)`
+} where f = helper-ref("__decorateClass"),
+        list = match decorators {
+          [init..., x] => ArrayLit(List(([Elem(d) for d in init] ++ [ElemLast(x)])...))
+          [] => ArrayLit(List())
+        }
 
 # `class A { @d m() {} }` and `@c class A {}`, as TypeScript's experimentalDecorators runs them:
 # members first, instance before static, then the class, which the decorators may replace.
-fn decorated-class(class-decorators: [Node], cls: Node, exported: Bool) -> [Node] {
-  if not settings.decorators {
-    panic "JavaScript decorators are not implemented yet; set \"experimentalDecorators\": true in tsconfig.json for TypeScript's"
-  }
-  let name = cls.name.text
-  let each = [member-decorating(m, name, pass) for pass in [false, true] for m in cls.body.members.kids
-              if not (member-core(m) is ClassEmpty() | TsErased()) and static-member?(m) == pass]
-  let whole = class-decorators ++ ((last d in each: d.constructor) ?? [])
-  let after = [s for d in each for s in d.after] ++ class-decorating(whole, name)
-  let plain = lowered(undecorated(cls))
-  [if exported then ExportClass(plain) with { lo: cls.lo, hi: cls.hi } else plain] ++ after
+fn decorated-class(class-decorators: [Node], cls: Node, exported: Bool) -> [Node] = match settings.decorators {
+  false => panic "JavaScript decorators are not implemented yet; set \"experimentalDecorators\": true in tsconfig.json for TypeScript's"
+  true => [match exported {
+             true => ExportClass(plain) with { lo: cls.lo, hi: cls.hi }
+             false => plain
+           }] ++ after
+    where name = cls.name.text,
+          each = [member-decorating(m, name, pass) for pass in [false, true] for m in cls.body.members.kids
+                  if not (member-core(m) is ClassEmpty() | TsErased()) and static-member?(m) == pass],
+          whole = class-decorators ++ ((last d in each: d.constructor) ?? []),
+          after = [s for d in each for s in d.after] ++ class-decorating(whole, name),
+          plain = lowered(undecorated(cls))
 }
 
 # What a member's decorators become: for the constructor, the decorators of its parameters, which
 # decorate the class; for any other, a call after the class.
 record Decorating { constructor: [Node]?, after: [Node] }
 
-fn member-decorating(m: Node, name: Text, static: Bool) -> Decorating {
-  if member-core(m) is Method(PropName("constructor"), ...) {
-    return Decorating(constructor: some(param-decorators(params-of-member(m))), after: [])
+fn member-decorating(m: Node, name: Text, static: Bool) -> Decorating = match member-core(m) {
+  Method(PropName("constructor"), ...) => Decorating(constructor: some(param-decorators(params-of-member(m))), after: [])
+  _ => match own-decorators(m) ++ param-decorators(params-of-member(m)) {
+    [] => Decorating(constructor: none, after: [])
+    all-decorators => Decorating(constructor: none, after: [ExprStmt(decorate-call(all-decorators, target, some(decorated-key(m)), member-kind(m)))])
+      where holder = ident(name),
+            target = match static {
+              true => holder
+              false => Member(holder, PropName("prototype"))
+            }
   }
-  let own: [Node] = match m {
-    TsDecoratedMember(List(ds...), _) => [lowered(d.expr) for d in ds]
-    _ => []
-  }
-  let all-decorators = own ++ param-decorators(params-of-member(m))
-  if len(all-decorators) == 0 { return Decorating(constructor: none, after: []) }
-  let holder = ident(name)
-  let target = if static then holder else Member(holder, PropName("prototype"))
-  Decorating(constructor: none, after: [ExprStmt(decorate-call(all-decorators, target, some(decorated-key(m)), member-kind(m)))])
+}
+
+fn own-decorators(m: Node) -> [Node] = match m {
+  TsDecoratedMember(List(ds...), _) => [lowered(d.expr) for d in ds]
+  _ => []
 }
 
 # `C = __decorateClass([…], C)`, when anything decorates the class itself.
-fn class-decorating(decorators: [Node], name: Text) -> [Node] {
-  if len(decorators) == 0 { return [] }
-  let holder = ident(name)
-  let value = decorate-call(decorators, ident(name), none, 0)
-  [stmt`$holder = $value;`]
+fn class-decorating(decorators: [Node], name: Text) -> [Node] = match decorators {
+  [] => []
+  _ => [stmt`$holder = $value;`]
+    where holder = ident(name),
+          value = decorate-call(decorators, ident(name), none, 0)
 }
 
 # ---------------------------------------------------------------- the walk
@@ -589,9 +590,7 @@ fn declared-name(s: Node) -> [Text] = match s {
   _ => []
 }
 
-fn lowered-statements(xs: [Node]) -> [Node] {
-  with declared = declared-names(xs) { [statement-lowered(x)... for x in xs] }
-}
+fn lowered-statements(xs: [Node]) -> [Node] = with declared = declared-names(xs) { [statement-lowered(x)... for x in xs] }
 
 fn statement-lowered(x: Node) -> [Node] = match x {
   TsErased() => []
@@ -599,30 +598,28 @@ fn statement-lowered(x: Node) -> [Node] = match x {
   TsDecoratedExport(List(ds...), cls) | TsExportDecorated(List(ds...), cls) =>
     decorated-class([lowered(d.expr) for d in ds], cls, true)
   TsDecoratedDefault(...) | TsDefaultDecorated(...) => panic "a decorated `export default class` is not implemented yet; name the class and export it"
-  ClassDecl(...) => if decorated-anything?(x) then decorated-class([], x, false) else [lowered(x)]
-  ExportClass(c) => if decorated-anything?(c) then decorated-class([], c, true) else [lowered(x)]
+  ClassDecl(...) if decorated-anything?(x) => decorated-class([], x, false)
+  ExportClass(c) if decorated-anything?(c) => decorated-class([], c, true)
   TsEnum(...) => [VarDecl(List(enum-declarator(x))) with { lo: x.lo, hi: x.hi }]
   TsExportEnum(e) => [ExportVar(List(enum-declarator(e))) with { lo: x.lo, hi: x.hi }]
   TsNamespace(...) => namespace-statements(x, false)
   TsExportNamespace(n) => namespace-statements(n, true)
-  TsImportRequire(name, from) | TsExportImport(TsImportRequire(name, from)) => {
-    let req = ident("require")
-    let required = exp`$req($from)`
-    let d = List(Declarator(name, required) with { lo: x.lo, hi: x.hi })
-    [if x is TsExportImport(_) then ExportLexical(ConstDecl(d)) else ConstDecl(d)]
-  }
+  TsImportRequire(name, from) | TsExportImport(TsImportRequire(name, from)) => [match x {
+      TsExportImport(_) => ExportLexical(ConstDecl(d))
+      _ => ConstDecl(d)
+    }] where req = ident("require"),
+             required = exp`$req($from)`,
+             d = List(Declarator(name, required) with { lo: x.lo, hi: x.hi })
   TsImportAlias(name, target) =>
     [ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi })) with { lo: x.lo, hi: x.hi }]
   TsExportImport(TsImportAlias(name, target)) =>
     [ExportLexical(ConstDecl(List(Declarator(name, target) with { lo: x.lo, hi: x.hi }))) with { lo: x.lo, hi: x.hi }]
-  TsExportAssign(e) => {
-    let value = lowered(e)
-    let holder = ident("module")
-    [stmt`$holder.exports = $value;`]
-  }
+  TsExportAssign(e) => [stmt`$holder.exports = $value;`]
+    where value = lowered(e),
+          holder = ident("module")
   # `import {type A} from "x"` and its like are gone once their specifiers are.
-  Import(ImportNamed(List(specs...)), _) | ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) =>
-    if len(specs) == 0 or (any s in specs: not (s is TsErased())) then [lowered(x)] else []
+  Import(ImportNamed(List(specs...)), _) | ExportNamed(List(specs...)) | ExportFrom(List(specs...), _)
+    if len(specs) > 0 and (all s in specs: s is TsErased()) => []
   _ => [lowered(x)]
 }
 
@@ -635,7 +632,8 @@ fn lowered(n: Node) -> Node = match n {
     n with { kids: [lowered(name), lowered(heritage), class-body(body, not (heritage is None()))] }
   ClassBody(...) => class-body(n, false)
   TsParamProp(...) => panic "a parameter property is only allowed in a constructor"
-  _ => if len(n.kids) == 0 then n else n with { kids: [lowered(k) for k in n.kids] }
+  _ if len(n.kids) == 0 => n
+  _ => n with { kids: [lowered(k) for k in n.kids] }
 }
 
 # ---------------------------------------------------------------- imports that named only types
@@ -651,26 +649,20 @@ everywhere fn export-mentions(n: Node) -> [Text] = match n {
   ExportNamed(List(specs...)) => [x.text for ExportName(x) | ExportAs(x, _) in specs]
 }
 
-fn keep-binding?(bound: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool}, keep: [Text]) -> Bool {
-  if bound.text in keep or bound.text in exported { return true }
-  match b[bound.lo] {
-    some(s) => s in used
-    none => true
-  }
-}
+fn keep-binding?(bound: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool}, keep: [Text]) -> Bool =
+  bound.text in keep or bound.text in exported or (all s in b[bound.lo]: s in used)
 
 fn pruned-clause(c: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool}, keep: [Text]) -> Node? = match c {
-  ImportDefault(x) | ImportNamespace(x) => if keep-binding?(x, b, used, exported, keep) then some(c) else none
-  ImportNamed(List(specs...)) => {
-    let left = [s for s in specs if keep-binding?(s.name, b, used, exported, keep)]
-    if len(left) == 0 then none else some(c with { specs: List(left...) with { lo: c.specs.lo, hi: c.specs.hi } })
+  ImportDefault(x) | ImportNamespace(x) => first y in [c] if keep-binding?(x, b, used, exported, keep): y
+  ImportNamed(List(specs...)) => match [s for s in specs if keep-binding?(s.name, b, used, exported, keep)] {
+    [] => none
+    left => some(c with { specs: List(left...) with { lo: c.specs.lo, hi: c.specs.hi } })
   }
-  ImportDefaultAnd(x, rest) => {
-    let first = keep-binding?(x, b, used, exported, keep)
-    match pruned-clause(rest, b, used, exported, keep) {
-      some(r) => some(if first then c with { kids: [x, r] } else r)
-      none => if first then some(ImportDefault(x) with { lo: c.lo, hi: c.hi }) else none
-    }
+  ImportDefaultAnd(x, rest) => match keep-binding?(x, b, used, exported, keep), pruned-clause(rest, b, used, exported, keep) {
+    true, some(r) => some(c with { kids: [x, r] })
+    false, some(r) => some(r)
+    true, none => some(ImportDefault(x) with { lo: c.lo, hi: c.hi })
+    false, none => none
   }
   _ => some(c)
 }
@@ -691,34 +683,33 @@ everywhere fn without-aliases(n: Node, b: {Int:Int}, used: {Int:Bool}, aliases: 
   List(xs...) => n with { kids: [without-aliases(x, b, used, aliases) for x in xs if not alias-unused?(x, b, used, aliases)] }
 }
 
-fn pruned(tree: Node, keep: [Text], aliases: {Int:Bool}) -> Node {
-  let bindings = sc.analysis(tree, []).bindings
-  let used = {s: true for s in value-mentions(tree, bindings)}
-  let exported = {x: true for x in export-mentions(tree)}
-  let plain = without-aliases(tree.body, bindings, used, aliases)
-  let declared = early.module-names(tree.body.kids)
-  Program(tree.hashbang, List([pruned-statement(s, bindings, used, exported, keep, declared)... for s in plain.kids]...))
-}
+fn pruned(tree: Node, keep: [Text], aliases: {Int:Bool}) -> Node =
+  Program(tree.hashbang, List([pruned-statement(s, bindings, used, exported, keep, names)... for s in plain.kids]...))
+  where bindings = sc.analysis(tree, []).bindings,
+        used = {s: true for s in value-mentions(tree, bindings)},
+        exported = {x: true for x in export-mentions(tree)},
+        plain = without-aliases(tree.body, bindings, used, aliases),
+        names = early.module-names(tree.body.kids)
 
 fn pruned-statement(s: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Bool}, keep: [Text], declared: [Text]) -> [Node] = match s {
-  Import(clause, from) =>
-    if settings.keeping-imports then [s] else [s with { kids: [c, from] } if let some(c) = pruned-clause(clause, b, used, exported, keep)]
+  Import(_, _) if settings.keeping-imports => [s]
+  Import(clause, from) => [s with { kids: [c, from] } if let some(c) = pruned-clause(clause, b, used, exported, keep)]
   # What is exported but not declared was a type.
-  ExportNamed(List(specs...)) => {
-    let left = [x for x in specs if x.local.text in declared]
-    if len(left) > 0 or len(specs) == 0 then [s with { specs: List(left...) with { lo: s.specs.lo, hi: s.specs.hi } }] else []
+  ExportNamed(List(specs...)) => match [x for x in specs if x.local.text in declared] {
+    [] if len(specs) > 0 => []
+    left => [s with { specs: List(left...) with { lo: s.specs.lo, hi: s.specs.hi } }]
   }
   _ => [s]
 }
 
 # ---------------------------------------------------------------- the whole file
 
-fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool, decorators: Bool) -> Lowered {
-  let given = Settings(src: source, assign-fields: not define-fields, keeping-imports: keep-imports, decorators: decorators)
-  with settings = given, next-offset = -1000, pure = {}, namespace-exports = {} {
-    let stmts = lowered-statements(tree.body.kids)
-    let whole = Program(tree.hashbang, List(stmts...))
-    let helpers = if decorators then [h for h in helpers-called(whole) distinct h] else []
-    Lowered(tree: pruned(whole, keep, {lo: true for lo in alias-names(tree)}), pure-calls: pure, helpers: helpers)
+fn lowered-file(whole: Node, keep: [Text], decorators: Bool, tree: Node) -> Lowered =
+  Lowered(tree: pruned(whole, keep, {lo: true for lo in alias-names(tree)}), pure-calls: pure,
+          helpers: [h for h in helpers-called(whole) if decorators distinct h])
+
+fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool, decorators: Bool) -> Lowered =
+  with settings = Settings(src: source, assign-fields: not define-fields, keeping-imports: keep-imports, decorators: decorators),
+       next-offset = -1000, pure = {}, namespace-exports = {} {
+    lowered-file(Program(tree.hashbang, List(lowered-statements(tree.body.kids)...)), keep, decorators, tree)
   }
-}
