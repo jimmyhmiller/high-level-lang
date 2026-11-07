@@ -65,8 +65,8 @@ def main():
                 body = EQUATION.sub("  EQ ", body)
             for r, to in GUARDS:
                 body = r.sub(to, body)
-            # `e where x = …, y = …`: what follows `where` is equations.
-            before_where = re.split(r"\bwhere\b", body)[0]
+            # `e where x = …, y = …`: what follows `where` is equations; so is a `with`'s binding.
+            before_where = re.sub(r"\bwith\b[^{]*\{", "with {", re.split(r"\bwhere\b", body)[0])
             hits = [k for k, r in IMPERATIVE.items() if r.search(before_where if k == "assign" else body)]
             total_lines += n
             total_units += 1
