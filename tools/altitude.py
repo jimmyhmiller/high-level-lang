@@ -61,6 +61,8 @@ def main():
             n = len(code)
             # What is inside a string is text, not code.
             body = re.sub(r'"(?:\\.|[^"\\])*"', '""', "\n".join(code))
+            # So is a template's: stmt`for (…) …` is JavaScript.
+            body = re.sub(r'[a-z]+`(?:\\.|[^`\\])*`', 'tpl``', body)
             if chunk.startswith("on "):
                 body = EQUATION.sub("  EQ ", body)
             for r, to in GUARDS:

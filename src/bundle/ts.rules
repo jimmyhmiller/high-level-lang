@@ -177,50 +177,38 @@ everywhere fn with-members(e: Node, names: [Text], param: Text) -> Node = match 
 # One member settled: its name, its value when it is known here, and the statement that sets it.
 record Settled { key: Text, value: Value?, set: Node }
 
+fn nothing-settled() -> [Settled] = []
+
 fn value-named(known: [Settled], x: Text) -> Value? = last s in known if s.key == x: s.value
 
 # The function that fills an enum in, called on what `outer` evaluates to. Pure when every value
 # is known here.
 fn enum-call(n: Node, outer: Node) -> Node = match n {
-  TsEnum(name, List(members...)) => {
-    let param = fresh-name(name.text)
-    let p = bind(param)
-    let a = ident(param)
-    let settled: [Settled] = fold done = [] for m in members: done ++ [member-settled(done, m, name.text, param, a)]
-    let body = [s.set for s in settled] ++ [stmt`return $a;`]
-    let call = exp`(($p) => { $$body })($outer)`
-    let at = fresh-offset()
-    if all s in settled: is-some(s.value) { pure[at] = at }
-    call with { lo: at, hi: at }
-  }
+  TsEnum(name, List(members...)) => marked-pure(call with { lo: at, hi: at }, all s in settled: is-some(s.value))
+    where param = fresh-name(name.text),
+          p = bind(param),
+          a = ident(param),
+          settled = fold done = nothing-settled() for m in members: done ++ [member-settled(done, m, name.text, param, a)],
+          body = [s.set for s in settled] ++ [stmt`return $a;`],
+          call = exp`(($p) => { $$body })($outer)`,
+          at = fresh-offset()
   _ => panic "expected an enum"
 }
 
 # A member without an initializer counts on from a number before it; one whose initializer is not
 # known here is computed when the enum is made, where earlier members' bare names mean them.
-fn member-settled(done: [Settled], m: Node, self: Text, param: Text, a: Node) -> Settled {
-  let k = member-key(m.key)
-  let key = string-node(k)
-  if m.init is None() {
-    let v = following(done) ?? panic "enum member {} needs an initializer: the one before it is not a number known here", k
-    let number = number-node(v)
-    return Settled(key: k, value: some(number-value(v)), set: stmt`$a[$a[$key] = $number] = $key;`)
+fn member-settled(done: [Settled], m: Node, self: Text, param: Text, a: Node) -> Settled = match m.init {
+  None() => Settled(key: k, value: some(number-value(v)), set: stmt`$a[$a[$key] = $number] = $key;`)
+    where v = (following(done) ?? panic "enum member {} needs an initializer: the one before it is not a number known here", k),
+          number = number-node(v)
+  init => match evaluated(lowered(init), done, self) {
+    some(v) if v.is-text => Settled(key: k, value: some(v), set: stmt`$a[$key] = $text;`) where text = v.node
+    some(v) => Settled(key: k, value: some(v), set: stmt`$a[$a[$key] = $number] = $key;`) where number = number-node(v.num)
+    none => Settled(key: k, value: none, set: stmt`$a[$a[$key] = $computed] = $key;`)
+      where computed = with-members(lowered(init), [s.key for s in done], param)
   }
-  match evaluated(lowered(m.init), done, self) {
-    some(v) => {
-      if v.is-text {
-        let text = v.node
-        return Settled(key: k, value: some(v), set: stmt`$a[$key] = $text;`)
-      }
-      let number = number-node(v.num)
-      Settled(key: k, value: some(v), set: stmt`$a[$a[$key] = $number] = $key;`)
-    }
-    none => {
-      let computed = with-members(lowered(m.init), [s.key for s in done], param)
-      Settled(key: k, value: none, set: stmt`$a[$a[$key] = $computed] = $key;`)
-    }
-  }
-}
+} where k = member-key(m.key),
+        key = string-node(k)
 
 # The number after the last member's, if that was a number known here.
 fn following(done: [Settled]) -> Int? = match done {
@@ -231,13 +219,7 @@ fn following(done: [Settled]) -> Int? = match done {
 fn enum-name(n: Node) -> Text = n.name.text
 
 # `var E = ((E2) => { … })(E || {});`
-fn enum-declarator(n: Node) -> Node {
-  let name = n.name
-  let again = ident(name.text)
-  let empty = ObjectLit(List())
-  let call = enum-call(n, Or(again, empty))
-  Declarator(name, call) with { lo: n.lo, hi: n.hi }
-}
+fn enum-declarator(n: Node) -> Node = Declarator(n.name, enum-call(n, Or(ident(n.name.text), ObjectLit(List())))) with { lo: n.lo, hi: n.hi }
 
 # ---------------------------------------------------------------- namespaces
 
@@ -296,17 +278,13 @@ fn namespace-statement(s: Node, param: Text) -> [Node] = match s {
   ExportLexical(d) => export-declarators(d.declarators.kids, param)
   ExportFunction(f) => lowered-statements([f]) ++ [assign-out(param, f.name.text, ident(f.name.text))]
   ExportClass(c) => lowered-statements([c]) ++ [assign-out(param, c.name.text, ident(c.name.text))]
-  TsExportEnum(e) => {
-    let name = enum-name(e)
-    let holder = bind(name)
-    let ns1 = ident(param)
-    let ns2 = ident(param)
-    let local = ident(name)
-    let outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
-    let call = enum-call(e, outer)
-    pure-off(call)
-    [stmt`let $holder;`, ExprStmt(call)]
-  }
+  TsExportEnum(e) => [stmt`let $holder;`, ExprStmt(pure-off(enum-call(e, outer)))]
+    where name = enum-name(e),
+          holder = bind(name),
+          ns1 = ident(param),
+          ns2 = ident(param),
+          local = ident(name),
+          outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
   TsExportNamespace(TsNamespace(name, body)) => nested-namespace(name.text, body, param)
   TsExportImport(TsImportAlias(name, target)) => [assign-out(param, name.text, target)]
   TsExportImport(TsImportRequire(name, from)) => [assign-out(param, name.text, exp`$req($from)`)] where req = ident("require")
@@ -320,10 +298,18 @@ fn exported-as(spec: Node) -> Node = match spec {
   _ => spec.local
 }
 
-fn pure-off(n: Node) -> Void {
+# What lowering a file gathers, besides its tree: the calls it made that may go if nothing uses them.
+fn marked-pure(call: Node, pure-call: Bool) -> Node {
+  if pure-call { pure[call.lo] = call.hi }
+  call
+}
+
+# An enum exported from a namespace is stored where its value is read: not a call that may go.
+fn pure-off(n: Node) -> Node {
   if let some(hi) = pure[n.lo] {
     if hi == n.hi { pure[n.lo] = n.hi + 1 }
   }
+  n
 }
 
 fn export-declarators(ds: [Node], param: Text) -> [Node] = match ds {
