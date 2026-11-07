@@ -59,7 +59,8 @@ def main():
                 continue
             code = code_lines(chunk)
             n = len(code)
-            body = "\n".join(code)
+            # What is inside a string is text, not code.
+            body = re.sub(r'"(?:\\.|[^"\\])*"', '""', "\n".join(code))
             if chunk.startswith("on "):
                 body = EQUATION.sub("  EQ ", body)
             for r, to in GUARDS:
