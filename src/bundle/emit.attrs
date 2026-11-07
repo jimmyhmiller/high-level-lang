@@ -277,9 +277,9 @@ fn import-or-init(t: m.Module) -> Node? = match an.opaque?(t) {
 # The body statements of a part, ready to print. None for a part with no code.
 fn part-output(s: Node) -> Node? = match s {
   ImportBare(from) => match t.kind {
-    Cjs => some(stmt`$call_me();`) where call-me = final-of(an.require-sym(t))
+    Cjs => some(import-cjs-stmt(t))
     External if an.kept?(t) => some(ImportBare(path-of(t)))
-    External => some(stmt`$object;`) where object = external-object(t)
+    External => some(stmt`var $v = $object;`) where v = final-of(an.known-import-var(here, t.id)), object = external-object(t)
     _ => init-call(t)
   } where t = m.modules[an.known-dep(here, from)]
   ExportAll(from) => match an.opaque?(t) {
@@ -374,14 +374,21 @@ fn param-of(s: Int) -> Node = Param(BindName(final-of(s)), None())
 
 # `var require_x = __commonJS({ "path"(exports, module) { … } });`, leaving out parameters nothing
 # uses, as esbuild does.
-fn cjs-part() -> Node = stmt`var $name = $wrap({ $path($$params) { $$body } });`
-  where e = wrapper-param("exports"),
+fn cjs-part() -> Node = match an.linking.compact {
+  true => stmt`var $name = $wrap(($$params) => { $$body });`
+  false => stmt`var $name = $wrap({ $path($$params) { $$body } });`
+} where e = wrapper-param("exports"),
         mo = wrapper-param("module"),
-        body = [stamped(rewritten(s)) for s in here.tree.body.kids],
+        # Its statements that stay, after the wrapper's own part.
+        body = [stamped(rewritten(stmts[i])) for i in 0..len(stmts) if live?(ps[i + 1]) and in-this-chunk?(ps[i + 1])],
+        stmts = here.tree.body.kids,
+        ps = parts-of(here.id),
         name = final-of(an.require-sym(here)),
-        wrap = helper-name("__commonJS"),
+        wrap = helper-name(an.wrapper-helper("__commonJS")),
         path = Str(quote-text(m.shown-path(here.path))),
-        params = match sym.symbol-at(m.table, mo).uses > 0, sym.symbol-at(m.table, e).uses > 0 {
+        # `eval` may read either.
+        params = match sym.symbol-at(m.table, mo).uses > 0 or sym.scope-at(m.table, here.root).dynamic,
+                       sym.symbol-at(m.table, e).uses > 0 {
           true, _ => [param-of(e), param-of(mo)]
           false, true => [param-of(e)]
           false, false => []
@@ -398,7 +405,7 @@ fn export-getter(name-id: Int) -> Node = Prop(key, exp`() => $target`)
         }
 
 # `var x_exports = {}; __export(x_exports, { a: () => a, … });`, names sorted.
-fn namespace-stmts() -> [Node] = [stmt`var $ns = {};`, stmt`$export_all($ns, { $$getters });`]
+fn namespace-stmts() -> [Node] = [stmt`var $ns = {};`] ++ [stmt`$export_all($ns, { $$getters });` for g in [getters] if len(g) > 0]
   where ns = final-of(an.ns-sym(here)),
         getters = [export-getter(n) for n in sort n in [n for m.db.resolved(here.id, ?n, _) distinct n] by name-of(m.names, n)],
         export-all = helper-name("__export")
@@ -461,12 +468,15 @@ fn function-decl?(n: Node) -> Bool = n is FuncDecl(...) | GenDecl(...) | AsyncFu
 # an initialiser: its names hoist out and its values become assignments. Functions hoist whole.
 fn wrapped-module(outputs: [Node]) -> [Node] =
   [VarDecl(List(hoisted...)) for h in [hoisted] if len(h) > 0] ++ [s for s in outputs if function-decl?(s)]
-  ++ [stmt`var $name = $wrap({ $path() { $$body } });`]
+  ++ [match an.linking.compact {
+        true => stmt`var $name = $wrap(() => { $$body });`
+        false => stmt`var $name = $wrap({ $path() { $$body } });`
+      }]
   where rest = [s for s in outputs if not function-decl?(s)],
         hoisted = [declared-names(d)... for VarDecl(List(ds...)) in rest for d in ds],
         body = [initializing(s)... for s in rest],
         name = final-of(an.init-sym(here)),
-        wrap = helper-name("__esm"),
+        wrap = helper-name(an.wrapper-helper("__esm")),
         path = Str(quote-text(m.shown-path(here.path)))
 
 # A wrapped module's variables are declared outside it and set inside it.
@@ -530,10 +540,21 @@ fn order-children(key: Text) -> [Text] = match key {
   _ => []
 }
 
+# An import that runs code waits for the next module whose own code runs (a plain ES module), and
+# goes just before it, as esbuild places it; one that no such module follows goes with its module.
+# What CommonJS and wrapped modules add before then are definitions, which run nothing.
+record Order { nodes: [Text], pending: [Text] }
+
 fn module-children(mo: m.Module) -> [Text] = match split?(mo) {
-  true => [k for p in imports-of(mo) for k in ["m:" ++ int-text(imported-module(mo, p))] ++ eager-node(mo, p)] ++ deps
+  true => o.nodes ++ deps ++ o.pending where o = fold st = Order(nodes: [], pending: []) for p in imports-of(mo): import-children(st, mo, p)
   false => deps
 } where deps = ["m:" ++ int-text(d) for d in mo.deps]
+
+fn import-children(st: Order, mo: m.Module, p: Int) -> Order = match split?(t) {
+  true => Order(nodes: st.nodes ++ st.pending ++ [key], pending: [])
+  false => Order(nodes: st.nodes ++ [key], pending: st.pending ++ eager-node(mo, p))
+} where t = m.modules[imported-module(mo, p)],
+        key = "m:" ++ int-text(t.id)
 
 fn eager-node(mo: m.Module, p: Int) -> [Text] =
   ["p:" ++ int-text(mo.id) ++ ":" ++ int-text(p) for t in [m.modules[imported-module(mo, p)]] if runs-code?(t)]

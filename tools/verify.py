@@ -67,7 +67,7 @@ for a in "named all cjs features three zod rx datefns preact immer react d3 reex
 
 print("== normalized identity with esbuild (unminified)")
 norm = "const e=require('esbuild'),fs=require('fs');const n=f=>e.transformSync(fs.readFileSync(f,'utf8'),{loader:'js',legalComments:'none',minifyWhitespace:true,logLevel:'silent'}).code;console.log(n(process.argv[1])===n(process.argv[2]))"
-for a in ["named", "all", "three", "datefns", "preact", "exdate", "exes"]:
+for a in ["named", "all", "three", "datefns", "preact", "exdate", "exes", "cjsret"]:
     theirs, ours = f"{SCRATCH}/{a}.esb.js", f"{SCRATCH}/{a}.js"
     sh([E, f"apps/{a}.js", "--bundle", "--format=iife", f"--outfile={theirs}", "--log-level=silent"])
     sh([ESB, f"apps/{a}.js", f"--outfile={ours}"], 60)
@@ -438,9 +438,20 @@ mod("s-esm-throws.js", 'for (const k of [1, 2]) { try { require("./boom.js"); co
 mod("s-names.js", 'var Symbol = 1, Object = 2, Array = 3, Promise = 4\nconsole.log(Symbol, Object, Array, Promise, require("./c.cjs").c)\n')
 mod("s-names-alone.js", 'var Symbol = 1, Object = 2, Promise = 4, require = 5\nconsole.log(Symbol, Object, Promise, require)\n')
 mod("s-external.js", 'try { console.log(typeof require("node:os").EOL) } catch (e) { console.log(e.message) }\n')
+mod("shaken.cjs", '"use strict"\nfunction unused() { return 1 }\nfunction used() { return 2 }\nvar k = 3\nexports.x = used()\n')
+mod("evals.cjs", 'function unused() { return 1 }\nexports.x = eval("1 + 1")\n')
+mod("s-cjs-shaken.js", 'console.log(require("./shaken.cjs").x, require("./evals.cjs").x)\n')
+mod("first.cjs", 'globalThis.seen = (globalThis.seen || "") + "cjs "\n')
+mod("second.js", 'globalThis.seen = (globalThis.seen || "") + "esm "\nexport const s = 1\n')
+mod("s-order.js", 'import "./first.cjs"\nimport { s } from "./second.js"\nconsole.log(globalThis.seen, s)\n')
+mod("plain.mjs", 'console.log("plain .mjs")\n')
+mod("s-mjs.js", 'console.log(Object.keys(require("./plain.mjs")).length)\n')
+mod("bare.js", 'module.exports = 1\nglobalThis.bare = 1\n')
+mod("s-bare.js", 'import "./bare.js"\nimport "node:os"\nconsole.log(globalThis.bare)\n')
 mod("s-pure.js", 'var a = typeof Foo === "function" ? Foo : null\nvar b = typeof Bar < "u" ? Bar : 0\nvar n = -90\n'
                  'var t = { Int8Array, Uint8Array }\nvar c = Object.create\nclass M extends Map {}\nvar k = Symbol.iterator\nconsole.log("pure")\n')
-for name in ["s-required", "s-imported", "s-entry", "s-esm-throws", "s-names", "s-names-alone", "s-external", "s-pure"]:
+for name in ["s-required", "s-imported", "s-entry", "s-esm-throws", "s-names", "s-names-alone", "s-external", "s-pure",
+             "s-cjs-shaken", "s-order", "s-mjs", "s-bare"]:
     for flags in [[], ["--minify"]]:
         ours, theirs = f"{MOD}/{name}.o.js", f"{MOD}/{name}.e.js"
         code, out = sh([ESB, f"{MOD}/{name}.js", f"--outfile={ours}", "--external:node:os"] + flags)

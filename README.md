@@ -42,12 +42,12 @@ that name in the spec. `out/bin/spec FILE` builds any spec with those steps.
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 5,874 | Resolution, modules, TypeScript, tsconfig, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, what a build spec means, the tools |
-| `.attrs` | 2,707 | Early errors, what a file loads, JSX, what each statement declares, emit's renaming: attribute grammars, computed in one traversal |
+| `.rules` | 5,891 | Resolution, modules, TypeScript, tsconfig, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, what a build spec means, the tools |
+| `.attrs` | 2,755 | Early errors, what a file loads, JSX, what each statement declares, emit's renaming: attribute grammars, computed in one traversal |
 | `.syntax` | 906 | JavaScript with JSX and TypeScript, CSS, literals, comments, where a big file can be cut, package.json and tsconfig.json, build specs |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
 | `.facts` | 133 | Linking, tree shaking, and which root reaches what for code splitting |
-| `.js` | 156 | The runtime's helpers, the bundle's and lowering's, in esbuild's order |
+| `.js` | 171 | The runtime's helpers, the bundle's and lowering's, in esbuild's order |
 | `.bundler` | 64 | A demo build: data, read with `spec.syntax` |
 | `.pipeline` | 48 | Which stages may run in parallel, and five plans for running them |
 | `.scopes` | 34 | Scoping, for JavaScript and for a small language with ML's `let` |

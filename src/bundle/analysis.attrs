@@ -20,6 +20,8 @@ record Linking {
   esm-output: Bool,
   # Output whose runner has `require`; otherwise an external module is loaded with `__require`.
   native-require: Bool,
+  # Wrappers with no names for a profiler to show, as esbuild's are when it minifies identifiers.
+  compact: Bool,
   # `--pure:NAME`: calls of these free names may go when nothing uses their value.
   pure-names: [Text],
   # How many threads walk modules for their facts.
@@ -75,6 +77,12 @@ fn known-dep(mo: m.Module, from: Node) -> Int =
 
 # Imported as an opaque object at run time, rather than linked by name.
 fn opaque?(t: m.Module) -> Bool = t.kind == Cjs or t.kind == External
+
+# The helper that wraps a module: `__commonJS` or `__esm`, or their compact forms.
+fn wrapper-helper(name: Text) -> Text = match linking.compact {
+  true => name ++ "Min"
+  false => name
+}
 
 # In ES module output, an `import` of an external module, or an `export … from` one other than
 # `export *`, stays a statement that binds its own names, as esbuild leaves it: the runtime links it.
@@ -171,11 +179,11 @@ fn summary-of(n: Node, declares: Bool) -> Summary =
 fn once-each-symbol(ms: [Mention]) -> [Mention] =
   [x for x in ms distinct (if x.reach == Symbol then some(x.id) else none)]
 
-# A module's summaries: CommonJS is one, of its whole tree; an ES module has one for each top-level
-# statement, empty for those whose facts come from what they import and export.
+# A module's summaries: one for each top-level statement, empty for an ES module's that get their
+# facts from what they import and export.
 fn summaries-of(id: Int) -> [Summary] = with here = m.modules[id] {
   match here.kind {
-    Cjs => [summary-of(here.tree, false)]
+    Cjs => [summary-of(s, true) for s in here.tree.body.kids]
     _ => [statement-summary(s) for s in here.tree.body.kids]
   }
 }
@@ -495,7 +503,7 @@ fn made-for(made: [Made], first: Int, purpose: Purpose) -> {Int:Int} =
 # What a statement needs made: the variable an opaque import is held in, and the names re-exported
 # from it.
 fn statement-made(mo: m.Module, s: Node) -> [Made] = match s {
-  Import(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
+  Import(_, from) | ImportBare(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
   ExportAll(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
   ExportAllAs(_, from) | ExportFrom(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
     ++ [Made(purpose: ReexportName, owner: mo.id, exported: r.exported, scope: mo.root, name: reexport-name(r))
@@ -511,16 +519,16 @@ fn reexport-name(r: Reexport) -> Text = match kept?(m.modules[r.target]), r.name
   false, _ => "reexport_" ++ r.exported
 }
 
-# A module's parts, each standing for a statement: CommonJS is one, its whole tree. An ES module's
-# first are `None`, its namespace object, and `Flag`, the `__esm` wrapper's `init_x`, which brings
-# the whole module with it.
+# A module's parts, each standing for a statement. CommonJS's first is `Flag`, its wrapper's
+# `require_x`; an ES module's are `None`, its namespace object, and `Flag`, the `__esm` wrapper's
+# `init_x`, which brings the whole module with it.
 fn module-parts(mo: m.Module, wrapped: {Int:Bool}) -> [Node] = match mo.kind {
-  Cjs => [mo.tree]
+  Cjs => [Flag()] ++ mo.tree.body.kids
   _ => synthetic(mo, wrapped) ++ mo.tree.body.kids
 }
 
 fn part-count(mo: m.Module, wrapped: {Int:Bool}) -> Int = match mo.kind {
-  Cjs => 1
+  Cjs => 1 + len(mo.tree.body.kids)
   _ => len(synthetic(mo, wrapped)) + len(mo.tree.body.kids)
 }
 
@@ -610,7 +618,9 @@ fn module-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] =
 
 fn parts-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] = match mo.kind {
   Cjs => [link.fact-part-of(start, mo.id), link.fact-effect(start), link.fact-declares(start, require-sym(mo)),
-          link.fact-mentions(start, helper("__commonJS"))] ++ summary-facts(mo, start, summaries[0])
+          link.fact-mentions(start, helper(wrapper-helper("__commonJS")))]
+         ++ [cjs-statement-facts(mo, summaries[i], start + 1 + i, i < directives)... for i in 0..len(summaries)]
+    where directives = len([s for s in mo.tree.body.kids while s is ExprStmt(Str(_))])
   _ => synthetic-facts(mo, start) ++ [part-facts(mo, stmts[i], summaries[i], first + i)... for i in 0..len(stmts)]
        ++ [export-local(mo, "default", default-name(mo, name)) for s in mo.source if let some(name) = m.default-of(s)]
     where stmts = mo.tree.body.kids,
@@ -622,19 +632,31 @@ fn default-name(mo: m.Module, name: Text) -> Text = match name {
   _ => name
 }
 
+# A statement of CommonJS: inside the wrapper, so its names are no top-level names, but a statement
+# that reads one needs it, as esbuild has it. It stays for what it does, unless it does nothing; a
+# directive such as "use strict" always does, and anything may be read when the module calls `eval`.
+fn cjs-statement-facts(mo: m.Module, sm: Summary, part: Int, directive: Bool) -> [link.Fact] =
+  [link.fact-part-of(part, mo.id)] ++ [link.fact-cjs-binding(s, part) for s in sm.declares]
+  ++ [mention-facts(mo, part, x)... for x in sm.mentions]
+  ++ [link.fact-effect(part) for p in [part] if directive or not sm.pure or sym.scope-at(m.table, mo.root).dynamic]
+
 # The parts with no statement: the namespace object, which a format that exposes the entry as an
 # object keeps; and the wrapper's `init_x`.
 fn synthetic-facts(mo: m.Module, start: Int) -> [link.Fact] = match mo.kind, wrapped?(mo) {
   Esm, true => namespace-part(mo, start) ++ [link.fact-part-of(start + 1, mo.id), link.fact-declares(start + 1, init-sym(mo)),
-                                         link.fact-mentions(start + 1, helper("__esm"))]
+                                         link.fact-mentions(start + 1, helper(wrapper-helper("__esm")))]
   Esm, false => namespace-part(mo, start)
   _, _ => []
 }
 
 fn namespace-part(mo: m.Module, part: Int) -> [link.Fact] =
   [link.fact-part-of(part, mo.id), link.fact-ns-part(part, mo.id), link.fact-ns-symbol(mo.id, ns-sym(mo)),
-   link.fact-declares(part, ns-sym(mo)), link.fact-mentions(part, helper("__export"))]
+   link.fact-declares(part, ns-sym(mo))]
+  ++ [link.fact-mentions(part, helper("__export")) for s in [mo] if any x in mo.tree.body.kids: exporting?(x)]
   ++ entry-namespace(mo, part)
+
+# A statement that exports: a module with none has an empty namespace object, and no `__export`.
+fn exporting?(s: Node) -> Bool = starts-with(js.kind-name(s.kind), "Export")
 
 fn entry-namespace(mo: m.Module, part: Int) -> [link.Fact] = match linking.entry-namespace and mo.id == m.entry {
   true => [link.fact-root-part(part), link.fact-mentions(part, helper("__toCommonJS"))]
@@ -739,9 +761,14 @@ fn import-facts(mo: m.Module, part: Int, t: Int, clause: Node) -> [link.Fact] = 
   _, _ => []
 }
 
-fn bare-import-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match opaque?(m.modules[t]) {
-  true => required(part, t) ++ [link.fact-effect(part)]
-  false => []
+# `import "x"` of CommonJS, or of an outside module held in a variable, holds it in an import
+# variable too, as esbuild writes it.
+fn bare-import-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match held?(m.modules[t]), m.modules[t].kind {
+  true, Cjs => [link.fact-declares(part, known-import-var(mo, t)), link.fact-mentions(part, helper("__toESM"))]
+               ++ required(part, t) ++ [link.fact-effect(part)]
+  true, _ => [link.fact-declares(part, known-import-var(mo, t))] ++ required(part, t) ++ [link.fact-effect(part)]
+  # Kept as an import statement, it loads the module where it stands.
+  false, _ => [link.fact-effect(part) for x in [t] if kept?(m.modules[t])]
 }
 
 # `export *`: from CommonJS, copied at run time onto the namespace object.
