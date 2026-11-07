@@ -24,10 +24,10 @@ context settings: Settings = Settings(src: "", assign-fields: false, keeping-imp
 # what each namespace has exported so far.
 context next-offset: Int = -1000
 context pure: {Int:Int} = {}
-context namespace-exports: {Text:[Text]} = {}
+# Each namespace body's exports, by where it is: its own, after those of the bodies before it of
+# the same namespace.
+context namespace-exports: {Int:[Text]} = {}
 context namespace-path: Text = ""
-# What the statement list being lowered declares already, so a namespace there need not.
-context declared: [Text] = []
 
 # Scope analysis finds a name's symbol by offset. Real offsets are not negative.
 fn fresh-offset() -> Int {
@@ -325,19 +325,36 @@ fn namespace-call(name: Text, body: Node, outer: Node) -> Node? = match namespac
 
 # What the namespace at `path` holds, as statements of the function its body becomes. Every body of
 # one namespace exports into the same object: what earlier ones exported is read through it.
-fn namespace-body(path: Text, body: Node, param: Text) -> [Node] {
-  with namespace-path = path {
-    match body {
-      TsNamespaceNested(inner, rest) => nested-namespace(inner.text, rest, param)
-      TsNamespaceBlock(List(ss...)) => {
-        let exported = (namespace-exports[path] ?? []) ++ exported-variables(ss)
-        namespace-exports[path] = exported
-        [through-namespace(s, exported, param) for s in [namespace-statement(s, param)... for s in ss]]
-      }
-      _ => panic "unexpected namespace body"
-    }
+fn namespace-body(path: Text, body: Node, param: Text) -> [Node] = with namespace-path = path {
+  match body {
+    TsNamespaceNested(inner, rest) => nested-namespace(inner.text, rest, param)
+    TsNamespaceBlock(List(ss...)) => [through-namespace(s, exported, param) for s in [namespace-statement(s, param)... for s in ss]]
+      where exported = namespace-exports[body.lo] ?? panic "a namespace body that was not found ahead"
+    _ => panic "unexpected namespace body"
   }
 }
+
+# A namespace body: where it is, the namespace's path, and what it exports itself.
+record Body { at: Int, path: Text, own: [Text] }
+
+# Every namespace body in a tree, in the order lowering meets them: a body before what is in it.
+fn namespace-bodies(n: Node, path: Text) -> [Body] = match n {
+  TsNamespace(name, body) => namespace-chain(body, path ++ "." ++ name.text)
+  _ => [b for k in n.kids for b in namespace-bodies(k, path)]
+}
+
+fn namespace-chain(body: Node, path: Text) -> [Body] = match body {
+  TsNamespaceNested(inner, rest) => namespace-chain(rest, path ++ "." ++ inner.text)
+  TsNamespaceBlock(List(ss...)) => [Body(at: body.lo, path: path, own: exported-variables(ss))] ++ [b for s in ss for b in namespace-bodies(s, path)]
+  _ => []
+}
+
+# What each namespace has exported so far, and so each body's exports.
+record Exports { by-path: {Text:[Text]}, at: {Int:[Text]} }
+
+fn exports-at(tree: Node) -> {Int:[Text]} =
+  (fold e = Exports(by-path: {}, at: {}) for b in namespace-bodies(tree, ""):
+     (e with { by-path: e.by-path ++ {b.path: all}, at: e.at ++ {b.at: all} } where all = (e.by-path[b.path] ?? []) ++ b.own)).at
 
 # `let M; ((M2) => { … })(M = N2.M || (N2.M = {}));`
 fn nested-namespace(name: Text, body: Node, param: Text) -> [Node] = match namespace-call(name, body, outer) {
@@ -348,22 +365,23 @@ fn nested-namespace(name: Text, body: Node, param: Text) -> [Node] = match names
         local = ident(name),
         outer = exp`$local = $ns1.$name || ($ns2.$name = {})`
 
+# What lowering a statement of a list made, and the name it declared for the statements after it.
+record Step { nodes: [Node], declares: [Text] }
+
 # `var N; ((N2) => { … })(N || (N = {}));`, without the `var` if something already declares N.
-fn namespace-statements(n: Node, exported: Bool) -> [Node] = match n {
-  TsNamespace(name, body) => {
-    let again1 = ident(name.text)
-    let again2 = ident(name.text)
-    let outer = exp`$again1 || ($again2 = {})`
-    match namespace-call(name.text, body, outer) {
-      none => []
-      some(call) => {
-        if name.text in declared { return [ExprStmt(call)] }
-        declared += name.text
-        let holder = Declarator(name, None()) with { lo: n.lo, hi: n.hi }
-        [if exported then ExportVar(List(holder)) else VarDecl(List(holder)), ExprStmt(call)]
-      }
-    }
-  }
+fn namespace-step(n: Node, exported: Bool, declared: [Text]) -> Step = match n {
+  TsNamespace(name, body) => match namespace-call(name.text, body, outer) {
+    none => Step(nodes: [], declares: [])
+    some(call) if name.text in declared => Step(nodes: [ExprStmt(call)], declares: [])
+    some(call) => Step(nodes: [match exported {
+                                  true => ExportVar(List(holder))
+                                  false => VarDecl(List(holder))
+                                }, ExprStmt(call)],
+                       declares: [name.text])
+      where holder = Declarator(name, None()) with { lo: n.lo, hi: n.hi }
+  } where again1 = ident(name.text),
+          again2 = ident(name.text),
+          outer = exp`$again1 || ($again2 = {})`
   _ => panic "expected a namespace"
 }
 
@@ -576,7 +594,19 @@ fn declared-name(s: Node) -> [Text] = match s {
   _ => []
 }
 
-fn lowered-statements(xs: [Node]) -> [Node] = with declared = declared-names(xs) { [statement-lowered(x)... for x in xs] }
+# A statement list lowered, one statement after another: a namespace that one of them declares, those
+# after it do not declare again.
+record Listed { out: [Node], declared: [Text] }
+
+fn lowered-statements(xs: [Node]) -> [Node] =
+  (fold l = Listed(out: [], declared: declared-names(xs)) for x in xs:
+     (l with { out: l.out ++ step.nodes, declared: l.declared ++ step.declares } where step = statement-step(x, l.declared))).out
+
+fn statement-step(x: Node, declared: [Text]) -> Step = match x {
+  TsNamespace(...) => namespace-step(x, false, declared)
+  TsExportNamespace(n) => namespace-step(n, true, declared)
+  _ => Step(nodes: statement-lowered(x), declares: [])
+}
 
 fn statement-lowered(x: Node) -> [Node] = match x {
   TsErased() => []
@@ -588,8 +618,7 @@ fn statement-lowered(x: Node) -> [Node] = match x {
   ExportClass(c) if decorated-anything?(c) => decorated-class([], c, true)
   TsEnum(...) => [VarDecl(List(enum-declarator(x))) with { lo: x.lo, hi: x.hi }]
   TsExportEnum(e) => [ExportVar(List(enum-declarator(e))) with { lo: x.lo, hi: x.hi }]
-  TsNamespace(...) => namespace-statements(x, false)
-  TsExportNamespace(n) => namespace-statements(n, true)
+  TsNamespace(...) | TsExportNamespace(_) => (statement-step(x, []).nodes)
   TsImportRequire(name, from) | TsExportImport(TsImportRequire(name, from)) => [match x {
       TsExportImport(_) => ExportLexical(ConstDecl(d))
       _ => ConstDecl(d)
@@ -696,6 +725,6 @@ fn lowered-file(whole: Node, keep: [Text], decorators: Bool, tree: Node) -> Lowe
 
 fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool, decorators: Bool) -> Lowered =
   with settings = Settings(src: source, assign-fields: not define-fields, keeping-imports: keep-imports, decorators: decorators),
-       next-offset = -1000, pure = {}, namespace-exports = {} {
+       next-offset = -1000, pure = {}, namespace-exports = exports-at(tree) {
     lowered-file(Program(tree.hashbang, List(lowered-statements(tree.body.kids)...)), keep, decorators, tree)
   }
