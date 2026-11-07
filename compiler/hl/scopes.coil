@@ -16,6 +16,8 @@
 ;;;   key-first Method ;        # the node's first child resolves outside its scope
 ;;;   inside Let name body ;    # of a node that opens a scope, the children in it: the
 ;;;                             # others resolve in the scope around it (ML's `let`)
+;;;   sequential LetStmt ;      # a node whose scope also holds the siblings after it
+;;;                             # (`let` in a block, where each one shadows the last)
 ;;;   dynamic-kind With ;       # names in and around this cannot be renamed
 ;;;   dynamic-name eval ;       # nor around a reference to this name
 ;;;
@@ -125,6 +127,8 @@
         (mut dynamic-kind) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut dynamic-name) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut insides) (ArrayList::new [g/Node] (malloc-allocator))
+        (mut sequential) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut sequential-nodes) (ArrayList::new [g/Node] (malloc-allocator))
         kinds (grammar-kinds context src path (get (.kids tree) 0))]
     (for table (.kids (get (.kids tree) 1))
       (let [t (get (.kids table) 0)
@@ -140,6 +144,9 @@
                     (fail-on src path n
                              (dsl/join3 "the grammar " grammar (dsl/join2 " has no node named " (.text n))))))))
         (cond (= w "inside") (push! (mut insides) table)
+              (= w "sequential")
+                (do (set! sequential names)
+                    (for n (.kids (get (.kids table) 1)) (push! (mut sequential-nodes) n)))
               (= w "ref") (set! ref names)
               (= w "bind") (set! bind names)
               (= w "function") (set! function names)
@@ -164,6 +171,10 @@
       (for n function (push! (mut opening) n))
       (for n block (push! (mut opening) n))
       (for t insides (push! (mut inside-arms) (inside-arm kinds src path t opening)))
+      (for n sequential-nodes
+        (unless (has-name? opening (.text n))
+          (fail-on src path n
+                   (dsl/join3 (.text n) " opens no scope: name it under block or function" ""))))
       (dsl/render `(do
                      (import "hl.symtab" :as sym)
                      (import "coil.hashmap" :use [HashMap i64-keyops])
@@ -200,6 +211,8 @@
                      ;;; Whether child `i` of a node of kind `k` that opens a scope is in that scope.
                      (defn inside? [(k syn/Kind) (i i64)] (-> bool)
                        (match k ~@inside-arms (_ true)))
+                     (defn sequential? [(k syn/Kind)] (-> bool)
+                       ~(kind-test sequential))
 
                      (defn opens? [(k syn/Kind)] (-> bool)
                        (or (function? k) (block? k)))
@@ -271,10 +284,11 @@
                          (for i (range 0 count)
                            (when (inside? k i) (lexical-kid! (get (.kids n) i) (mut t) inner)))))
 
+                     ;;; Walk a node; the scope it opened, or -1.
                      (defn walk [(n syn/Node)
                                  (t (mut sym/Table))
                                  (scope i64)
-                                 (b (mut (HashMap i64 i64)))] (-> void)
+                                 (b (mut (HashMap i64 i64)))] (-> i64)
                        (let [k (.kind n)]
                          (cond (ref? k)
                                  (do
@@ -284,15 +298,18 @@
                                      (Some [s]
                                            (sym/add-use! (mut t) s)
                                            (set! (mut b) (.lo n) s))
-                                     (None [] (sym/add-free! (mut t) (.text n)))))
+                                     (None [] (sym/add-free! (mut t) (.text n))))
+                                   -1)
                                (bind? k)
-                                 (match (sym/resolve (mut t) scope (.text n))
-                                   (Some [s]
-                                         (sym/add-use! (mut t) s)
-                                         (set! (mut b) (.lo n) s))
-                                   (None []
-                                         (panic "binding {} was not declared by the scope tables"
-                                                (.text n))))
+                                 (do
+                                   (match (sym/resolve (mut t) scope (.text n))
+                                     (Some [s]
+                                           (sym/add-use! (mut t) s)
+                                           (set! (mut b) (.lo n) s))
+                                     (None []
+                                           (panic "binding {} was not declared by the scope tables"
+                                                  (.text n))))
+                                   -1)
                                (opens? k)
                                  (let [inner
                                          (sym/new-scope! (mut t)
@@ -312,17 +329,27 @@
                                            scope
                                            (mut b))
                                      (set! start 1))
-                                   (for i (range start (len (.kids n)))
-                                     (walk (get (.kids n) i)
-                                           (mut t)
-                                           (if (inside? k i) inner scope)
-                                           (mut b))))
+                                   ;; A sequential child's scope holds the siblings after it, on its side.
+                                   (let [(mut in) inner
+                                         (mut out) scope]
+                                     (for i (range start (len (.kids n)))
+                                       (let [kid (get (.kids n) i)
+                                             opened (walk kid (mut t) (if (inside? k i) in out) (mut b))]
+                                         (when (and (sequential? (.kind kid)) (>= opened 0))
+                                           (if (inside? k i)
+                                               (do (set! in opened) 0)
+                                               (do (set! out opened) 0))))))
+                                   inner)
                                :else
                                  (do
                                    (when (dynamic-kind? k)
                                      (sym/mark-dynamic! (mut t) scope))
-                                   (for (ref child) (.kids n)
-                                     (walk child (mut t) scope (mut b)))))))
+                                   (let [(mut cur) scope]
+                                     (for (ref child) (.kids n)
+                                       (let [opened (walk child (mut t) cur (mut b))]
+                                         (when (and (sequential? (.kind child)) (>= opened 0))
+                                           (set! cur opened)))))
+                                   -1))))
 
                      ;;; Analyse a whole program in its own new function-level scope.
                      (defn analyze [(tree syn/Node)
@@ -344,10 +371,14 @@
 
                      ;;; What it then does for each part of the program, in a table whose scope 0 stands for
                      ;;; the program's (`table-under`): so parts can be walked at once, and grafted in order.
+                     ;;; A sequential part's scope would hold the parts after it, which are walked apart.
                      (defn walk-part [(n syn/Node)
                                       (t (mut sym/Table))
                                       (b (mut (HashMap i64 i64)))] (-> void)
-                       (walk n (mut t) 0 (mut b)))
+                       (when (sequential? (.kind n))
+                         (panic "a sequential statement at the top level needs the program analysed whole, not in parts"))
+                       (walk n (mut t) 0 (mut b))
+                       0)
 
                      ;;; Under a function scope, and with `outer` names, under one more function scope that
                      ;;; declares them: a wrapper's parameters, say.
