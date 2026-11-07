@@ -67,7 +67,7 @@ for a in "named all cjs features three zod rx datefns preact immer react d3 reex
 
 print("== normalized identity with esbuild (unminified)")
 norm = "const e=require('esbuild'),fs=require('fs');const n=f=>e.transformSync(fs.readFileSync(f,'utf8'),{loader:'js',legalComments:'none',minifyWhitespace:true,logLevel:'silent'}).code;console.log(n(process.argv[1])===n(process.argv[2]))"
-for a in ["named", "all", "three", "datefns", "preact", "exdate", "exes", "cjsret"]:
+for a in ["named", "all", "three", "datefns", "preact", "exdate", "exes", "cjsret", "lib"]:
     theirs, ours = f"{SCRATCH}/{a}.esb.js", f"{SCRATCH}/{a}.js"
     sh([E, f"apps/{a}.js", "--bundle", "--format=iife", f"--outfile={theirs}", "--log-level=silent"])
     sh([ESB, f"apps/{a}.js", f"--outfile={ours}"], 60)
