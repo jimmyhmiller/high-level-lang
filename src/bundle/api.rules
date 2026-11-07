@@ -575,23 +575,26 @@ fn loading-of(o: Options, out-dir: Text) -> m.Loading =
             on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir, load-threads: o.plan.load-threads,
             packages-external: o.packages-external, public-path: o.public-path)
 
-fn linking-of(o: Options, entry-namespace: Bool, keep-entry-exports: Bool, splitting: Bool) -> an.Linking =
+fn linking-of(o: Options, entry-namespace: Bool, keep-entry-exports: Bool, splitting: Bool, esm-output: Bool) -> an.Linking =
   an.Linking(entry-namespace: entry-namespace, keep-entry-exports: keep-entry-exports, tree-shaking: o.tree-shaking,
-             splitting: splitting, pure-names: o.pure, facts-threads: o.plan.facts-threads)
+             splitting: splitting, esm-output: esm-output, pure-names: o.pure, facts-threads: o.plan.facts-threads)
 
 fn emitting-of(o: Options, esm-output: Bool) -> e.Emitting =
-  e.Emitting(void-undefined: o.minify-syntax, esm-output: esm-output, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
+  e.Emitting(void-undefined: o.minify-syntax, esm-output: esm-output, drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap,
+             emit-threads: o.plan.emit-threads)
 
 # The names esbuild gives output files: the entry's path below the entries' common directory.
 fn common-dir(paths: [Text]) -> Text = fold dir = dir-of(paths[0]) for p in paths: enclosing(dir, p)
 
 fn enclosing(dir: Text, path: Text) -> Text = match dir {
-  _ if dir == "." or starts-with(path, dir ++ "/") => dir
+  "." | "/" => dir
+  _ if starts-with(path, dir ++ "/") => dir
   _ => enclosing(dir-of(dir), path)
 }
 
 fn below(dir: Text, path: Text) -> Text = match dir {
   "." => path
+  "/" => path[1..len(path)]
   _ => path[len(dir) + 1..len(path)]
 }
 
@@ -608,17 +611,35 @@ fn base-dir(o: Options) -> Text = match o.outbase {
 record Written { path: Text, text: Text, said: Text }
 
 # One bundle, or one per entry, or one split into chunks, each name looked up as the options say:
-# the files they make, written.
-fn build(options: Options) -> Void = timed(options.timing, "write", written(files(options)))
+# the files they make, written; or, with nowhere to write it, the one bundle printed.
+fn build(options: Options) -> Void = timed(options.timing, "write", match printing?(options) {
+  true => to-standard-output(files(options))
+  false => written(files(options))
+})
 
 # The files a build makes, not yet written.
 fn files(options: Options) -> [Written] =
   with res.options = resolve-options(options), tsc.forced = options.tsconfig, ascii.braces = options.target >= 2015,
        cssb.loaders = loader-map(options) {
-    built(options)
+    built(printable(options))
   }
 
 fn written(ws: [Written]) -> Void = write-files!([w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
+
+# With no output file or directory, one entry's bundle goes to standard output, as esbuild's does:
+# its source map inline, and nothing that needs a file of its own.
+fn printing?(o: Options) -> Bool = not o.splitting and o.outdir == "" and o.outfile == "" and len(o.entries) == 1
+
+fn printable(o: Options) -> Options = match printing?(o), o.legal-comments {
+  true, "linked" | "external" => panic "linked or external legal comments need an output path: give --outfile or --outdir"
+  true, _ if "file" in [l.value for l in o.loaders] => panic "the file loader needs an output path: give --outfile or --outdir"
+  _, _ => o
+}
+
+fn to-standard-output(ws: [Written]) -> Void = match ws {
+  [w] => write-standard-output!(w.text)
+  _ => panic "this build makes {} files, and standard output takes one: give --outfile or --outdir", len(ws)
+}
 
 fn built(options: Options) -> [Written] = match options.splitting, options.outdir, len(options.entries) {
   true, _, _ => split-built(options)
@@ -648,11 +669,14 @@ fn beside(path: Text, text: Text) -> [Written] = [Written(path: path, text: t, s
 
 # Output, and when there is a source map, the line that points to it and the map, of `source`, the
 # part of the text the marks describe, which starts at `base`.
-fn with-map(o: Options, path: Text, text: Text, source: Text, base: Int, marks: [Mark]) -> [Written] = match o.sourcemap {
-  true => [Written(path: path, text: mapped, said: said-of(mapped, path)),
-           Written(path: path ++ ".map", text: map.build-map(source, base, marks, path), said: "")]
+fn with-map(o: Options, path: Text, text: Text, source: Text, base: Int, marks: [Mark]) -> [Written] = match o.sourcemap, printing?(o) {
+  true, false => [Written(path: path, text: mapped, said: said-of(mapped, path)),
+                  Written(path: path ++ ".map", text: map.build-map(source, base, marks, path), said: "")]
     where mapped = text ++ "//# sourceMappingURL=" ++ path-base(path) ++ ".map\n"
-  false => [Written(path: path, text: text, said: said-of(text, path))]
+  true, true => [Written(path: path, text: inline, said: "")]
+    where inline = text ++ "//# sourceMappingURL=data:application/json;base64,"
+                   ++ host.base64(map.build-map(source, base, marks, path)) ++ "\n"
+  false, _ => [Written(path: path, text: text, said: said-of(text, path))]
 }
 
 # A stylesheet entry: its imports and the files it names, and nothing for JavaScript to do.
@@ -675,7 +699,7 @@ fn one-built(options: Options) -> [Written] = match options.entry {
   _ ++ ".css" => css-built(options)
   _ if options.pretty and options.jsx.runtime == jsx.Preserve =>
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
-  _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, f.export-names, false),
+  _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, f.export-names, false, f.hoist-externals),
             e.emitting = emitting-of(o, f.hoist-externals), e.chunk-parts = none, printing = printing-of(o), m.names = names-new() {
          loaded-built(timed(o.timing, "startup", o), f)
        }
@@ -784,7 +808,7 @@ fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roo
 fn split-built(options: Options) -> [Written] = match options.outdir, options.format.export-names {
   "", _ => panic "code splitting needs --outdir"
   _, false => panic "code splitting needs --format=esm"
-  _, true => with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, true), e.emitting = emitting-of(o, true),
+  _, true => with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, true, true), e.emitting = emitting-of(o, true),
                   printing = printing-of(o), m.names = names-new() {
       with m.ahead = m.parsed-ahead(o.entries) { split-graph(o, m.graph(include-text("runtime.js"), o.entries)) }
     } where o = with-node-env(options)

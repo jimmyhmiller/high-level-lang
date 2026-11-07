@@ -2686,8 +2686,12 @@
   (unless (and (= (.kind call) (g/KCall)) (= (.kind (kid call 0)) (g/KFieldE)))
     (die (mut k) call "a query is db.relation(columns)"))
   (let [rel-name (.text (kid (kid call 0) 1))
-        db (place (mut k) (kid (kid call 0) 0))
-        rel-code `(mut (~(primitive/code-symbol "." rel-name) ~(.code db)))
+        base (kid (kid call 0) 0)
+        db (if (is-place? base) (place (mut k) base) (expr (mut k) base ""))
+        rel-of `(~(primitive/code-symbol "." rel-name) ~(.code db))
+        held (writable? (mut k) base)
+        copy (fresh (mut k) "rel")
+        rel-code (if held `(mut ~rel-of) `(mut ~(sym copy)))
         args (list-kids (kid call 1))
         (mut lets) (primitive/code-list-new)
         (mut tests) (primitive/code-list-new)
@@ -2697,6 +2701,11 @@
         (mut key-col) -1
         (mut key-sym) ""]
     (rel-check (mut k) call (.ty db) rel-name (len args))
+    ;; A query only reads, though it may build an index as it goes. A relation's indexes live in
+    ;; storage its copies share, so one held by `let` (or made by a call) is read through a copy.
+    (unless held
+      (push! (mut lets) `(mut ~(sym copy)))
+      (push! (mut lets) rel-of))
     (for i (range 0 (len args))
       (let [a (get args i)]
         (cond (= (.kind a) (g/KQvar)) 0
@@ -2727,8 +2736,7 @@
       :seq
         (if (>= key-col 0)
             `(rt/rel-bucket ~rel-code ~key-col ~(sym key-sym))
-            `(range 0
-                    (.count (~(primitive/code-symbol "." rel-name) ~(.code db)))))
+            `(range 0 (.count ~(if held rel-of (sym copy)))))
       :hi `0
       :lets `(~@lets)
       :row row
@@ -3962,6 +3970,20 @@
                  (ctor-qualified (mut k) n callee args want))
       (_ (die (mut k) n "this cannot be called")))))
 
+;;; Whether `(mut e)` may be taken: a `var`, a setting or state, or a field of one.
+(defn writable? [(k (mut Comp)) (e g/Node)] (-> bool)
+  (match (.kind e)
+    (g/KName []
+             (match (find-local (mut k) (.text e))
+               (Some [l] (.mutable l))
+               (None [] true)))
+    (g/KFieldE []
+               (match (module-prefix (mut k) (kid e 0))
+                 (Some [_] true)
+                 (None [] (writable? (mut k) (kid e 0)))))
+    (g/KGroup [] (writable? (mut k) (kid e 0)))
+    (_ false)))
+
 (defn is-place? [(e g/Node)] (-> bool)
   (match (.kind e)
     (g/KName [] true)
@@ -4021,9 +4043,12 @@
           (for a args
             (let [x (expect (mut k) a (expr (mut k) a "Int") "Int")]
               (push! (mut cs) (.code x))))
-          (te `(~(sym (qualified (mut k) module (cat3 "has-" rel "?"))) (mut ~(.code db))
-                  ~@cs)
-              "Bool")))))
+          (let [has (sym (qualified (mut k) module (cat3 "has-" rel "?")))]
+            (if (writable? (mut k) (kid (kid n 0) 0))
+                (te `(~has (mut ~(.code db)) ~@cs) "Bool")
+                ;; Read through a copy, as a query does: the copies share their indexes.
+                (let [copy (sym (fresh (mut k) "db"))]
+                  (te `(let [(mut ~copy) ~(.code db)] (~has (mut ~copy) ~@cs)) "Bool"))))))))
 
 ;; ---------------------------------------------------------------- constructors
 

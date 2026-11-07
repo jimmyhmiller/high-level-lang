@@ -16,6 +16,8 @@ record Linking {
   tree-shaking: Bool,
   # Code splitting: `import()` loads a chunk, so what it names runs when loaded, and needs no wrapper.
   splitting: Bool,
+  # ES module output, where an import of an external module stays an import statement.
+  esm-output: Bool,
   # `--pure:NAME`: calls of these free names may go when nothing uses their value.
   pure-names: [Text],
   # How many threads walk modules for their facts.
@@ -71,6 +73,13 @@ fn known-dep(mo: m.Module, from: Node) -> Int =
 
 # Imported as an opaque object at run time, rather than linked by name.
 fn opaque?(t: m.Module) -> Bool = t.kind == Cjs or t.kind == External
+
+# In ES module output, an `import` of an external module, or an `export … from` one other than
+# `export *`, stays a statement that binds its own names, as esbuild leaves it: the runtime links it.
+fn kept?(t: m.Module) -> Bool = linking.esm-output and t.kind == External
+
+# Held in an import variable, made an ES module with `__toESM`: an opaque module not kept.
+fn held?(t: m.Module) -> Bool = opaque?(t) and not kept?(t)
 
 fn bound?(n: Node) -> Bool = n.lo in here.bindings
 
@@ -395,11 +404,20 @@ fn made-for(made: [Made], first: Int, purpose: Purpose) -> {Int:Int} =
 # What a statement needs made: the variable an opaque import is held in, and the names re-exported
 # from it.
 fn statement-made(mo: m.Module, s: Node) -> [Made] = match s {
-  Import(_, from) | ExportAll(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
-  ExportAllAs(_, from) | ExportFrom(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
-    ++ [Made(purpose: ReexportName, owner: mo.id, exported: r.exported, scope: mo.root, name: "reexport_" ++ r.exported)
+  Import(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
+  ExportAll(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
+  ExportAllAs(_, from) | ExportFrom(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
+    ++ [Made(purpose: ReexportName, owner: mo.id, exported: r.exported, scope: mo.root, name: reexport-name(r))
         for r in statement-reexports(mo, s)]
   _ => []
+}
+
+# A kept re-export's name is what it imports, as esbuild's is; one through an import variable says
+# what it exports.
+fn reexport-name(r: Reexport) -> Text = match kept?(m.modules[r.target]), r.namespace {
+  true, true => r.exported
+  true, false => r.name
+  false, _ => "reexport_" ++ r.exported
 }
 
 # A module's parts, each standing for a statement: CommonJS is one, its whole tree. An ES module's
@@ -434,11 +452,12 @@ fn linked-of(calls: [[Node]], first: Int) -> Linked =
          reexports: reexports,
          cjs-imports: {b.symbol: CjsImport(importer: id, import-var: symbol-in(import-vars, import-key(m.modules[id], b.target)),
                                            name: b.name, namespace: b.namespace)
-                       for i in 0..len(m.order) for id in [m.order[i]] for b in bindings[i] if opaque?(m.modules[b.target])}
+                       for i in 0..len(m.order) for id in [m.order[i]] for b in bindings[i] if held?(m.modules[b.target])}
                       ++ {reexport-in(reexports, mo, r.exported):
                             CjsImport(importer: mo.id, import-var: symbol-in(import-vars, import-key(mo, r.target)), name: r.name,
                                       namespace: r.namespace)
-                          for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for r in statement-reexports(mo, s)},
+                          for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for r in statement-reexports(mo, s)
+                          if held?(m.modules[r.target])},
          ns-imports: {b.symbol: b.target for bs in bindings for b in bs if b.namespace and not opaque?(m.modules[b.target])},
          part-stmt: [module-parts(m.modules[id], wrapped)... for id in m.order],
          any-dynamic: any id in m.order for mo in [m.modules[id]] for s in linked-statements(mo): dynamic-star?(mo, s),
@@ -450,7 +469,7 @@ fn linked-of(calls: [[Node]], first: Int) -> Linked =
         bindings = [import-bindings(m.modules[id]) for id in m.order],
         made = [x for x in [x for id in m.order for x in module-made(m.modules[id], wrapped)]
                            ++ [import-made(m.modules[m.order[i]], b.target) for i in 0..len(m.order) for b in bindings[i]
-                               if opaque?(m.modules[b.target])]
+                               if held?(m.modules[b.target])]
                            ++ [x for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for x in statement-made(mo, s)]
                 distinct made-once(x)],
         import-vars = made-for(made, first, ImportVar),
@@ -589,11 +608,15 @@ fn reexported(mo: m.Module, part: Int, exported: Text) -> [link.Fact] =
   [link.fact-local-export(mo.id, m.name-id(exported), s), link.fact-cjs-binding(s, part)]
   where s = reexport-sym(mo, exported)
 
+# A name a kept `export … from` binds, as its import does, and exports.
+fn kept-reexported(mo: m.Module, part: Int, exported: Text) -> [link.Fact] =
+  reexported(mo, part, exported) ++ [link.fact-declares(part, reexport-sym(mo, exported))]
+
 # One top-level statement of an ES module is one part.
 fn part-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact] = [link.fact-part-of(part, mo.id)] ++ statement-facts(mo, s, sm, part)
 
 fn statement-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact] = match s {
-  Import(_, from) => imported(mo, part, t) ++ import-facts(mo, part, t) where t = known-dep(mo, from)
+  Import(clause, from) => imported(mo, part, t) ++ import-facts(mo, part, t, clause) where t = known-dep(mo, from)
   ImportBare(from) => imported(mo, part, t) ++ bare-import-facts(mo, part, t) where t = known-dep(mo, from)
   ExportAll(from) => imported(mo, part, t) ++ star-facts(mo, part, t) where t = known-dep(mo, from)
   ExportAllAs(name, from) => imported(mo, part, t) ++ star-as-facts(mo, part, t, m.module-name(name)) where t = known-dep(mo, from)
@@ -605,11 +628,13 @@ fn statement-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact]
        ++ [link.fact-effect(part) for p in [part] if wrapped?(mo) or not (mo.kind == Runtime or sm.pure)]
 }
 
-# An import of an opaque module holds it in a variable, made an ES module.
-fn import-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match opaque?(m.modules[t]) {
-  true => [link.fact-declares(part, known-import-var(mo, t))] ++ required(part, t)
-          ++ [link.fact-effect(part), link.fact-mentions(part, helper("__toESM"))]
-  false => []
+# An import of an opaque module holds it in a variable, made an ES module. A kept one declares its
+# own names, and stays for what loading the module does, as esbuild keeps it.
+fn import-facts(mo: m.Module, part: Int, t: Int, clause: Node) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
+  true, _ => [link.fact-declares(part, known-import-var(mo, t))] ++ required(part, t)
+             ++ [link.fact-effect(part), link.fact-mentions(part, helper("__toESM"))]
+  _, true => [link.fact-declares(part, b.symbol) for b in clause-bindings(mo, t, clause)] ++ [link.fact-effect(part)]
+  _, _ => []
 }
 
 fn bare-import-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match opaque?(m.modules[t]) {
@@ -624,14 +649,16 @@ fn star-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match opaque?(m.
   false => [link.fact-star(mo.id, t)]
 }
 
-fn star-as-facts(mo: m.Module, part: Int, t: Int, exported: Text) -> [link.Fact] = match opaque?(m.modules[t]) {
-  true => reexport-import(mo, part, t) ++ reexported(mo, part, exported)
-  false => [link.fact-local-export(mo.id, m.name-id(exported), ns-sym(m.modules[t]))]
+fn star-as-facts(mo: m.Module, part: Int, t: Int, exported: Text) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
+  true, _ => reexport-import(mo, part, t) ++ reexported(mo, part, exported)
+  _, true => [link.fact-effect(part)] ++ kept-reexported(mo, part, exported)
+  _, _ => [link.fact-local-export(mo.id, m.name-id(exported), ns-sym(m.modules[t]))]
 }
 
-fn export-from-facts(mo: m.Module, part: Int, t: Int, specs: [Node]) -> [link.Fact] = match opaque?(m.modules[t]) {
-  true => reexport-import(mo, part, t) ++ [reexported(mo, part, export-spec-names(spec))... for spec in specs]
-  false => [link.fact-reexport(mo.id, m.name-id(export-spec-names(spec)), t, m.name-id(m.module-name(spec.local)))
+fn export-from-facts(mo: m.Module, part: Int, t: Int, specs: [Node]) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
+  true, _ => reexport-import(mo, part, t) ++ [reexported(mo, part, export-spec-names(spec))... for spec in specs]
+  _, true => [link.fact-effect(part)] ++ [kept-reexported(mo, part, export-spec-names(spec))... for spec in specs]
+  _, _ => [link.fact-reexport(mo.id, m.name-id(export-spec-names(spec)), t, m.name-id(m.module-name(spec.local)))
             for spec in specs]
 }
 

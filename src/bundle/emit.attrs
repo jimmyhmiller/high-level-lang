@@ -11,9 +11,9 @@ use bundle.naming as nm
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
-# How the build emits: `undefined` as `void 0`, external imports hoisted as ES imports, nodes
-# stamped for a source map, and how many threads emit modules.
-record Emitting { void-undefined: Bool, esm-output: Bool, sourcemap: Bool, emit-threads: Int }
+# How the build emits: `undefined` as `void 0`, ES module output, the names a kept import binds
+# that nothing reads left out, nodes stamped for a source map, and how many threads emit modules.
+record Emitting { void-undefined: Bool, esm-output: Bool, drop-unused-imports: Bool, sourcemap: Bool, emit-threads: Int }
 
 setting emitting: Emitting
 # Code splitting: the statements of the chunk being printed, none when it is the whole program; and
@@ -222,12 +222,10 @@ fn external-object(t: m.Module) -> Node = match emitting.esm-output {
 
 fn external-name(t: m.Module) -> Text = "__external_" ++ t.base
 
-# What a statement needs hoisted, in ES module output: the `import * as` of each external module it
-# reads as a namespace.
+# What a statement needs hoisted, in ES module output: the `import * as` of the external module an
+# `export *` copies from at run time. Every other import of one stays a statement.
 fn externals-of(s: Node) -> [Text] = match s {
-  ImportBare(from) => external-lines(m.modules[an.known-dep(here, from)])
-  ExportAll(from) | ExportAllAs(_, from) | ExportFrom(_, from) | Import(_, from) =>
-    [x for t in [m.modules[an.known-dep(here, from)]] if an.opaque?(t) for x in external-lines(t)]
+  ExportAll(from) => [x for t in [m.modules[an.known-dep(here, from)]] if an.opaque?(t) for x in external-lines(t)]
   _ => []
 }
 
@@ -264,6 +262,7 @@ fn import-or-init(t: m.Module) -> Node? = match an.opaque?(t) {
 fn part-output(s: Node) -> Node? = match s {
   ImportBare(from) => match t.kind {
     Cjs => some(stmt`$call_me();`) where call-me = final-of(an.require-sym(t))
+    External if an.kept?(t) => some(ImportBare(path-of(t)))
     External => some(stmt`$object;`) where object = external-object(t)
     _ => init-call(t)
   } where t = m.modules[an.known-dep(here, from)]
@@ -271,13 +270,78 @@ fn part-output(s: Node) -> Node? = match s {
     true => some(reexport-all(t))
     false => init-call(t)
   } where t = m.modules[an.known-dep(here, from)]
-  ExportAllAs(_, from) | ExportFrom(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
+  ExportAllAs(name, from) => match an.kept?(t) {
+    true => some(Import(ImportNamespace(BindName(reexport-local(name))), path-of(t)))
+    false => import-or-init(t)
+  } where t = m.modules[an.known-dep(here, from)]
+  ExportFrom(List(specs...), from) => match an.kept?(t) {
+    true => some(Import(ImportNamed(List([import-spec(spec.local, reexport-local(spec)) for spec in specs if exported-spec?(spec)]...)),
+                        path-of(t)))
+    false => import-or-init(t)
+  } where t = m.modules[an.known-dep(here, from)]
   ExportNamed(...) => none
-  Import(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
+  Import(clause, from) => match an.kept?(t) {
+    true => some(kept-import(clause, t))
+    false => import-or-init(t)
+  } where t = m.modules[an.known-dep(here, from)]
   ExportVar(list) => some(rewritten(VarDecl(list) with { lo: s.lo, hi: s.hi }))
   ExportLexical(d) | ExportFunction(d) | ExportClass(d) => some(rewritten(d))
   _ => some(rewritten(s))
 }
+
+# ---------------------------------------------------------------- imports kept as statements
+
+# An import an external module keeps in ES module output, its names as the output spells them, and
+# those nothing reads left out when asked, as esbuild's `--minify-syntax` leaves them: with none
+# left, only the loading.
+fn kept-import(clause: Node, t: m.Module) -> Node = match kept-clause(clause) {
+  some(c) => Import(c, path-of(t))
+  none => ImportBare(path-of(t))
+}
+
+fn kept-clause(c: Node) -> Node? = match c {
+  ImportDefault(b) if wanted?(b) => some(ImportDefault(local-of(b)))
+  ImportNamespace(b) if wanted?(b) => some(ImportNamespace(local-of(b)))
+  ImportDefaultAnd(b, rest) => match wanted?(b), kept-clause(rest) {
+    true, some(r) => some(ImportDefaultAnd(local-of(b), r))
+    true, none => some(ImportDefault(local-of(b)))
+    false, r => r
+  }
+  ImportNamed(List(specs...)) => match [named-spec(x) for x in specs if named-binding?(x) and wanted?(x.name)] {
+    [] => none
+    kept => some(ImportNamed(List(kept...)))
+  }
+  _ => none
+}
+
+fn named-binding?(x: Node) -> Bool = x is ImportAs(...) or x is ImportName(...)
+
+fn named-spec(x: Node) -> Node = match x {
+  ImportAs(imported, b) => import-spec(imported, final-of(binding-sym(b)))
+  _ => import-spec(PropName(x.name.text), final-of(binding-sym(x.name)))
+}
+
+# `{ x }` when the local name is the one imported, and `{ x as y }` when it is not.
+fn import-spec(imported: Node, local: Text) -> Node = match imported {
+  PropName(name) if name == local => ImportName(BindName(local))
+  _ => ImportAs(imported, BindName(local))
+}
+
+fn wanted?(b: Node) -> Bool = not emitting.drop-unused-imports or (any m.db.mentions(?p, binding-sym(b)): live?(p))
+
+fn binding-sym(b: Node) -> Int = m.symbol-of(here, b.lo) ?? panic "{}: no symbol for import {}", here.path, b.text
+
+fn local-of(b: Node) -> Node = BindName(final-of(binding-sym(b)))
+
+# The name a kept `export … from` binds: its re-export's symbol.
+fn reexport-local(spec: Node) -> Text = final-of(an.reexport-sym(here, match spec {
+  ExportAs(...) | ExportName(...) => an.export-spec-names(spec)
+  _ => m.module-name(spec)
+}))
+
+fn exported-spec?(spec: Node) -> Bool = spec is ExportAs(...) or spec is ExportName(...)
+
+fn path-of(t: m.Module) -> Node = Str(quote-text(t.path))
 
 # For a source map: each leaf's offset gains its module, as (module+1)<<32 | offset.
 fn stamp-tree(n: Node, base: Int) -> Node = match n.lo {
@@ -444,8 +508,9 @@ fn unit-emitted(u: Unit) -> Emitted = match included?(u.module) and any-part-her
 fn module-emitted(u: Unit) -> Emitted = match here.kind {
   Cjs => Emitted(body: [cjs-part()], namespace: [], externals: [])
   # Each part in order, as what it adds to the namespace object or to the body.
+  # An import statement cannot be inside the wrapper: it goes before it, where it still loads first.
   _ => Emitted(body: match an.wrapped?(here) {
-                       true => wrapped-module(outputs)
+                       true => [s for s in outputs if import-statement?(s)] ++ wrapped-module([s for s in outputs if not import-statement?(s)])
                        false => outputs
                      },
                namespace: [s for pc in pieces for s in pc.namespace],
@@ -453,6 +518,8 @@ fn module-emitted(u: Unit) -> Emitted = match here.kind {
     where pieces = [part-emitted(p) for p in parts-of(u.module)[u.from..u.to] if live?(p) and in-this-chunk?(p)],
           outputs = [s for pc in pieces for s in pc.body]
 }
+
+fn import-statement?(s: Node) -> Bool = s is Import(...) or s is ImportBare(...)
 
 fn part-emitted(p: Int) -> Emitted = match an.linked.part-stmt[p] {
   None() => Emitted(body: [], namespace: namespace-stmts(), externals: [])

@@ -27,11 +27,12 @@ There is no bundler logic in Coil. Everything written in the languages is under 
 holds no `.coil` file at all, and the Coil under `compiler/` knows nothing about bundling and
 names no JavaScript node: it is grammars, types, tables, Datalog and rewriting in general, plus a
 runtime of buffers, files and Unicode. Two places still lean on JavaScript. `.scopes` takes node
-names as parameters, but its tables are JavaScript's binding forms (`var` hoisting, `let`, named
-function expressions, `with` and `eval`), and it cannot say a scope rule JavaScript lacks, such as
-ML's `let x = x + 1 in …`, whose initializer sees the outer `x`: say that with an attribute grammar.
-And the grammar language's printer directives (`nomix`, `keepforbid`, a soft `;`) are general, but
-each exists for one of JavaScript's quirks.
+names as parameters, checked against the grammar, and its tables are named for JavaScript's binding
+forms (`var` hoisting, `let`, named function expressions, `with` and `eval`). It can say rules
+JavaScript lacks: `inside Let name body` puts only those children of a `let` in its scope, so ML's
+`let x = x + 1 in …` reads the outer `x` (`src/tools/letlang.scopes`, checked by langtest). And the
+grammar language's printer directives (`nomix`, `keepforbid`, a soft `;`) are general, but each
+exists for one of JavaScript's quirks.
 
 A build spec (`build.bundler`) is data, like `package.json`: `spec.syntax` reads it and
 `spec.rules` says what each setting means, as a match from setting to options, with each error
@@ -41,18 +42,18 @@ that name in the spec. `out/bin/spec FILE` builds any spec with those steps.
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 5,719 | Resolution, modules, TypeScript, tsconfig, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, what a build spec means, the tools |
-| `.attrs` | 2,438 | Early errors, what a file loads, JSX, what each statement declares, emit's renaming: attribute grammars, computed in one traversal |
-| `.syntax` | 879 | JavaScript with JSX and TypeScript, CSS, literals, comments, where a big file can be cut, package.json and tsconfig.json, build specs |
+| `.rules` | 5,777 | Resolution, modules, TypeScript, tsconfig, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, what a build spec means, the tools |
+| `.attrs` | 2,532 | Early errors, what a file loads, JSX, what each statement declares, emit's renaming: attribute grammars, computed in one traversal |
+| `.syntax` | 905 | JavaScript with JSX and TypeScript, CSS, literals, comments, where a big file can be cut, package.json and tsconfig.json, build specs |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
-| `.facts` | 126 | Linking, tree shaking, and which root reaches what for code splitting |
+| `.facts` | 133 | Linking, tree shaking, and which root reaches what for code splitting |
 | `.js` | 171 | The bundle's runtime helpers, and those lowering adds |
 | `.bundler` | 64 | A demo build: data, read with `spec.syntax` |
 | `.pipeline` | 48 | Which stages may run in parallel, and five plans for running them |
-| `.scopes` | 26 | Scoping |
+| `.scopes` | 34 | Scoping, for JavaScript and for a small language with ML's `let` |
 | `.coil` | 15 | Four `main` functions, because a package's entry must be plain Coil |
 
-The compilers for those languages are about 12,100 lines of Coil and 240 of grammars, with a runtime
+The compilers for those languages are about 12,200 lines of Coil and 240 of grammars, with a runtime
 of 2,100 (text, paths, tables, threads), counting neither comments nor blank lines.
 
 `.rules` is the least specific of these languages: a typed language over the grammar's nodes, with
@@ -387,8 +388,10 @@ functions, async generators and `for await`, class fields, private members and s
 checked by acorn at that version), `--drop:console`, `--drop:debugger`, `--pure:`, `--packages=external`, `--charset`,
 `--main-fields`, `--conditions`, `--resolve-extensions`, `--public-path`, several entries with `--outdir`, code splitting with
 shared chunks and `import()` (`--splitting`, `--entry-names`, `--chunk-names`, `--outbase`), global
-names, `--external`, `--platform=node`, identifier and syntax minification, source maps, and resolve,
-load, transform and optimize hooks.
+names, `--external` (a package's subpaths with it, and `*` patterns; in ES module output each import
+of one stays an import statement, as esbuild leaves it), `--platform=node`, identifier and syntax
+minification, source maps, output to standard output when no path is given (its map inline), and
+resolve, load, transform and optimize hooks.
 
 ## What it does not do
 

@@ -343,6 +343,83 @@ for a in ["named.js", "cjs.js", "features.js", "jsx/main.jsx"]:
     m = re.search(r"(\d+) sources, (\d+) mappings, (\d+) check out", text)
     check(m and m.group(2) == m.group(3), f"{a}: {m.group(0) if m else text[:80]}")
 
+print("== standard output")
+# With nowhere to write, one bundle goes to standard output, as esbuild's does, its map inline.
+def printed(args):
+    code, out, err, _, reason = guard.run([ESB] + args + EXTRA, 4000, 120, quiet=True)
+    return (124 if reason else code), out, err
+filed = f"{SCRATCH}/printed.js"
+sh([ESB, "apps/named.js", f"--outfile={filed}"])
+code, out, _ = printed(["apps/named.js"])
+check(code == 0 and out == open(filed).read(), "a bundle with no output path is printed, the same as the file")
+sh([ESB, "apps/named.js", "--sourcemap", f"--outfile={filed}"])
+code, out, _ = printed(["apps/named.js", "--sourcemap"])
+body, _, url = out.rstrip("\n").rpartition("\n")
+import base64
+inline = json.loads(base64.b64decode(url.split(",", 1)[1])) if url.startswith("//# sourceMappingURL=data:application/json;base64,") else {}
+filemap = json.load(open(filed + ".map"))
+# Its sources are named from where the build runs, as esbuild's are, not from where a file would go.
+same_map = inline and all(inline[k] == filemap[k] for k in ["mappings", "sourcesContent", "names"]) and \
+    all(f.endswith("/" + i) for f, i in zip(filemap["sources"], inline["sources"]))
+with open(f"{SCRATCH}/inline.js", "w") as f: f.write(body + "\n")
+with open(f"{SCRATCH}/inline.js.map", "w") as f: json.dump(inline, f)
+m = re.search(r"(\d+) sources, (\d+) mappings, (\d+) check out", sh(["node", "oracles/checkmap.mjs", f"{SCRATCH}/inline.js"])[1])
+check(code == 0 and same_map and m and m.group(2) == m.group(3) and body + "\n" == open(filed).read().rpartition("//# sourceMappingURL")[0],
+      f"a printed bundle's source map is inline, the file's map named from here: {m.group(0) if m else 'no map'}")
+with open(f"{SCRATCH}/sheet.css", "w") as f: f.write("body { color: red }\n")
+with open(f"{SCRATCH}/sheeted.js", "w") as f: f.write('import "./sheet.css"\nconsole.log(1)\n')
+for args, says in [([f"{SCRATCH}/sheeted.js"], "standard output takes one"),
+                   (["apps/named.js", "--loader:.png=file"], "the file loader needs an output path"),
+                   (["apps/named.js", "--legal-comments=external"], "legal comments need an output path")]:
+    code, out, err = printed(args)
+    check(code != 0 and out == "" and says in err, f"{' '.join(args)}: {says}")
+
+print("== external modules")
+# An entry outside any project, its packages left external: in ES module output each import stays a
+# statement binding its own names, so a default import is the module's default, as when it runs
+# unbundled. The checks run from tests/, whose package.json must not be taken for one at the root.
+import tempfile
+OUT = tempfile.mkdtemp(prefix="esb-ext-")
+def put(rel, text):
+    os.makedirs(os.path.dirname(f"{OUT}/{rel}"), exist_ok=True)
+    with open(f"{OUT}/{rel}", "w") as f: f.write(text)
+put("node_modules/dep/package.json", '{"name":"dep","type":"module","main":"index.js"}')
+put("node_modules/dep/index.js", 'export default 42; export const x = 1, z = 3;')
+put("node_modules/dep2/package.json", '{"name":"dep2","type":"module","main":"index.js"}')
+put("node_modules/dep2/index.js", 'globalThis.order = (globalThis.order || "") + "dep2 ";')
+put("node_modules/dep2/sub.js", 'export const sub = "dep2/sub";')
+put("b.js", 'import {x} from "dep"\nexport const bx = x\nconst y = 1\nexport const by = y\n')
+put("w.js", 'import {x} from "dep"\nexport const w = x\n')
+put("a.js", 'import d, {x as y} from "dep"\nimport * as ns from "dep"\nimport "dep2"\nimport {sub} from "dep2/sub.js"\n'
+            'import {bx, by} from "./b.js"\nexport {z, default as dd} from "dep"\nexport * as all from "dep"\n'
+            'const wrapped = require("./w.js")\n'
+            'console.log(JSON.stringify([d, y, ns.default, ns.x, sub, bx, by, wrapped.w, globalThis.order]))\n')
+put("run.mjs", 'import * as m from "./out.mjs"; console.log(JSON.stringify([m.z, m.dd, m.all.default]))')
+ext = ["--external:dep", "--external:dep2"]
+for flags in [[], ["--minify"]]:
+    code, out = sh([ESB, f"{OUT}/a.js", "--format=esm", f"--outfile={OUT}/out.mjs"] + ext + flags)
+    ours = sh(["node", f"{OUT}/out.mjs"], 15)[1] + sh(["node", f"{OUT}/run.mjs"], 15)[1]
+    sh([E, f"{OUT}/a.js", "--bundle", "--format=esm", f"--outfile={OUT}/out.mjs", "--log-level=error"] + ext + flags)
+    theirs = sh(["node", f"{OUT}/out.mjs"], 15)[1] + sh(["node", f"{OUT}/run.mjs"], 15)[1]
+    check(code == 0 and ours == theirs and ours.startswith('[42,1,42,1,"dep2/sub",1,1,1,"dep2 "]'),
+          f"ES module output importing external packages {' '.join(flags)}, from outside any project: {ours.splitlines()[0] if code == 0 and ours else out.strip()[:120]}")
+    if not flags:
+        sh([ESB, f"{OUT}/a.js", "--format=esm", f"--outfile={OUT}/out.mjs"] + ext)
+        text = open(f"{OUT}/out.mjs").read()
+        # Two imports in a.js, its two re-exports, and one each in b.js and w.js.
+        check("__toESM" not in text and len(re.findall(r'from\s*"dep"', text)) == 6,
+              "each import of an external module stays an import statement, with no __toESM")
+put("u.js", 'import {unused} from "dep"\nimport "dep2"\nconsole.log(1)\n')
+sh([ESB, f"{OUT}/u.js", "--format=esm", "--minify-syntax", f"--outfile={OUT}/u.mjs"] + ext)
+check(re.search(r'import\s*"dep"', open(f"{OUT}/u.mjs").read()) is not None, "--minify-syntax leaves out an import's unused names, as esbuild does")
+# A package left external takes its subpaths with it; one `*` stands for anything.
+for flag in ["--external:dep2", "--external:dep*"]:
+    code, out = sh([ESB, f"{OUT}/a.js", "--format=esm", f"--outfile={OUT}/out.mjs", "--external:dep", flag])
+    check(code == 0 and "dep2/sub.js" in open(f"{OUT}/out.mjs").read(), f"{flag} leaves dep2/sub.js external too")
+code, out = sh([ESB, f"{OUT}/a.js", f"--outdir={OUT}/nested/deeper", "--external:dep", "--external:dep2"])
+check(code == 0 and os.path.exists(f"{OUT}/nested/deeper/a.js"), "an output directory is made with the ones it is in")
+import shutil; shutil.rmtree(OUT, ignore_errors=True)
+
 print()
 print("FAILED:" if failures else "All checks passed.")
 for f in failures: print("  " + f)
