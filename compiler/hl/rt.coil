@@ -35,7 +35,7 @@
 (extern pthread_getspecific :cc (cc/C) [i64] (-> (ptr i8)))
 
 ;;; `key`: a thread-specific value holding the slot plus one, so no value means slot 0.
-(defstruct Workers [(ready bool) (ids (ArrayList i64)) (count i64) (key i64) (tree-key i64)])
+(defstruct Workers [(ready bool) (ids (ArrayList i64)) (count i64) (key i64) (tree-key i64) (pass-key i64)])
 
 ;;; Called before any worker starts: from `main`, and from a reader at compile time.
 (defn workers [] (-> (ptr Workers))
@@ -45,7 +45,8 @@
       (for _ (range 0 (max-workers)) (push! (mut (.ids w)) 0))
       (set! (.count w) 1)
       (when (or (!= (pthread_key_create (field w key) (cast (ptr i8) 0)) (: 0 i32))
-                (!= (pthread_key_create (field w tree-key) (cast (ptr i8) 0)) (: 0 i32)))
+                (!= (pthread_key_create (field w tree-key) (cast (ptr i8) 0)) (: 0 i32))
+                (!= (pthread_key_create (field w pass-key) (cast (ptr i8) 0)) (: 0 i32)))
         (panic "cannot make a thread-specific key"))
       (set! (.ready w) true))
     w))
@@ -671,11 +672,30 @@
     (push-str! (mut b) "\"")
     (finish! (mut b))))
 
-;;; Each run of a rewrite gets a number; a node stamped with it is already normal.
+;;; Each run of a rewrite gets a number; a node stamped with it is already normal. Numbers are
+;;; handed out in blocks, one to a thread at a time, so threads that rewrite at once never contend
+;;; for them: a run per leaf, on every thread, would otherwise all touch one word.
 (defstruct PassCounter [(n i64)])
+(defstruct PassBlock [(next i64) (end i64)])
+
+(defn pass-block [] (-> (ptr PassBlock))
+  (let [key (.pass-key (workers))
+        found (pthread_getspecific key)]
+    (if (= (primitive/cast i64 found) 0)
+        (let [cell (box! (malloc-allocator) PassBlock (PassBlock :next 0 :end 0))]
+          (pthread_setspecific key (cast (ptr i8) cell))
+          cell)
+        (cast (ptr PassBlock) found))))
 
 (defn next-pass! [] (-> i64)
-  (+ (atomic/add (primitive/cast (ptr i64) (primitive/alloc-static PassCounter)) 1) 1))
+  (let [b (pass-block)]
+    (when (>= (.next b) (.end b))
+      (let [start (atomic/add (primitive/cast (ptr i64) (primitive/alloc-static PassCounter)) 65536)]
+        (set! (.next b) (+ start 1))
+        (set! (.end b) (+ start 65537))))
+    (let [p (.next b)]
+      (set! (.next b) (+ p 1))
+      p)))
 
 ;; ---------------------------------------------------------------- integers
 
