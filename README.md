@@ -381,11 +381,11 @@ Everything written in the languages is under `src/`; everything in Coil under `c
 - `compiler/hl/`: the languages' compilers. `syntax`, `rules`, `rewrite`, `facts`, `scopes`,
   `bundler` and `pipeline` are readers; `rt` and `symtab` are their domain-free runtime;
   `grammars/` turns each grammar in `src/languages/` into its parser.
-- `compiler/boot/`: four `main` functions, because a package's entry must be plain Coil.
+- `compiler/boot/`: five `main` functions, because a package's entry must be plain Coil.
 - `tests/apps/`: the apps and fixtures the checks build; `tests/oracles/` the Node scripts that
   check outputs with acorn and esbuild. `tests/node_modules/` and `tests/test262/` are not checked in.
 - `tools/`: building (`build-tools.sh`, `readers.sh`, `guard.py`), the checks (`verify.py`,
-  `same.py`, `same-lowered.py`, `same-split.py`), measuring (`altitude.py`, `bench.py`,
+  `same.py`, `same-lowered.py`, `same-split.py`, `same-plans.py`), measuring (`altitude.py`, `bench.py`,
   `profile.sh`, `min.sh`, `formats.sh`, `go.sh`). Run them from the top; they work in `tests/`.
 - `out/`: everything built: binaries, the reader artifact, the frozen baseline, the checks'
   outputs. Not checked in, but for `out/package.json`, which runs outputs as ES modules.

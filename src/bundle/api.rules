@@ -190,18 +190,14 @@ fn names-in-use() -> [Text] =
 fn for-target(o: Options, p: Node) -> Node {
   let dropped = if o.drop-console or o.drop-debugger then without-dropped(o, p) else p
   let lowered = if o.target >= lower.no-lowering then dropped else lower.run(dropped, o.target, names-in-use(), o.minify-identifiers)
-  if o.charset-ascii {
-    # Once prepared, any part may be converted, so the parts are converted at once.
-    ascii.prepare!(o.target)
-    return in-parts(o, lowered, fin.ascii-only)
-  }
+  if o.charset-ascii { return in-parts(o, lowered, fin.ascii-only) }
   lowered
 }
 
 # `f` on each part of the program at once.
 fn in-parts(o: Options, p: Node, f: Fn(Node)->Node) -> Node {
   if o.plan.optimize-parts <= 1 { return f(p) }
-  joined(p, parallel-map(parts-of(p, o.plan.optimize-parts), f, o.plan.optimize-threads))
+  in-pieces(p, o.plan.optimize-parts, o.plan.optimize-threads, f, false)
 }
 
 # `--drop:console` and `--drop:debugger`. Names are final here, and every free name was kept free, so
@@ -305,14 +301,16 @@ fn closed?(s: Node) -> Bool = match s {
   _ => false
 }
 
-# How much work a statement is, near enough: its length in the source, or one when it was made.
-fn weight(s: Node) -> Int = if s.hi > s.lo then s.hi - s.lo else 1
+# How much work a node is, near enough: its length in the source, or for a node the build made,
+# its children's.
+fn mass(n: Node) -> Int = if n.hi > n.lo then n.hi - n.lo else sum k in n.kids: mass(k)
 
-# A program cut into about `n` parts of about equal weight, each cut just after a declaration, so
-# the parts optimise as the whole program would. Fewer when there are not such places enough.
-fn parts-of(p: Node, n: Int) -> [Node] {
-  let stmts = p.body.kids
-  if n <= 1 or len(stmts) <= 1 { return [p] }
+fn weight(s: Node) -> Int = max(1, mass(s))
+
+# Statements cut into about `n` runs of about equal weight, each cut just after a declaration, so
+# the runs optimise as the whole list would. Fewer when there are not such places enough.
+fn runs-of(stmts: [Node], n: Int) -> [[Node]] {
+  if n <= 1 or len(stmts) <= 1 { return [stmts] }
   let total = sum s in stmts: weight(s)
   # `before[j]`: the weight of the first j statements.
   let before = [0] ++ (scan w = 0 for s in stmts: w + weight(s))
@@ -323,20 +321,119 @@ fn parts-of(p: Node, n: Int) -> [Node] {
       some(j) => cs ++ [j]
       none => cs
     }
-  if len(cuts) < 2 { return [p] }
   let ends = cuts ++ [len(stmts)]
-  [program-of(if i == 0 then p.hashbang else None(), stmts[ends[i]..ends[i + 1]]) for i in 0..len(cuts)]
+  [stmts[ends[i]..ends[i + 1]] for i in 0..len(cuts)]
+}
+
+# A program cut into runs of its statements, each a program of its own.
+fn parts-of(p: Node, n: Int) -> [Node] {
+  let runs = runs-of(p.body.kids, n)
+  if len(runs) < 2 then [p] else [program-of(if i == 0 then p.hashbang else None(), runs[i]) for i in 0..len(runs)]
 }
 
 fn program-of(hashbang: Node, stmts: [Node]) -> Node = Program(hashbang, List(stmts...))
 
 fn joined(p: Node, parts: [Node]) -> Node = p with { body: List([s for part in parts for s in part.body.kids]...) }
 
+# ---------------------------------------------------------------- bodies in parts
+
+# A CommonJS module is one statement, its wrapper, and so is a library inside one function: the
+# work is in a single function body. Such a body is taken out of its statement, which keeps a hole,
+# and cut into runs as a program is; the runs fill the hole again once they are done.
+record Hole { at: Int, stmts: [Node] }
+record Hollowed { shell: Node, holes: [Hole] }
+record Taken { node: Node, stmts: [Node] }
+
+# A hole's mark: an identifier no source can spell, which every pass leaves be and prints as it is.
+fn hole-name(at: Int) -> Text = byte-text(1) ++ "hole" ++ int-text(at) ++ byte-text(1)
+
+fn hole-mark(at: Int) -> Node = ExprStmt(Ident(hole-name(at)) with { lo: -1, hi: -1 }) with { lo: -1, hi: -1 }
+
+# Each statement heavier than a part's share gives up the body most of it is in.
+fn hollowed(p: Node, n: Int) -> Hollowed {
+  let stmts = p.body.kids
+  let total = sum s in stmts: weight(s)
+  let takes = [if weight(stmts[i]) * n > total then taken(stmts[i], hole-mark(i)) else none for i in 0..len(stmts)]
+  let kept = [taken-or(takes[i], stmts[i]) for i in 0..len(stmts)]
+  Hollowed(shell: p with { body: List(kept...) }, holes: [Hole(at: i, stmts: t.stmts) for i in 0..len(stmts) if let some(t) = takes[i]])
+}
+
+fn taken-or(t: Taken?, s: Node) -> Node = match t {
+  some(x) => x.node
+  none => s
+}
+
+# The deepest function body holding nearly all of a node's work, swapped for `mark`.
+fn taken(n: Node, mark: Node) -> Taken? = match n {
+  FuncBody(List(ss...)) => match taken-below(n, mark) {
+    some(t) => some(t)
+    none => if len(ss) > 1 then some(Taken(node: n with { stmts: n.stmts with { kids: [mark] } }, stmts: ss)) else none
+  }
+  _ => taken-below(n, mark)
+}
+
+# Through the child that holds nearly all of a node's work, if one does.
+fn taken-below(n: Node, mark: Node) -> Taken? {
+  let whole = mass(n)
+  match first i in 0..len(n.kids): if mass(n.kids[i]) * 10 >= whole * 9 then some(i) else none {
+    some(i) => match taken(n.kids[i], mark) {
+      some(t) => some(Taken(node: n with { kids: [if j == i then t.node else n.kids[j] for j in 0..len(n.kids)] }, stmts: t.stmts))
+      none => none
+    }
+    none => none
+  }
+}
+
+# A hole filled with its body's statements.
+everywhere fn filled(n: Node, bodies: {Text:[Node]}) -> Node = match n {
+  FuncBody(List(ExprStmt(Ident(x)))) if x in bodies => n with { stmts: n.stmts with { kids: bodies[x] ?? panic "lost a body" } }
+}
+
+# A body's runs, as many as its share of the work.
+fn body-parts(hole: Hole, total: Int, n: Int) -> [Node] =
+  [program-of(None(), r) for r in runs-of(hole.stmts, max(1, n * (sum s in hole.stmts: weight(s)) / total))]
+
+# Where each body's parts start among all the parts, the shell's first; and where the last ends.
+fn body-starts(shell-parts: Int, bodies: [[Node]]) -> [Int] = [shell-parts] ++ (scan at = shell-parts for b in bodies: at + len(b))
+
+# Whether a rule for a function body's end would have changed the body these statements end: a
+# `return;` last, or an `if (c) return;` with anything after it. Then the body is done whole.
+record Ends { bare: Bool, early: Bool, early-last: Bool }
+
+fn ends-of(ss: [Node]) -> Ends =
+  Ends(bare: len(ss) > 0 and last(ss) is Return(None()),
+       early: any s in ss[0..max(0, len(ss) - 1)]: early-return?(s),
+       early-last: len(ss) > 0 and early-return?(last(ss)))
+
+fn early-return?(s: Node) -> Bool = s is If(_, Return(None()), None())
+
+fn end-changed?(es: [Ends]) -> Bool =
+  len(es) > 0 and ((any e in es: e.early) or (any k in 0..len(es) - 1: es[k].early-last) or last(es).bare)
+
+# `f` of each part at once, the program's runs and its bodies' runs, put back together. When `f`
+# minifies and a body's end would have changed, all of it is done in top-level parts instead.
+fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) -> Node {
+  let h = hollowed(p, n)
+  let total = sum s in p.body.kids: weight(s)
+  let shell-parts = parts-of(h.shell, n)
+  let bodies = [body-parts(hole, total, n) for hole in h.holes]
+  let done = heaviest-first(shell-parts ++ [x for b in bodies for x in b], f, threads)
+  let starts = body-starts(len(shell-parts), bodies)
+  let made = [[s for d in done[starts[k]..starts[k + 1]] for s in d.body.kids] for k in 0..len(bodies)]
+  if minifying and (any b in made: end-changed?([ends-of(b)])) {
+    return joined(p, heaviest-first(parts-of(p, n), f, threads))
+  }
+  let shell = joined(h.shell, done[0..len(shell-parts)])
+  if len(made) == 0 then shell else filled(shell, {hole-name(h.holes[k].at): made[k] for k in 0..len(made)})
+}
+
 # The optimiser on each part at once. Parts end after declarations, which nothing merges with
-# what follows, so this is the program the optimiser would make of the whole.
+# what follows, so this is the program the optimiser would make of the whole. A spec's own
+# optimiser is given top-level parts only: what it does to a body with a hole is its own.
 fn optimized(o: Options, p: Node) -> Node {
   if o.plan.optimize-parts <= 1 { return o.optimize(p) }
-  joined(p, heaviest-first(parts-of(p, o.plan.optimize-parts), o.optimize, o.plan.optimize-threads))
+  if o.has-optimize { return joined(p, heaviest-first(parts-of(p, o.plan.optimize-parts), o.optimize, o.plan.optimize-threads)) }
+  in-pieces(p, o.plan.optimize-parts, o.plan.optimize-threads, o.optimize, true)
 }
 
 # ---------------------------------------------------------------- the back half at once
@@ -349,34 +446,47 @@ fn fusable?(o: Options) -> Bool =
   and o.target >= lower.no-lowering and not o.drop-console and not o.drop-debugger
 
 
-fn finished-part(p: Node) -> Rendered = render-part(fin.finished(minify.run(p), printing.ascii))
+# A part minified, made ASCII and printed, and how its statements end.
+record Piece { rendered: Rendered, ends: Ends }
+
+fn finished-piece(p: Node) -> Piece {
+  let t = fin.finished(minify.run(p), printing.ascii)
+  Piece(rendered: render-part(t), ends: ends-of(t.body.kids))
+}
+
+fn printed-piece(p: Node) -> Piece = Piece(rendered: render-part(p), ends: ends-of([]))
 
 fn finished-output(o: Options, f: Format, p: Node) -> Printed {
-  let parts = parts-of(p, o.plan.optimize-parts)
-  let order = sort i in [i for i in 0..len(parts)] by part-weight(parts[i]) desc
-  let done = parallel-map([parts[i] for i in order], finished-part, o.plan.optimize-threads)
-  let place = {order[k]: k for k in 0..len(order)}
+  let r = rendered-pieces(o, p, o.plan.optimize-parts, o.plan.optimize-threads, finished-piece, true)
   # What the format adds goes after, as it is: it was never minified.
   let exports = export-statements(f)
-  let r = pieces-joined(o, [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
-                           ++ (if len(exports) == 0 then [] else [render-part(Program(None(), List(exports...)))]))
-  Printed(text: f.prefix ++ r.text ++ f.suffix, base: len(f.prefix), marks: r.marks)
+  let all = pieces-joined(o, [r] ++ (if len(exports) == 0 then [] else [render-part(Program(None(), List(exports...)))]))
+  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
 }
 
 # `f` of each part at once, the heaviest started first, so the last to finish is a light one; the
 # results in the parts' order.
 fn heaviest-first(parts: [Node], f: Fn(Node)->Node, threads: Int) -> [Node] {
-  let order = sort i in [i for i in 0..len(parts)] by part-weight(parts[i]) desc
+  let order = heaviest-order(parts)
   let done = parallel-map([parts[i] for i in order], f, threads)
   let place = {order[k]: k for k in 0..len(order)}
   [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
 }
 
+fn heaviest-pieces(parts: [Node], f: Fn(Node)->Piece, threads: Int) -> [Piece] {
+  let order = heaviest-order(parts)
+  let done = parallel-map([parts[i] for i in order], f, threads)
+  let place = {order[k]: k for k in 0..len(order)}
+  [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
+}
+
+fn heaviest-order(parts: [Node]) -> [Int] = sort i in [i for i in 0..len(parts)] by part-weight(parts[i]) desc
+
 fn part-weight(p: Node) -> Int = sum s in p.body.kids: weight(s)
 
 fn folded(o: Options, p: Node) -> Node {
   if o.plan.optimize-parts <= 1 { return fold.run(p) }
-  joined(p, parallel-map(parts-of(p, o.plan.optimize-parts), fold.run, o.plan.optimize-threads))
+  in-pieces(p, o.plan.optimize-parts, o.plan.optimize-threads, fold.run, false)
 }
 
 # How parts are printed, which the threads that print them read: set with the build's other settings.
@@ -390,7 +500,40 @@ fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, prin
 # printer would have written it had the next part followed.
 fn rendered-in-parts(o: Options, p: Node) -> Rendered {
   if o.plan.print-parts <= 1 { return js.render-tracked(p, o.pretty, o.sourcemap) }
-  pieces-joined(o, parallel-map(parts-of(p, o.plan.print-parts), render-part, o.plan.print-threads))
+  rendered-pieces(o, p, o.plan.print-parts, o.plan.print-threads, printed-piece, false)
+}
+
+# `f` of each part at once, printing it, and the texts put together: each body's parts joined, and
+# spliced into the shell's text where its hole printed, the marks after it moved along. When `f`
+# minifies and a body's end would have changed, all of it is done in top-level parts instead.
+fn rendered-pieces(o: Options, p: Node, n: Int, threads: Int, f: Fn(Node)->Piece, minifying: Bool) -> Rendered {
+  let h = hollowed(p, n)
+  let total = sum s in p.body.kids: weight(s)
+  let shell-parts = parts-of(h.shell, n)
+  let bodies = [body-parts(hole, total, n) for hole in h.holes]
+  let done = heaviest-pieces(shell-parts ++ [x for b in bodies for x in b], f, threads)
+  let starts = body-starts(len(shell-parts), bodies)
+  let changed = minifying and (any k in 0..len(bodies): end-changed?([d.ends for d in done[starts[k]..starts[k + 1]]]))
+  let shell = pieces-joined(o, [d.rendered for d in done[0..len(shell-parts)]])
+  let texts = [pieces-joined(o, [d.rendered for d in done[starts[k]..starts[k + 1]]]) for k in 0..len(bodies)]
+  let whole: Rendered? = if changed then none
+                         else fold r = some(shell) for k in 0..len(bodies): spliced(r, hole-name(h.holes[k].at), texts[k])
+  whole ?? pieces-joined(o, [d.rendered for d in heaviest-pieces(parts-of(p, n), f, threads)])
+}
+
+# `body` where `name` printed, if it printed once.
+fn spliced(into: Rendered?, name: Text, body: Rendered) -> Rendered? = match into {
+  some(r) => match index-of(r.text, name) {
+    some(at) if (last-index-of(r.text, name) ?? -1) == at => {
+      let after = at + len(name)
+      some(Rendered(text: r.text[0..at] ++ body.text ++ r.text[after..len(r.text)],
+                    marks: [mk for mk in r.marks if mk.out <= at] ++ [Mark(out: mk.out + at, src: mk.src) for mk in body.marks]
+                           ++ [Mark(out: mk.out + len(body.text) - len(name), src: mk.src) for mk in r.marks if mk.out >= after],
+                    open: r.open))
+    }
+    _ => none
+  }
+  none => none
 }
 
 # Rendered pieces one after another, a `;` between two where the first left a statement open, and
