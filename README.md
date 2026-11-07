@@ -109,15 +109,21 @@ It is closer to a small ML than to a one-purpose language. The goal is that ever
 bundler is said as patterns, rules, derived facts and grammars, with no statements at all:
 `tools/altitude.py` counts the lines of `.rules` and `.attrs` in functions with a statement of any
 kind (`let`, an `if` statement or `if … then`, a loop, `return`, an assignment, a call made for its
-effect). That was 81% on 2026-11-06 and is 13% on 2026-11-07. Functions are matches: on text
+effect). That was 81% on 2026-11-06, 13% on the morning of 2026-11-07, and is 15 lines (0.3%) at
+the end of that day. Functions are matches: on text
 (`"./" ++ rest`, `stem ++ ".js"`, `m ++ "e" ++ x`), lists (`[x, rest...]`), records
 (`Options(explicit: true, ...)`) and several values at once (`match a, b { … }`), with guards whose
 `is` patterns bind names; quantifiers take clauses (`first p in xs if file?(p): p`); `where` names
 what an expression, an arm or an `on` block is made of; `on` blocks take guards; a fold over a
 record changes its fields in place. A module's settings (resolve options, loaders, the chosen
-names) are declared `setting` and given for a call's extent by `with`. What is still written
-imperatively is the core that holds state: the facts linking asserts, the parallel loading walk,
-the build's file writes, and the supplies of fresh names for lowering.
+names, the modules, the linking database) are declared `setting` and given for a call's extent by
+`with`; no module keeps state. The module graph is a value made by a depth-first walk the language
+knows (`depth-first(roots, children)`); linking answers what it works out, and each module's facts
+are a list of `link.Fact` values, solved into a database by `link.solved`; a build answers the files
+it writes, and one effect writes them; a lap of `--timing` is `timed(on, label, value)`. What is
+still imperative is lowering's supply of fresh names (`fresh-name`, `temp`, `helper` in
+`lower.rules`): esbuild names temporaries in the order lowering asks for them, so the order is
+threaded through lowering as a context that changes.
 `tools.langtest` (`src/tools/langtest.rules`) checks what the language's forms mean.
 
 Where a big file can be cut for parsing in parallel is a grammar too (`coarse.syntax`), all of it
