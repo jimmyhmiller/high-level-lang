@@ -20,30 +20,21 @@ record Lowered { tree: Node, pure-calls: {Int:Int}, helpers: [Text] }
 # it is a type. `decorators`: `experimentalDecorators`.
 record Settings { src: Text, assign-fields: Bool, keeping-imports: Bool, decorators: Bool }
 context settings: Settings = Settings(src: "", assign-fields: false, keeping-imports: false, decorators: false)
-# What lowering one file gathers: offsets for the names it makes, the calls it knows are pure, and
-# what each namespace has exported so far.
-context next-offset: Int = -1000
-context pure: {Int:Int} = {}
 # Each namespace body's exports, by where it is: its own, after those of the bodies before it of
 # the same namespace.
 context namespace-exports: {Int:[Text]} = {}
 context namespace-path: Text = ""
 
-# Scope analysis finds a name's symbol by offset. Real offsets are not negative.
-fn fresh-offset() -> Int {
-  next-offset = next-offset - 1
-  next-offset
-}
+# A name lowering makes has no place in the source. It is made unplaced, and once the file is
+# lowered takes an offset of its own (see `placed`): scope analysis finds a name's symbol by
+# offset, and real offsets are not negative. A call that may go if nothing uses its value ends at
+# `unplaced-pure` until then.
+const unplaced: Int = -1000
+const unplaced-pure: Int = -999
 
-fn ident(name: Text) -> Node {
-  let at = fresh-offset()
-  Ident(name) with { lo: at, hi: at }
-}
+fn ident(name: Text) -> Node = Ident(name) with { lo: unplaced, hi: unplaced }
 
-fn bind(name: Text) -> Node {
-  let at = fresh-offset()
-  BindName(name) with { lo: at, hi: at }
-}
+fn bind(name: Text) -> Node = BindName(name) with { lo: unplaced, hi: unplaced }
 
 # A name no code in this file can mean, for the parameter of an enum's or namespace's function.
 fn fresh-name(base: Text) -> Text = first n in 2.. if not contains-text?(settings.src, base ++ int-text(n)): base ++ int-text(n)
@@ -184,14 +175,13 @@ fn value-named(known: [Settled], x: Text) -> Value? = last s in known if s.key =
 # The function that fills an enum in, called on what `outer` evaluates to. Pure when every value
 # is known here.
 fn enum-call(n: Node, outer: Node) -> Node = match n {
-  TsEnum(name, List(members...)) => marked-pure(call with { lo: at, hi: at }, all s in settled: is-some(s.value))
+  TsEnum(name, List(members...)) => marked-pure(call, all s in settled: is-some(s.value))
     where param = fresh-name(name.text),
           p = bind(param),
           a = ident(param),
           settled = fold done = nothing-settled() for m in members: done ++ [member-settled(done, m, name.text, param, a)],
           body = [s.set for s in settled] ++ [stmt`return $a;`],
-          call = exp`(($p) => { $$body })($outer)`,
-          at = fresh-offset()
+          call = exp`(($p) => { $$body })($outer)`
   _ => panic "expected an enum"
 }
 
@@ -298,18 +288,50 @@ fn exported-as(spec: Node) -> Node = match spec {
   _ => spec.local
 }
 
-# What lowering a file gathers, besides its tree: the calls it made that may go if nothing uses them.
-fn marked-pure(call: Node, pure-call: Bool) -> Node {
-  if pure-call { pure[call.lo] = call.hi }
-  call
+# A call lowering makes, and whether it may go if nothing uses its value.
+fn marked-pure(call: Node, pure-call: Bool) -> Node = match pure-call {
+  true => call with { lo: unplaced, hi: unplaced-pure }
+  false => call with { lo: unplaced, hi: unplaced }
 }
 
 # An enum exported from a namespace is stored where its value is read: not a call that may go.
-fn pure-off(n: Node) -> Node {
-  if let some(hi) = pure[n.lo] {
-    if hi == n.hi { pure[n.lo] = n.hi + 1 }
-  }
-  n
+fn pure-off(n: Node) -> Node = match n.hi {
+  hi if hi == unplaced-pure => n with { hi: unplaced }
+  _ => n
+}
+
+# ---------------------------------------------------------------- placing what lowering made
+
+# Each unplaced node takes an offset, -1001 and down in the order a walk of the tree meets them;
+# those that ended at `unplaced-pure` are the calls that may go.
+record Numbered { node: Node, next: Int, pure: [Int] }
+record Numbering { nodes: [Node], next: Int, pure: [Int] }
+
+# A program's statements placed in turn. A statement with nothing unplaced in it stays as it is.
+fn placed-program(program: Node) -> Numbered = match program {
+  Program(hashbang, List(stmts...)) =>
+    Numbered(node: Program(hashbang, List(all.nodes...)) with { lo: program.lo, hi: program.hi }, next: all.next, pure: all.pure)
+    where all = fold a = Numbering(nodes: [], next: unplaced - 1, pure: []) for s in stmts:
+                  (a with { nodes: a.nodes ++ [q.node], next: q.next, pure: q.pure }
+                   where q = match unplaced-in?(s) {
+                     true => node-placed(s, a.next, a.pure)
+                     false => Numbered(node: s, next: a.next, pure: a.pure)
+                   })
+}
+
+fn unplaced-in?(n: Node) -> Bool = n.lo == unplaced or (any k in n.kids: unplaced-in?(k))
+
+# A node placed, if it is unplaced, then its children in order.
+fn node-placed(n: Node, next: Int, pure: [Int]) -> Numbered = match n.lo == unplaced {
+  true => kids-placed(n with { lo: next, hi: next }, next - 1, pure ++ [next for hi in [n.hi] if hi == unplaced-pure])
+  false => kids-placed(n, next, pure)
+}
+
+fn kids-placed(n: Node, next: Int, pure: [Int]) -> Numbered = match n.kids {
+  [] => Numbered(node: n, next: next, pure: pure)
+  kids => Numbered(node: n with { kids: all.nodes }, next: all.next, pure: all.pure)
+    where all = fold a = Numbering(nodes: [], next: next, pure: pure) for k in kids:
+                  (a with { nodes: a.nodes ++ [q.node], next: q.next, pure: q.pure } where q = node-placed(k, a.next, a.pure))
 }
 
 fn export-declarators(ds: [Node], param: Text) -> [Node] = match ds {
@@ -720,11 +742,12 @@ fn pruned-statement(s: Node, b: {Int:Int}, used: {Int:Bool}, exported: {Text:Boo
 # ---------------------------------------------------------------- the whole file
 
 fn lowered-file(whole: Node, keep: [Text], decorators: Bool, tree: Node) -> Lowered =
-  Lowered(tree: pruned(whole, keep, {lo: true for lo in alias-names(tree)}), pure-calls: pure,
-          helpers: [h for h in helpers-called(whole) if decorators distinct h])
+  Lowered(tree: pruned(p.node, keep, {lo: true for lo in alias-names(tree)}), pure-calls: {at: at for at in p.pure},
+          helpers: [h for h in helpers-called(p.node) if decorators distinct h])
+  where p = placed-program(whole)
 
 fn lower(tree: Node, source: Text, keep: [Text], define-fields: Bool, keep-imports: Bool, decorators: Bool) -> Lowered =
   with settings = Settings(src: source, assign-fields: not define-fields, keeping-imports: keep-imports, decorators: decorators),
-       next-offset = -1000, pure = {}, namespace-exports = exports-at(tree) {
+       namespace-exports = exports-at(tree) {
     lowered-file(Program(tree.hashbang, List(lowered-statements(tree.body.kids)...)), keep, decorators, tree)
   }
