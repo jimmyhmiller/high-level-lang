@@ -1546,6 +1546,36 @@
     (locals-reset! (mut k) mark)
     (te `(let [~@lets] ~(.code body)) (.ty body))))
 
+;;; The order to work out equations in: each after the others it mentions. A circle stops.
+(defn where-order [(inits (ArrayList g/Node))] (-> (ArrayList i64))
+  (let [count (len inits)
+        (mut names) (text-list)
+        (mut done) (ArrayList::new [bool] (malloc-allocator))
+        (mut order) (ArrayList::new [i64] (malloc-allocator))
+        (mut uses) (ArrayList::new [(ArrayList i64)] (malloc-allocator))]
+    (for i inits (do (push! (mut names) (.text (kid i 0))) (push! (mut done) false)))
+    (for i inits
+      (let [(mut mentioned) (text-list)
+            (mut idx) (ArrayList::new [i64] (malloc-allocator))]
+        (names-in! (kid i 1) (mut mentioned))
+        (for j (range 0 count)
+          (let [(mut hit) false]
+            (for m mentioned (when (= m (get names j)) (set! hit true)))
+            (when hit (push! (mut idx) j))))
+        (push! (mut uses) idx)))
+    (while (< (len order) count)
+      (let [(mut progressed) false]
+        (for j (range 0 count)
+          (when (not (get done j))
+            (let [(mut ready) true]
+              (for u (get uses j) (unless (and (!= u j) (get done u)) (set! ready false)))
+              (when ready
+                (set! (mut done) j true)
+                (push! (mut order) j)
+                (set! progressed true)))))
+        (unless progressed (panic "where: equations that use each other in a circle, or one that uses itself"))))
+    order))
+
 ;;; A `where`'s equations, bound for what follows, as the bindings of a `let`.
 (defn where-open! [(k (mut Comp)) (n g/Node)] (-> Code)
   (let [inits (list-kids (kid n 1))
@@ -3696,9 +3726,17 @@
           (Some [x]
             (if (not (opt? (.ty x)))
                 (None [TE])
+                ;; `problem += p` keeps the first; with `p` an option, the first some.
                 (let [p (place (mut k) target)
-                      v (expect (mut k) (kid s 1) (expr (mut k) (kid s 1) (opt-of (.ty x))) (opt-of (.ty x)))]
-                  (Some (te `(match ~(.code p) (None [] (set! ~(.code p) (Some ~(.code v)))) (_ 0)) "Void")))))))))
+                      v0 (expr (mut k) (kid s 1) (.ty x))
+                      y (fresh (mut k) "y")]
+                  (if (= (.ty v0) (.ty x))
+                      (Some (te `(match ~(.code v0)
+                                   (Some [~(sym y)] (match ~(.code p) (None [] (set! ~(.code p) (Some ~(sym y)))) (_ 0)))
+                                   (None [] 0))
+                                "Void"))
+                      (let [v (expect (mut k) (kid s 1) v0 (opt-of (.ty x)))]
+                        (Some (te `(match ~(.code p) (None [] (set! ~(.code p) (Some ~(.code v)))) (_ 0)) "Void")))))))))))
 
 (defn plain-assign [(k (mut Comp)) (s g/Node)] (-> TE)
       (let [target (kid s 0)]
@@ -3953,7 +3991,21 @@
 
 ;;; One alternative of an `on` block: or-patterns at the top become several. `block` is which
 ;;; block, in the file's order.
-(defstruct OnAlt [(pat g/Node) (as-name g/Node) (body g/Node) (owner bool) (block i64)])
+(defstruct OnAlt [(pat g/Node) (as-name g/Node) (guard g/Node) (body g/Node) (owner bool) (block i64)])
+
+;;; An `on` block's body, with its `where` equations first, each after those it uses.
+(defn on-body-with-where [(d g/Node)] (-> g/Node)
+  (let [body (kid d 2)
+        w (kid d 3)]
+    (if (none? w)
+        body
+        (let [inits (list-kids (kid w 0))
+              (mut stmts) (g/new-kids)]
+          (for j (where-order inits)
+            (let [i (get inits j)]
+              (push! (mut stmts) (g/mk (g/KLet) (three (kid i 0) (g/none-node) (kid i 1)) (.lo i) (.hi i)))))
+          (for s (list-kids (kid body 0)) (push! (mut stmts) s))
+          (g/mk (g/KBlock) (one (list-node stmts (kid body 0))) (.lo body) (.hi body))))))
 
 (defn on-alts [(k (mut Comp)) (decls (ArrayList g/Node))] (-> (ArrayList OnAlt))
   (let [(mut out) (ArrayList::new [OnAlt] (malloc-allocator))
@@ -3964,13 +4016,15 @@
               has-as (= (.kind p0) (g/KPAs))
               as-name (if has-as (kid p0 1) (g/none-node))
               p (if has-as (kid p0 0) p0)
-              owner (gives-children? (mut k) (kid d 1))]
+              body (on-body-with-where d)
+              owner (gives-children? (mut k) body)
+              guard (kid d 1)]
           (if (= (.kind p) (g/KPOr))
               (do
-                (push! (mut out) (OnAlt :pat (kid p 0) :as-name as-name :body (kid d 1) :owner owner :block b))
+                (push! (mut out) (OnAlt :pat (kid p 0) :as-name as-name :guard guard :body body :owner owner :block b))
                 (for q (list-kids (kid p 1))
-                  (push! (mut out) (OnAlt :pat q :as-name as-name :body (kid d 1) :owner owner :block b))))
-              (push! (mut out) (OnAlt :pat p :as-name as-name :body (kid d 1) :owner owner :block b)))
+                  (push! (mut out) (OnAlt :pat q :as-name as-name :guard guard :body body :owner owner :block b))))
+              (push! (mut out) (OnAlt :pat p :as-name as-name :guard guard :body body :owner owner :block b)))
           (set! b (+ b 1)))))
     out))
 
@@ -4230,6 +4284,9 @@
     (unless (none? (.as-name a))
       (let [s (bind-local! (mut k) (.text (.as-name a)) ty false)]
         (push! (mut steps) (SBind s subject))))
+    ;; `on Pat if cond { … }`: the block holds only where the condition does.
+    (unless (none? (.guard a))
+      (push! (mut steps) (STest (.code (expect (mut k) (.guard a) (expr (mut k) (.guard a) "Bool") "Bool")))))
     (let [indices (target-indices (mut k) a (.targets b) subject)
           code (if (.inline b)
                    (let [(mut slots) (ArrayList::new [EqSlot] (malloc-allocator))]
@@ -4311,7 +4368,7 @@
             (unless (match (find-kind gr h) (Some [_] true) (None [] false))
               (die (mut k) (.pat a) (cat4 "the grammar " over " has no node named " h)))
             (push! (mut heads) h)))
-        (push! (mut alts) (OnAlt :pat (.pat a) :as-name (.as-name a) :body (.body a) :owner false
+        (push! (mut alts) (OnAlt :pat (.pat a) :as-name (.as-name a) :guard (.guard a) :body (.body a) :owner false
                                  :block (+ (.block a) offset)))))
     (set! (.attrs-from k) "")
     (set! (.src k) saved-src)
@@ -4453,7 +4510,7 @@
         (mut alts) (on-alts (mut k) decls)
         (mut ovrs) (ArrayList::new [OvrSlot] (malloc-allocator))
         (mut heads) (text-list)]
-    (for d decls (when (= (.kind d) (g/KOn)) (find-ovrs! (mut k) (kid d 1) (mut ovrs))))
+    (for d decls (when (= (.kind d) (g/KOn)) (find-ovrs! (mut k) (on-body-with-where d) (mut ovrs))))
     (let [(mut givens) (ArrayList::new [Given] (malloc-allocator))]
       (for d decls
         (when (= (.kind d) (g/KGiven))

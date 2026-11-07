@@ -50,14 +50,17 @@ enum Role {
 }
 given role: Role = Plain
 
-fn report(message: Text, n: Node) -> Void {
-  if checking { problem += Problem(message: message, at: n.lo) }
+# A rule a node breaks when `bad`: the problem, where the language is checked. Rules joined with
+# `??` give the first one broken.
+fn rule(bad: Bool, message: Text, at: Node) -> Problem? = match bad and checking {
+  true => some(Problem(message: message, at: at.lo))
+  false => none
 }
 
-fn report-first(p: Problem?) -> Void {
-  if let some(x) = p {
-    if checking { problem += x }
-  }
+# A problem found otherwise, where the language is checked.
+fn checked(p: Problem?) -> Problem? = match checking {
+  true => p
+  false => none
 }
 
 # ---------------------------------------------------------------- names
@@ -85,8 +88,10 @@ fn piece-points(p: lit.Node) -> [Int] = match p {
 }
 
 # `\u0061` in a name means `a`, and an escaped keyword is still a keyword.
-fn unescaped(s: Text) -> Text =
-  if not has-byte?(s, '\\') then s else text-of-points([cp for cp in code-points(s) if cp >= 0])
+fn unescaped(s: Text) -> Text = match s {
+  _ if has-byte?(s, '\\') => text-of-points([cp for cp in code-points(s) if cp >= 0])
+  _ => s
+}
 
 const id-start-categories: [Text] = ["Lu", "Ll", "Lt", "Lm", "Lo", "Nl"]
 const id-part-categories: [Text] = ["Mn", "Mc", "Nd", "Pc"]
@@ -94,37 +99,30 @@ const other-id-start: [Int] = [4256, 8472, 8494, 12443, 12444]
 const other-id-continue: [Int] = [183, 903, 6618]
 
 # ID_Start and ID_Continue, by general category, plus what the language adds.
-fn id-part?(cp: Int, first: Bool) -> Bool {
-  if cp < 0 or cp > 1114111 or (cp >= 55296 and cp <= 57343) { return false }
-  if cp == 36 or cp == 95 { return true }
-  if not first and (cp == 8204 or cp == 8205) { return true }
-  let cat = unicode-category(cp)
-  cat in id-start-categories or cp in other-id-start
-    or (not first and (cat in id-part-categories or cp in other-id-continue
-                       or (cp >= 4969 and cp <= 4977)))
+fn id-part?(cp: Int, first: Bool) -> Bool = match cp {
+  _ if cp < 0 or cp > 1114111 or (cp >= 55296 and cp <= 57343) => false
+  36 | 95 => true
+  8204 | 8205 if not first => true
+  _ => cat in id-start-categories or cp in other-id-start
+         or (not first and (cat in id-part-categories or cp in other-id-continue or (cp >= 4969 and cp <= 4977)))
+    where cat = unicode-category(cp)
 }
 
-fn valid-name?(s: Text) -> Bool {
-  if all c in s: c != '\\' and c < 128 { return true }
-  let points = code-points(s)
-  len(points) > 0 and (all i in 0..len(points): id-part?(points[i], i == 0))
+fn valid-name?(s: Text) -> Bool = match s {
+  _ if all c in s: c != '\\' and c < 128 => true
+  _ => len(points) > 0 and (all i in 0..len(points): id-part?(points[i], i == 0)) where points = code-points(s)
 }
 
-fn check-name(n: Node) -> Void {
-  let name = unescaped(n.text)
-  if not valid-name?(n.text) { report("this is not a valid identifier", n) }
-  if name != n.text and name in reserved-words { report("a keyword cannot contain an escape", n) }
-  if strict and name in strict-reserved { report("this name is reserved in strict mode", n) }
-  if in-generator and name == "yield" { report("yield is reserved in a generator", n) }
-  if (in-async or module) and name == "await" { report("await is reserved here", n) }
-}
+fn name-problem(n: Node) -> Problem? =
+  rule(not valid-name?(n.text), "this is not a valid identifier", n)
+  ?? rule(name != n.text and name in reserved-words, "a keyword cannot contain an escape", n)
+  ?? rule(strict and name in strict-reserved, "this name is reserved in strict mode", n)
+  ?? rule(in-generator and name == "yield", "yield is reserved in a generator", n)
+  ?? rule((in-async or module) and name == "await", "await is reserved here", n)
+  where name = unescaped(n.text)
 
-fn check-binding(n: Node) -> Void {
-  check-name(n)
-  if strict and restricted?(unescaped(n.text)) {
-    report("eval and arguments cannot be bound in strict mode", n)
-  }
-}
+fn binding-problem(n: Node) -> Problem? =
+  name-problem(n) ?? rule(strict and restricted?(unescaped(n.text)), "eval and arguments cannot be bound in strict mode", n)
 
 # ---------------------------------------------------------------- declarations
 
@@ -147,8 +145,7 @@ everywhere fn var-names(n: Node) -> [Text] = match n {
 fn lexical-names(s: Node, function-top: Bool) -> [Text] = match s {
   LetDecl(...) | ConstDecl(...) | Import(...) => bound-names(s)
   ClassDecl(name, ...) => [unescaped(name.text)]
-  GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) =>
-    if function-top then [] else [unescaped(name.text)]
+  GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) => [unescaped(name.text) for x in [name] if not function-top]
   ExportFunction(d) => lexical-names(d, function-top)
   ExportDefaultDecl(d) => match d.name {
     BindName(x) => [unescaped(x)]
@@ -161,7 +158,7 @@ fn lexical-names(s: Node, function-top: Bool) -> [Text] = match s {
 
 # Plain function declarations in a block, which sloppy code may declare twice.
 fn block-functions(s: Node, function-top: Bool) -> [Text] = match s {
-  FuncDecl(name, ...) => if function-top then [] else [unescaped(name.text)]
+  FuncDecl(name, ...) => [unescaped(name.text) for x in [name] if not function-top]
   ExportFunction(d) => block-functions(d, function-top)
   ExportLexical(d) | ExportClass(d) => block-functions(d, false)
   Labeled(_, body) => block-functions(body, function-top)
@@ -169,27 +166,21 @@ fn block-functions(s: Node, function-top: Bool) -> [Text] = match s {
 }
 
 # The first problem with what a statement list declares, under strictness `now-strict`.
-fn declaration-problem(stmts: [Node], function-top: Bool, params: [Text], at: Node, now-strict: Bool) -> Problem? {
-  let names = [lexical-names(s, function-top)... for s in stmts]
-  let functions = [block-functions(s, function-top)... for s in stmts]
-  let vars = [var-names(s)... for s in stmts]
-  let twice = Problem(message: "this name is declared twice in one block", at: at.lo)
-  if duplicates?(names) { return some(twice) }
-  for f in functions {
-    if f in names or f in vars { return some(twice) }
-  }
-  if now-strict and duplicates?(functions) {
-    return some(Problem(message: "this function is declared twice in one block", at: at.lo))
-  }
-  for n in names {
-    if n in vars { return some(Problem(message: "a let or const collides with a var", at: at.lo)) }
-    if n in params { return some(Problem(message: "a let or const collides with a parameter", at: at.lo)) }
-  }
-  none
-}
+fn declaration-problem(stmts: [Node], function-top: Bool, params: [Text], at: Node, now-strict: Bool) -> Problem? =
+  (first p in [Problem(message: "this name is declared twice in one block", at: at.lo)]
+     if duplicates?(names) or (any f in functions: f in names or f in vars): p)
+  ?? (first p in [Problem(message: "this function is declared twice in one block", at: at.lo)] if now-strict and duplicates?(functions): p)
+  ?? (first n in names if n in vars or n in params:
+        Problem(message: match n in vars {
+                  true => "a let or const collides with a var"
+                  false => "a let or const collides with a parameter"
+                }, at: at.lo))
+  where names = [lexical-names(s, function-top)... for s in stmts],
+        functions = [block-functions(s, function-top)... for s in stmts],
+        vars = [var-names(s)... for s in stmts]
 
-fn check-declarations(stmts: [Node], function-top: Bool, params: [Text], at: Node, now-strict: Bool) -> Void =
-  report-first(declaration-problem(stmts, function-top, params, at, now-strict))
+fn declarations-problem(stmts: [Node], function-top: Bool, params: [Text], at: Node, now-strict: Bool) -> Problem? =
+  checked(declaration-problem(stmts, function-top, params, at, now-strict))
 
 # ---------------------------------------------------------------- functions
 
@@ -242,55 +233,38 @@ fn fn-kind(n: Node) -> FnKind = match n {
 }
 
 # A function's own rules: its parameters, and what its body declares.
-fn function-checks(params: Node, body: Node, f: FnKind) -> Void {
-  let stmts = body-stmts(body)
-  let own-strict = has-use-strict?(stmts)
-  let now-strict = strict or own-strict
-  let param-names = match params {
-    Params(...) => bound-names(params)
-    BindName(x) => [unescaped(x)]
-    _ => []
+fn function-problem(params: Node, body: Node, f: FnKind) -> Problem? =
+  params-problem(params, param-names, own-strict, strict or own-strict, f)
+  ?? match body {
+    FuncBody(...) => declarations-problem(stmts, true, param-names, body, strict or own-strict)
+    _ => none
   }
-  match params {
-    Params(...) => {
-      if f.arrow and in-generator and "yield" in param-names {
-        report("yield is reserved in a generator", params)
-      }
-      if own-strict and not simple-params?(params) {
-        report("use strict needs simple parameters", params)
-      }
-      if duplicates?(param-names) and (now-strict or f.arrow or f.method or not simple-params?(params)) {
-        report("a parameter is named twice", params)
-      }
-      if ((f.gen or (f.arrow and in-generator)) and contains-kind?(params, true))
-         or ((f.async or (f.arrow and in-async)) and contains-kind?(params, false)) {
-        report("yield and await expressions cannot be parameter defaults here", params)
-      }
-    }
-    _ => {}
-  }
-  if body is FuncBody(...) { check-declarations(stmts, true, param-names, body, now-strict) }
+  where stmts = body-stmts(body),
+        own-strict = has-use-strict?(stmts),
+        param-names = match params {
+          Params(...) => bound-names(params)
+          BindName(x) => [unescaped(x)]
+          _ => []
+        }
+
+fn params-problem(params: Node, names: [Text], own-strict: Bool, now-strict: Bool, f: FnKind) -> Problem? = match params {
+  Params(...) =>
+    rule(f.arrow and in-generator and "yield" in names, "yield is reserved in a generator", params)
+    ?? rule(own-strict and not simple-params?(params), "use strict needs simple parameters", params)
+    ?? rule(duplicates?(names) and (now-strict or f.arrow or f.method or not simple-params?(params)), "a parameter is named twice", params)
+    ?? rule(((f.gen or (f.arrow and in-generator)) and contains-kind?(params, true))
+            or ((f.async or (f.arrow and in-async)) and contains-kind?(params, false)),
+            "yield and await expressions cannot be parameter defaults here", params)
+  _ => none
 }
 
 # What a method's name and parameters may be, in a class or an object.
-fn member-checks(n: Node, key: Node, params: Node) -> Void {
-  let in-class = role == Member or role == StaticMember
-  let is-static = role == StaticMember
-  match n {
-    Method(...) => if is-static and prop-is?(key, "prototype") {
-      report("a static method cannot be named prototype", key)
-    }
-    GenMethod(...) | AsyncMethod(...) | AsyncGenMethod(...) => if in-class { special-key(key, is-static) }
-    Getter(...) => {
-      accessor-params(params, 0)
-      if in-class { special-key(key, is-static) }
-    }
-    Setter(...) => {
-      accessor-params(params, 1)
-      if in-class { special-key(key, is-static) }
-    }
-    _ => {}
-  }
+fn member-problem(n: Node, key: Node, params: Node) -> Problem? = match n {
+  Method(...) => rule(role == StaticMember and prop-is?(key, "prototype"), "a static method cannot be named prototype", key)
+  GenMethod(...) | AsyncMethod(...) | AsyncGenMethod(...) => special-key-problem(key)
+  Getter(...) => accessor-problem(params, 0) ?? special-key-problem(key)
+  Setter(...) => accessor-problem(params, 1) ?? special-key-problem(key)
+  _ => none
 }
 
 # ---------------------------------------------------------------- assignment targets
@@ -300,113 +274,111 @@ fn pattern-role?(r: Role) -> Bool = r == PatTarget or r == PatElem
 
 # Can this be assigned to? A pattern allows the destructuring forms, and a pattern's element a
 # default too.
-fn target-checks(t: Node) -> Void = match t {
-  Ident(x) => if strict and restricted?(unescaped(x)) {
-    report("eval and arguments cannot be assigned in strict mode", t)
-  }
-  Member(...) | Index(...) => {}
-  Paren(inner) => if not (inner is Ident(_) | Paren(_) | Member(...) | Index(...)) {
-    report("invalid assignment target", t)
-  }
-  ArrayLit(...) | ObjectLit(...) => if not pattern-role?(role) { report("invalid assignment target", t) }
-  Assignment(_, AssignOp("="), _) => if role != PatElem { report("invalid assignment target", t) }
-  _ => report("invalid assignment target", t)
+fn target-problem(t: Node) -> Problem? = match t {
+  Ident(x) => rule(strict and restricted?(unescaped(x)), "eval and arguments cannot be assigned in strict mode", t)
+  Member(...) | Index(...) => none
+  Paren(inner) => rule(not (inner is Ident(_) | Paren(_) | Member(...) | Index(...)), "invalid assignment target", t)
+  ArrayLit(...) | ObjectLit(...) => rule(not pattern-role?(role), "invalid assignment target", t)
+  Assignment(_, AssignOp("="), _) => rule(role != PatElem, "invalid assignment target", t)
+  _ => rule(true, "invalid assignment target", t)
 }
 
-fn array-pattern-checks(t: Node) -> Void {
-  let slots = t.slots.kids
-  for i in 0..len(slots) {
-    let s = slots[i]
-    if not (s is Hole()) {
-      match s.value {
-        Spread(inner) => {
-          if not (i == len(slots) - 1 and s is ElemLast(_)) {
-            report("a rest element must come last, with no comma after it", s)
-          }
-          if inner is Assignment(...) { report("a rest element cannot have a default", s) }
-        }
-        _ => {}
-      }
-    }
+# A name the code around it assigns to.
+fn target-name-problem(n: Node) -> Problem? = match role {
+  Target | PatTarget | PatElem => target-problem(n)
+  _ => none
+}
+
+# What the code around a node makes of it: an assignment target, a substatement, a pattern's property.
+fn role-problem(n: Node) -> Problem? = match role {
+  Target | PatTarget | PatElem => match n {
+    Ident(_) => none
+    _ => target-problem(n)
+  }
+  Substmt => substatement-problem(n, false)
+  SubstmtFn => substatement-problem(n, true)
+  ObjPatProp => rule(not (n is Shorthand(_) | CoverInit(...) | Prop(...) | SpreadProp(_)), "this cannot be destructured into", n)
+  _ => none
+}
+
+fn array-pattern-problem(t: Node) -> Problem? = first i in 0..len(slots): slot-problem(slots, i)
+  where slots = t.slots.kids
+
+fn slot-problem(slots: [Node], i: Int) -> Problem? = match slots[i] {
+  Hole() => none
+  s => match s.value {
+    Spread(inner) => rule(not (i == len(slots) - 1 and s is ElemLast(_)), "a rest element must come last, with no comma after it", s)
+                     ?? rule(inner is Assignment(...), "a rest element cannot have a default", s)
+    _ => none
   }
 }
 
-fn object-pattern-checks(t: Node) -> Void {
-  let props = t.props.kids
-  for i in 0..len(props) {
-    let p = props[i]
-    match p {
-      SpreadProp(inner) => {
-        if i != len(props) - 1 { report("a rest property must come last", p) }
-        if not (inner is Ident(_) | Member(...) | Index(...)) {
-          report("a rest property must be a simple target", p)
-        }
-      }
-      _ => {}
-    }
-  }
+fn object-pattern-problem(t: Node) -> Problem? = first i in 0..len(props): property-problem(props, i)
+  where props = t.props.kids
+
+fn property-problem(props: [Node], i: Int) -> Problem? = match props[i] {
+  SpreadProp(inner) as p => rule(i != len(props) - 1, "a rest property must come last", p)
+                            ?? rule(not (inner is Ident(_) | Member(...) | Index(...)), "a rest property must be a simple target", p)
+  _ => none
 }
 
 # ---------------------------------------------------------------- statements
 
-fn substatement-kind(s: Node, allow-function: Bool) -> Void = match s {
-  LetDecl(...) | ConstDecl(...) => report("a lexical declaration needs a block here", s)
-  ClassDecl(...) => report("a class declaration needs a block here", s)
-  GenDecl(...) => report("a generator declaration needs a block here", s)
-  AsyncFuncDecl(...) => report("an async function declaration needs a block here", s)
-  AsyncGenDecl(...) => report("an async generator declaration needs a block here", s)
-  FuncDecl(...) => if not (allow-function and not strict) {
-    report("a function declaration needs a block here", s)
-  }
-  Labeled(_, body) => substatement-kind(body, false)
-  _ => {}
+fn substatement-problem(s: Node, allow-function: Bool) -> Problem? = match s {
+  LetDecl(...) | ConstDecl(...) => rule(true, "a lexical declaration needs a block here", s)
+  ClassDecl(...) => rule(true, "a class declaration needs a block here", s)
+  GenDecl(...) => rule(true, "a generator declaration needs a block here", s)
+  AsyncFuncDecl(...) => rule(true, "an async function declaration needs a block here", s)
+  AsyncGenDecl(...) => rule(true, "an async generator declaration needs a block here", s)
+  FuncDecl(...) => rule(not (allow-function and not strict), "a function declaration needs a block here", s)
+  Labeled(_, body) => substatement-problem(body, false)
+  _ => none
 }
 
 # A declaration's names must be initialised where the form requires it.
-fn decl-list-checks(list: Node, need-init: Bool, lexical: Bool) -> Void {
-  for d in list.kids {
-    match d {
-      Declarator(target, init) => {
-        if init is None() and (need-init or not (target is BindName(_))) {
-          report("this declaration needs an initial value", d)
-        }
-        if lexical {
-          let names = bound-names(target)
-          for n in names {
-            if n == "let" { report("let cannot be the name of a lexical binding", d) }
-          }
-          if duplicates?(names) { report("a name is bound twice in one pattern", d) }
-        }
-      }
-      _ => panic "a declaration list holds declarators"
+fn decl-list-problem(list: Node, need-init: Bool, lexical: Bool) -> Problem? =
+  first d in list.kids: declarator-problem(d, need-init, lexical)
+
+fn declarator-problem(d: Node, need-init: Bool, lexical: Bool) -> Problem? = match d {
+  Declarator(target, init) =>
+    rule(init is None() and (need-init or not (target is BindName(_))), "this declaration needs an initial value", d)
+    ?? rule(lexical and "let" in names, "let cannot be the name of a lexical binding", d)
+    ?? rule(lexical and duplicates?(names), "a name is bound twice in one pattern", d)
+    where names = match lexical {
+      true => bound-names(target)
+      false => []
     }
-  }
+  _ => panic "a declaration list holds declarators"
 }
 
-fn head-collision(head: Node, body: Node) -> Void {
-  let names = bound-names(head)
-  if duplicates?(names) { report("a name is bound twice in one pattern", head) }
-  let vars = var-names(body)
-  for n in names {
-    if n in vars { report("a var in the body collides with the loop's binding", head) }
-    if n == "let" { report("let cannot be the name of a lexical binding", head) }
-  }
-}
+fn loop-head-problem(head: Node, body: Node) -> Problem? =
+  rule(duplicates?(names), "a name is bound twice in one pattern", head)
+  ?? (first n in names if n in vars or n == "let":
+        rule(true, match n in vars {
+               true => "a var in the body collides with the loop's binding"
+               false => "let cannot be the name of a lexical binding"
+             }, head))
+  where names = bound-names(head),
+        vars = var-names(body)
 
 fn for-head?(left: Node) -> Bool = left is VarLeft(...) | VarLeftInit(...) | LetLeft(...) | ConstLeft(...)
 
-fn for-left-checks(left: Node, body: Node, is-in: Bool) -> Void = match left {
-  VarLeftInit(target, _) => if strict or not is-in or not (target is BindName(_)) {
-    report("this for-in head cannot have an initial value", left)
-  }
-  LetLeft(...) | ConstLeft(...) => head-collision(left, body)
-  _ => {}
+fn for-left-problem(left: Node, body: Node, is-in: Bool) -> Problem? = match left {
+  VarLeftInit(target, _) => rule(strict or not is-in or not (target is BindName(_)), "this for-in head cannot have an initial value", left)
+  LetLeft(...) | ConstLeft(...) => loop-head-problem(left, body)
+  _ => none
 }
 
-fn module-item(n: Node) -> Void {
-  if not top-level { report("import and export are only valid at the top level", n) }
-  if not module { report("import and export are only valid in a module", n) }
+fn for-init-problem(init: Node, body: Node) -> Problem? = match init {
+  VarInit(list) => decl-list-problem(list, false, false)
+  LetInit(list) => decl-list-problem(list, false, true) ?? loop-head-problem(init, body)
+  ConstInit(list) => decl-list-problem(list, true, true) ?? loop-head-problem(init, body)
+  _ => none
 }
+
+fn module-item-problem(n: Node) -> Problem? =
+  rule(not top-level, "import and export are only valid at the top level", n)
+  ?? rule(not module, "import and export are only valid in a module", n)
 
 fn is-loop-through-labels?(s: Node) -> Bool = match s {
   For(...) | ForIn(...) | ForOf(...) | While(...) | DoWhile(...) => true
@@ -432,45 +404,34 @@ fn member-key(m: Node) -> Node? = match m {
 # A member declaring a private name: the member without `static`, and the name.
 record Private { member: Node, name: Text }
 
-fn private-of(m: Node) -> Private? {
-  let inner = if m is StaticMethod(_) then m.method else m
-  match member-key(inner) {
-    some(PrivateName(name)) => some(Private(member: inner, name: name))
-    _ => none
-  }
+fn private-of(m: Node) -> Private? = match member-key(inner) {
+  some(PrivateName(name)) => some(Private(member: inner, name: name))
+  _ => none
+} where inner = match m {
+  StaticMethod(x) => x
+  _ => m
 }
 
-fn special-key(key: Node, is-static: Bool) -> Void {
-  if not is-static and prop-is?(key, "constructor") {
-    report("a constructor cannot be a generator, async, or an accessor", key)
-  }
-  if is-static and prop-is?(key, "prototype") {
-    report("a static method cannot be named prototype", key)
-  }
-}
+fn special-key-problem(key: Node) -> Problem? =
+  rule(role == Member and prop-is?(key, "constructor"), "a constructor cannot be a generator, async, or an accessor", key)
+  ?? rule(role == StaticMember and prop-is?(key, "prototype"), "a static method cannot be named prototype", key)
 
-fn accessor-params(params: Node, wanted: Int) -> Void {
-  let list = params.items.kids
-  if len(list) != wanted { report("a getter takes no parameters and a setter takes one", params) }
-  if wanted == 1 and len(list) == 1 and list[0] is RestParam(_) {
-    report("a setter's parameter cannot be a rest", params)
-  }
-}
+fn accessor-problem(params: Node, wanted: Int) -> Problem? =
+  rule(len(list) != wanted, "a getter takes no parameters and a setter takes one", params)
+  ?? rule(wanted == 1 and len(list) == 1 and list[0] is RestParam(_), "a setter's parameter cannot be a rest", params)
+  where list = params.items.kids
 
 # A class's members together: private names, and constructors.
-fn class-checks(class: Node, body: Node) -> Void {
-  let members = body.members.kids
-  let privates = [p for m in members if let some(p) = private-of(m)]
-  for i in 0..len(privates) {
-    let p = privates[i]
-    if p.name == "#constructor" { report("#constructor is not a valid private name", p.member) }
-    if not (p.member is Getter(...) | Setter(...)) and (any j in 0..i: privates[j].name == p.name) {
-      report("a private name is declared twice", p.member)
-    }
-  }
-  let constructors = count m in members: m is Method(...) and prop-is?(m.key, "constructor")
-  if constructors > 1 { report("a class has one constructor", class) }
-}
+fn class-problem(class: Node, body: Node) -> Problem? =
+  (first i in 0..len(privates): private-problem(privates, i))
+  ?? rule((count m in members: m is Method(...) and prop-is?(m.key, "constructor")) > 1, "a class has one constructor", class)
+  where members = body.members.kids,
+        privates = [p for m in members if let some(p) = private-of(m)]
+
+fn private-problem(privates: [Private], i: Int) -> Problem? =
+  rule(p.name == "#constructor", "#constructor is not a valid private name", p.member)
+  ?? rule(not (p.member is Getter(...) | Setter(...)) and (any j in 0..i: privates[j].name == p.name), "a private name is declared twice", p.member)
+  where p = privates[i]
 # ---------------------------------------------------------------- literals
 
 fn octal-escape?(s: Text) -> Bool = any p in host.pieces(s): p is lit.EscOctal(_)
@@ -482,19 +443,13 @@ fn bad-escape?(s: Text) -> Bool = any p in host.pieces(s): match p {
   _ => false
 }
 
-fn regex-flags-bad?(text: Text) -> Bool {
-  let flags = text[(last-index-of(text, "/") ?? 0) + 1..len(text)]
-  any i in 0..len(flags):
-    not (flags[i] == 'd' or flags[i] == 'g' or flags[i] == 'i' or flags[i] == 'm'
-         or flags[i] == 's' or flags[i] == 'u' or flags[i] == 'v' or flags[i] == 'y')
-    or (any j in 0..i: flags[j] == flags[i])
-}
+fn regex-flags-bad?(text: Text) -> Bool =
+  any i in 0..len(flags): not has-byte?("dgimsuvy", flags[i]) or (any j in 0..i: flags[j] == flags[i])
+  where flags = text[(last-index-of(text, "/") ?? 0) + 1..len(text)]
 
 fn legacy-octal?(t: Text) -> Bool = len(t) > 1 and t[0] == '0' and digit-byte?(t[1])
 
-fn template-chunk(n: Node) -> Void {
-  if bad-escape?(n.text) or octal-escape?(n.text) { report("an invalid escape in a template", n) }
-}
+fn template-problem(n: Node) -> Problem? = rule(bad-escape?(n.text) or octal-escape?(n.text), "an invalid escape in a template", n)
 
 # The name at the start of a member chain, or "".
 fn spine-root(n: Node) -> Text = match n {
@@ -524,13 +479,18 @@ fn spec-text(n: Node) -> Text = match n {
 # The names a module exports, for spotting one exported twice.
 fn exported-names(s: Node) -> [Text] = match s {
   ExportNamed(List(specs...)) | ExportFrom(List(specs...), _) =>
-    [if spec is ExportAs(...) then spec-text(spec.exported) else spec-text(spec.local) for spec in specs if not (spec is TsErased())]
+    [exported-name(spec) for spec in specs if not (spec is TsErased())]
   ExportAllAs(name, _) => [spec-text(name)]
   ExportDefault(...) | ExportDefaultDecl(...) => ["default"]
   ExportVar(...) => bound-names(s)
   ExportLexical(d) => bound-names(d)
   ExportFunction(d) | ExportClass(d) => [d.name.text]
   _ => []
+}
+
+fn exported-name(spec: Node) -> Text = match spec {
+  ExportAs(_, to) => spec-text(to)
+  _ => spec-text(spec.local)
 }
 
 fn module-statement?(s: Node) -> Bool =
@@ -550,30 +510,18 @@ fn top-declared(s: Node) -> [Text] = match s {
 }
 
 # Every name a module declares at its top level.
-fn module-names(stmts: [Node]) -> [Text] {
+fn module-names(stmts: [Node]) -> [Text] =
   [(lexical-names(s, false) ++ var-names(s) ++ top-declared(s))... for s in stmts] ++ [block-functions(s, false)... for s in stmts]
-}
 
 
 # ---------------------------------------------------------------- equations
 
 # Names.
-on Ident(x) | LabelName(x) as n {
-  check-name(n)
-  if role != Plain and target-role?(role) { target-checks(n) }
-}
-on BindName(_) as n { check-binding(n) }
+on Ident(x) | LabelName(x) as n { problem += name-problem(n) ?? target-name-problem(n) }
+on BindName(_) as n { problem += binding-problem(n) }
 
 # Whatever a node is, what its parent's use of it allows.
-on n {
-  if role != Plain {
-    if target-role?(role) and not (n is Ident(_)) { target-checks(n) }
-    if role == Substmt or role == SubstmtFn { substatement-kind(n, role == SubstmtFn) }
-    if role == ObjPatProp and not (n is Shorthand(_) | CoverInit(...) | Prop(...) | SpreadProp(_)) {
-      report("this cannot be destructured into", n)
-    }
-  }
-}
+on n if role != Plain { problem += role-problem(n) }
 
 # A list's elements are what its owner makes them.
 on List(...) {
@@ -594,87 +542,72 @@ on TsNamespaceBlock(List(ss...)) {
   kids.top-level = true
 }
 on JsxElement(open, _, JsxClose(_, close)) {
-  if js.render(open, false) != js.render(close, false) {
-    report("this closing tag does not match its opening tag", close)
-  }
+  problem += rule(js.render(open, false) != js.render(close, false), "this closing tag does not match its opening tag", close)
 }
 on Num(t) as n {
-  if strict and legacy-octal?(t) { report("a legacy octal literal is not allowed in strict mode", n) }
-  if legacy-octal?(t) and (any c in t: c == '_') { report("a legacy octal literal cannot contain _", n) }
+  problem += rule(strict and legacy-octal?(t), "a legacy octal literal is not allowed in strict mode", n)
+             ?? rule(legacy-octal?(t) and has-byte?(t, '_'), "a legacy octal literal cannot contain _", n)
 }
 on Str(raw) as n {
-  if bad-escape?(unquote(raw)) { report("an incomplete escape sequence", n) }
-  if strict and octal-escape?(unquote(raw)) { report("an octal escape is not allowed in strict mode", n) }
+  problem += rule(bad-escape?(unquote(raw)), "an incomplete escape sequence", n)
+             ?? rule(strict and octal-escape?(unquote(raw)), "an octal escape is not allowed in strict mode", n)
 }
-on TemplateFull(_) | TemplateHead(_) | TemplateMiddle(_) | TemplateTail(_) as n { template-chunk(n) }
+on TemplateFull(_) | TemplateHead(_) | TemplateMiddle(_) | TemplateTail(_) as n { problem += template-problem(n) }
 # A tagged template may have any escapes, and is not an optional chain's.
 on Tagged(tag, tpl) as n {
-  if optional-spine?(tag) { report("a tagged template cannot be in an optional chain", n) }
+  problem += rule(optional-spine?(tag), "a tagged template cannot be in an optional chain", n)
   tpl.role = TaggedTpl
-  if not (tpl is Template(...)) { tpl.checking = false }
+  tpl.checking = checking and tpl is Template(...)
 }
-on Template(head, _, rest, tail) {
-  if role == TaggedTpl {
-    head.checking = false
-    tail.checking = false
-    rest.role = TaggedParts
-  }
+on Template(head, _, rest, tail) if role == TaggedTpl {
+  head.checking = false
+  tail.checking = false
+  rest.role = TaggedParts
 }
-on TemplatePart(chunk, _) { if role == TaggedPart { chunk.checking = false } }
-on Regex(t) as n { if regex-flags-bad?(t) { report("invalid regular expression flags", n) } }
+on TemplatePart(chunk, _) if role == TaggedPart { chunk.checking = false }
+on Regex(t) as n { problem += rule(regex-flags-bad?(t), "invalid regular expression flags", n) }
 
 # ---- assignment, update and patterns
-on Assignment(target, AssignOp(op), _) { target.role = if op == "=" then PatTarget else Target }
+on Assignment(target, AssignOp(op), _) {
+  target.role = match op {
+    "=" => PatTarget
+    _ => Target
+  }
+}
 on PreInc(t) | PreDec(t) | PostInc(t) | PostDec(t) { t.role = Target }
-on Paren(inner) {
-  if target-role?(role) and (inner is Ident(_) | Paren(_)) { inner.role = Target }
-}
+on Paren(inner) if target-role?(role) and (inner is Ident(_) | Paren(_)) { inner.role = Target }
 on Delete(operand) as n {
-  let t = unparen(operand)
-  if strict and t is Ident(_) { report("delete of a name is not allowed in strict mode", n) }
-  match t {
-    Member(_, PrivateName(_)) | OptMember(_, PrivateName(_)) => report("a private member cannot be deleted", n)
-    _ => {}
+  problem += rule(strict and unparen(operand) is Ident(_), "delete of a name is not allowed in strict mode", n)
+             ?? rule(unparen(operand) is Member(_, PrivateName(_)) | OptMember(_, PrivateName(_)), "a private member cannot be deleted", n)
+}
+on ArrayLit(slots) as n if pattern-role?(role) {
+  problem += array-pattern-problem(n)
+  slots.role = ArrSlots
+}
+on Elem(e) | ElemLast(e) if role == ArrSlot {
+  e.role = match e {
+    Spread(_) => RestSlot
+    _ => PatElem
   }
 }
-on ArrayLit(slots) as n {
-  if pattern-role?(role) {
-    array-pattern-checks(n)
-    slots.role = ArrSlots
-  }
+on Spread(inner) if role == RestSlot { inner.role = PatTarget }
+on ObjectLit(props) as n if pattern-role?(role) {
+  problem += object-pattern-problem(n)
+  props.role = ObjPatProps
 }
-on Elem(e) | ElemLast(e) { if role == ArrSlot { e.role = if e is Spread(_) then RestSlot else PatElem } }
-on Spread(inner) { if role == RestSlot { inner.role = PatTarget } }
 on ObjectLit(props) as n {
-  if pattern-role?(role) {
-    object-pattern-checks(n)
-    props.role = ObjPatProps
-  } else {
-    if (count p in props.kids: p is Prop(...) and prop-is?(p.key, "__proto__")) > 1 {
-      report("__proto__ is set twice", n)
-    }
-    props.role = ObjProps
-  }
+  problem += rule((count p in props.kids: p is Prop(...) and prop-is?(p.key, "__proto__")) > 1, "__proto__ is set twice", n)
+  props.role = ObjProps
 }
-on Shorthand(x) { if role == ObjPatProp { x.role = Target } }
-on CoverInit(x, _) as n {
-  if role == ObjPatProp { x.role = Target } else { report("`=` here is only allowed when destructuring", n) }
-}
-on Prop(_, v) { if role == ObjPatProp { v.role = PatElem } }
-on SpreadProp(inner) { if role == ObjPatProp { inner.role = Target } }
+on Shorthand(x) if role == ObjPatProp { x.role = Target }
+on CoverInit(...) as n if role != ObjPatProp { problem += rule(true, "`=` here is only allowed when destructuring", n) }
+on CoverInit(x, _) if role == ObjPatProp { x.role = Target }
+on Prop(_, v) if role == ObjPatProp { v.role = PatElem }
+on SpreadProp(inner) if role == ObjPatProp { inner.role = Target }
 
 # ---- classes
-on ClassDecl(name, heritage, body) as n {
-  class-checks(n, body)
-  name.strict = true
-  heritage.strict = true
-  heritage.top-level = false
-  body.strict = true
-  body.top-level = false
-  body.in-derived = not (heritage is None())
-}
-on ClassExpr(name, heritage, body) as n {
-  class-checks(n, body)
+on ClassDecl(name, heritage, body) | ClassExpr(name, heritage, body) as n {
+  problem += class-problem(n, body)
   name.strict = true
   heritage.strict = true
   heritage.top-level = false
@@ -683,11 +616,10 @@ on ClassExpr(name, heritage, body) as n {
   body.in-derived = not (heritage is None())
 }
 on ClassBody(members) { members.role = ClassMembers }
-on StaticMethod(m) { if role == Member { m.role = StaticMember } }
+on StaticMethod(m) if role == Member { m.role = StaticMember }
 on Field(key, value) | StaticField(key, value) as n {
-  let is-static = n is StaticField(...)
-  if prop-is?(key, "constructor") { report("a field cannot be named constructor", key) }
-  if is-static and prop-is?(key, "prototype") { report("a field cannot be named prototype", key) }
+  problem += rule(prop-is?(key, "constructor"), "a field cannot be named constructor", key)
+             ?? rule(n is StaticField(...) and prop-is?(key, "prototype"), "a field cannot be named prototype", key)
   value.in-function = true
   value.allow-new-target = true
   value.allow-super-prop = true
@@ -709,25 +641,21 @@ on StaticBlock(...) {
 }
 # What the language does not check in a class: decorated members, and the types.
 on TsDecoratedMember(...) | TsErased(...) { kids.checking = false }
-on Super() as n { report("super is only valid in a method", n) }
-on CallExpr(callee, _) as n {
-  if callee is Super() {
-    if not allow-super-call { report("super() is only valid in a derived constructor", n) }
-    callee.checking = false
-  }
+on Super() as n { problem += rule(true, "super is only valid in a method", n) }
+on CallExpr(Super() as callee, _) as n {
+  problem += rule(not allow-super-call, "super() is only valid in a derived constructor", n)
+  callee.checking = false
 }
-on Member(object, _) | Index(object, _) as n {
-  if object is Super() {
-    if not allow-super-prop { report("super is only valid in a method", n) }
-    object.checking = false
-  }
+on Member(Super() as object, _) | Index(Super() as object, _) as n {
+  problem += rule(not allow-super-prop, "super is only valid in a method", n)
+  object.checking = false
 }
-on NewTarget() as n { if not allow-new-target { report("new.target is only valid in a function", n) } }
+on NewTarget() as n { problem += rule(not allow-new-target, "new.target is only valid in a function", n) }
 on NewExpr(callee, _) as n {
-  if callee is ImportCall(...) { report("import() cannot be used with new", n) }
-  if optional-spine?(callee) { report("new cannot have an optional chain", n) }
+  problem += rule(callee is ImportCall(...), "import() cannot be used with new", n)
+             ?? rule(optional-spine?(callee), "new cannot have an optional chain", n)
 }
-on ImportMeta() as n { if not module { report("import.meta is only valid in a module", n) } }
+on ImportMeta() as n { problem += rule(not module, "import.meta is only valid in a module", n) }
 
 # ---- functions
 # A declaration's name belongs to the code around it, under the body's strictness; an
@@ -737,16 +665,18 @@ on FuncDecl(name, params, body) | GenDecl(name, params, body) | AsyncFuncDecl(na
    | AsyncFuncExpr(name, params, body) | AsyncGenExpr(name, params, body)
    | Method(name, params, body) | GenMethod(name, params, body) | AsyncMethod(name, params, body)
    | AsyncGenMethod(name, params, body) | Getter(name, params, body) | Setter(name, params, body) as n {
-  let f = fn-kind(n)
-  member-checks(n, name, params)
-  function-checks(params, body, f)
-  let now = strict or has-use-strict?(body-stmts(body))
-  if not f.method {
-    name.strict = now
-    if expression-fn?(n) {
-      name.in-generator = f.gen
-      name.in-async = f.async
-    }
+  problem += member-problem(n, name, params) ?? function-problem(params, body, f)
+  name.strict = match f.method {
+    true => strict
+    false => now
+  }
+  name.in-generator = match f.method or not expression-fn?(n) {
+    true => in-generator
+    false => f.gen
+  }
+  name.in-async = match f.method or not expression-fn?(n) {
+    true => in-async
+    false => f.async
   }
   params.strict = now
   params.in-function = true
@@ -772,12 +702,11 @@ on FuncDecl(name, params, body) | GenDecl(name, params, body) | AsyncFuncDecl(na
   body.allow-new-target = true
   body.allow-super-prop = f.method
   body.allow-super-call = f.super-call
-}
+} where f = fn-kind(n),
+        now = strict or has-use-strict?(body-stmts(body))
 # An arrow resets `yield`, only ever adds `await`, and keeps the rest of the code around it.
 on Arrow(params, body) | AsyncArrow(params, body) as n {
-  let f = fn-kind(n)
-  function-checks(params, body, f)
-  let now = strict or has-use-strict?(body-stmts(body))
+  problem += function-problem(params, body, f)
   params.strict = now
   params.in-function = true
   params.in-loop = false
@@ -796,26 +725,33 @@ on Arrow(params, body) | AsyncArrow(params, body) as n {
   body.top-level = false
   body.in-generator = false
   body.in-async = in-async or f.async
-}
+} where f = fn-kind(n),
+        now = strict or has-use-strict?(body-stmts(body))
 
 # ---- statements
 on Program(_, List(stmts...)) as n {
-  let s = if part then program-strict else module or has-use-strict?(stmts)
-  kids.strict = s
+  problem += match part {
+    true => none
+    false => checked(head-problem(n, module, now))
+  }
+  kids.strict = now
   kids.in-async = module
   kids.top-level = true
-  kids.exportable = if part then program-exportable else module-names(stmts)
-  if not part { report-first(head-problem(n, module, s)) }
-}
+  kids.exportable = match part {
+    true => program-exportable
+    false => module-names(stmts)
+  }
+} where now = match part {
+          true => program-strict
+          false => module or has-use-strict?(stmts)
+        }
 on Block(List(stmts...)) | TryBlock(List(stmts...)) as n {
-  check-declarations(stmts, false, [], n, strict)
+  problem += declarations-problem(stmts, false, [], n, strict)
   kids.top-level = false
 }
-on Return(...) as n {
-  if not (in-function or allow-top-return) { report("return is only valid in a function", n) }
-}
+on Return(...) as n { problem += rule(not (in-function or allow-top-return), "return is only valid in a function", n) }
 on With(_, body) as n {
-  if strict { report("with is not allowed in strict mode", n) }
+  problem += rule(strict, "with is not allowed in strict mode", n)
   body.role = Substmt
 }
 on If(_, t, e) {
@@ -836,130 +772,110 @@ on DoWhile(body, ...) {
 }
 # A `for` head's declarations: their names must not collide with the body's.
 on For(init, _, _, body) {
-  match init {
-    VarInit(list) => decl-list-checks(list, false, false)
-    LetInit(list) => {
-      decl-list-checks(list, false, true)
-      head-collision(init, body)
-    }
-    ConstInit(list) => {
-      decl-list-checks(list, true, true)
-      head-collision(init, body)
-    }
-    _ => {}
-  }
+  problem += for-init-problem(init, body)
   body.in-loop = true
   body.top-level = false
   body.role = Substmt
 }
 on ForIn(left, _, body) {
-  for-left-checks(left, body, true)
-  if not for-head?(left) { left.role = PatTarget }
+  problem += for-left-problem(left, body, true)
+  left.role = match for-head?(left) {
+    true => Plain
+    false => PatTarget
+  }
   body.in-loop = true
   body.top-level = false
   body.role = Substmt
 }
 on ForOf(wait, left, _, body) as n {
-  for-left-checks(left, body, false)
-  if spine-root(left) == "let" { report("for (let of …) is not allowed", left) }
-  if left is Ident("async") and wait is None() { report("for (async of …) is not allowed", left) }
-  if not (wait is None()) and not (in-async or (module and not in-function)) {
-    report("for await is only valid in an async function", n)
+  problem += for-left-problem(left, body, false)
+             ?? rule(spine-root(left) == "let", "for (let of …) is not allowed", left)
+             ?? rule(left is Ident("async") and wait is None(), "for (async of …) is not allowed", left)
+             ?? rule(not (wait is None()) and not (in-async or (module and not in-function)), "for await is only valid in an async function", n)
+  left.role = match for-head?(left) {
+    true => Plain
+    false => PatTarget
   }
-  if not for-head?(left) { left.role = PatTarget }
   body.in-loop = true
   body.top-level = false
   body.role = Substmt
 }
 on Switch(_, List(cases...) as list) as n {
-  if (count c in cases: c is Default(_)) > 1 { report("a switch has one default", n) }
-  check-declarations([s for Case(_, List(ss...)) | Default(List(ss...)) in cases for s in ss], false, [], n, strict)
+  problem += rule((count c in cases: c is Default(_)) > 1, "a switch has one default", n)
+             ?? declarations-problem([s for Case(_, List(ss...)) | Default(List(ss...)) in cases for s in ss], false, [], n, strict)
   list.in-switch = true
   list.top-level = false
 }
-on Break(None()) as n {
-  if not (in-loop or in-switch) { report("break is only valid in a loop or switch", n) }
-}
+on Break(None()) as n { problem += rule(not (in-loop or in-switch), "break is only valid in a loop or switch", n) }
 on Break(l) as n {
-  if not (l is None()) and not (l.text in labels) { report("break to an unknown label", n) }
+  problem += rule(not (l is None()) and not (l.text in labels), "break to an unknown label", n)
   kids.checking = false
 }
 on Continue(l) as n {
-  if not in-loop { report("continue is only valid in a loop", n) }
-  if not (l is None()) and not (l.text in loop-labels) {
-    report("continue to a label that is not a loop", n)
-  }
+  problem += rule(not in-loop, "continue is only valid in a loop", n)
+             ?? rule(not (l is None()) and not (l.text in loop-labels), "continue to a label that is not a loop", n)
   kids.checking = false
 }
 on Labeled(label, body) {
-  if label.text in labels { report("this label is already in use", label) }
-  let is-loop = is-loop-through-labels?(body)
+  problem += rule(label.text in labels, "this label is already in use", label)
   body.labels = labels ++ [label.text]
-  body.loop-labels = if is-loop then loop-labels ++ [label.text] else loop-labels
+  body.loop-labels = match is-loop-through-labels?(body) {
+    true => loop-labels ++ [label.text]
+    false => loop-labels
+  }
   body.top-level = false
   body.role = SubstmtFn
 }
-on Try(_, handler, finisher) as n {
-  if handler is None() and finisher is None() { report("try needs catch or finally", n) }
-}
-on VarDecl(list) { decl-list-checks(list, false, false) }
-on ExportVar(list) as n {
-  module-item(n)
-  decl-list-checks(list, false, false)
-}
-on LetDecl(list) { decl-list-checks(list, false, true) }
-on ConstDecl(list) { decl-list-checks(list, true, true) }
+on Try(_, handler, finisher) as n { problem += rule(handler is None() and finisher is None(), "try needs catch or finally", n) }
+on VarDecl(list) { problem += decl-list-problem(list, false, false) }
+on ExportVar(list) as n { problem += module-item-problem(n) ?? decl-list-problem(list, false, false) }
+on LetDecl(list) { problem += decl-list-problem(list, false, true) }
+on ConstDecl(list) { problem += decl-list-problem(list, true, true) }
 on Catch(head, body) {
-  let stmts = body.stmts.kids
-  let names = if head is None() then [] else bound-names(head)
-  if duplicates?(names) { report("a catch parameter is bound twice", head) }
-  for l in [lexical-names(s, false)... for s in stmts] ++ [block-functions(s, false)... for s in stmts] {
-    if l in names { report("this name collides with the catch parameter", body) }
-  }
-  if not (head is None()) and not (head.target is BindName(_)) {
-    for v in [var-names(s)... for s in stmts] {
-      if v in names { report("a var collides with a destructured catch parameter", body) }
-    }
-  }
+  problem += catch-problem(head, body)
   kids.top-level = false
 }
 
 # ---- modules
 # What an import or re-export lists names nothing here to check.
 on Import(...) | ImportBare(...) | ExportAll(...) | ExportAllAs(...) | ExportFrom(...) as n {
-  module-item(n)
+  problem += module-item-problem(n)
   kids.checking = false
 }
 on ExportNamed(List(specs...)) as n {
-  module-item(n)
-  for spec in specs {
-    if not (spec is TsErased()) {
-      let local = spec.local
-      if local is Str(_) or local.text in reserved-words {
-        report("this export names no local binding", local)
-      }
-      if not types-erased and not (unescaped(local.text) in exportable) {
-        report("this export names nothing declared in the module", local)
-      }
-    }
-  }
+  problem += module-item-problem(n) ?? (first spec in specs if not (spec is TsErased()): export-spec-problem(spec.local))
   kids.checking = false
 }
 on ExportDefault(...) | ExportDefaultDecl(...) | ExportLexical(...) | ExportFunction(...) | ExportClass(...) as n {
-  module-item(n)
+  problem += module-item-problem(n)
 }
+
+# A catch's parameters: bound once, and not declared again in its block.
+fn catch-problem(head: Node, body: Node) -> Problem? =
+  rule(duplicates?(names), "a catch parameter is bound twice", head)
+  ?? (first l in [lexical-names(s, false)... for s in stmts] ++ [block-functions(s, false)... for s in stmts] if l in names:
+        rule(true, "this name collides with the catch parameter", body))
+  ?? (first v in [var-names(s)... for s in stmts] if not (head is None()) and not (head.target is BindName(_)) and v in names:
+        rule(true, "a var collides with a destructured catch parameter", body))
+  where stmts = body.stmts.kids,
+        names = match head {
+          None() => []
+          _ => bound-names(head)
+        }
+
+# What an export statement names must be declared here.
+fn export-spec-problem(local: Node) -> Problem? =
+  rule(local is Str(_) or local.text in reserved-words, "this export names no local binding", local)
+  ?? rule(not types-erased and not (unescaped(local.text) in exportable), "this export names nothing declared in the module", local)
 
 # ---------------------------------------------------------------- the checks
 
 # What concerns a program's statements together: names exported twice, and what its top level
 # declares. `now-strict` is the program's strictness.
-fn head-problem(tree: Node, is-module: Bool, now-strict: Bool) -> Problem? {
-  let stmts = tree.body.kids
-  if is-module {
-    if duplicates?([exported-names(s)... for s in stmts]) { return some(Problem(message: "a name is exported twice", at: tree.lo)) }
-  }
-  declaration-problem(stmts, not is-module, [], tree, now-strict)
-}
+fn head-problem(tree: Node, is-module: Bool, now-strict: Bool) -> Problem? =
+  (first p in [Problem(message: "a name is exported twice", at: tree.lo)] if is-module and duplicates?([exported-names(s)... for s in stmts]): p)
+  ?? declaration-problem(stmts, not is-module, [], tree, now-strict)
+  where stmts = tree.body.kids
 
 # The first early error in a program. `is-module` is whether it is an ES module, which the
 # bundler decides from its syntax. `top-return` is for CommonJS, whose top level is a function.
