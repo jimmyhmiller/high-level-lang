@@ -737,20 +737,13 @@ everywhere fn as-class-name(n: Node, ref: Node, inner-name: Text) -> Node = matc
   Ident(_) => n
 }
 
-fn lowered-function-body(b: Node) -> Node {
-  with temps = [] { FuncBody(list-of(with-temps(lowered-list(b.stmts.kids), temps))) }
-}
+fn lowered-function-body(b: Node) -> Node = with temps = [] { FuncBody(list-of(with-temps(lowered-list(b.stmts.kids), temps))) }
 
 fn constructor-method?(m: Node) -> Bool = m is Method(PropName("constructor"), _, _)
 
 fn directive-count(stmts: [Node]) -> Int = len([s for s in stmts while s is ExprStmt(Str(_))])
 
-fn plain-super-at(stmts: [Node]) -> Int? {
-  for i in 0..len(stmts) {
-    if stmts[i] is ExprStmt(CallExpr(Super(), _)) { return some(i) }
-  }
-  none
-}
+fn plain-super-at(stmts: [Node]) -> Int? = first i in 0..len(stmts) if stmts[i] is ExprStmt(CallExpr(Super(), _)): i
 
 everywhere fn calls-super?(n: Node) -> Bool = match n {
   CallExpr(Super(), _) => true
@@ -766,52 +759,42 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 # it. Anywhere else, as in `if (a) super()` or what the minifier made of it, every such call goes
 # through an arrow that does both.
 fn constructor-with-fields(existing: Node?, fields: [Node], derived: Bool) -> Node = match existing {
-  some(Method(key, params, FuncBody(List(ss...)))) => {
-    if len(fields) == 0 { return Method(key, params, FuncBody(List(ss...))) }
-    if let some(i) = plain-super-at(ss) {
-      return Method(key, params, FuncBody(list-of(ss[0..i + 1] ++ fields ++ ss[i + 1..len(ss)])))
-    }
-    let at = directive-count(ss)
-    if not (any x in ss: calls-super?(x)) {
-      return Method(key, params, FuncBody(list-of(ss[0..at] ++ fields ++ ss[at..len(ss)])))
-    }
-    let name = fresh-name("__super")
-    let passed = fresh-name("_")
-    let inner = [ExprStmt(CallExpr(Super(), Args(List(Spread(Ident(passed))))))] ++ fields ++ [Return(This())]
-    let through = Arrow(Params(List(RestParam(BindName(passed)))), FuncBody(list-of(inner)))
-    let holder = VarDecl(List(Declarator(BindName(name), through)))
-    let rest = [super-through(x, name) for x in ss[at..len(ss)]]
-    Method(key, params, FuncBody(list-of(ss[0..at] ++ [holder] ++ rest)))
-  }
-  none => {
-    let calls: [Node] = if derived then [stmt`super(...arguments);`] else []
-    let stmts = calls ++ fields
-    Method(PropName("constructor"), Params(List()), FuncBody(List(stmts...)))
-  }
+  some(Method(key, params, FuncBody(List(ss...)))) => match fields, plain-super-at(ss) {
+    [], _ => Method(key, params, FuncBody(List(ss...)))
+    _, some(i) => Method(key, params, FuncBody(list-of(ss[0..i + 1] ++ fields ++ ss[i + 1..len(ss)])))
+    _, none if not (any x in ss: calls-super?(x)) => Method(key, params, FuncBody(list-of(ss[0..at] ++ fields ++ ss[at..len(ss)])))
+    _, none => Method(key, params, FuncBody(list-of(ss[0..at] ++ [holder] ++ [super-through(x, name) for x in ss[at..len(ss)]])))
+      where name = fresh-name("__super"),
+            passed = fresh-name("_"),
+            inner = [ExprStmt(CallExpr(Super(), Args(List(Spread(Ident(passed))))))] ++ fields ++ [Return(This())],
+            holder = VarDecl(List(Declarator(BindName(name), Arrow(Params(List(RestParam(BindName(passed)))), FuncBody(list-of(inner))))))
+  } where at = directive-count(ss)
+  none => Method(PropName("constructor"), Params(List()), FuncBody(List(([stmt`super(...arguments);` for d in [derived] if d] ++ fields)...)))
   _ => panic "expected a constructor"
 }
 
 fn class-statements(n: Node) -> [Node] = match n {
-  ClassDecl(name, heritage, body) => {
-    if not class-needs-lowering?(body) { return [lowered(n)] }
-    let parts = lowered-class(body, not (heritage is None()), "", Ident(name.text))
+  ClassDecl(_, _, body) if not class-needs-lowering?(body) => [lowered(n)]
+  ClassDecl(name, heritage, body) =>
     [ExprStmt(b) for b in parts.before] ++ [ClassDecl(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }]
     ++ parts.after ++ parts.statics
-  }
+    where parts = lowered-class(body, not (heritage is None()), "", Ident(name.text))
   _ => panic "expected a class declaration"
 }
 
 # `(_a = class { … }, __publicField(_a, "x", 1), _a)`
 fn class-expression(n: Node) -> Node = match n {
-  ClassExpr(name, heritage, body) => {
-    if not class-needs-lowering?(body) { return n with { heritage: lowered(heritage), body: lowered(body) } }
-    let holder = Ident(temp())
-    let inner-name = if name is BindName(_) then name.text else ""
-    let parts = lowered-class(body, not (heritage is None()), inner-name, holder)
-    let plain = ClassExpr(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }
-    if len(parts.before) == 0 and len(parts.after) == 0 and len(parts.statics) == 0 { return plain }
-    seq(parts.before ++ [assign(holder, plain)] ++ [s.expr for s in parts.after ++ parts.statics] ++ [holder])
-  }
+  ClassExpr(_, heritage, body) if not class-needs-lowering?(body) => n with { heritage: lowered(heritage), body: lowered(body) }
+  ClassExpr(name, heritage, body) => match parts {
+    ClassParts(before: [], after: [], statics: [], ...) => plain
+    _ => seq(parts.before ++ [assign(holder, plain)] ++ [s.expr for s in parts.after ++ parts.statics] ++ [holder])
+  } where holder = Ident(temp()),
+          inner-name = match name {
+            BindName(x) => x
+            _ => ""
+          },
+          parts = lowered-class(body, not (heritage is None()), inner-name, holder),
+          plain = ClassExpr(name, lowered(heritage), parts.body) with { lo: n.lo, hi: n.hi }
   _ => panic "expected a class expression"
 }
 
@@ -821,86 +804,84 @@ fn class-expression(n: Node) -> Node = match n {
 fn lowered-list(xs: [Node]) -> [Node] = [lowered-item(x)... for x in xs]
 
 fn lowered-item(x: Node) -> [Node] = match x {
-  ClassDecl(...) => if before?(2022) then class-statements(x) else [lowered(x)]
-  Declarator(t, init) => if before?(2018) and top-rest?(t) then rest-declarators(t, lowered(init), x) else [lowered(x)]
+  ClassDecl(...) if before?(2022) => class-statements(x)
+  Declarator(t, init) if before?(2018) and top-rest?(t) => rest-declarators(t, lowered(init), x)
   _ => [lowered(x)]
 }
 
-fn check-number(n: Node, t: Text) -> Node {
-  if before?(2020) and ends-with(t, "n") {
-    panic "big integer literals are not available in the configured target"
-  }
-  if before?(2021) and contains-text?(t, "_") then Num(replace-all(t, "_", "")) with { lo: n.lo, hi: n.hi } else n
+fn check-number(n: Node, t: Text) -> Node = match t {
+  _ ++ "n" if before?(2020) => panic "big integer literals are not available in the configured target"
+  _ if before?(2021) and contains-text?(t, "_") => Num(replace-all(t, "_", "")) with { lo: n.lo, hi: n.hi }
+  _ => n
 }
 
 fn lowered(n: Node) -> Node = match n {
   Num(t) => check-number(n, t)
-  Coalesce(a, b) => if before?(2020) then coalesced(lowered(a), lowered(b)) else generic(n)
-  Pow(a, b) => if before?(2016) then helper-call("__pow", [lowered(a), lowered(b)]) else generic(n)
-  OptMember(...) | OptIndex(...) | OptCall(...) => if chain-lowers?(n) then chain(n, undefined-value(), false) else generic(n)
-  Member(o, PrivateName(x)) => if not before?(2022) then generic(n)
-    else if chain-lowers?(n) then chain(n, undefined-value(), false)
-    else private-get(lowered(o), x)
-  Member(...) | Index(...) | Tagged(...) => if chain-lowers?(n) then chain(n, undefined-value(), false) else generic(n)
-  CallExpr(Paren(inner), _) => {
-    if chain-lowers?(inner) {
-      panic "a parenthesized optional chain being called is not implemented for this target"
-    }
-    generic(n)
-  }
-  CallExpr(Member(o, PrivateName(x)), Args(List(args...))) => {
-    if not before?(2022) { return generic(n) }
-    if chain-lowers?(n) { return chain(n, undefined-value(), false) }
-    let inner = lowered(o)
-    let self = if repeatable?(inner) then inner else Ident(temp())
-    let first = if repeatable?(inner) then inner else assign(self, inner)
-    let f = Member(private-get(first, x), PropName("call"))
-    let passed = [self] ++ [lowered(a) for a in args]
-    CallExpr(f, Args(List(passed...))) with { lo: n.lo, hi: n.hi }
-  }
-  CallExpr(...) => if chain-lowers?(n) then chain(n, undefined-value(), false) else generic(n)
-  Delete(x) => if chain-lowers?(x) then chain(x, True(), true) else generic(n)
+  Coalesce(a, b) if before?(2020) => coalesced(lowered(a), lowered(b))
+  Pow(a, b) if before?(2016) => helper-call("__pow", [lowered(a), lowered(b)])
+  OptMember(...) | OptIndex(...) | OptCall(...) if chain-lowers?(n) => chain(n, undefined-value(), false)
+  Member(o, PrivateName(_)) if not before?(2022) => generic(n)
+  Member(o, PrivateName(_)) if chain-lowers?(n) => chain(n, undefined-value(), false)
+  Member(o, PrivateName(x)) => private-get(lowered(o), x)
+  Member(...) | Index(...) | Tagged(...) if chain-lowers?(n) => chain(n, undefined-value(), false)
+  CallExpr(Paren(inner), _) if chain-lowers?(inner) => panic "a parenthesized optional chain being called is not implemented for this target"
+  CallExpr(Paren(_), _) => generic(n)
+  CallExpr(Member(_, PrivateName(_)), _) if not before?(2022) => generic(n)
+  CallExpr(Member(_, PrivateName(_)), _) if chain-lowers?(n) => chain(n, undefined-value(), false)
+  CallExpr(Member(o, PrivateName(x)), Args(List(args...))) =>
+    CallExpr(Member(private-get(held.first, x), PropName("call")), Args(List(([held.after] ++ [lowered(a) for a in args])...))) with { lo: n.lo, hi: n.hi }
+    where held = held-once(lowered(o))
+  CallExpr(...) if chain-lowers?(n) => chain(n, undefined-value(), false)
+  Delete(x) if chain-lowers?(x) => chain(x, True(), true)
   Assignment(t, AssignOp(op), v) => assignment(n, t, op, v)
-  In(PrivateName(x), o) => {
-    if not before?(2022) { return generic(n) }
-    let p = privates[x] ?? panic "no private name {} in scope", x
-    helper-call("__privateIn", [Ident(p.holder), lowered(o)])
-  }
-  PreInc(Member(o, PrivateName(x))) | PreDec(Member(o, PrivateName(x))) | PostInc(Member(o, PrivateName(x))) | PostDec(Member(o, PrivateName(x))) => {
-    if not before?(2022) { return generic(n) }
-    let p = privates[x] ?? panic "no private name {} in scope", x
-    let wrap = helper-call("__privateWrapper", [lowered(o), Ident(p.holder)] ++
-                    (if len(p.setter) > 0 or len(p.getter) > 0
-                     then [if len(p.setter) > 0 then Ident(p.setter) else undefined-value(),
-                           if len(p.getter) > 0 then Ident(p.getter) else undefined-value()]
-                     else []))
-    n with { kids: [Member(wrap, PropName("_"))] }
-  }
-  ObjectLit(List(xs...)) => if before?(2018) and (any x in xs: x is SpreadProp(_)) then object-spread(xs) else generic(n)
-  Catch(None(), block) => if before?(2019) then Catch(CatchHead(BindName(fresh-name("_"))), lowered(block)) with { lo: n.lo, hi: n.hi } else generic(n)
-  ForOf(flag, ...) => if flag is Flag() and before?(2018) then for-await(n) else generic(n)
-  ClassExpr(...) => if before?(2022) then class-expression(n) else generic(n)
+  In(PrivateName(_), _) if not before?(2022) => generic(n)
+  In(PrivateName(x), o) => helper-call("__privateIn", [Ident(p.holder), lowered(o)])
+    where p = (privates[x] ?? panic "no private name {} in scope", x)
+  PreInc(Member(_, PrivateName(_))) | PreDec(Member(_, PrivateName(_))) | PostInc(Member(_, PrivateName(_)))
+    | PostDec(Member(_, PrivateName(_))) if not before?(2022) => generic(n)
+  PreInc(Member(o, PrivateName(x))) | PreDec(Member(o, PrivateName(x))) | PostInc(Member(o, PrivateName(x))) | PostDec(Member(o, PrivateName(x))) =>
+    n with { kids: [Member(helper-call("__privateWrapper", [lowered(o), Ident(p.holder)] ++ accessors(p)), PropName("_"))] }
+    where p = (privates[x] ?? panic "no private name {} in scope", x)
+  ObjectLit(List(xs...)) if before?(2018) and (any x in xs: x is SpreadProp(_)) => object-spread(xs)
+  Catch(None(), block) if before?(2019) => Catch(CatchHead(BindName(fresh-name("_"))), lowered(block)) with { lo: n.lo, hi: n.hi }
+  ForOf(Flag(), ...) if before?(2018) => for-await(n)
+  ClassExpr(...) if before?(2022) => class-expression(n)
   List(xs...) => n with { kids: lowered-list(xs) }
-  _ => if sc.function?(n.kind) then function-node(n) else generic(n)
+  _ if sc.function?(n.kind) => function-node(n)
+  _ => generic(n)
 }
 
-fn generic(n: Node) -> Node = if len(n.kids) == 0 then n else n with { kids: [lowered(k) for k in n.kids] }
+# A private accessor's setter and getter, for `__privateWrapper`; nothing for a field.
+fn accessors(p: Private) -> [Node] = match p {
+  Private(setter: "", getter: "", ...) => []
+  _ => [named-or-undefined(p.setter), named-or-undefined(p.getter)]
+}
+
+fn named-or-undefined(name: Text) -> Node = match name {
+  "" => undefined-value()
+  _ => Ident(name)
+}
+
+fn generic(n: Node) -> Node = match n.kids {
+  [] => n
+  kids => n with { kids: [lowered(k) for k in kids] }
+}
 
 # ---------------------------------------------------------------- helpers
 
-fn helper-definitions() -> [Node] {
-  if len(helpers) == 0 { return [] }
-  let all-stmts = js.parse(include-text("lower_runtime.js"), "<lower runtime>").body.kids
-  let wanted = needed(helpers, {helper-name-of(s): s for s in all-stmts})
-  [s for s in all-stmts if helper-name-of(s) in wanted]
+fn helper-definitions() -> [Node] = match helpers {
+  [] => []
+  _ => [s for s in all-stmts if helper-name-of(s) in wanted]
+    where all-stmts = js.parse(include-text("lower_runtime.js"), "<lower runtime>").body.kids,
+          wanted = needed(helpers, {helper-name-of(s): s for s in all-stmts})
 }
 
 # These helpers, and those they mention, until none mentions one more.
-fn needed(names: [Text], definitions: {Text:Node}) -> [Text] {
-  let more = [x for n in names if let some(d) = definitions[n] for x in idents(d)
-              if starts-with(x, "__") and not (x in names) distinct x]
-  if len(more) == 0 then names else needed(names ++ more, definitions)
-}
+fn needed(names: [Text], definitions: {Text:Node}) -> [Text] =
+  match [x for n in names if let some(d) = definitions[n] for x in idents(d) if starts-with(x, "__") and not (x in names) distinct x] {
+    [] => names
+    more => needed(names ++ more, definitions)
+  }
 
 everywhere fn idents(n: Node) -> [Text] = match n {
   Ident(x) => [x]
@@ -918,16 +899,22 @@ everywhere fn shortened(n: Node, short: {Text:Text}) -> Node = match n {
   }
 }
 
-fn helper-name-of(s: Node) -> Text = s.declarators.kids[0].target.text
+fn helper-name-of(s: Node) -> Text = match s.declarators {
+  List(Declarator(target, _), ...) => target.text
+}
 
 # A program for an older target. `names` is every name already in use.
-fn run(program: Node, year: Int, names: [Text], minify: Bool) -> Node {
-  if year >= no-lowering { return program }
-  if year < 2015 { panic "the configured target is older than esbuild supports: es{}", year }
-  with target = year, taken = {x: true for x in names}, next-temp = 0, temps = [], helpers = [] {
-    let stmts = lowered-list(program.body.kids)
-    let defs = helper-definitions()
-    let plain = Program(program.hashbang, List((defs ++ with-temps(stmts, temps))...))
-    if not minify then plain else shortened(plain, {helper-name-of(d): fresh-name("$") for d in defs})
-  }
+fn run(program: Node, year: Int, names: [Text], minify: Bool) -> Node = match year {
+  _ if year >= no-lowering => program
+  _ if year < 2015 => panic "the configured target is older than esbuild supports: es{}", year
+  _ => with target = year, taken = {x: true for x in names}, next-temp = 0, temps = [], helpers = [] { lowered-program(program, minify) }
 }
+
+# The program lowered, and the helpers it uses in front of it; under --minify they get short names
+# like everything else.
+fn lowered-program(program: Node, minify: Bool) -> Node = match minify {
+  false => plain
+  true => shortened(plain, {helper-name-of(d): fresh-name("$") for d in defs})
+} where stmts = lowered-list(program.body.kids),
+        defs = helper-definitions(),
+        plain = Program(program.hashbang, List((defs ++ with-temps(stmts, temps))...))
