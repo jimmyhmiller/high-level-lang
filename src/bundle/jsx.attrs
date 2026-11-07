@@ -28,9 +28,12 @@ record Span { lo: Int, hi: Int }
 input now: Options
 input src: Text
 input path: Text
-# Calls that may go if nothing uses them, and the runtime's names the calls use, as `from\nname`.
+# Calls that may go if nothing uses them.
 collect pure: [Span]
-collect imports: [Text]
+
+# Each element and fragment becomes one call, which may go if nothing uses its value, unless the
+# build says JSX has effects.
+on JsxElement(...) | JsxFragment(...) as n if not now.side-effects { pure += Span(lo: n.lo, hi: n.hi) }
 
 
 # ---------------------------------------------------------------- pragmas
@@ -148,14 +151,50 @@ fn fresh-name(base: Text, source: Text) -> Text = unused(base, source) ?? first 
 
 fn unused(name: Text, source: Text) -> Text? = first x in [name] if not contains-text?(source, x): x
 
-fn imported-ref(name: Text, from: Text, lo: Int) -> Node {
-  imports += from ++ "\n" ++ name
-  Ident(fresh-name(name, src)) with { lo: lo, hi: lo }
-}
+# A name of the automatic runtime's, which its import binds.
+fn imported-ref(name: Text, lo: Int) -> Node = Ident(fresh-name(name, src)) with { lo: lo, hi: lo }
 
-fn runtime-module() -> Text = now.import-source ++ match now.dev {
+fn runtime-module-of(o: Options) -> Text = o.import-source ++ match o.dev {
   true => "/jsx-dev-runtime"
   false => "/jsx-runtime"
+}
+
+# The runtime's names the calls use, as `from\nname`, in the order the calls are made: each piece's
+# own pieces first, then a fragment's `Fragment`, then its call's own.
+everywhere fn imports-made(n: Node, o: Options) -> [Text] = match n {
+  JsxElement(_, props, rest) => [imports-made(k, o)... for k in n.kids] ++ [element-import(props.kids, children(rest), o)]
+  JsxFragment(kids) =>
+    [imports-made(k, o)... for k in n.kids] ++ [runtime-module-of(o) ++ "\nFragment", element-import([], kids.kids, o)]
+}
+
+# The name an element's call is: `createElement` when a key follows a spread, else the runtime's
+# for one child, several, or a development build.
+fn element-import(props: [Node], kids: [Node], o: Options) -> Text = match key-after-spread-attr?(props) {
+  true => o.import-source ++ "\ncreateElement"
+  false => runtime-module-of(o) ++ "\n" ++ match o.dev, many-children?(kids) {
+    true, _ => "jsxDEV"
+    false, true => "jsxs"
+    false, false => "jsx"
+  }
+}
+
+fn key-after-spread-attr?(props: [Node]) -> Bool =
+  any i in 0..len(props): props[i] is JsxAttr(JsxName("key"), _) and (any j in 0..i: props[j] is JsxSpreadAttr(_))
+
+# Whether children are more than one value, or one spread: blank text and an empty `{}` are none.
+fn many-children?(kids: [Node]) -> Bool = match sum k in kids: child-values(k) {
+  n if n > 1 => true
+  1 => any k in kids: k is JsxSpreadChild(_)
+  _ => false
+}
+
+fn child-values(k: Node) -> Int = match k {
+  JsxText(raw) => match child-text(raw) {
+    "" => 0
+    _ => 1
+  }
+  JsxContainer(None()) => 0
+  _ => 1
 }
 
 
@@ -184,10 +223,7 @@ fn key-of(name: Node) -> Node = match name {
   JsxNs(a, b) => string-at(a.text ++ ":" ++ b.text, name)
 }
 
-fn call-of(callee: Node, args: [Node], at: Node) -> Node {
-  if not now.side-effects { pure += Span(lo: at.lo, hi: at.hi) }
-  CallExpr(callee, Args(List(args...))) with { lo: at.lo, hi: at.hi }
-}
+fn call-of(callee: Node, args: [Node], at: Node) -> Node = CallExpr(callee, Args(List(args...))) with { lo: at.lo, hi: at.hi }
 
 fn text-child(raw: Text, at: Node) -> [Node] = match child-text(raw) {
   "" => []
@@ -236,9 +272,9 @@ fn js-bool(b: Bool) -> Node = match b {
 
 fn automatic(tag: Node, attrs: [Node], children: [Node], at: Node) -> Node = match attrs {
   _ if key-after-spread?(attrs) =>
-    call-of(imported-ref("createElement", now.import-source, at.lo), [tag, ObjectLit(List(attrs...))] ++ children, at)
+    call-of(imported-ref("createElement", at.lo), [tag, ObjectLit(List(attrs...))] ++ children, at)
   _ if any v in keys: v is True() => panic "{}: `key` needs an explicit value", path
-  _ => call-of(imported-ref(name, runtime-module(), at.lo), [tag, whole] ++ key ++ dev, at)
+  _ => call-of(imported-ref(name, at.lo), [tag, whole] ++ key ++ dev, at)
 } where keys = [v for Prop(PropName("key"), v) in attrs],
         many = len(children) > 1 or (len(children) == 1 and not spread-free?(children)),
         whole = ObjectLit(List(([a for a in attrs if not (a is Prop(PropName("key"), _))] ++ children-prop(children, at))...)),
@@ -258,7 +294,7 @@ fn automatic(tag: Node, attrs: [Node], children: [Node], at: Node) -> Node = mat
         }
 
 fn fragment-tag(at: Node) -> Node = match now.runtime {
-  Automatic => imported-ref("Fragment", runtime-module(), at.lo + 1)
+  Automatic => imported-ref("Fragment", at.lo + 1)
   _ => dotted(now.fragment, at.lo + 1)
 }
 
@@ -289,13 +325,15 @@ fn children(rest: Node) -> [Node] = match rest {
 # A tree with no JSX left in it, and which of its calls may go if unused.
 fn lower(tree: Node, source: Text, file: Text, o: Options) -> Lowered = match with-pragmas(o, source, file) {
   Options(runtime: Preserve, ...) => Lowered(tree: tree, pure-calls: {}, imports: false)
-  now-options => lowered-with(run(tree, now-options, source, file), source)
+  now-options => lowered-with(run(tree, now-options, source, file), source, match now-options.runtime {
+    Automatic => first-of-each(imports-made(tree, now-options))
+    _ => []
+  })
 }
 
-fn lowered-with(a: Attrs, source: Text) -> Lowered =
+fn lowered-with(a: Attrs, source: Text, keys: [Text]) -> Lowered =
   Lowered(tree: Program(a.tree.hashbang, List(import-statements(keys, source) ++ a.tree.body.kids...)),
           pure-calls: {s.lo: s.hi for s in a.pure}, imports: len(keys) > 0)
-  where keys = first-of-each(a.imports)
 
 # Names a kept `<div/>` will need once something else lowers it, so TypeScript must not take their
 # imports for types.
