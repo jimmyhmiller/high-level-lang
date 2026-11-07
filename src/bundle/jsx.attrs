@@ -207,6 +207,52 @@ fn import-statement(key: Text, at: Int, source: Text) -> Node = match key {
                                 Str(host.js-string(from)))
 }
 
+# In CommonJS the runtime is required instead, as esbuild has it: `var import_jsx_runtime =
+# require("react/jsx-runtime");`, and each name the calls read, `(0, import_jsx_runtime.jsx)`.
+record Read { holder: Text, name: Text }
+
+fn runtime-required(tree: Node, source: Text) -> Node =
+  Program(tree.hashbang, List(([required-holder(holders[modules[k]] ?? "", modules[k], k) for k in 0..len(modules)]
+                                ++ [read-from(s, reads) for s in rest])...))
+  where injected = [s for s in tree.body.kids while injected?(s)],
+        rest = tree.body.kids[len(injected)..len(tree.body.kids)],
+        modules = [imported-from(s) for s in injected distinct imported-from(s)],
+        holders = {mo: fresh-name("import_" ++ holder-base(mo), source) for mo in modules},
+        reads = {local-of(s): Read(holder: holders[imported-from(s)] ?? "", name: imported-name(s)) for s in injected}
+
+# Names a leaf's offset identifies, so a made one has an offset no source leaf has: below the
+# imports' own, -2 and down.
+fn required-holder(holder: Text, mo: Text, k: Int) -> Node =
+  VarDecl(List(Declarator(BindName(holder) with { lo: at, hi: at },
+                          CallExpr(Ident("require") with { lo: at - 1, hi: at - 1 }, Args(List(Str(host.js-string(mo))))))))
+  where at = -1000000 - 2 * k
+
+everywhere fn read-from(n: Node, reads: {Text:Read}) -> Node = match n {
+  # A call reads its function first, so it is called with no `this`.
+  CallExpr(Ident(x) as callee, args) if x in reads =>
+    CallExpr(Paren(Seq(Num("0"), held-read(callee, reads))) with { lo: callee.lo, hi: callee.hi }, read-from(args, reads)) with { lo: n.lo, hi: n.hi }
+  Ident(x) if x in reads => held-read(n, reads)
+}
+
+fn held-read(n: Node, reads: {Text:Read}) -> Node = match reads[n.text] {
+  some(r) => Member(Ident(r.holder) with { lo: n.lo, hi: n.hi }, PropName(r.name)) with { lo: n.lo, hi: n.hi }
+  none => n
+}
+
+# An import this lowering made: its binding has no place in the source.
+fn injected?(s: Node) -> Bool = match s {
+  Import(ImportNamed(List(ImportAs(_, b))), _) => b.lo < 0
+  _ => false
+}
+
+fn imported-from(s: Node) -> Text = unquote(s.from.text)
+fn imported-name(s: Node) -> Text = s.clause.specs.kids[0].imported.text
+fn local-of(s: Node) -> Text = s.clause.specs.kids[0].name.text
+
+# `react/jsx-runtime` -> `jsx_runtime`, as esbuild names what holds it.
+fn holder-base(mo: Text) -> Text = text-of-bytes([match c { '-' | '.' | '@' => '_'  _ => c } for c in last-segment])
+  where last-segment = last(split(mo, "/"))
+
 fn first-of-each(xs: [Text]) -> [Text] = [xs[i] for i in 0..len(xs) if not (any j in 0..i: xs[j] == xs[i])]
 
 # ---------------------------------------------------------------- the calls

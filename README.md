@@ -401,8 +401,7 @@ Being explicit, because "everything esbuild does" is a lot:
   (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
   and inlining enum values across files.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside
-  another, stylesheets with `--splitting`, `--legal-comments=inline`, the automatic JSX runtime in a
-  CommonJS module, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`
+  another, stylesheets with `--splitting`, `--legal-comments=inline`, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`
   class, and decorators on members with computed names.
 - **Hard errors when lowering:** `super` inside an async function, object rest nested inside another
   pattern or in an assignment, a computed key in an object rest, and calling a parenthesized optional

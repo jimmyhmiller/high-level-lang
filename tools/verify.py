@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Everything the bundler claims, checked against esbuild and acorn. Run from anywhere; it works in tests/.
 #   usage: verify.py ESB-BINARY JSPARSE-BINARY
-import glob, gzip, json, os, re, subprocess, sys, time
+import glob, gzip, json, os, re, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guard
 ESB, PARSE = guard.in_tests(sys.argv[1:3])
@@ -147,6 +147,22 @@ for flags in [[], ["--minify"]]:
     check(ra[0] == 0 and ra[1] and ra[1] == rb[1], f"--jsx=preserve {' '.join(flags)}: means what esbuild's means")
 code, text = sh([ESB, f"{JSX}/mismatch.jsx", f"--outfile={SCRATCH}/jsx.bad.js"])
 check(code != 0 and "does not match" in text, "a closing tag that does not match is an error")
+
+# The automatic runtime in CommonJS is required, not imported, which would make the file an ES
+# module. Outside out/, whose package.json says "type": "module".
+JX = tempfile.mkdtemp(prefix="esb-jsx-")
+with open(f"{JX}/jsx-cjs.jsx", "w") as f:
+    f.write('const F = () => <><b key="k" {...{}} /></>\nmodule.exports = () => <div>{F()}</div>\n')
+with open(f"{JX}/entry.js", "w") as f:
+    f.write('const r = require("./jsx-cjs.jsx")()\nconsole.log(r.type, r.props.children.type === Symbol.for("react.fragment"))\n')
+for flags in [[], ["--minify-syntax"]]:
+    ours, theirs = f"{JX}/o.js", f"{JX}/e.js"
+    code, out = sh([ESB, f"{JX}/entry.js", "--jsx=automatic", "--external:react", f"--outfile={ours}"] + flags)
+    sh([E, f"{JX}/entry.js", "--bundle", "--jsx=automatic", "--external:react", f"--outfile={theirs}", "--log-level=error"] + flags)
+    ran = [sh(["node", f], 15)[1] for f in (ours, theirs)]
+    same = flags or sh(["node", "-e", norm, ours, theirs])[1].strip() == "true"
+    check(code == 0 and ran[0] == ran[1] and ran[0].strip() == "div true" and same,
+          f"the automatic runtime in a CommonJS module {' '.join(flags)}: {'runs' if flags else 'the same once normalised, and runs'} as esbuild's: {ran[0].strip() if code == 0 else out.strip()[:100]}")
 
 print("== TypeScript against esbuild")
 for entry in ["main", "eq", "rx", "zod3", "zod4", "immer"]:
