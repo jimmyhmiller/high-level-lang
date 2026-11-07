@@ -14,7 +14,7 @@ DECL = re.compile(r"\n(?=(?:everywhere |memo )?fn |on |rewrite |const |record |s
                   r"|enum |inh |syn |given |collect |input |use |rules |attrs |include |#)")
 UNIT = re.compile(r"(?:everywhere |memo )?fn |on |rewrite ")
 IMPERATIVE = collections.OrderedDict([
-    ("block",  re.compile(r"^(?:everywhere |memo )?fn [^\n]*\)\s*(?:->[^\n=]*)?\{\s*$", re.M)),
+    ("block",  re.compile(r"^(?:everywhere |memo )?fn [^=\n]*\{\s*$", re.M)),
     ("let",    re.compile(r"^\s+let ", re.M)),
     ("var",    re.compile(r"^\s*var ", re.M)),
     ("if",     re.compile(r"\bif\b")),
@@ -24,9 +24,10 @@ IMPERATIVE = collections.OrderedDict([
     ("assign", re.compile(r"^\s*[a-z][\w\-?!.\[\]]*\s*(?:=|\+=|\+\+=)\s", re.M)),
     ("effect", re.compile(r"^\s*(?:assert |[a-z][\w.\-]*!\()", re.M)),
 ])
-# Guards are declarative: a comprehension's or query's `if`, a rewrite's, a match arm's.
+# Guards are declarative: a comprehension's or quantifier's `if`, a rewrite's, a match arm's.
 GUARDS = [
     (re.compile(r"(\bfor\b[^\]\n]*?)\bif\b"), r"\1WHERE"),
+    (re.compile(r"(\b(?:first|last|any|all|count|sum)\b[^:\n]*?)\bif\b"), r"\1WHERE"),
     (re.compile(r"(^rewrite[^\n]*?)\bif\b", re.M), r"\1WHERE"),
     (re.compile(r"\bif\b(?=[^\n]*=>)"), "WHERE"),
 ]
@@ -57,7 +58,9 @@ def main():
                 body = EQUATION.sub("  EQ ", body)
             for r, to in GUARDS:
                 body = r.sub(to, body)
-            hits = [k for k, r in IMPERATIVE.items() if r.search(body)]
+            # `e where x = …, y = …`: what follows `where` is equations.
+            before_where = re.split(r"\bwhere\b", body)[0]
+            hits = [k for k, r in IMPERATIVE.items() if r.search(before_where if k == "assign" else body)]
             total_lines += n
             total_units += 1
             all_here += n

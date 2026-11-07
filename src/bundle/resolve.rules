@@ -13,31 +13,31 @@ record Options {
 record Resolved { path: Text, side-effects: Bool }
 
 # How the build looks names up. Every answer below is a memo, worked out once for all workers, and
-# a new build, which may look names up differently, starts them over.
-state options: Options = Options(main-fields: [], conditions: [], extensions: [], external: [], node-builtins: false)
-
-fn new-build!(o: Options) -> Void {
-  options = o
-  forget-memos!()
-}
+# a build that is given other options starts them over.
+input options: Options
 
 # What a directory holds, by name: 'f' a file, 'd' a directory, 'l' a link. Read once, as esbuild does,
 # so each candidate a resolution tries costs a lookup and not a system call.
-memo fn listing-of(dir: Text) -> {Text:Int} {
-  let lines = split(dir-listing(dir), "\n")
-  {line[1..len(line)]: line[0] for line in lines[0..len(lines) - 1]}
+memo fn listing-of(dir: Text) -> {Text:Int} =
+  {line[1..len(line)]: line[0] for line in split(dir-listing(dir), "\n") if line != ""}
+
+memo fn file?(path: Text) -> Bool = match listing-of(dir-of(path))[path-base(path)] {
+  # A link is the one case the listing cannot answer.
+  some('l') => readable-file?(path)
+  some('f') => true
+  _ => false
 }
 
-memo fn file?(path: Text) -> Bool {
-  let kind = listing-of(dir-of(path))[path-base(path)] ?? 0
-  # A link is the one case the listing cannot answer.
-  if kind == 'l' then readable-file?(path) else kind == 'f'
-}
+# The file at `path`, if there is one.
+fn existing(path: Text) -> Text? = first p in [path] if file?(p): p
 
 memo fn doc-of(path: Text) -> pkg.Node = pkg.parse(read-file(path), path)
 
+# The package.json in a directory, read.
+fn package-doc(dir: Text) -> pkg.Node? = first pj in existing(dir ++ "/package.json"): doc-of(pj)
+
 fn member(object: pkg.Node, key: Text) -> pkg.Node? = match object {
-  pkg.Object(List(ms...)) => last m in ms: if unquote(m.key.text) == key then some(m.value) else none
+  pkg.Object(List(ms...)) => last m in ms if unquote(m.key.text) == key: m.value
   _ => none
 }
 
@@ -49,71 +49,48 @@ fn text-member(object: pkg.Node, key: Text) -> Text? = match member(object, key)
 # A package `exports` value: a path, or conditions tried in the file's order.
 fn exports-target(v: pkg.Node) -> Text? = match v {
   pkg.Str(raw) => some(unquote(raw))
-  pkg.Object(List(ms...)) => first m in ms: condition-target(m)
+  pkg.Object(List(ms...)) => first m in ms if condition?(unquote(m.key.text)): exports-target(m.value)
   _ => none
 }
 
-fn condition-target(m: pkg.Node) -> Text? {
-  let key = unquote(m.key.text)
-  if key == "default" or key in options.conditions then exports-target(m.value) else none
+fn condition?(key: Text) -> Bool = key == "default" or key in options.conditions
+
+# `exports` keyed by subpath, or one target for the package itself.
+fn package-exports(doc: pkg.Node, subpath: Text) -> Text? = match member(doc, "exports"), subpath {
+  some(e), _ if subpath-keyed?(e) => first v in member(e, subpath): exports-target(v)
+  some(e), "." => exports-target(e)
+  _, _ => none
 }
 
-fn package-exports(doc: pkg.Node, subpath: Text) -> Text? = match member(doc, "exports") {
-  none => none
-  some(e) => match e {
-    pkg.Object(List(first-member, ...)) =>
-      if unquote(first-member.key.text)[0] == '.' {
-        match member(e, subpath) {
-          some(v) => exports-target(v)
-          none => none
-        }
-      } else if subpath == "." then exports-target(e) else none
-    _ => if subpath == "." then exports-target(e) else none
-  }
-}
+fn subpath-keyed?(e: pkg.Node) -> Bool = e is pkg.Object(List(m, ...)) and unquote(m.key.text) is "." ++ _
 
-fn try-file(base: Text) -> Text? {
-  if file?(base) { return some(base) }
-  let found = first ext in options.extensions: if file?(base ++ ext) then some(base ++ ext) else none
-  found ?? typescript-instead(base)
-}
+# A file: the name as written, with each extension the build tries, then what TypeScript meant.
+fn try-file(base: Text) -> Text? =
+  first path in [base] ++ [base ++ ext for ext in options.extensions] ++ typescript-instead(base) if file?(path): path
 
 # TypeScript writes `./x.js` and means `./x.ts`: what it will be called once compiled.
-fn typescript-instead(base: Text) -> Text? {
-  if ends-with(base, ".js") { return same-stem(base, 3, [".ts", ".tsx"]) }
-  if ends-with(base, ".jsx") { return same-stem(base, 4, [".ts", ".tsx"]) }
-  if ends-with(base, ".mjs") { return same-stem(base, 4, [".mts"]) }
-  if ends-with(base, ".cjs") { return same-stem(base, 4, [".cts"]) }
-  none
+fn typescript-instead(base: Text) -> [Text] = match base {
+  stem ++ ".js" | stem ++ ".jsx" => [stem ++ ".ts", stem ++ ".tsx"]
+  stem ++ ".mjs" => [stem ++ ".mts"]
+  stem ++ ".cjs" => [stem ++ ".cts"]
+  _ => []
 }
 
-fn same-stem(base: Text, cut: Int, exts: [Text]) -> Text? {
-  let stem = base[0..len(base) - cut]
-  first ext in exts: if file?(stem ++ ext) then some(stem ++ ext) else none
-}
-
-# A directory: its package.json entry, then its index.
-fn try-dir(dir: Text) -> Text? {
-  let pj = dir ++ "/package.json"
-  let from-main: Text? =
-    if file?(pj) {
-      let doc = doc-of(pj)
-      first field-name in options.main-fields: match text-member(doc, field-name) {
-        some(target) => try-path(path-normalize(dir ++ "/" ++ target))
-        none => none
-      }
-    } else { none }
-  from-main ?? try-file(dir ++ "/index")
-}
+# A directory: the first of its package.json's main fields that leads somewhere, then its index.
+fn try-dir(dir: Text) -> Text? =
+  (first doc in package-doc(dir) for field-name in options.main-fields if let some(target) = text-member(doc, field-name):
+     try-path(path-normalize(dir ++ "/" ++ target)))
+  ?? try-file(dir ++ "/index")
 
 fn try-path(base: Text) -> Text? = try-file(base) ?? try-dir(base)
 
-
 # The package.json governing a directory: the nearest one at or above it.
-fn package-json-for(start: Text) -> Text? =
-  first dir in path-ancestors(start): if file?(in-dir(dir, "package.json")) then some(in-dir(dir, "package.json")) else none
+fn package-json-for(start: Text) -> Text? = first dir in path-ancestors(start): existing(in-dir(dir, "package.json"))
 
-fn in-dir(dir: Text, name: Text) -> Text = if dir == "." then name else dir ++ "/" ++ name
+fn in-dir(dir: Text, name: Text) -> Text = match dir {
+  "." => name
+  _ => dir ++ "/" ++ name
+}
 
 # Is the package.json governing a file `"type": "module"`?
 fn package-type-module?(path: Text) -> Bool = type-module-dir?(dir-of(path))
@@ -135,67 +112,42 @@ memo fn effect-patterns(dir: Text) -> [Text] = match package-json-for(dir) {
 }
 
 # A pattern with no slash may be anywhere in the package.
-fn package-pattern(root: Text, pattern: Text) -> Text =
-  path-normalize(root ++ (if has-byte?(pattern, '/') then "/" else "/**/") ++ pattern)
-
-fn side-effects-of(path: Text) -> Bool =
-  any p in effect-patterns(dir-of(path)): len(p) == 0 or glob-match?(p, 0, path, 0)
-
-# `*` is within one path segment, `?` is one byte, and `**` as a whole segment is any number of them.
-fn glob-match?(p: Text, i: Int, s: Text, j: Int) -> Bool {
-  if i == len(p) { return j == len(s) }
-  match p[i] {
-    '?' => return j < len(s) and glob-match?(p, i + 1, s, j + 1)
-    '*' => {
-      var after = i
-      while after < len(p) and p[after] == '*' { after += 1 }
-      let whole-segment = after - i > 1 and (i == 0 or p[i - 1] == '/')
-                          and (after == len(p) or p[after] == '/')
-      if whole-segment {
-        let rest = if after < len(p) then after + 1 else after
-        var k = j
-        while true {
-          if glob-match?(p, rest, s, k) { return true }
-          while k < len(s) and s[k] != '/' { k += 1 }
-          if k >= len(s) { return false }
-          k += 1
-        }
-      }
-      var k = j
-      while true {
-        if glob-match?(p, after, s, k) { return true }
-        if k >= len(s) or s[k] == '/' { return false }
-        k += 1
-      }
-    }
-    c => return j < len(s) and s[j] == c and glob-match?(p, i + 1, s, j + 1)
-  }
-  false
+fn package-pattern(root: Text, pattern: Text) -> Text = match pattern {
+  _ if has-byte?(pattern, '/') => path-normalize(root ++ "/" ++ pattern)
+  _ => path-normalize(root ++ "/**/" ++ pattern)
 }
 
-# Where a package's name ends: `@scope/name` has two parts.
-fn split-package(spec: Text) -> Int {
-  let need = if spec[0] == '@' then 2 else 1
-  let slashes = occurrences(spec, ["/"])
-  if len(slashes) >= need then slashes[need - 1] else len(spec)
+fn side-effects-of(path: Text) -> Bool = any p in effect-patterns(dir-of(path)): p == "" or glob?(p, path)
+
+# esbuild's globs: `**/` is any number of directories, `**` anything else, `*` anything but a slash,
+# and `?` any one byte.
+fn glob?(p: Text, s: Text) -> Bool = match p {
+  "" => s == ""
+  "**/" ++ rest => glob?(rest, s) or glob?(rest, "") or (any i in 0..len(s) if s[i] == '/': glob?(rest, s[i + 1..len(s)]))
+  "**" ++ rest => any i in 0..len(s) + 1: glob?(rest, s[i..len(s)])
+  "*" ++ rest => any i in 0..segment-end(s) + 1: glob?(rest, s[i..len(s)])
+  "?" ++ rest => s != "" and glob?(rest, s[1..len(s)])
+  _ => s != "" and p[0] == s[0] and glob?(p[1..len(p)], s[1..len(s)])
 }
 
-fn resolve-bare(spec: Text, from-dir: Text) -> Text? {
-  let cut = split-package(spec)
-  let name = spec[0..cut]
-  let sub = if cut < len(spec) then "." ++ spec[cut..len(spec)] else "."
-  first dir in path-ancestors(from-dir): package-target(in-dir(dir, "node_modules/" ++ name), sub)
-}
+# Where the text's first path segment ends.
+fn segment-end(s: Text) -> Int = (first i in 0..len(s) if s[i] == '/': i) ?? len(s)
+
+# A bare name: the package's own directory in the nearest node_modules that has one, and the part
+# of the name after the package's, `@scope/name` being two parts.
+fn resolve-bare(spec: Text, from-dir: Text) -> Text? =
+  first dir in path-ancestors(from-dir): package-target(in-dir(dir, "node_modules/" ++ join(parts[0..cut], "/")),
+                                                        join(["."] ++ parts[cut..len(parts)], "/"))
+  where parts = split(spec, "/"),
+        cut = min(len(parts), match spec { "@" ++ _ => 2  _ => 1 })
 
 # What `sub` of the package in `pdir` names, if there is a package there that has it.
-fn package-target(pdir: Text, sub: Text) -> Text? {
-  let pj = pdir ++ "/package.json"
-  if not file?(pj) { return none }
-  match package-exports(doc-of(pj), sub) {
-    some(target) => some(path-normalize(pdir ++ "/" ++ target))
-    none => if sub == "." then try-dir(pdir) else try-path(path-normalize(pdir ++ "/" ++ sub))
+fn package-target(pdir: Text, sub: Text) -> Text? =
+  first doc in package-doc(pdir): match package-exports(doc, sub), sub {
+    some(target), _ => some(path-normalize(pdir ++ "/" ++ target))
+    none, "." => try-dir(pdir)
+    none, _ => try-path(path-normalize(pdir ++ "/" ++ sub))
   }
-}
 
 const node-builtin-names: [Text] = ["assert", "async_hooks", "buffer", "child_process", "cluster",
   "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs",
@@ -203,28 +155,31 @@ const node-builtin-names: [Text] = ["assert", "async_hooks", "buffer", "child_pr
   "process", "punycode", "querystring", "readline", "repl", "stream", "stream/promises",
   "string_decoder", "timers", "tls", "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib"]
 
-fn node-builtin?(spec: Text) -> Bool = starts-with(spec, "node:") or spec in node-builtin-names
+fn node-builtin?(spec: Text) -> Bool = match spec {
+  "node:" ++ _ => true
+  _ => spec in node-builtin-names
+}
 
 # Is this import left for the runtime to resolve?
 fn external?(spec: Text) -> Bool =
   (options.node-builtins and node-builtin?(spec)) or spec in options.external
 
-fn relative?(spec: Text) -> Bool =
-  starts-with(spec, "./") or starts-with(spec, "../") or spec == "." or spec == ".." or starts-with(spec, "/")
+fn relative?(spec: Text) -> Bool = match spec {
+  "./" ++ _ | "../" ++ _ | "/" ++ _ | "." | ".." => true
+  _ => false
+}
 
-fn target-of(spec: Text, from-dir: Text) -> Text? =
-  if relative?(spec) then try-path(path-normalize(if starts-with(spec, "/") then spec else from-dir ++ "/" ++ spec))
-  else resolve-bare(spec, from-dir)
+fn target-of(spec: Text, from-dir: Text) -> Text? = match spec {
+  "/" ++ _ => try-path(path-normalize(spec))
+  _ if relative?(spec) => try-path(path-normalize(from-dir ++ "/" ++ spec))
+  _ => resolve-bare(spec, from-dir)
+}
 
 memo fn resolution(from-dir: Text, spec: Text) -> Text? = target-of(spec, from-dir)
 
 # The same, or nothing: for looking ahead at imports that may never be needed.
-fn resolve-opt(spec: Text, importer: Text) -> Resolved? = match resolution(dir-of(importer), spec) {
-  some(p) => some(Resolved(path: p, side-effects: side-effects-of(p)))
-  none => none
-}
+fn resolve-opt(spec: Text, importer: Text) -> Resolved? =
+  first p in resolution(dir-of(importer), spec): Resolved(path: p, side-effects: side-effects-of(p))
 
-fn resolve(spec: Text, importer: Text) -> Resolved {
-  let path = resolution(dir-of(importer), spec) ?? panic "{}: could not resolve {}", importer, spec
-  Resolved(path: path, side-effects: side-effects-of(path))
-}
+fn resolve(spec: Text, importer: Text) -> Resolved = Resolved(path: path, side-effects: side-effects-of(path))
+  where path = resolution(dir-of(importer), spec) ?? panic "{}: could not resolve {}", importer, spec
