@@ -51,7 +51,7 @@ that name in the spec. `out/bin/spec FILE` builds any spec with those steps.
 | `.js` | 171 | The runtime's helpers, the bundle's and lowering's, in esbuild's order |
 | `.bundler` | 64 | A demo build: data, read with `spec.syntax` |
 | `.pipeline` | 48 | Which stages may run in parallel, and five plans for running them |
-| `.scopes` | 39 | Scoping, for JavaScript and for a small language with ML's and Rust's `let` |
+| `.scopes` | 38 | Scoping, for JavaScript and for a small language with ML's and Rust's `let` |
 | `.coil` | 15 | Four `main` functions, because a package's entry must be plain Coil |
 
 The compilers for those languages are about 12,200 lines of Coil and 240 of grammars, with a runtime
