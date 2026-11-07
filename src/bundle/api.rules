@@ -162,31 +162,39 @@ fn with-target(o: Options, name: Text) -> Options = o with { target: match name 
 fn names-in-use() -> [Text] =
   nm.finals ++ [f for mo in m.modules for f in mo.free] ++ nm.keywords
 
-fn for-target(o: Options, p: Node) -> Node {
-  let dropped = if o.drop-console or o.drop-debugger then without-dropped(o, p) else p
-  let lowered = if o.target >= lower.no-lowering then dropped else lower.run(dropped, o.target, names-in-use(), o.minify-identifiers)
-  if o.charset-ascii { return in-parts(o, lowered, fin.ascii-only) }
-  lowered
-}
+fn for-target(o: Options, p: Node) -> Node = match o.charset-ascii {
+  true => in-parts(o, lowered, fin.ascii-only)
+  false => lowered
+} where dropped = match o.drop-console or o.drop-debugger {
+          true => without-dropped(o, p)
+          false => p
+        },
+        lowered = match o.target {
+          t if t >= lower.no-lowering => dropped
+          t => lower.run(dropped, t, names-in-use(), o.minify-identifiers)
+        }
 
 # `f` on each part of the program at once.
-fn in-parts(o: Options, p: Node, f: Fn(Node)->Node) -> Node {
-  if o.plan.optimize-parts <= 1 { return f(p) }
-  in-pieces(p, o.plan.optimize-parts, o.plan.optimize-threads, f, false)
+fn in-parts(o: Options, p: Node, f: Fn(Node)->Node) -> Node = match o.plan.optimize-parts {
+  n if n <= 1 => f(p)
+  n => in-pieces(p, n, o.plan.optimize-threads, f, false)
 }
 
 # `--drop:console` and `--drop:debugger`. Names are final here, and every free name was kept free, so
 # `console` can only be the global one.
 fn without-dropped(o: Options, n: Node) -> Node = match n {
-  Debugger() => if o.drop-debugger then Empty() with { lo: n.lo, hi: n.hi } else n
-  CallExpr(Member(Ident("console"), _), _) | OptCall(Member(Ident("console"), _), _) =>
-    if o.drop-console then exp`void 0` else drop-kids(o, n)
-  ExprStmt(CallExpr(Member(Ident("console"), _), _)) | ExprStmt(OptCall(Member(Ident("console"), _), _)) =>
-    if o.drop-console then Empty() with { lo: n.lo, hi: n.hi } else drop-kids(o, n)
+  Debugger() if o.drop-debugger => Empty() with { lo: n.lo, hi: n.hi }
+  Debugger() => n
+  CallExpr(Member(Ident("console"), _), _) | OptCall(Member(Ident("console"), _), _) if o.drop-console => exp`void 0`
+  ExprStmt(CallExpr(Member(Ident("console"), _), _)) | ExprStmt(OptCall(Member(Ident("console"), _), _)) if o.drop-console =>
+    Empty() with { lo: n.lo, hi: n.hi }
   _ => drop-kids(o, n)
 }
 
-fn drop-kids(o: Options, n: Node) -> Node = if len(n.kids) == 0 then n else n with { kids: [without-dropped(o, k) for k in n.kids] }
+fn drop-kids(o: Options, n: Node) -> Node = match n.kids {
+  [] => n
+  kids => n with { kids: [without-dropped(o, k) for k in kids] }
+}
 
 fn clear-words() -> [Text] = []
 
@@ -213,37 +221,25 @@ fn define-value(text: Text) -> Node = js.parse(text ++ ";", "<define>").body.kid
 fn program-plus(p: Node, s: Node) -> Node = p with { body: List(p.body.kids ++ [s]...) }
 
 # An entry that is itself wrapped only runs if something calls it.
-fn run-entry(p: Node) -> Node {
-  let mo = m.modules[m.entry]
-  if mo.kind == m.Cjs {
-    let call-me = e.final-of(mo.require-sym)
-    program-plus(p, stmt`$call_me();`)
-  } else if mo.wrapped {
-    let call-me = e.final-of(mo.init-sym)
-    program-plus(p, stmt`$call_me();`)
-  } else {
-    p
-  }
+fn run-entry(p: Node) -> Node = match m.modules[m.entry] {
+  m.Module(kind: m.Cjs, ...) as mo => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(mo.require-sym)
+  m.Module(wrapped: true, ...) as mo => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(mo.init-sym)
+  _ => p
 }
 
-fn to-common-js() -> Node {
-  let to-cjs = e.helper-name("__toCommonJS")
-  let ns = e.final-of(m.modules[m.entry].ns-sym)
-  exp`$to_cjs($ns)`
-}
+fn to-common-js() -> Node = exp`$to_cjs($ns)`
+  where to-cjs = e.helper-name("__toCommonJS"),
+        ns = e.final-of(m.modules[m.entry].ns-sym)
 
 # `export { a, b as c };` for the entry's names, and `var` statements for those a local name can't
 # hold, which come first.
 fn esm-exports() -> [Node] = exports-of-root(m.entry)
 
-fn exports-of-root(root: Int) -> [Node] {
-  if m.db.dynamic(root) {
-    panic "{}: `export *` from a CommonJS or external module in the entry point of ES module output is not implemented yet", m.modules[root].path
-  }
-  let found = [exported(name-of(m.names, n), s) for n in [n for m.db.resolved(root, ?n, _) distinct n]
-               if let some(s) = e.resolved-export(root, n)]
-  let specs = [x.spec for x in found]
-  [h for x in found for h in x.hoisted] ++ (if len(specs) == 0 then [] else [ExportNamed(List(specs...))])
+fn exports-of-root(root: Int) -> [Node] = match m.db.dynamic(root) {
+  true => panic "{}: `export *` from a CommonJS or external module in the entry point of ES module output is not implemented yet", m.modules[root].path
+  false => [h for x in found for h in x.hoisted] ++ [ExportNamed(List([x.spec for x in found]...)) for f in [found] if len(f) > 0]
+    where found = [exported(name-of(m.names, n), s) for n in [n for m.db.resolved(root, ?n, _) distinct n]
+                   if let some(s) = e.resolved-export(root, n)]
 }
 
 # An export of the entry: its specifier, after a variable holding it when what it reads is no name.
@@ -251,20 +247,16 @@ record Exported { hoisted: [Node], spec: Node }
 
 fn exported(name: Text, s: Int) -> Exported = match e.symbol-read(s) {
   Ident(local) => Exported(hoisted: [], spec: ExportAs(PropName(local), PropName(name)))
-  read => {
-    let hoisted = "export_" ++ name
-    Exported(hoisted: [stmt`var $hoisted = $read;`], spec: ExportAs(PropName(hoisted), PropName(name)))
-  }
+  read => Exported(hoisted: [stmt`var $hoisted = $read;`], spec: ExportAs(PropName(hoisted), PropName(name)))
+    where hoisted = "export_" ++ name
 }
 
 # The output text: `prefix`, the printed program, `suffix`. `base` is where the program starts, for
 # source map positions.
 record Printed { text: Text, base: Int, marks: [Mark] }
 
-fn printed(o: Options, p: Node, prefix: Text, suffix: Text) -> Printed {
-  let r = rendered-in-parts(o, p)
-  Printed(text: prefix ++ r.text ++ suffix, base: len(prefix), marks: r.marks)
-}
+fn printed(o: Options, p: Node, prefix: Text, suffix: Text) -> Printed =
+  Printed(text: prefix ++ r.text ++ suffix, base: len(prefix), marks: r.marks) where r = rendered-in-parts(o, p)
 
 # ---------------------------------------------------------------- work in parts
 
@@ -277,33 +269,32 @@ fn closed?(s: Node) -> Bool = match s {
 }
 
 # How much work a statement is, near enough: its length in the source, or one when it was made.
-fn weight(s: Node) -> Int = if s.hi > s.lo then s.hi - s.lo else 1
+fn weight(s: Node) -> Int = max(1, s.hi - s.lo)
 
 # The same for a node the build made around source, such as CommonJS's wrapper: its children's.
-fn mass(n: Node) -> Int = if n.hi > n.lo then n.hi - n.lo else sum k in n.kids: mass(k)
+fn mass(n: Node) -> Int = match n.hi - n.lo {
+  size if size > 0 => size
+  _ => sum k in n.kids: mass(k)
+}
 
 # Statements cut into about `n` runs of about equal weight, each cut just after a declaration, so
 # the runs optimise as the whole list would. Fewer when there are not such places enough.
-fn runs-of(stmts: [Node], n: Int) -> [[Node]] {
-  if n <= 1 or len(stmts) <= 1 { return [stmts] }
-  # `before[j]`: the weight of the first j statements.
-  let before = [0] ++ (scan w = 0 for s in stmts: w + weight(s))
-  let total = last(before)
-  # Each cut is the first after the last at which its share of the weight is reached, after a
-  # statement that closes.
-  let cuts: [Int] = fold cs = [0] for i in 1..n:
-    match first j in last(cs) + 1..len(stmts): if before[j] >= total * i / n and closed?(stmts[j - 1]) then some(j) else none {
-      some(j) => cs ++ [j]
-      none => cs
-    }
-  let ends = cuts ++ [len(stmts)]
-  [stmts[ends[i]..ends[i + 1]] for i in 0..len(cuts)]
+fn runs-of(stmts: [Node], n: Int) -> [[Node]] = match stmts {
+  _ if n <= 1 or len(stmts) <= 1 => [stmts]
+  _ => [stmts[ends[i]..ends[i + 1]] for i in 0..len(cuts)]
+    where before = [0] ++ (scan w = 0 for s in stmts: w + weight(s)),
+          total = last(before),
+          # Each cut is the first after the last at which its share of the weight is reached, after
+          # a statement that closes.
+          cuts = fold cs = [0] for i in 1..n:
+            cs ++ [j for j in first k in last(cs) + 1..len(stmts) if before[k] >= total * i / n and closed?(stmts[k - 1]): k],
+          ends = cuts ++ [len(stmts)]
 }
 
 # A program cut into runs of its statements, each a program of its own.
-fn parts-of(p: Node, n: Int) -> [Node] {
-  let runs = runs-of(p.body.kids, n)
-  if len(runs) < 2 then [p] else [program-of(if i == 0 then p.hashbang else None(), runs[i]) for i in 0..len(runs)]
+fn parts-of(p: Node, n: Int) -> [Node] = match runs-of(p.body.kids, n) {
+  [_] => [p]
+  runs => [program-of(match i { 0 => p.hashbang  _ => None() }, runs[i]) for i in 0..len(runs)]
 }
 
 fn program-of(hashbang: Node, stmts: [Node]) -> Node = Program(hashbang, List(stmts...))
@@ -326,14 +317,18 @@ fn hole-mark(at: Int) -> Node = ExprStmt(Ident(hole-name(at)) with { lo: -1, hi:
 
 # Each statement heavier than a part's share gives up the body most of it is in, when that body
 # can be cut.
-fn hollowed(p: Node, n: Int) -> Hollowed {
-  let stmts = p.body.kids
-  let weights = [max(1, mass(s)) for s in stmts]
-  let total = sum w in weights: w
-  let takes = [if weights[i] * n > total then cut-body(taken(stmts[i], hole-mark(i)), total, n) else none for i in 0..len(stmts)]
-  let kept = [taken-or(takes[i], stmts[i]) for i in 0..len(stmts)]
-  Hollowed(shell: p with { body: List(kept...) }, holes: [Hole(at: i, stmts: t.stmts) for i in 0..len(stmts) if let some(t) = takes[i]],
+fn hollowed(p: Node, n: Int) -> Hollowed =
+  Hollowed(shell: p with { body: List([taken-or(takes[i], stmts[i]) for i in 0..len(stmts)]...) },
+           holes: [Hole(at: i, stmts: t.stmts) for i in 0..len(stmts) if let some(t) = takes[i]],
            total: total)
+  where stmts = p.body.kids,
+        weights = [max(1, mass(s)) for s in stmts],
+        total = sum w in weights: w,
+        takes = [heavy-taken(stmts[i], i, weights[i] * n > total, total, n) for i in 0..len(stmts)]
+
+fn heavy-taken(s: Node, i: Int, heavy: Bool, total: Int, n: Int) -> Taken? = match heavy {
+  true => cut-body(taken(s, hole-mark(i)), total, n)
+  false => none
 }
 
 fn cut-body(t: Taken?, total: Int, n: Int) -> Taken? = match t {
@@ -351,24 +346,18 @@ fn taken-or(t: Taken?, s: Node) -> Node = match t {
 
 # The deepest function body holding nearly all of a node's work, swapped for `mark`.
 fn taken(n: Node, mark: Node) -> Taken? = match n {
-  FuncBody(List(ss...)) => match taken-below(n, mark) {
-    some(t) => some(t)
-    none => if len(ss) > 1 then some(Taken(node: n with { stmts: n.stmts with { kids: [mark] } }, stmts: ss)) else none
+  FuncBody(List(ss...)) => match taken-below(n, mark), ss {
+    some(t), _ => some(t)
+    none, [_, _, ...] => some(Taken(node: n with { stmts: n.stmts with { kids: [mark] } }, stmts: ss))
+    none, _ => none
   }
   _ => taken-below(n, mark)
 }
 
 # Through the child that holds nearly all of a node's work, if one does.
-fn taken-below(n: Node, mark: Node) -> Taken? {
-  let whole = mass(n)
-  match first i in 0..len(n.kids): if mass(n.kids[i]) * 10 >= whole * 9 then some(i) else none {
-    some(i) => match taken(n.kids[i], mark) {
-      some(t) => some(Taken(node: n with { kids: [if j == i then t.node else n.kids[j] for j in 0..len(n.kids)] }, stmts: t.stmts))
-      none => none
-    }
-    none => none
-  }
-}
+fn taken-below(n: Node, mark: Node) -> Taken? =
+  first i in 0..len(n.kids) if mass(n.kids[i]) * 10 >= mass(n) * 9 for t in taken(n.kids[i], mark):
+    Taken(node: n with { kids: [n.kids[0..i]..., t.node, n.kids[i + 1..len(n.kids)]...] }, stmts: t.stmts)
 
 # A hole filled with its body's statements.
 everywhere fn filled(n: Node, bodies: {Text:[Node]}) -> Node = match n {
@@ -398,27 +387,26 @@ fn end-changed?(es: [Ends]) -> Bool =
 
 # `f` of each part at once, the program's runs and its bodies' runs, put back together. When `f`
 # minifies and a body's end would have changed, all of it is done in top-level parts instead.
-fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) -> Node {
-  let h = hollowed(p, n)
-  if len(h.holes) == 0 { return joined(p, heaviest-first(parts-of(p, n), f, threads)) }
-  let shell-parts = parts-of(h.shell, n)
-  let bodies = [body-parts(hole, h.total, n) for hole in h.holes]
-  let done = heaviest-first(shell-parts ++ [x for b in bodies for x in b], f, threads)
-  let starts = body-starts(len(shell-parts), bodies)
-  let made = [[s for d in done[starts[k]..starts[k + 1]] for s in d.body.kids] for k in 0..len(bodies)]
-  if minifying and (any b in made: end-changed?([ends-of(b)])) {
-    return joined(p, heaviest-first(parts-of(p, n), f, threads))
+fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) -> Node = match hollowed(p, n) {
+  h if len(h.holes) == 0 => joined(p, heaviest-first(parts-of(p, n), f, threads))
+  h => match minifying and (any b in made: end-changed?([ends-of(b)])) {
+    true => joined(p, heaviest-first(parts-of(p, n), f, threads))
+    false => filled(joined(h.shell, done[0..len(shell-parts)]), {hole-name(h.holes[k].at): made[k] for k in 0..len(made)})
   }
-  filled(joined(h.shell, done[0..len(shell-parts)]), {hole-name(h.holes[k].at): made[k] for k in 0..len(made)})
+    where shell-parts = parts-of(h.shell, n),
+          bodies = [body-parts(hole, h.total, n) for hole in h.holes],
+          done = heaviest-first(shell-parts ++ [x for b in bodies for x in b], f, threads),
+          starts = body-starts(len(shell-parts), bodies),
+          made = [[s for d in done[starts[k]..starts[k + 1]] for s in d.body.kids] for k in 0..len(bodies)]
 }
 
 # The optimiser on each part at once. Parts end after declarations, which nothing merges with
 # what follows, so this is the program the optimiser would make of the whole. A spec's own
 # optimiser is given top-level parts only: what it does to a body with a hole is its own.
-fn optimized(o: Options, p: Node) -> Node {
-  if o.plan.optimize-parts <= 1 { return o.optimize(p) }
-  if o.has-optimize { return joined(p, heaviest-first(parts-of(p, o.plan.optimize-parts), o.optimize, o.plan.optimize-threads)) }
-  in-pieces(p, o.plan.optimize-parts, o.plan.optimize-threads, o.optimize, true)
+fn optimized(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
+  n if n <= 1 => o.optimize(p)
+  n if o.has-optimize => joined(p, heaviest-first(parts-of(p, n), o.optimize, o.plan.optimize-threads))
+  n => in-pieces(p, n, o.plan.optimize-threads, o.optimize, true)
 }
 
 # ---------------------------------------------------------------- the back half at once
@@ -434,44 +422,39 @@ fn fusable?(o: Options) -> Bool =
 # A part minified, made ASCII and printed, and how its statements end.
 record Piece { rendered: Rendered, ends: Ends }
 
-fn finished-piece(p: Node) -> Piece {
-  let t = fin.finished(minify.run(p), printing.ascii)
-  Piece(rendered: render-part(t), ends: ends-of(t.body.kids))
-}
+fn finished-piece(p: Node) -> Piece = Piece(rendered: render-part(t), ends: ends-of(t.body.kids))
+  where t = fin.finished(minify.run(p), printing.ascii)
 
 fn printed-piece(p: Node) -> Piece = Piece(rendered: render-part(p), ends: ends-of([]))
 
-fn finished-output(o: Options, f: Format, p: Node) -> Printed {
-  let r = rendered-pieces(o, p, o.plan.optimize-parts, o.plan.optimize-threads, finished-piece, true)
-  # What the format adds goes after, as it is: it was never minified.
-  let exports = export-statements(f)
-  let all = pieces-joined(o, [r] ++ (if len(exports) == 0 then [] else [render-part(Program(None(), List(exports...)))]))
+fn finished-output(o: Options, f: Format, p: Node) -> Printed =
   Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
-}
+  where r = rendered-pieces(o, p, o.plan.optimize-parts, o.plan.optimize-threads, finished-piece, true),
+        # What the format adds goes after, as it is: it was never minified.
+        exports = export-statements(f),
+        all = pieces-joined(o, [r] ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
 
 # `f` of each part at once, the heaviest started first, so the last to finish is a light one; the
 # results in the parts' order.
-fn heaviest-first(parts: [Node], f: Fn(Node)->Node, threads: Int) -> [Node] {
-  let order = heaviest-order(parts)
-  let done = parallel-map([parts[i] for i in order], f, threads)
-  let place = {order[k]: k for k in 0..len(order)}
+fn heaviest-first(parts: [Node], f: Fn(Node)->Node, threads: Int) -> [Node] =
   [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
-}
+  where order = heaviest-order(parts),
+        done = parallel-map([parts[i] for i in order], f, threads),
+        place = {order[k]: k for k in 0..len(order)}
 
-fn heaviest-pieces(parts: [Node], f: Fn(Node)->Piece, threads: Int) -> [Piece] {
-  let order = heaviest-order(parts)
-  let done = parallel-map([parts[i] for i in order], f, threads)
-  let place = {order[k]: k for k in 0..len(order)}
+fn heaviest-pieces(parts: [Node], f: Fn(Node)->Piece, threads: Int) -> [Piece] =
   [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
-}
+  where order = heaviest-order(parts),
+        done = parallel-map([parts[i] for i in order], f, threads),
+        place = {order[k]: k for k in 0..len(order)}
 
 fn heaviest-order(parts: [Node]) -> [Int] = sort i in [i for i in 0..len(parts)] by part-weight(parts[i]) desc
 
 fn part-weight(p: Node) -> Int = sum s in p.body.kids: weight(s)
 
-fn folded(o: Options, p: Node) -> Node {
-  if o.plan.optimize-parts <= 1 { return fold.run(p) }
-  in-pieces(p, o.plan.optimize-parts, o.plan.optimize-threads, fold.run, false)
+fn folded(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
+  n if n <= 1 => fold.run(p)
+  n => in-pieces(p, n, o.plan.optimize-threads, fold.run, false)
 }
 
 # How parts are printed, which the threads that print them read: set with the build's other settings.
@@ -483,87 +466,108 @@ fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, prin
 # Each part printed at once, the texts joined end to end, and every source map mark moved to
 # where its part landed. A part that ends where the printer dropped a `;` gets it back, as the
 # printer would have written it had the next part followed.
-fn rendered-in-parts(o: Options, p: Node) -> Rendered {
-  if o.plan.print-parts <= 1 { return js.render-tracked(p, o.pretty, o.sourcemap) }
-  rendered-pieces(o, p, o.plan.print-parts, o.plan.print-threads, printed-piece, false)
+fn rendered-in-parts(o: Options, p: Node) -> Rendered = match o.plan.print-parts {
+  n if n <= 1 => js.render-tracked(p, o.pretty, o.sourcemap)
+  n => rendered-pieces(o, p, n, o.plan.print-threads, printed-piece, false)
 }
 
 # `f` of each part at once, printing it, and the texts put together: each body's parts joined, and
 # spliced into the shell's text where its hole printed, the marks after it moved along. When `f`
 # minifies and a body's end would have changed, all of it is done in top-level parts instead.
-fn rendered-pieces(o: Options, p: Node, n: Int, threads: Int, f: Fn(Node)->Piece, minifying: Bool) -> Rendered {
-  let h = hollowed(p, n)
-  if len(h.holes) == 0 { return pieces-joined(o, [d.rendered for d in heaviest-pieces(parts-of(p, n), f, threads)]) }
-  let shell-parts = parts-of(h.shell, n)
-  let bodies = [body-parts(hole, h.total, n) for hole in h.holes]
-  let done = heaviest-pieces(shell-parts ++ [x for b in bodies for x in b], f, threads)
-  let starts = body-starts(len(shell-parts), bodies)
-  let changed = minifying and (any k in 0..len(bodies): end-changed?([d.ends for d in done[starts[k]..starts[k + 1]]]))
-  let shell = pieces-joined(o, [d.rendered for d in done[0..len(shell-parts)]])
-  let texts = [pieces-joined(o, [d.rendered for d in done[starts[k]..starts[k + 1]]]) for k in 0..len(bodies)]
-  let whole: Rendered? = if changed then none else spliced(shell, [hole-name(hole.at) for hole in h.holes], texts)
-  whole ?? pieces-joined(o, [d.rendered for d in heaviest-pieces(parts-of(p, n), f, threads)])
+fn rendered-pieces(o: Options, p: Node, n: Int, threads: Int, f: Fn(Node)->Piece, minifying: Bool) -> Rendered = match hollowed(p, n) {
+  h if len(h.holes) == 0 => whole-pieces(o, p, n, threads, f)
+  h => match changed {
+    true => none
+    false => spliced(shell, [hole-name(hole.at) for hole in h.holes], texts)
+  } ?? whole-pieces(o, p, n, threads, f)
+    where shell-parts = parts-of(h.shell, n),
+          bodies = [body-parts(hole, h.total, n) for hole in h.holes],
+          done = heaviest-pieces(shell-parts ++ [x for b in bodies for x in b], f, threads),
+          starts = body-starts(len(shell-parts), bodies),
+          changed = minifying and (any k in 0..len(bodies): end-changed?([d.ends for d in done[starts[k]..starts[k + 1]]])),
+          shell = pieces-joined(o, [d.rendered for d in done[0..len(shell-parts)]]),
+          texts = [pieces-joined(o, [d.rendered for d in done[starts[k]..starts[k + 1]]]) for k in 0..len(bodies)]
 }
+
+# Only top-level parts, each printed, joined.
+fn whole-pieces(o: Options, p: Node, n: Int, threads: Int, f: Fn(Node)->Piece) -> Rendered =
+  pieces-joined(o, [d.rendered for d in heaviest-pieces(parts-of(p, n), f, threads)])
 
 # Each body where its hole printed, in one pass: the shell's text between holes and the bodies'
 # texts written out in turn, and each mark moved by what the holes before it grew by. Nothing when
 # the holes did not print once each, in order.
-fn spliced(shell: Rendered, names: [Text], bodies: [Rendered]) -> Rendered? {
-  let at = occurrences(shell.text, [byte-text(1) ++ "hole"])
-  if len(at) != len(names) or not (all k in 0..len(at): at?(shell.text, at[k], names[k])) { return none }
-  # `grown[k]`: how much longer the text is before hole k than the shell's; `from[k]`: where the
-  # shell's text after hole k - 1 starts.
-  let grown = [0] ++ (scan d = 0 for k in 0..len(at): d + len(bodies[k].text) - len(names[k]))
-  let from = [0] ++ [at[k] + len(names[k]) for k in 0..len(at)]
-  let upto = at ++ [len(shell.text)]
-  # The shell's marks after hole k - 1 up to hole k, a mark on the hole itself being the first of
-  # the body's tokens, then body k's.
-  let outs = [mk.out for mk in shell.marks]
-  let cut = [0] ++ [bisect(outs, a) for a in at] ++ [len(outs)]
-  let marks = [mk for k in 0..len(at) + 1
-                  for mk in [Mark(out: m.out + grown[k], src: m.src) for m in shell.marks[cut[k]..cut[k + 1]]]
-                            ++ (if k < len(at) then [Mark(out: m.out + at[k] + grown[k], src: m.src) for m in bodies[k].marks] else [])]
-  some(Rendered(text: join([shell.text[from[k]..upto[k]] ++ (if k < len(at) then bodies[k].text else "") for k in 0..len(at) + 1], ""),
-                marks: marks, open: shell.open))
+fn spliced(shell: Rendered, names: [Text], bodies: [Rendered]) -> Rendered? = match at {
+  _ if len(at) != len(names) or not (all k in 0..len(at): at?(shell.text, at[k], names[k])) => none
+  _ => some(Rendered(text: join([shell.text[from[k]..upto[k]] ++ body-text(bodies, k) for k in 0..len(at) + 1], ""),
+                     marks: marks, open: shell.open))
+    where # `grown[k]`: how much longer the text is before hole k than the shell's; `from[k]`: where
+          # the shell's text after hole k - 1 starts.
+          grown = [0] ++ (scan d = 0 for k in 0..len(at): d + len(bodies[k].text) - len(names[k])),
+          from = [0] ++ [at[k] + len(names[k]) for k in 0..len(at)],
+          upto = at ++ [len(shell.text)],
+          # The shell's marks after hole k - 1 up to hole k, a mark on the hole itself being the first
+          # of the body's tokens, then body k's.
+          outs = [mk.out for mk in shell.marks],
+          cut = [0] ++ [bisect(outs, a) for a in at] ++ [len(outs)],
+          marks = [mk for k in 0..len(at) + 1
+                      for mk in [Mark(out: m.out + grown[k], src: m.src) for m in shell.marks[cut[k]..cut[k + 1]]]
+                                ++ [Mark(out: m.out + at[k] + grown[k], src: m.src) for b in bodies[k..min(k + 1, len(bodies))] for m in b.marks]]
+} where at = occurrences(shell.text, [byte-text(1) ++ "hole"])
+
+# Body k's text, after the shell's text before hole k; nothing after the last.
+fn body-text(bodies: [Rendered], k: Int) -> Text = match k {
+  _ if k < len(bodies) => bodies[k].text
+  _ => ""
 }
 
 # Rendered pieces one after another, a `;` between two where the first left a statement open, and
 # each piece's marks moved by where it starts.
-fn pieces-joined(o: Options, pieces: [Rendered]) -> Rendered {
-  let gaps = [if i > 0 and pieces[i - 1].open and len(pieces[i].text) > 0 then (if o.pretty then ";\n" else ";") else ""
-              for i in 0..len(pieces)]
-  let ends = scan at = 0 for i in 0..len(pieces): at + len(gaps[i]) + len(pieces[i].text)
+fn pieces-joined(o: Options, pieces: [Rendered]) -> Rendered =
   Rendered(text: join([gaps[i] ++ pieces[i].text for i in 0..len(pieces)], ""),
            marks: [Mark(out: mk.out + ends[i] - len(pieces[i].text), src: mk.src) for i in 0..len(pieces) for mk in pieces[i].marks],
            open: len(pieces) > 0 and last(pieces).open)
+  where gaps = [gap-before(o, pieces, i) for i in 0..len(pieces)],
+        ends = scan at = 0 for i in 0..len(pieces): at + len(gaps[i]) + len(pieces[i].text)
+
+# A `;` before a piece when the one before left a statement open.
+fn gap-before(o: Options, pieces: [Rendered], i: Int) -> Text = match i {
+  _ if i > 0 and pieces[i - 1].open and len(pieces[i].text) > 0 => match o.pretty {
+    true => ";\n"
+    false => ";"
+  }
+  _ => ""
 }
 
 # Every `%` in a format's statement, as this text.
 fn fill-in(template: Text, value: Text) -> Text = replace-all(template, "%", value)
 
 # A format's statements, once the names they refer to are final.
-fn export-statements(f: Format) -> [Node] {
-  if f.export-names { return esm-exports() }
-  if len(f.exports) == 0 { return [] }
-  let ns = js.render(to-common-js(), false)
-  [js.parse(fill-in(f.exports, ns), "<format>").body.kids[0]]
+fn export-statements(f: Format) -> [Node] = match f {
+  Format(export-names: true, ...) => esm-exports()
+  Format(exports: "", ...) => []
+  _ => [js.parse(fill-in(f.exports, js.render(to-common-js(), false)), "<format>").body.kids[0]]
 }
 
 fn wrap-format(o: Options, f: Format, p: Node) -> Printed =
   printed(o, fold whole = p for x in export-statements(f): program-plus(whole, x), f.prefix, f.suffix)
 
 # `--global-name`: an IIFE whose value is the entry's namespace.
-fn named(f: Format, global-name: Text) -> Format =
-  if len(global-name) == 0 then f
-  else f with { prefix: "var " ++ global-name ++ "=" ++ f.prefix, exports: "return %;" }
+fn named(f: Format, global-name: Text) -> Format = match global-name {
+  "" => f
+  _ => f with { prefix: "var " ++ global-name ++ "=" ++ f.prefix, exports: "return %;" }
+}
 
 fn has-define?(o: Options, key: Text) -> Bool = any d in o.defines: d.key == key
 
 # A browser has no `process`, so the build decides. Node's programs decide when they run.
-fn with-node-env(o: Options) -> Options =
-  if has-define?(o, "process.env.NODE_ENV") or o.platform-node then o
-  else o with { defines: o.defines ++ [DefineText(key: "process.env.NODE_ENV",
-                                                  value: if o.minify-syntax then "\"production\"" else "\"development\"")] }
+fn with-node-env(o: Options) -> Options = match o {
+  _ if has-define?(o, "process.env.NODE_ENV") or o.platform-node => o
+  _ => o with { defines: o.defines ++ [DefineText(key: "process.env.NODE_ENV",
+                                                  value: match o.minify-syntax {
+                                                    true => "\"production\""
+                                                    false => "\"development\""
+                                                  })] }
+}
 
 # How the build loads, links and emits, as the modules that do it are told.
 fn loading-of(o: Options, out-dir: Text) -> m.Loading =
@@ -597,20 +601,24 @@ fn reset-all(o: Options) -> Void {
 # The names esbuild gives output files: the entry's path below the entries' common directory.
 fn common-dir(paths: [Text]) -> Text = fold dir = dir-of(paths[0]) for p in paths: enclosing(dir, p)
 
-fn enclosing(dir: Text, path: Text) -> Text =
-  if dir == "." or starts-with(path, dir ++ "/") then dir else enclosing(dir-of(dir), path)
-
-fn below(dir: Text, path: Text) -> Text =
-  if dir == "." then path else path[len(dir) + 1..len(path)]
-
-fn entry-output(o: Options, entry: Text, base: Text) -> Text {
-  let rel = below(base, entry)
-  let dir = dir-of(rel)
-  let name = chunks.pattern-path(o.entry-names, if dir == "." then "" else dir, path-stem(rel), "")
-  o.outdir ++ "/" ++ name ++ ".js"
+fn enclosing(dir: Text, path: Text) -> Text = match dir {
+  _ if dir == "." or starts-with(path, dir ++ "/") => dir
+  _ => enclosing(dir-of(dir), path)
 }
 
-fn base-dir(o: Options) -> Text = if len(o.outbase) > 0 then o.outbase else common-dir(o.entries)
+fn below(dir: Text, path: Text) -> Text = match dir {
+  "." => path
+  _ => path[len(dir) + 1..len(path)]
+}
+
+fn entry-output(o: Options, entry: Text, base: Text) -> Text =
+  o.outdir ++ "/" ++ chunks.pattern-path(o.entry-names, match dir-of(rel) { "." => ""  d => d }, path-stem(rel), "") ++ ".js"
+  where rel = below(base, entry)
+
+fn base-dir(o: Options) -> Text = match o.outbase {
+  "" => common-dir(o.entries)
+  base => base
+}
 
 # One bundle, or one per entry, or one split into chunks, each name looked up as the options say.
 fn build(options: Options) -> Void =
@@ -640,9 +648,9 @@ fn resolve-options(o: Options) -> res.Options =
   res.Options(main-fields: o.main-fields, conditions: o.conditions, extensions: o.extensions,
               external: o.external, node-builtins: o.platform-node)
 
-fn with-extension(path: Text, ext: Text) -> Text {
-  let dir = dir-of(path)
-  (if dir == "." and not starts-with(path, "./") then "" else dir ++ "/") ++ path-stem(path) ++ ext
+fn with-extension(path: Text, ext: Text) -> Text = match dir-of(path) {
+  "." if not starts-with(path, "./") => path-stem(path) ++ ext
+  dir => dir ++ "/" ++ path-stem(path) ++ ext
 }
 
 # A stylesheet entry: its imports and the files it names, and nothing for JavaScript to do.
