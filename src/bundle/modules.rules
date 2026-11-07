@@ -481,25 +481,42 @@ record Analysed { analysis: Analysis, scopes: sym.Table }
 
 # What a file declares and uses, in a table of its own. Defines are substituted and the branches
 # they decide removed, then the result is analysed again, so what they kill is never seen by tree
-# shaking; CommonJS is analysed again inside its (exports, module) wrapper. A name free in any
-# of the analyses is free.
+# shaking; CommonJS is analysed inside its (exports, module) wrapper. A script that names those is
+# analysed inside the wrapper at once, and again without it only if it is not CommonJS after all
+# (or a define is about `module` or `exports`, which the wrapper would hide). A name free in any of
+# the analyses is free.
 fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed {
   let esm = early.program-has-module-syntax?(tree0)
   let tree = normalized-tree(tree0, base)
-  let first = scope.scoped(tree, [])
-  let cjs = not esm and (any f in ["module", "exports", "require"]: f in first.free)
-  if jsx-imports and not early.program-has-module-syntax?(parsed) and ("module" in first.free or "exports" in first.free) {
+  let maybe-cjs = not esm and (any name in cjs-names: contains-text?(src, name))
+                  and not (any d in loading.defines: text-before(d.key, ".") in ["module", "exports"])
+  let wrapped: scope.Scoped? = if maybe-cjs then some(scope.scoped(tree, ["exports", "module"])) else none
+  let wrapped-cjs = match wrapped {
+    some(w) => "require" in w.free or wrapper-used?(w.table, wrapper-of(w), "module") or wrapper-used?(w.table, wrapper-of(w), "exports")
+    none => false
+  }
+  let first = if wrapped-cjs then wrapped ?? panic "lost the wrapped analysis" else scope.scoped(tree, [])
+  let cjs = wrapped-cjs or (not esm and (any f in cjs-names: f in first.free))
+  # Whether it names `module` or `exports` without declaring them.
+  let names-module = if wrapped-cjs then wrapper-used?(first.table, wrapper-of(first), "module") or wrapper-used?(first.table, wrapper-of(first), "exports")
+                     else "module" in first.free or "exports" in first.free
+  if jsx-imports and not early.program-has-module-syntax?(parsed) and names-module {
     panic "{}: the automatic JSX runtime in a CommonJS module is not implemented yet", path
   }
   let defined = mentions-define?(src) and defines-apply?(tree, first.bindings)
   let final-tree = if defined then dce.run(substitute(tree, first.bindings)) else tree
-  let final = if cjs or defined then scope.scoped(final-tree, if cjs then ["exports", "module"] else []) else first
+  let final = if defined or (cjs and not wrapped-cjs) then scope.scoped(final-tree, if cjs then ["exports", "module"] else []) else first
   let free = first.free ++ [f for f in final.free if not (f in first.free)]
   let real-free = [f for f in free if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
   Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
                               shift: 0, defined: defined),
            scopes: final.table)
 }
+
+const cjs-names: [Text] = ["module", "exports", "require"]
+
+# The wrapper scope of an analysis made inside CommonJS's wrapper: the root's parent.
+fn wrapper-of(s: scope.Scoped) -> Int = sym.scope-at(s.table, s.root).parent
 
 # A file analysed on its own, moved into the shared table: its ids move by where it lands.
 fn grafted(p: Parsed) -> Analysis = grafted-analysis(Analysed(analysis: p.analysis, scopes: p.scopes))
