@@ -25,11 +25,11 @@ record Module {
   kind: ModuleKind,
   tree: Node,
   root: Int,
-  bindings: {Int:Int},
+  bindings: {Int:Int},  # the symbol each name leaf is, by where it starts, as its own table numbers them
   side-effects: Bool,
   deps: [Int],
   dep-ids: {Text:Int},  # the module each specifier it imports or requires led to
-  symbol-shift: Int,    # while the graph is made: how far `bindings` must move to the shared table's numbering
+  symbol-shift: Int,    # how far those symbols moved when its table joined the shared one
   base: Text,
   source: [Node],
   free: [Text],
@@ -59,9 +59,9 @@ setting table: sym.Table
 # The scope around every module's top level: the table's first.
 const bundle-scope: Int = 0
 
-state db: link.Db = link.new-db()
-state names: rt.Names = names-new()
-state hook-answers: {Text:Text} = {}
+# The facts linking states, solved; and the names they use, interned as linking meets them.
+setting db: link.Db
+setting names: rt.Names
 
 # Files parsed ahead of the walk that links them, by path.
 setting ahead: {Text:Parsed}
@@ -88,11 +88,7 @@ record Loading {
 
 setting loading: Loading
 
-fn name-id(s: Text) -> Int {
-  let id = intern!(names, s)
-  if s != "default" { assert db.not-default(id) }
-  id
-}
+fn name-id(s: Text) -> Int = intern!(names, s)
 
 # `node_modules/lodash-es/_root.js` -> `root`, as esbuild names things.
 fn base-name(path: Text) -> Text = match text-of-bytes([name-byte(c) for c in raw[start..len(raw)]]) {
@@ -326,15 +322,13 @@ fn alias-of(a: TextPair, spec: Text) -> Text? = match spec {
   _ => none
 }
 
-# What a resolve hook says about this import. Asked once per place it could appear from.
-fn hook-path(spec: Text, importer: Text) -> Text? {
-  if len(loading.on-resolve) == 0 { return none }
-  let key = dir-of(importer) ++ "\n" ++ spec
-  if let some(p) = hook-answers[key] { return if len(p) == 0 then none else some(p) }
-  let answer = first hook in loading.on-resolve: hook(spec, importer)
-  hook-answers[key] = answer ?? ""
-  answer
+# What a resolve hook says about this import, asked once.
+fn hook-path(spec: Text, importer: Text) -> Text? = match loading.on-resolve {
+  [] => none
+  hooks => hook-answer(spec, importer)
 }
+
+memo fn hook-answer(spec: Text, importer: Text) -> Text? = first hook in loading.on-resolve: hook(spec, importer)
 
 # Is this import left for the runtime? A hook's answer overrides that, as an alias does, and with
 # `--packages=external` so is every package.
@@ -492,11 +486,8 @@ const cjs-names: [Text] = ["module", "exports", "require"]
 # The wrapper scope of an analysis made inside CommonJS's wrapper: the root's parent.
 fn wrapper-of(s: sym.Analysis) -> Int = sym.scope-at(s.table, s.root).parent
 
-# A module's bindings in the shared table's numbering.
-fn rebased(mo: Module) -> Module = match mo.symbol-shift {
-  0 => mo
-  shift => mo with { bindings: {k: s + shift for k in keys(mo.bindings) if let some(s) = mo.bindings[k]}, symbol-shift: 0 }
-}
+# The symbol the name leaf starting at `lo` is, in the shared table's numbering.
+fn symbol-of(mo: Module, lo: Int) -> Int? = first s in mo.bindings[lo]: s + mo.symbol-shift
 
 # The text a module of this loader stands for. Not the file loader's: that writes an asset, so it
 # is made by `as-module`, on the thread that links.
@@ -1021,10 +1012,9 @@ fn external?(key: Text) -> Bool = key is "external:" ++ _
 # The program's modules: the runtime, id 0, then every file and outside import the entries lead to,
 # numbered in the order a walk from each entry in turn first reaches them; and that walk's order,
 # each module after what it imports, as it runs in esbuild's output. Every module's symbols join
-# one table in the order of their ids, and its bindings move to that table's numbering.
+# one table in the order of their ids, and each module knows how far its own moved.
 fn graph(runtime: Text, paths: [Text]) -> Graph =
-  Graph(modules: parallel-map([runtime-module(rt-tree, rt, runtime, joined)] ++ [module-at(w, i, ids, joined, parts) for i in 0..len(w.pre)],
-                              rebased, loading.load-threads),
+  Graph(modules: [runtime-module(rt-tree, rt, runtime, joined)] ++ [module-at(w, i, ids, joined, parts) for i in 0..len(w.pre)],
         by-path: ids, order: [0] ++ [i + 1 for i in w.post if not external?(w.pre[i])],
         entries: [ids[p] ?? (panic "{} was not loaded", p) for p in paths], table: joined.table)
   where w = depth-first(paths, led-to),

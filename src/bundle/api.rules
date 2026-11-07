@@ -198,21 +198,6 @@ fn drop-kids(o: Options, n: Node) -> Node = match n.kids {
 
 fn clear-words() -> [Text] = []
 
-# ---------------------------------------------------------------- timing
-
-state last-ms: Int = 0
-
-fn lap(o: Options, label: Text) -> Void {
-  if o.timing {
-    let now = now-us()
-    if last-ms > 0 {
-      let us = now - last-ms
-      print "{:>4}.{} ms  {}  ({} MB)", us / 1000, (us % 1000) / 100, label, max-rss() / 1048576
-    }
-    last-ms = now
-  }
-}
-
 # ---------------------------------------------------------------- the build
 
 # A define's value is a JavaScript expression in text: `false`, `"production"`, `1`.
@@ -464,7 +449,7 @@ fn folded(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
 
 # How parts are printed, which the threads that print them read: set with the build's other settings.
 record Printing { pretty: Bool, maps: Bool, ascii: Bool }
-state printing: Printing = Printing(pretty: false, maps: false, ascii: false)
+setting printing: Printing
 
 fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, printing.maps)
 
@@ -588,19 +573,6 @@ fn linking-of(o: Options, entry-namespace: Bool, keep-entry-exports: Bool, split
 fn emitting-of(o: Options, esm-output: Bool) -> e.Emitting =
   e.Emitting(void-undefined: o.minify-syntax, esm-output: esm-output, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
 
-# A new build: every module's state as it starts, and what it was told.
-fn configure!(o: Options) -> Void {
-  reset-all(o)
-  printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii)
-}
-
-fn reset-all(o: Options) -> Void {
-  m.reset-state!()
-  m.forget-memos!()
-  arrivals-reset!()
-  an.reset-state!()
-}
-
 # The names esbuild gives output files: the entry's path below the entries' common directory.
 fn common-dir(paths: [Text]) -> Text = fold dir = dir-of(paths[0]) for p in paths: enclosing(dir, p)
 
@@ -623,26 +595,26 @@ fn base-dir(o: Options) -> Text = match o.outbase {
   base => base
 }
 
-# One bundle, or one per entry, or one split into chunks, each name looked up as the options say.
+# A file a build writes, and what to say once it is written, if anything.
+record Written { path: Text, text: Text, said: Text }
+
+# One bundle, or one per entry, or one split into chunks, each name looked up as the options say:
+# the files they make, written.
 fn build(options: Options) -> Void =
   with res.options = resolve-options(options), tsc.forced = options.tsconfig, ascii.braces = options.target >= 2015,
        cssb.loaders = loader-map(options) {
-    built(options)
+    timed(options.timing, "write", written(built(options)))
   }
 
-fn built(options: Options) -> Void {
-  if options.splitting {
-    build-split(options)
-  } else if len(options.outdir) > 0 {
-    let base = base-dir(options)
-    for entry in options.entries {
-      build-one(options with { entry: entry, entries: [entry], outfile: entry-output(options, entry, base) })
-    }
-  } else if len(options.entries) > 1 {
-    panic "several entry points need --outdir"
-  } else {
-    build-one(options)
-  }
+fn written(ws: [Written]) -> Void = write-files!([w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
+
+fn built(options: Options) -> [Written] = match options.splitting, options.outdir, len(options.entries) {
+  true, _, _ => split-built(options)
+  false, "", n if n > 1 => panic "several entry points need --outdir"
+  false, "", _ => one-built(options)
+  false, _, _ => [one-built(options with { entry: entry, entries: [entry], outfile: entry-output(options, entry, base) })...
+                  for entry in options.entries]
+    where base = base-dir(options)
 }
 
 fn loader-map(o: Options) -> {Text:Text} = {l.key: l.value for l in o.loaders}
@@ -656,63 +628,71 @@ fn with-extension(path: Text, ext: Text) -> Text = match dir-of(path) {
   dir => dir ++ "/" ++ path-stem(path) ++ ext
 }
 
-# A stylesheet entry: its imports and the files it names, and nothing for JavaScript to do.
-fn build-css(o: Options) -> Void {
-  reset-all(o)
-  let b = cssb.bundle([o.entry], o.outfile, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
-  write-sheet(o.outfile, b)
-  cssb.write-assets(b.assets)
+# What a file says once written: how big it is, and where.
+fn said-of(text: Text, path: Text) -> Text = int-text(len(text)) ++ " bytes -> " ++ path
+
+# A file beside another, such as its legal comments', when it has anything in it.
+fn beside(path: Text, text: Text) -> [Written] = [Written(path: path, text: t, said: "") for t in [text] if len(t) > 0]
+
+# Output, and when there is a source map, the line that points to it and the map, of `source`, the
+# part of the text the marks describe, which starts at `base`.
+fn with-map(o: Options, path: Text, text: Text, source: Text, base: Int, marks: [Mark]) -> [Written] = match o.sourcemap {
+  true => [Written(path: path, text: mapped, said: said-of(mapped, path)),
+           Written(path: path ++ ".map", text: map.build-map(source, base, marks, path), said: "")]
+    where mapped = text ++ "//# sourceMappingURL=" ++ path-base(path) ++ ".map\n"
+  false => [Written(path: path, text: text, said: said-of(text, path))]
 }
 
+# A stylesheet entry: its imports and the files it names, and nothing for JavaScript to do.
+fn css-built(o: Options) -> [Written] = sheet-written(o.outfile, b) ++ assets-written(b.assets)
+  where b = cssb.bundle([o.entry], o.outfile, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
+
 # A bundled stylesheet, and its legal comments' file when it has one.
-fn write-sheet(path: Text, b: cssb.Bundled) -> Void {
-  if len(b.legal) > 0 { write-file(path ++ ".LEGAL.txt", b.legal) }
-  write-file(path, b.text)
-  print "{} bytes -> {}", len(b.text), path
-}
+fn sheet-written(path: Text, b: cssb.Bundled) -> [Written] =
+  beside(path ++ ".LEGAL.txt", b.legal) ++ [Written(path: path, text: b.text, said: said-of(b.text, path))]
+
+# Each copied file, once.
+fn assets-written(assets: [cssb.Asset]) -> [Written] = [Written(path: a.to, text: read-file(a.from), said: "") for a in assets distinct a.to]
 
 # The files the program's modules stand for, copied beside it: what the file loader gives.
 fn module-assets(out-dir: Text) -> [cssb.Asset] =
   [cssb.asset-of(mo.path, out-dir) for mo in m.modules if mo.kind != m.External and m.loader-of(mo.path) == "file"]
 
-fn build-one(options: Options) -> Void {
-  if ends-with(options.entry, ".css") { return build-css(options) }
-  if options.pretty and options.jsx.runtime == jsx.Preserve {
+# One bundle, as the build's settings say how to load, link, emit and print it.
+fn one-built(options: Options) -> [Written] = match options.entry {
+  _ ++ ".css" => css-built(options)
+  _ if options.pretty and options.jsx.runtime == jsx.Preserve =>
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
-  }
-  let o = with-node-env(options)
-  let f = if o.format.export-names or len(o.format.exports) > 0 then o.format else named(o.format, o.global-name)
-  configure!(o)
-  with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, f.export-names, false),
-       e.emitting = emitting-of(o, f.hoist-externals), e.chunk-parts = none {
-    loaded-build(o, f)
-  }
+  _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, f.export-names, false),
+            e.emitting = emitting-of(o, f.hoist-externals), e.chunk-parts = none, printing = printing-of(o), m.names = names-new() {
+         loaded-built(timed(o.timing, "startup", o), f)
+       }
+    where o = with-node-env(options),
+          f = match o.format.export-names or len(o.format.exports) > 0 {
+            true => o.format
+            false => named(o.format, o.global-name)
+          }
 }
+
+fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii)
 
 # A build once it is set up: load, link, name, and the rest.
-fn loaded-build(o: Options, f: Format) -> Void {
-  lap(o, "startup")
-  with m.ahead = m.parsed-ahead([o.entry]) {
-    lap(o, "load: parse files ahead")
-    graph-build(o, f, m.graph(include-text("runtime.js"), [o.entry]))
+fn loaded-built(o: Options, f: Format) -> [Written] =
+  with m.ahead = timed(o.timing, "load: parse files ahead", m.parsed-ahead([o.entry])) {
+    graph-built(o, f, timed(o.timing, "load: resolve, scopes, the graph", m.graph(include-text("runtime.js"), [o.entry])))
   }
-}
 
 # A build once its modules are known.
-fn graph-build(o: Options, f: Format, g: m.Graph) -> Void {
+fn graph-built(o: Options, f: Format, g: m.Graph) -> [Written] =
   with m.modules = g.modules, m.by-path = g.by-path, m.order = g.order, m.entries = g.entries, m.entry = g.entries[0],
        m.table = g.table {
-    linked-build(o, f)
+    linked-built(o, f)
   }
-}
 
-fn linked-build(o: Options, f: Format) -> Void {
-  lap(o, "load: resolve, scopes, the graph")
-  with an.linked = an.link() {
-    lap(o, "link: facts and Datalog")
-    with nm.finals = final-names(o) { named-build(o, f) }
+fn linked-built(o: Options, f: Format) -> [Written] =
+  with an.linked = an.link(), m.db = timed(o.timing, "link: facts and Datalog", an.solved-facts()) {
+    with nm.finals = timed(o.timing, "naming", final-names(o)) { named-built(o, f) }
   }
-}
 
 # Each symbol's name: minified, or as esbuild's number renamer gives them.
 fn final-names(o: Options) -> [Text] = match o.minify-identifiers {
@@ -720,46 +700,35 @@ fn final-names(o: Options) -> [Text] = match o.minify-identifiers {
   false => nm.esbuild-names()
 }
 
-# The rest of a build, once every symbol has its name.
-fn named-build(o: Options, f: Format) -> Void {
-  lap(o, "naming")
-  let emission = e.program()
-  let emitted = run-entry(emission.tree, f)
-  lap(o, "emit: rewrite identifiers")
-  let fused = fusable?(o)
-  let p = if fused then emitted else for-target(o, if o.minify-syntax then optimized(o, emitted) else folded(o, emitted))
-  lap(o, "minify rules")
-  let out0 = if fused then finished-output(o, f, p) else wrap-format(o, f, p)
-  # The banner and hoisted external imports come first, ahead of everything the map describes.
-  let head = (if len(o.banner) > 0 then o.banner ++ "\n" else "") ++ join(emission.externals, "")
-  let footer = if len(o.footer) > 0 then o.footer ++ "\n" else ""
-  let notes = legal.placed(o.legal-comments, legal-of-modules(none), o.outfile)
-  let full = head ++ out0.text ++ footer ++ notes.tail
-  let base = len(head) + out0.base
-  let text = if o.sourcemap then full ++ "//# sourceMappingURL=" ++ path-base(o.outfile) ++ ".map\n" else full
-  if len(notes.file) > 0 { write-file(o.outfile ++ ".LEGAL.txt", notes.file) }
-  lap(o, "print")
-  write-file(o.outfile, text)
-  if o.sourcemap { write-file(o.outfile ++ ".map", map.build-map(full, base, out0.marks, o.outfile)) }
-  print "{} bytes -> {}", len(text), o.outfile
-  # Stylesheets the program imports go beside it, under its name.
-  let sheets = m.css-imports()
-  let css-out = with-extension(o.outfile, ".css")
-  let css: [cssb.Bundled] = [cssb.bundle(sheets, css-out, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
-                             for s in [sheets] if len(s) > 0]
-  for b in css { write-sheet(css-out, b) }
-  cssb.write-assets([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
-  lap(o, "write")
-}
+# The rest of a build, once every symbol has its name: the program, its legal comments and its map;
+# the stylesheets it imports, beside it under its name; and the files those and its modules name.
+fn named-built(o: Options, f: Format) -> [Written] =
+  beside(o.outfile ++ ".LEGAL.txt", notes.file) ++ with-map(o, o.outfile, full, full, len(head) + out0.base, out0.marks)
+  ++ [sheet-written(css-out, b)... for b in css]
+  ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
+  where emission = e.program(),
+        emitted = timed(o.timing, "emit: rewrite identifiers", run-entry(emission.tree, f)),
+        fused = fusable?(o),
+        p = timed(o.timing, "minify rules", match fused, o.minify-syntax {
+          true, _ => emitted
+          false, true => for-target(o, optimized(o, emitted))
+          false, false => for-target(o, folded(o, emitted))
+        }),
+        out0 = match fused {
+          true => finished-output(o, f, p)
+          false => wrap-format(o, f, p)
+        },
+        # The banner and hoisted external imports come first, ahead of everything the map describes.
+        head = (match o.banner { "" => ""  b => b ++ "\n" }) ++ join(emission.externals, ""),
+        footer = match o.footer { "" => ""  t => t ++ "\n" },
+        notes = legal.placed(o.legal-comments, legal-of-modules(none), o.outfile),
+        full = timed(o.timing, "print", head ++ out0.text ++ footer ++ notes.tail),
+        sheets = m.css-imports(),
+        css-out = with-extension(o.outfile, ".css"),
+        css = [cssb.bundle(sheets, css-out, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
+               for s in [sheets] if len(s) > 0]
 
 # ---------------------------------------------------------------- code splitting
-
-state chunk-of-root: {Int:Int} = {}
-
-fn path-of-root(root: Int) -> Text {
-  let c = chunk-of-root[root] ?? panic "{} has no chunk", m.modules[root].path
-  chunks.placeholder(c)
-}
 
 # The legal comments of the modules in the output, or in one chunk of it, in module order.
 fn legal-of-modules(chunk: chunks.Chunk?) -> [legal.Note] =
@@ -777,72 +746,69 @@ fn root-statements(root: Int) -> [Node] = match m.modules[root] {
   _ => exports-of-root(root)
 }
 
+fn chunk-root-statements(c: chunks.Chunk) -> [Node] = match c.root {
+  r if r < 0 => []
+  r => root-statements(r)
+}
+
 # The body of one chunk, as text with placeholders in it.
-fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk]) -> Printed {
-  let emission = with e.chunk-parts = some(c.parts) { e.program() }
-  let body = emission.tree
-  let p = for-target(o, if o.minify-syntax then o.optimize(body) else fold.run(body))
-  let stmts = chunks.imports-of(c, all) ++ p.body.kids ++ (if c.root >= 0 then root-statements(c.root) else []) ++ chunks.exports-of(c, all)
-  let r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
-  let head = join(emission.externals, "")
+fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk]) -> Printed =
   Printed(text: head ++ r.text ++ "\n", base: len(head), marks: r.marks)
+  where emission = with e.chunk-parts = some(c.parts) { e.program() },
+        p = for-target(o, match o.minify-syntax {
+          true => o.optimize(emission.tree)
+          false => fold.run(emission.tree)
+        }),
+        stmts = chunks.imports-of(c, all) ++ p.body.kids ++ chunk-root-statements(c) ++ chunks.exports-of(c, all),
+        r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap),
+        head = join(emission.externals, "")
+
+fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text = match c.root {
+  r if r < 0 => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"
+  r if r in static-roots => entry-output(o, m.modules[r].path, base)
+  r => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(m.modules[r].path), hash) ++ ".js"
 }
 
-fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text {
-  if c.root < 0 {
-    return o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"
-  }
-  let path = m.modules[c.root].path
-  if c.root in static-roots { return entry-output(o, path, base) }
-  o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(path), hash) ++ ".js"
+fn split-built(options: Options) -> [Written] = match options.outdir, options.format.export-names {
+  "", _ => panic "code splitting needs --outdir"
+  _, false => panic "code splitting needs --format=esm"
+  _, true => with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, true), e.emitting = emitting-of(o, true),
+                  printing = printing-of(o), m.names = names-new() {
+      with m.ahead = m.parsed-ahead(o.entries) { split-graph(o, m.graph(include-text("runtime.js"), o.entries)) }
+    } where o = with-node-env(options)
 }
 
-fn build-split(options: Options) -> Void {
-  if len(options.outdir) == 0 { panic "code splitting needs --outdir" }
-  if not options.format.export-names { panic "code splitting needs --format=esm" }
-  let o = with-node-env(options)
-  configure!(o)
-  with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, true), e.emitting = emitting-of(o, true) {
-    with m.ahead = m.parsed-ahead(o.entries) { split-graph(o, m.graph(include-text("runtime.js"), o.entries)) }
-  }
-}
-
-# A split build once it is set up.
-fn split-graph(o: Options, g: m.Graph) -> Void =
+# A split build once its modules are known.
+fn split-graph(o: Options, g: m.Graph) -> [Written] =
   with m.modules = g.modules, m.by-path = g.by-path, m.order = g.order, m.entries = g.entries, m.entry = g.entries[0],
        m.table = g.table {
     linked-split(o)
   }
 
-fn linked-split(o: Options) -> Void = match m.css-imports() {
-  [] => with an.linked = an.link() { with nm.finals = final-names(o) { named-split(o) } }
+fn linked-split(o: Options) -> [Written] = match m.css-imports() {
+  [] => with an.linked = an.link(), m.db = an.solved-facts() { with nm.finals = final-names(o) { named-split(o) } }
   _ => panic "stylesheets with --splitting are not implemented yet"
 }
 
-# The rest of a split build, once every symbol has its name.
-fn named-split(o: Options) -> Void {
-  let roots = m.entries ++ an.linked.dynamic-roots
-  let all = chunks.chunks-of(roots)
-  chunk-of-root = {c.root: c.id for c in all if c.root >= 0}
-  with e.chunk-paths = {root: path-of-root(root) for root in roots} { written-chunks(o, all) }
-}
+# The rest of a split build, once every symbol has its name: a chunk for each root, which an import
+# of it names by a placeholder until every chunk's name is known.
+fn named-split(o: Options) -> [Written] =
+  with e.chunk-paths = {root: chunks.placeholder(ids[root] ?? (panic "{} has no chunk", m.modules[root].path)) for root in roots} {
+    chunks-written(o, all)
+  } where roots = m.entries ++ an.linked.dynamic-roots,
+          all = chunks.chunks-of(roots),
+          ids = {c.root: c.id for c in all if c.root >= 0}
 
-# Each chunk printed, its placeholders filled once every chunk's name is known, and written.
-fn written-chunks(o: Options, all: [chunks.Chunk]) -> Void {
-  let printed-chunks = [chunk-program(o, c, all) for c in all]
-  let texts = [p.text for p in printed-chunks]
-  let holes = [chunks.holes-in(t) for t in texts]
-  let base = base-dir(o)
-  let paths = [chunk-path-of(o, c, chunks.content-hash(c.id, texts, holes), base, m.entries) for c in all]
-  for i in 0..len(texts) {
-    let pr = printed-chunks[i]
-    let done = chunks.filled(pr.text, pr.base, pr.marks, holes[i], paths[i], paths)
-    let notes = legal.placed(o.legal-comments, legal-of-modules(some(all[i])), paths[i])
-    let body = done.text ++ notes.tail
-    if len(notes.file) > 0 { write-file(paths[i] ++ ".LEGAL.txt", notes.file) }
-    let text = if o.sourcemap then body ++ "//# sourceMappingURL=" ++ path-base(paths[i]) ++ ".map\n" else body
-    write-file(paths[i], text)
-    if o.sourcemap { write-file(paths[i] ++ ".map", map.build-map(done.text, pr.base, done.marks, paths[i])) }
-    print "{} bytes -> {}", len(text), paths[i]
-  }
-}
+# Each chunk printed, its placeholders filled once every chunk's name is known.
+fn chunks-written(o: Options, all: [chunks.Chunk]) -> [Written] =
+  [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths)... for i in 0..len(all)]
+  where printed = [chunk-program(o, c, all) for c in all],
+        texts = [p.text for p in printed],
+        holes = [chunks.holes-in(t) for t in texts],
+        base = base-dir(o),
+        paths = [chunk-path-of(o, c, chunks.content-hash(c.id, texts, holes), base, m.entries) for c in all]
+
+fn chunk-written(o: Options, c: chunks.Chunk, pr: Printed, holes: [chunks.Hole], path: Text, paths: [Text]) -> [Written] =
+  beside(path ++ ".LEGAL.txt", notes.file) ++ with-map(o, path, done.text ++ notes.tail, done.text, pr.base, done.marks)
+  where done = chunks.filled(pr.text, pr.base, pr.marks, holes, path, paths),
+        notes = legal.placed(o.legal-comments, legal-of-modules(some(c)), path)

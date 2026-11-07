@@ -482,14 +482,16 @@
 ;;; A function that gives a list partly made of what it gives itself, `fn f(…) -> [T]` calling `f`, is
 ;;; two functions, as a list-giving everywhere function is: `f-into!`, adding its answer to a list it
 ;;; is handed, which its own calls add to as well, and `f`, handing it an empty one. A recursion
-;;; then makes one list, not one per call copied into the next. Only one with no `return` and an
-;;; answer at its end.
+;;; then makes one list, not one per call copied into the next. So is one whose list a caller adds
+;;; to its own (spread, after `++`, or by `++=`), or that a function with a twin answers with: its
+;;; list goes straight into the caller's. Only one with no `return` and an answer at its end.
 (defn with-accumulators [(tree g/Node)] (-> g/Node)
   (let [decls (kid tree 2)
+        twinned (twinned-names (.kids decls))
         (mut out) (g/new-kids)
         (mut any) false]
     (for d (.kids decls)
-      (if (accumulates? d)
+      (if (and (accumulates? d) (has-name? twinned (.text (kid d 0))))
           (do (set! any true)
               (for f (accumulator-fns d) (push! (mut out) f)))
           (push! (mut out) d)))
@@ -538,6 +540,73 @@
        (match (answer-of (kid d 3))
          (Some [a] (or (calls-named? (kid d 3) (.text (kid d 0))) (builds-list? a)))
          (None [] false))))
+
+(defn has-name? [(names (ArrayList (slice u8))) (name (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for x names (when (= x name) (set! hit true)))
+    hit))
+
+(defn add-name! [(names (mut (ArrayList (slice u8)))) (name (slice u8))] (-> void)
+  (unless (has-name? names name) (push! (mut names) name))
+  0)
+
+;;; The functions of a module that get twins: those that call themselves, those whose lists a caller
+;;; adds to its own, and then those a function with a twin answers with, until there are no more.
+(defn twinned-names [(decls (ArrayList g/Node))] (-> (ArrayList (slice u8)))
+  (let [(mut wanted) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut out) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut changed) true]
+    (for d decls (spread-calls! d (mut wanted)))
+    (for d decls
+      (when (and (accumulates? d)
+                 (or (calls-named? (kid d 3) (.text (kid d 0))) (has-name? wanted (.text (kid d 0)))))
+        (add-name! (mut out) (.text (kid d 0)))))
+    (while changed
+      (set! changed false)
+      (for d decls
+        (when (and (accumulates? d) (has-name? out (.text (kid d 0))))
+          (match (answer-of (kid d 3))
+            (Some [a]
+              (let [(mut called) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                (answer-calls! a (mut called))
+                (for d2 decls
+                  (when (and (has-name? called (.text (kid d2 0))) (not (has-name? out (.text (kid d2 0))))
+                             (accumulates? d2))
+                    (add-name! (mut out) (.text (kid d2 0)))
+                    (set! changed true)))))
+            (None [] 0)))))
+    out))
+
+;;; Calls whose lists are added to another: spread, after or before `++`, or by `++=`.
+(defn spread-calls! [(n g/Node) (out (mut (ArrayList (slice u8))))] (-> void)
+  (match (.kind n)
+    (g/KSpread [] (note-call! (kid n 0) (mut out)))
+    (g/KCompSpread [] (note-call! (kid n 0) (mut out)))
+    (g/KConcat [] (do (note-call! (kid n 0) (mut out)) (note-call! (kid n 1) (mut out))))
+    (g/KExtend [] (note-call! (kid n 1) (mut out)))
+    (_ 0))
+  (for c (.kids n) (spread-calls! c (mut out)))
+  0)
+
+(defn note-call! [(e g/Node) (out (mut (ArrayList (slice u8))))] (-> void)
+  (cond
+    (= (.kind e) (g/KGroup)) (note-call! (kid e 0) (mut out))
+    (and (= (.kind e) (g/KCall)) (= (.kind (kid e 0)) (g/KName))) (add-name! (mut out) (.text (kid e 0)))
+    :else 0))
+
+;;; The calls an answer gives its list from, which a twin hands its list on to.
+(defn answer-calls! [(e g/Node) (out (mut (ArrayList (slice u8))))] (-> void)
+  (match (.kind e)
+    (g/KCall [] (note-call! e (mut out)))
+    (g/KConcat [] (do (answer-calls! (kid e 0) (mut out)) (answer-calls! (kid e 1) (mut out))))
+    (g/KCompSpread [] (note-call! (kid e 0) (mut out)))
+    (g/KMatch [] (for a (list-kids (kid e 1)) (answer-calls! (kid a 2) (mut out))))
+    (g/KMatchN [] (for a (list-kids (kid e 2)) (answer-calls! (kid a 3) (mut out))))
+    (g/KWhereE [] (answer-calls! (kid e 0) (mut out)))
+    (g/KGroup [] (answer-calls! (kid e 0) (mut out)))
+    (g/KWithCtx [] (match (answer-of (kid e 1)) (Some [a] (answer-calls! a (mut out))) (None [] 0)))
+    (_ 0))
+  0)
 
 ;;; A twin's arguments are values, so a function given something to change has none.
 (defn any-mut-param? [(params (ArrayList g/Node))] (-> bool)
@@ -735,6 +804,9 @@
       (param (mut f) "facts" (cat3 "[" module ".Fact]") false)
       (push! (mut (.funcs m)) f))
     (push! (mut (.funcs m)) (func-of "new-db" db))
+    (let [(mut f) (func-of "solved" db)]
+      (param (mut f) "facts" (cat3 "[" module ".Fact]") false)
+      (push! (mut (.funcs m)) f))
     (let [(mut f) (func-of "solve!" "Int")]
       (param (mut f) "db" db true)
       (push! (mut (.funcs m)) f))
@@ -1010,11 +1082,15 @@
 
 (defn bound-field [(name (slice u8))] (-> (slice u8)) (cat name "--bound"))
 
-;;; A module input's value, read where it has one.
+;;; A module input's value, read where it has one. The check is on the storage, which the field is
+;;; then read through, so a field of the value is read without copying the rest.
 (defn input-read [(k (mut Comp)) (x Global) (storage Code)] (-> Code)
-  `(do (when (= (~(primitive/code-symbol "." (bound-field (.name x))) ~storage) 0)
-         (panic ~(cat3 "the input " (.name x) " was read where nothing gave it a value")))
-       (~(primitive/code-symbol "." (.name x)) ~storage)))
+  (let [st (fresh (mut k) "storage")]
+    `(~(primitive/code-symbol "." (.name x))
+      (let [~(sym st) ~storage]
+        (when (= (~(primitive/code-symbol "." (bound-field (.name x))) ~(sym st)) 0)
+          (panic ~(cat3 "the input " (.name x) " was read where nothing gave it a value")))
+        ~(sym st)))))
 
 (defn add-global! [(k (mut Comp)) (ix i64) (module (slice u8)) (d g/Node) (assignable bool)] (-> void)
   (let [ty (resolve-type (mut k) module (kid d 1))
@@ -2451,11 +2527,22 @@
                              (unless (match (get (.seen ~(sym job-v)) ~(sym root-v)) (Some [_] true) (None [] false))
                                (set! (mut (.seen ~(sym job-v))) ~(sym root-v) true)
                                (push! (mut (.queue ~(sym job-v))) ~(sym root-v))))
+                           ;; What arrives where (`arrive!`) is counted afresh for each walk.
+                           (rt/arrivals-reset!)
                            (rt/run-workers (fnptr-of ~(sym body)) (cast (ptr i8) (mut ~(sym job-v))) ~(.code threads))
                            (let [(mut ~(sym res-v)) (ArrayList::new [~cr] (rt/tree-allocator))]
                              (for x (.results ~(sym job-v)) (push! (mut ~(sym res-v)) x))
                              ~(sym res-v)))
                         (cat3 "[" r "]"))))))
+      ;; `timed(on, label, e)`: `e`, and when `on`, how long it has been since the last lap said.
+      (and (= name "timed") (= count 3))
+        (let [on (expect (mut k) (get args 0) (expr (mut k) (get args 0) "Bool") "Bool")
+              label (expect (mut k) (get args 1) (expr (mut k) (get args 1) "Text") "Text")
+              v (expr (mut k) (get args 2) "")
+              x (fresh (mut k) "timed")]
+          (Some (if (= (.ty v) "Void")
+                    (te `(do ~(.code v) (when ~(.code on) (rt/lap! ~(.code label))) 0) "Void")
+                    (te `(let [~(sym x) ~(.code v)] (when ~(.code on) (rt/lap! ~(.code label))) ~(sym x)) (.ty v)))))
       (and (= name "include-text") (= count 1) (= (.kind (get args 0)) (g/KStr)))
         (Some (te `(~(sym "include-str") ~(str-literal (get args 0))) "Text"))
       :else (None [TE]))))
