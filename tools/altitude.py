@@ -11,7 +11,7 @@ import collections, glob, os, re, sys
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src/bundle")
 DECL = re.compile(r"\n(?=(?:everywhere |memo )?fn |on |rewrite |const |record |state |task state |context "
-                  r"|enum |inh |syn |given |collect |input |use |rules |attrs |include |#)")
+                  r"|enum |inh |syn |given |collect |input |setting |use |rules |attrs |include |#)")
 UNIT = re.compile(r"(?:everywhere |memo )?fn |on |rewrite ")
 IMPERATIVE = collections.OrderedDict([
     ("block",  re.compile(r"^(?:everywhere |memo )?fn [^=\n]*\{\s*$", re.M)),

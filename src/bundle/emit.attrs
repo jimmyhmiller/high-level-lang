@@ -11,19 +11,15 @@ use bundle.naming as nm
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
-# How the build emits, set once before it does: `undefined` as `void 0`, external imports hoisted as
-# ES imports, nodes stamped for a source map, and how many threads emit modules.
+# How the build emits: `undefined` as `void 0`, external imports hoisted as ES imports, nodes
+# stamped for a source map, and how many threads emit modules.
 record Emitting { void-undefined: Bool, esm-output: Bool, sourcemap: Bool, emit-threads: Int }
 
-state emitting: Emitting = Emitting(void-undefined: false, esm-output: false, sourcemap: false, emit-threads: 1)
-state external-imports: [Text] = []
-# What the module being emitted needs hoisted, gathered on its own thread.
-task state found-externals: [Text] = []
-# Code splitting: the statements of the chunk being printed, and what to write for the path of the
-# chunk each root module starts.
-state in-chunk: Bool = false
-state chunk-parts: {Int:Bool} = {}
-state chunk-paths: {Int:Text} = {}
+setting emitting: Emitting
+# Code splitting: the statements of the chunk being printed, none when it is the whole program; and
+# what to write for the path of the chunk each root module starts.
+setting chunk-parts: {Int:Bool}?
+setting chunk-paths: {Int:Text}
 
 fn chunk-path(root: Int) -> Text =
   chunk-paths[root] ?? panic "{} starts no chunk in this build", m.modules[root].path
@@ -33,16 +29,16 @@ context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
 fn import-symbol?(s: Int) -> Bool = nm.import-symbol?(s)
 
 # What a symbol finally means: an import means whatever it resolves to.
-fn target-of(s: Int) -> Int {
-  for m.db.import-of(s, ?d, ?n) {
-    match resolved-export(d, n) {
-      some(t) => return t
-      none => if m.db.dynamic(d) then return s
-              else panic "No matching export in {} for import {}", m.modules[d].path, name-of(m.names, n)
-    }
-  }
-  for m.db.ns-import(s, ?target) { return m.modules[target].ns-sym }
-  s
+fn target-of(s: Int) -> Int =
+  (first m.db.import-of(s, ?d, ?n): import-target(s, d, n))
+  ?? (first m.db.ns-import(s, ?target): m.modules[target].ns-sym)
+  ?? s
+
+# What an import of `n` from `d` means: its export, or with `export *` from CommonJS, itself.
+fn import-target(s: Int, d: Int, n: Int) -> Int = match resolved-export(d, n) {
+  some(t) => t
+  none if m.db.dynamic(d) => s
+  none => panic "No matching export in {} for import {}", m.modules[d].path, name-of(m.names, n)
 }
 
 fn included?(id: Int) -> Bool = nm.included?(id)
@@ -58,105 +54,83 @@ fn void-zero() -> Node = exp`void 0`
 # The CommonJS property this name reads, whether imported here or re-exported to here.
 fn cjs-import-of(leaf: Node) -> an.CjsImport? = match here.bindings[leaf.lo] {
   some(s) => match an.cjs-imports[s] {
-    some(ci) => some(ci)
-    none => if an.any-reexport then an.cjs-imports[target-of(s)] else none
+    none if an.any-reexport => an.cjs-imports[target-of(s)]
+    found => found
   }
   none => none
 }
 
-fn cjs-read(ci: an.CjsImport) -> Node {
-  let base = Ident(final-of(ci.import-var))
-  if ci.namespace then base else Member(base, PropName(ci.name))
+fn cjs-read(ci: an.CjsImport) -> Node = match ci.namespace {
+  true => Ident(final-of(ci.import-var))
+  false => Member(Ident(final-of(ci.import-var)), PropName(ci.name))
 }
 
-# The symbol an export name means in a module, preferring one that is not an import.
-# The last candidate that is not itself an import, or failing that the first.
+# The symbol an export name means in a module, preferring one that is not an import: the last
+# candidate that is not itself an import, or failing that the first.
 fn resolved-export(module: Int, name: Int) -> Int? =
-  match last m.db.resolved(module, name, ?c): if import-symbol?(c) then none else some(c) {
-    none => first m.db.resolved(module, name, ?c): some(c)
-    found => found
-  }
+  (last m.db.resolved(module, name, ?c) if not import-symbol?(c): c) ?? first m.db.resolved(module, name, ?c): c
 
 # What reading a symbol looks like in the output.
-fn symbol-read(s: Int) -> Node {
-  let t = target-of(s)
-  match an.cjs-imports[t] {
-    some(ci) => cjs-read(ci)
-    none => Ident(final-of(t))
-  }
-}
+fn symbol-read(s: Int) -> Node = match an.cjs-imports[t] {
+  some(ci) => cjs-read(ci)
+  none => Ident(final-of(t))
+} where t = target-of(s)
 
 fn namespace-property(target: Int, name: Text) -> Node = Member(Ident(final-of(m.modules[target].ns-sym)), PropName(name))
 
 # `ns.name` when `ns` is `import * as` of an ES module: the export itself.
 fn namespace-read(n: Node) -> Node? = match an.namespace-of(here, n.object) {
   none => none
-  # A name never interned is in no fact, so nothing exports it.
-  some(target) => {
-    let id = known-name(m.names, n.property.text)
-    match if id < 0 then none else resolved-export(target, id) {
-      some(s) => some(symbol-read(s))
-      none => some(if m.db.dynamic(target) then namespace-property(target, n.property.text) else void-zero())
-    }
+  some(target) => match exported(target, n.property.text) {
+    some(s) => some(symbol-read(s))
+    none if m.db.dynamic(target) => some(namespace-property(target, n.property.text))
+    none => some(void-zero())
   }
+}
+
+# What a module exports under a name. A name never interned is in no fact, so nothing exports it.
+fn exported(target: Int, name: Text) -> Int? = match known-name(m.names, name) {
+  id if id < 0 => none
+  id => resolved-export(target, id)
 }
 
 # An import of a name only `export *` from CommonJS can supply, known at run time.
-fn dynamic-read(s: Int) -> Node? {
-  if not an.any-dynamic { return none }
-  for m.db.import-of(s, ?d, ?n) {
-    if not m.db.resolved(d, n, _) and m.db.dynamic(d) {
-      return some(namespace-property(d, name-of(m.names, n)))
-    }
-  }
-  none
-}
+fn dynamic-read(s: Int) -> Node? =
+  first m.db.import-of(s, ?d, ?n) if an.any-dynamic and not m.db.resolved(d, n, _) and m.db.dynamic(d):
+    namespace-property(d, name-of(m.names, n))
 
-fn require-of(t: m.Module) -> Node {
-  let call-me = final-of(t.require-sym)
-  exp`$call_me()`
-}
+fn require-of(t: m.Module) -> Node = exp`$call_me()` where call-me = final-of(t.require-sym)
 
 # `require("x")` of a wrapped ES module: `(init_x(), __toCommonJS(x_exports))`.
-fn require-esm(t: m.Module) -> Node {
-  let init = final-of(t.init-sym)
-  let to-cjs = helper-name("__toCommonJS")
-  let ns = final-of(t.ns-sym)
-  exp`($init(), $to_cjs($ns))`
-}
+fn require-esm(t: m.Module) -> Node = exp`($init(), $to_cjs($ns))`
+  where init = final-of(t.init-sym),
+        to-cjs = helper-name("__toCommonJS"),
+        ns = final-of(t.ns-sym)
 
 # `import("x")`: nothing to fetch in one bundle, so a resolved promise of its namespace.
-fn import-call(t: m.Module) -> Node {
-  if t.kind == Cjs {
-    let to-esm = helper-name("__toESM")
-    let req = final-of(t.require-sym)
-    exp`Promise.resolve().then(() => $to_esm($req()))`
-  } else {
-    let init = final-of(t.init-sym)
-    let ns = final-of(t.ns-sym)
-    exp`Promise.resolve().then(() => ($init(), $ns))`
-  }
+fn import-call(t: m.Module) -> Node = match t.kind {
+  Cjs => exp`Promise.resolve().then(() => $to_esm($req()))`
+    where to-esm = helper-name("__toESM"),
+          req = final-of(t.require-sym)
+  _ => exp`Promise.resolve().then(() => ($init(), $ns))`
+    where init = final-of(t.init-sym),
+          ns = final-of(t.ns-sym)
 }
 
 # `import("x")` of a chunk: its file, and a CommonJS module's value comes out as its default export.
-fn import-chunk(t: m.Module) -> Node {
-  let path = Str(quote-text(chunk-path(t.id)))
-  if t.kind == Cjs {
-    let to-esm = helper-name("__toESM")
-    let param = if to-esm == "m" then "n" else "m"
-    exp`import($path).then(($param) => $to_esm($param.default))`
-  } else {
-    exp`import($path)`
-  }
-}
+fn import-chunk(t: m.Module) -> Node = match t.kind {
+  Cjs => exp`import($path).then(($param) => $to_esm($param.default))`
+    where to-esm = helper-name("__toESM"),
+          param = match to-esm { "m" => "n"  _ => "m" }
+  _ => exp`import($path)`
+} where path = Str(quote-text(chunk-path(t.id)))
 
 # Function-like kinds rebind `this`; arrows do not.
 fn rebinds-this?(n: Node) -> Bool = sc.function?(n.kind) and not (n is Arrow(...) | AsyncArrow(...))
 
-fn wrapper-param(name: Text) -> Int {
-  let wrapper = sym.scope-at(m.table, here.root).parent
-  sym.scope-at(m.table, wrapper).names[name] ?? panic "{}: a CommonJS wrapper has no {} symbol", here.path, name
-}
+fn wrapper-param(name: Text) -> Int =
+  sym.scope-at(m.table, sym.scope-at(m.table, here.root).parent).names[name]
+  ?? panic "{}: a CommonJS wrapper has no {} symbol", here.path, name
 
 # Identifiers take their final names, and what reads another module reads it as the bundle has it.
 # `depth` counts the functions, arrows aside, and class bodies around a node: `this` at the top of
@@ -172,20 +146,19 @@ rewrite BindName(_) as n => match here.bindings[n.lo] {
   some(s) => BindName(final-of(s)) with { lo: n.lo, hi: n.hi }
   none => n
 }
-rewrite This() as n =>
-  if depth > 0 then n
-  else if here.kind == Cjs then Ident(final-of(wrapper-param("exports")))
-  else void-zero()
-rewrite Shorthand(old) as n =>
-  if old.out is Ident(_) and old.out.text == old.text then n else Prop(PropName(old.text), old.out)
+rewrite This() as n if depth > 0 => n
+rewrite This() if here.kind == Cjs => Ident(final-of(wrapper-param("exports")))
+rewrite This() => void-zero()
+rewrite Shorthand(old) as n if old.out is Ident(_) and old.out.text == old.text => n
+rewrite Shorthand(old) => Prop(PropName(old.text), old.out)
 rewrite PatShort(old, init) => short-pattern(old, old.out, init.out)
 rewrite CallExpr(callee, _) as n => final-call(n, callee, n.out)
 rewrite Member(object, property) as n =>
   namespace-read(n) ?? Member(object.out, property) with { lo: object.out.lo, hi: property.hi }
 rewrite ImportCall(...) as n => match an.known-import-call-target(here, n) {
-  some(t) => if m.modules[t].kind == External then n
-             else if an.linking.splitting then import-chunk(m.modules[t])
-             else import-call(m.modules[t])
+  some(t) if m.modules[t].kind == External => n
+  some(t) if an.linking.splitting => import-chunk(m.modules[t])
+  some(t) => import-call(m.modules[t])
   none => n.out
 }
 rewrite ImportMeta() => exp`({})`.expr
@@ -197,104 +170,105 @@ fn without-empty(l: Node) -> Node = l with { kids: [k for k in l.kids if not (k 
 # A statement with its final names.
 fn rewritten(s: Node) -> Node = run(s).tree
 
-fn final-ident(n: Node, x: Text) -> Node = match cjs-import-of(n) {
-  some(ci) => cjs-read(ci)
-  none => match here.bindings[n.lo] {
-    some(s) => dynamic-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
-    # A free `undefined` is the shorter `void 0` under --minify-syntax.
-    none => if x in here.helpers then Ident(helper-name(x)) with { lo: n.lo, hi: n.hi }
-            else if emitting.void-undefined and x == "undefined" then void-zero() else n
-  }
+fn final-ident(n: Node, x: Text) -> Node = match cjs-import-of(n), here.bindings[n.lo] {
+  some(ci), _ => cjs-read(ci)
+  none, some(s) => dynamic-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
+  none, none if x in here.helpers => Ident(helper-name(x)) with { lo: n.lo, hi: n.hi }
+  # A free `undefined` is the shorter `void 0` under --minify-syntax.
+  none, none if emitting.void-undefined and x == "undefined" => void-zero()
+  none, none => n
 }
 
-fn short-pattern(old: Node, new: Node, init: Node) -> Node =
-  if new.text == old.text then PatShort(new, init) with { lo: new.lo, hi: init.hi }
-  else PatProp(PropName(old.text), BindElement(new, init) with { lo: new.lo, hi: init.hi })
+fn short-pattern(old: Node, new: Node, init: Node) -> Node = match new.text {
+  t if t == old.text => PatShort(new, init) with { lo: new.lo, hi: init.hi }
+  _ => PatProp(PropName(old.text), BindElement(new, init) with { lo: new.lo, hi: init.hi })
+}
 
 # `require("x")` becomes `require_x()`; a call of a CommonJS import keeps `this` undefined by
 # reading the function first: `(0, import_x.f)(…)`. `out` is the call with its parts rewritten.
-fn final-call(n: Node, callee: Node, out: Node) -> Node {
-  if let some(target) = an.known-require-target(here, n) {
-    let t = m.modules[target]
-    return match t.kind {
-      Cjs => require-of(t)
-      External => out
-      _ => require-esm(t)
-    }
-  }
-  let new-callee = out.callee
-  let import-read: an.CjsImport? = if callee is Ident(_) then cjs-import-of(callee) else none
-  let wrapped = match import-read {
-    some(ci) => if ci.namespace then new-callee else exp`(0, $new_callee)`
-    none => new-callee
-  }
-  CallExpr(wrapped, out.args) with { lo: wrapped.lo, hi: out.args.hi }
+fn final-call(n: Node, callee: Node, out: Node) -> Node = match an.known-require-target(here, n) {
+  some(target) => required(m.modules[target], out)
+  none => CallExpr(wrapped, out.args) with { lo: wrapped.lo, hi: out.args.hi }
+    where wrapped = callee-read(callee, out.callee)
 }
 
-fn init-call(t: m.Module) -> Node? {
-  if not t.wrapped { return none }
-  let init = final-of(t.init-sym)
-  some(stmt`$init();`)
+fn required(t: m.Module, out: Node) -> Node = match t.kind {
+  Cjs => require-of(t)
+  External => out
+  _ => require-esm(t)
+}
+
+fn callee-read(callee: Node, new-callee: Node) -> Node = match callee {
+  Ident(_) => match cjs-import-of(callee) {
+    some(ci) if not ci.namespace => exp`(0, $new_callee)`
+    _ => new-callee
+  }
+  _ => new-callee
+}
+
+fn init-call(t: m.Module) -> Node? = match t.wrapped {
+  true => some(stmt`$init();`) where init = final-of(t.init-sym)
+  false => none
 }
 
 # An external module, as an expression: `require("x")`, or in ES module output the namespace of an
 # `import * as` hoisted to the top of the file.
-fn external-object(t: m.Module) -> Node {
-  if emitting.esm-output {
-    let name = "__external_" ++ t.base
-    let line = "import * as " ++ name ++ " from \"" ++ t.path ++ "\";"
-    if not (line in found-externals) { found-externals += line }
-    Ident(name)
-  } else {
-    let path = Str(quote-text(t.path))
-    exp`require($path)`
-  }
+fn external-object(t: m.Module) -> Node = match emitting.esm-output {
+  true => Ident(external-name(t))
+  false => exp`require($path)` where path = Str(quote-text(t.path))
 }
+
+fn external-name(t: m.Module) -> Text = "__external_" ++ t.base
+
+# What a statement needs hoisted, in ES module output: the `import * as` of each external module it
+# reads as a namespace.
+fn externals-of(s: Node) -> [Text] = match s {
+  ImportBare(from) => external-lines(m.modules[an.known-dep(here, from)])
+  ExportAll(from) | ExportAllAs(_, from) | ExportFrom(_, from) | Import(_, from) =>
+    [x for t in [m.modules[an.known-dep(here, from)]] if an.opaque?(t) for x in external-lines(t)]
+  _ => []
+}
+
+fn external-lines(t: m.Module) -> [Text] =
+  ["import * as " ++ external-name(t) ++ " from \"" ++ t.path ++ "\";" for x in [t] if emitting.esm-output and x.kind == External]
 
 # `var import_x = __toESM(require_x(), 1);` Files in node mode (.mjs, or a package with
 # "type": "module") get the second argument, so `default` is module.exports.
-fn import-cjs-stmt(t: m.Module) -> Node {
-  let v = final-of(an.known-import-var(here, t.id))
-  let value = to-esm-call(t)
-  stmt`var $v = $value;`
-}
+fn import-cjs-stmt(t: m.Module) -> Node = stmt`var $v = $value;`
+  where v = final-of(an.known-import-var(here, t.id)),
+        value = to-esm-call(t)
 
-fn to-esm-call(t: m.Module) -> Node {
-  let to-esm = helper-name("__toESM")
-  let object = if t.kind == External then external-object(t) else require-of(t)
-  if m.node-mode?(here.path) then exp`$to_esm($object, 1)` else exp`$to_esm($object)`
-}
+fn to-esm-call(t: m.Module) -> Node = match m.node-mode?(here.path) {
+  true => exp`$to_esm($object, 1)`
+  false => exp`$to_esm($object)`
+} where to-esm = helper-name("__toESM"),
+        object = match t.kind {
+          External => external-object(t)
+          _ => require-of(t)
+        }
 
 # `export * from` CommonJS: `__reExport(x_exports, __toESM(require_y()));`
-fn reexport-all(t: m.Module) -> Node {
-  let re = helper-name("__reExport")
-  let ns = final-of(here.ns-sym)
-  let value = to-esm-call(t)
-  stmt`$re($ns, $value);`
-}
+fn reexport-all(t: m.Module) -> Node = stmt`$re($ns, $value);`
+  where re = helper-name("__reExport"),
+        ns = final-of(here.ns-sym),
+        value = to-esm-call(t)
 
-fn import-or-init(t: m.Module) -> Node? = if an.opaque?(t) then some(import-cjs-stmt(t)) else init-call(t)
+fn import-or-init(t: m.Module) -> Node? = match an.opaque?(t) {
+  true => some(import-cjs-stmt(t))
+  false => init-call(t)
+}
 
 # The body statements of a part, ready to print. None for a part with no code.
 fn part-output(s: Node) -> Node? = match s {
-  ImportBare(from) => {
-    let t = m.modules[an.known-dep(here, from)]
-    match t.kind {
-      Cjs => {
-        let call-me = final-of(t.require-sym)
-        some(stmt`$call_me();`)
-      }
-      External => {
-        let object = external-object(t)
-        some(stmt`$object;`)
-      }
-      _ => init-call(t)
-    }
-  }
-  ExportAll(from) => {
-    let t = m.modules[an.known-dep(here, from)]
-    if an.opaque?(t) then some(reexport-all(t)) else init-call(t)
-  }
+  ImportBare(from) => match t.kind {
+    Cjs => some(stmt`$call_me();`) where call-me = final-of(t.require-sym)
+    External => some(stmt`$object;`) where object = external-object(t)
+    _ => init-call(t)
+  } where t = m.modules[an.known-dep(here, from)]
+  ExportAll(from) => match an.opaque?(t) {
+    true => some(reexport-all(t))
+    false => init-call(t)
+  } where t = m.modules[an.known-dep(here, from)]
   ExportAllAs(_, from) | ExportFrom(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
   ExportNamed(...) => none
   Import(_, from) => import-or-init(m.modules[an.known-dep(here, from)])
@@ -304,66 +278,54 @@ fn part-output(s: Node) -> Node? = match s {
 }
 
 # For a source map: each leaf's offset gains its module, as (module+1)<<32 | offset.
-fn stamp-tree(n: Node, base: Int) -> Node {
-  let stamped = n with { kids: [stamp-tree(k, base) for k in n.kids] }
-  if n.lo > 0 and n.lo < 4294967296 then stamped with { lo: n.lo + base } else stamped
-}
+fn stamp-tree(n: Node, base: Int) -> Node = match n.lo {
+  lo if lo > 0 and lo < 4294967296 => stamped with { lo: lo + base }
+  _ => stamped
+} where stamped = n with { kids: [stamp-tree(k, base) for k in n.kids] }
 
-fn stamped(n: Node) -> Node = if emitting.sourcemap then stamp-tree(n, (here.id + 1) * 4294967296) else n
+fn stamped(n: Node) -> Node = match emitting.sourcemap {
+  true => stamp-tree(n, (here.id + 1) * 4294967296)
+  false => n
+}
 
 fn param-of(s: Int) -> Node = Param(BindName(final-of(s)), None())
 
 # `var require_x = __commonJS({ "path"(exports, module) { … } });`, leaving out parameters nothing
 # uses, as esbuild does.
-fn cjs-part() -> Node {
-  let e = wrapper-param("exports")
-  let mo = wrapper-param("module")
-  let use-module = sym.symbol-at(m.table, mo).uses > 0
-  let use-exports = use-module or sym.symbol-at(m.table, e).uses > 0
-  let body = [stamped(rewritten(s)) for s in here.tree.body.kids]
-  let name = final-of(here.require-sym)
-  let wrap = helper-name("__commonJS")
-  let path = Str(quote-text(here.path))
-  let params: [Node] =
-    if use-module then [param-of(e), param-of(mo)]
-    else if use-exports then [param-of(e)]
-    else []
-  stmt`var $name = $wrap({ $path($$params) { $$body } });`
-}
+fn cjs-part() -> Node = stmt`var $name = $wrap({ $path($$params) { $$body } });`
+  where e = wrapper-param("exports"),
+        mo = wrapper-param("module"),
+        body = [stamped(rewritten(s)) for s in here.tree.body.kids],
+        name = final-of(here.require-sym),
+        wrap = helper-name("__commonJS"),
+        path = Str(quote-text(here.path)),
+        params = match sym.symbol-at(m.table, mo).uses > 0, sym.symbol-at(m.table, e).uses > 0 {
+          true, _ => [param-of(e), param-of(mo)]
+          false, true => [param-of(e)]
+          false, false => []
+        }
 
 fn plain-key?(s: Text) -> Bool = len(s) > 0 and host.name-start-byte?(s[0]) and (all c in s: host.name-byte?(c))
 
-fn export-getter(name-id: Int) -> Node {
-  let name = name-of(m.names, name-id)
-  let s = resolved-export(here.id, name-id) ?? panic "{}: lost export {}", here.path, name
-  let target = symbol-read(s)
-  let getter = exp`() => $target`
-  Prop(if plain-key?(name) then PropName(name) else Str(quote-text(name)), getter)
-}
-
-fn unique-names(rows: [Int]) -> [Int] = [n for n in rows distinct n]
+fn export-getter(name-id: Int) -> Node = Prop(key, exp`() => $target`)
+  where name = name-of(m.names, name-id),
+        target = symbol-read(resolved-export(here.id, name-id) ?? panic "{}: lost export {}", here.path, name),
+        key = match name {
+          _ if plain-key?(name) => PropName(name)
+          _ => Str(quote-text(name))
+        }
 
 # `var x_exports = {}; __export(x_exports, { a: () => a, … });`, names sorted.
-fn namespace-stmts() -> [Node] {
-  let ns = final-of(here.ns-sym)
-  let names = unique-names([n for m.db.resolved(here.id, ?n, _)])
-  let sorted = sort n in names by name-of(m.names, n)
-  let getters = [export-getter(n) for n in sorted]
-  let export-all = helper-name("__export")
-  [stmt`var $ns = {};`, stmt`$export_all($ns, { $$getters });`]
-}
+fn namespace-stmts() -> [Node] = [stmt`var $ns = {};`, stmt`$export_all($ns, { $$getters });`]
+  where ns = final-of(here.ns-sym),
+        getters = [export-getter(n) for n in sort n in [n for m.db.resolved(here.id, ?n, _) distinct n] by name-of(m.names, n)],
+        export-all = helper-name("__export")
 
 # A binding pattern says the same thing as an assignment target, in other nodes.
 fn pattern-expr(t: Node) -> Node = match t {
   BindName(x) => Ident(x)
-  ArrayPattern(List(slots...)) => {
-    let items = [slot-expr(s) for s in slots]
-    ArrayLit(List(items...))
-  }
-  ObjectPattern(List(props...)) => {
-    let items = [prop-expr(p) for p in props]
-    ObjectLit(List(items...))
-  }
+  ArrayPattern(List(slots...)) => ArrayLit(List([slot-expr(s) for s in slots]...))
+  ObjectPattern(List(props...)) => ObjectLit(List([prop-expr(p) for p in props]...))
   _ => panic "unexpected binding pattern: {}", js.kind-name(t.kind)
 }
 
@@ -415,16 +377,15 @@ fn function-decl?(n: Node) -> Bool = n is FuncDecl(...) | GenDecl(...) | AsyncFu
 
 # `var a, b; function f() {} var init_x = __esm({ "path"() { a = 1; } });` A `var` statement inside
 # an initialiser: its names hoist out and its values become assignments. Functions hoist whole.
-fn wrapped-module(outputs: [Node]) -> [Node] {
-  let rest = [s for s in outputs if not function-decl?(s)]
-  let hoisted = [declared-names(d)... for VarDecl(List(ds...)) in rest for d in ds]
-  let body = [initializing(s)... for s in rest]
-  let name = final-of(here.init-sym)
-  let wrap = helper-name("__esm")
-  let path = Str(quote-text(here.path))
-  (if len(hoisted) > 0 then [VarDecl(List(hoisted...))] else []) ++ [s for s in outputs if function-decl?(s)]
+fn wrapped-module(outputs: [Node]) -> [Node] =
+  [VarDecl(List(hoisted...)) for h in [hoisted] if len(h) > 0] ++ [s for s in outputs if function-decl?(s)]
   ++ [stmt`var $name = $wrap({ $path() { $$body } });`]
-}
+  where rest = [s for s in outputs if not function-decl?(s)],
+        hoisted = [declared-names(d)... for VarDecl(List(ds...)) in rest for d in ds],
+        body = [initializing(s)... for s in rest],
+        name = final-of(here.init-sym),
+        wrap = helper-name("__esm"),
+        path = Str(quote-text(here.path))
 
 # A wrapped module's variables are declared outside it and set inside it.
 fn declared-names(d: Node) -> [Node] = match d {
@@ -440,14 +401,18 @@ fn initializing(s: Node) -> [Node] = match s {
 
 # `x = init;`, and `({ a, b } = init);` with the names hoisted, as esbuild does.
 fn assigning(d: Node) -> [Node] = match d {
-  Declarator(BindName(x), init) => if init is None() then [] else [stmt`$x = $init;`]
+  Declarator(BindName(_), None()) => []
+  Declarator(BindName(x), init) => [stmt`$x = $init;`]
   Declarator(target, init) => [ExprStmt(Assignment(pattern-expr(target), AssignOp("="), init))]
   _ => panic "a declaration list holds declarators"
 }
 
 # Every live statement, in module order. Namespace objects go right after the runtime: their
 # getters are all functions, so this makes them safe to read from any module's top level.
-fn in-this-chunk?(p: Int) -> Bool = not in-chunk or p in chunk-parts
+fn in-this-chunk?(p: Int) -> Bool = match chunk-parts {
+  some(parts) => p in parts
+  none => true
+}
 
 fn any-part-here?(id: Int) -> Bool = any p in parts-of(id): in-this-chunk?(p)
 
@@ -463,43 +428,46 @@ const unit-parts: Int = 64
 
 fn units-of-order() -> [Unit] = [module-units(id)... for id in m.order]
 
-fn module-units(id: Int) -> [Unit] {
-  let mo = m.modules[id]
-  let n = len(parts-of(id))
-  if not (mo.kind == m.Esm and not mo.wrapped and n > 2 * unit-parts) { return [Unit(module: id, from: 0, to: n)] }
-  [Unit(module: id, from: k * unit-parts, to: min(n, (k + 1) * unit-parts)) for k in 0..(n + unit-parts - 1) / unit-parts]
+fn module-units(id: Int) -> [Unit] = match m.modules[id] {
+  m.Module(kind: m.Esm, wrapped: false, ...) if n > 2 * unit-parts =>
+    [Unit(module: id, from: k * unit-parts, to: min(n, (k + 1) * unit-parts)) for k in 0..(n + unit-parts - 1) / unit-parts]
+  _ => [Unit(module: id, from: 0, to: n)]
+} where n = len(parts-of(id))
+
+fn unit-emitted(u: Unit) -> Emitted = match included?(u.module) and any-part-here?(u.module) {
+  false => Emitted(body: [], namespace: [], externals: [])
+  true => with here = m.modules[u.module] { module-emitted(u) }
 }
 
-fn unit-emitted(u: Unit) -> Emitted {
-  found-externals = []
-  if not (included?(u.module) and any-part-here?(u.module)) { return Emitted(body: [], namespace: [], externals: []) }
-  with here = m.modules[u.module] {
-    if here.kind == Cjs {
-      let body = [cjs-part()]
-      Emitted(body: body, namespace: [], externals: found-externals)
-    } else {
-      # Each part in order, as what it adds to the namespace object or to the body.
-      let pieces = [part-emitted(p) for p in parts-of(u.module)[u.from..u.to] if live?(p) and in-this-chunk?(p)]
-      let outputs = [s for pc in pieces for s in pc.body]
-      Emitted(body: if here.wrapped then wrapped-module(outputs) else outputs,
-              namespace: [s for pc in pieces for s in pc.namespace], externals: found-externals)
-    }
-  }
+fn module-emitted(u: Unit) -> Emitted = match here.kind {
+  Cjs => Emitted(body: [cjs-part()], namespace: [], externals: [])
+  # Each part in order, as what it adds to the namespace object or to the body.
+  _ => Emitted(body: match here.wrapped {
+                       true => wrapped-module(outputs)
+                       false => outputs
+                     },
+               namespace: [s for pc in pieces for s in pc.namespace],
+               externals: [x for pc in pieces for x in pc.externals distinct x])
+    where pieces = [part-emitted(p) for p in parts-of(u.module)[u.from..u.to] if live?(p) and in-this-chunk?(p)],
+          outputs = [s for pc in pieces for s in pc.body]
 }
 
 fn part-emitted(p: Int) -> Emitted = match an.part-stmt[p] {
   None() => Emitted(body: [], namespace: namespace-stmts(), externals: [])
   Flag() => Emitted(body: [], namespace: [], externals: [])
-  s => Emitted(body: [stamped(o) for some(o) in [part-output(s)]], namespace: [], externals: [])
+  s => Emitted(body: [stamped(o) for some(o) in [part-output(s)]], namespace: [], externals: externals-of(s))
 }
 
-fn program() -> Node {
-  let units = units-of-order()
-  let emitted = parallel-map(units, unit-emitted, emitting.emit-threads)
-  external-imports ++= [line for em in emitted for line in em.externals if not (line in external-imports) distinct line]
-  # The namespace objects go after the runtime's statements and before everything else.
-  let runtime-units = (last i in 0..len(units): if units[i].module == 0 then some(i + 1) else none) ?? 0
-  let runtime = [s for em in emitted[0..runtime-units] for s in em.body]
-  let rest = [s for em in emitted[runtime-units..len(emitted)] for s in em.body]
-  Program(None(), List((runtime ++ [s for em in emitted for s in em.namespace] ++ rest)...))
-}
+# The program, and the imports to hoist above it, each once.
+record Emission { tree: Node, externals: [Text] }
+
+# Every live statement, in module order. The namespace objects go after the runtime's statements
+# and before everything else.
+fn program() -> Emission =
+  Emission(tree: Program(None(), List((runtime ++ [s for em in emitted for s in em.namespace] ++ rest)...)),
+           externals: [line for em in emitted for line in em.externals distinct line])
+  where units = units-of-order(),
+        emitted = parallel-map(units, unit-emitted, emitting.emit-threads),
+        runtime-units = (last i in 0..len(units) if units[i].module == 0: i + 1) ?? 0,
+        runtime = [s for em in emitted[0..runtime-units] for s in em.body],
+        rest = [s for em in emitted[runtime-units..len(emitted)] for s in em.body]

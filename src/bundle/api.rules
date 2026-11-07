@@ -266,7 +266,7 @@ fn exports-of-root(root: Int) -> [Node] {
   if m.db.dynamic(root) {
     panic "{}: `export *` from a CommonJS or external module in the entry point of ES module output is not implemented yet", m.modules[root].path
   }
-  let found = [exported(name-of(m.names, n), s) for n in e.unique-names([n for m.db.resolved(root, ?n, _)])
+  let found = [exported(name-of(m.names, n), s) for n in [n for m.db.resolved(root, ?n, _) distinct n]
                if let some(s) = e.resolved-export(root, n)]
   let specs = [x.spec for x in found]
   [h for x in found for h in x.hoisted] ++ (if len(specs) == 0 then [] else [ExportNamed(List(specs...))])
@@ -606,11 +606,10 @@ fn emitting-of(o: Options, esm-output: Bool) -> e.Emitting =
   e.Emitting(void-undefined: o.minify-syntax, esm-output: esm-output, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
 
 # A new build: every module's state as it starts, and what it was told.
-fn configure!(o: Options, loading: m.Loading, linking: an.Linking, emitting: e.Emitting) -> Void {
+fn configure!(o: Options, loading: m.Loading, linking: an.Linking) -> Void {
   reset-all(o)
   m.loading = loading
   an.linking = linking
-  e.emitting = emitting
   printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii)
 }
 
@@ -619,7 +618,6 @@ fn reset-all(o: Options) -> Void {
   m.forget-memos!()
   arrivals-reset!()
   an.reset-state!()
-  e.reset-state!()
 }
 
 # The names esbuild gives output files: the entry's path below the entries' common directory.
@@ -699,8 +697,12 @@ fn build-one(options: Options) -> Void {
   }
   let o = with-node-env(options)
   let f = if o.format.export-names or len(o.format.exports) > 0 then o.format else named(o.format, o.global-name)
-  configure!(o, loading-of(o, dir-of(o.outfile)), linking-of(o, len(f.exports) > 0, f.export-names, false),
-             emitting-of(o, f.hoist-externals))
+  configure!(o, loading-of(o, dir-of(o.outfile)), linking-of(o, len(f.exports) > 0, f.export-names, false))
+  with e.emitting = emitting-of(o, f.hoist-externals), e.chunk-parts = none { loaded-build(o, f) }
+}
+
+# A build once it is set up: load, link, name, and the rest.
+fn loaded-build(o: Options, f: Format) -> Void {
   lap(o, "startup")
   m.load-runtime(include-text("runtime.js"))
   m.parse-ahead!([o.entry])
@@ -721,14 +723,15 @@ fn final-names(o: Options) -> [Text] = match o.minify-identifiers {
 # The rest of a build, once every symbol has its name.
 fn named-build(o: Options, f: Format) -> Void {
   lap(o, "naming")
-  let emitted = run-entry(e.program())
+  let emission = e.program()
+  let emitted = run-entry(emission.tree)
   lap(o, "emit: rewrite identifiers")
   let fused = fusable?(o)
   let p = if fused then emitted else for-target(o, if o.minify-syntax then optimized(o, emitted) else folded(o, emitted))
   lap(o, "minify rules")
   let out0 = if fused then finished-output(o, f, p) else wrap-format(o, f, p)
   # The banner and hoisted external imports come first, ahead of everything the map describes.
-  let head = (if len(o.banner) > 0 then o.banner ++ "\n" else "") ++ join(e.external-imports, "")
+  let head = (if len(o.banner) > 0 then o.banner ++ "\n" else "") ++ join(emission.externals, "")
   let footer = if len(o.footer) > 0 then o.footer ++ "\n" else ""
   let notes = legal.placed(o.legal-comments, legal-of-modules(none), o.outfile)
   let full = head ++ out0.text ++ footer ++ notes.tail
@@ -781,14 +784,12 @@ fn root-statements(root: Int) -> [Node] {
 
 # The body of one chunk, as text with placeholders in it.
 fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk]) -> Printed {
-  e.in-chunk = true
-  e.chunk-parts = c.parts
-  e.external-imports = []
-  let body = e.program()
+  let emission = with e.chunk-parts = some(c.parts) { e.program() }
+  let body = emission.tree
   let p = for-target(o, if o.minify-syntax then o.optimize(body) else fold.run(body))
   let stmts = chunks.imports-of(c, all) ++ p.body.kids ++ (if c.root >= 0 then root-statements(c.root) else []) ++ chunks.exports-of(c, all)
   let r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
-  let head = join(e.external-imports, "")
+  let head = join(emission.externals, "")
   Printed(text: head ++ r.text ++ "\n", base: len(head), marks: r.marks)
 }
 
@@ -805,7 +806,12 @@ fn build-split(options: Options) -> Void {
   if len(options.outdir) == 0 { panic "code splitting needs --outdir" }
   if not options.format.export-names { panic "code splitting needs --format=esm" }
   let o = with-node-env(options)
-  configure!(o, loading-of(o, o.outdir), linking-of(o, false, true, true), emitting-of(o, true))
+  configure!(o, loading-of(o, o.outdir), linking-of(o, false, true, true))
+  with e.emitting = emitting-of(o, true) { loaded-split(o) }
+}
+
+# A split build once it is set up.
+fn loaded-split(o: Options) -> Void {
   m.load-runtime(include-text("runtime.js"))
   m.load-trees(o.entries)
   if len(m.css-imports()) > 0 { panic "stylesheets with --splitting are not implemented yet" }
@@ -818,8 +824,11 @@ fn named-split(o: Options) -> Void {
   let roots = m.entries ++ an.dynamic-roots
   let all = chunks.chunks-of(roots)
   chunk-of-root = {c.root: c.id for c in all if c.root >= 0}
-  e.chunk-paths = {}
-  for root in roots { e.chunk-paths[root] = path-of-root(root) }
+  with e.chunk-paths = {root: path-of-root(root) for root in roots} { written-chunks(o, all) }
+}
+
+# Each chunk printed, its placeholders filled once every chunk's name is known, and written.
+fn written-chunks(o: Options, all: [chunks.Chunk]) -> Void {
   let printed-chunks = [chunk-program(o, c, all) for c in all]
   let texts = [p.text for p in printed-chunks]
   let holes = [chunks.holes-in(t) for t in texts]
