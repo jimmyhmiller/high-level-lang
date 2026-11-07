@@ -13,8 +13,8 @@ record Placed { path: Text, media: [Node] }
 # A copied file: where it came from, and where it went.
 record Asset { from: Text, to: Text }
 
-state assets: [Asset] = []
-state loaders: {Text:Text} = {}
+# How each kind of file a stylesheet names is loaded, by extension.
+input loaders: {Text:Text}
 
 memo fn tree-of(path: Text) -> Node = css.parse(read-file(path), path)
 
@@ -30,37 +30,35 @@ fn without-space(xs: [Node]) -> [Node] = [x for x in xs if not space?(x)]
 record Import { spec: Text, media: [Node] }
 
 fn import-of(rule: Node) -> Import? = match rule {
-  AtRule(AtName(name), List(parts...), AtSemi()) => {
-    if name != "@import" { return none }
-    let comps = without-space(parts)
-    if len(comps) == 0 { return none }
-    let spec: Text? = match comps[0] {
-      Str(raw) => some(unquote(raw))
-      Url(raw) => some(url-text(raw))
-      Func(FuncName(f), List(inner...)) => {
-        let args = without-space(inner)
-        if (f == "url(" or f == "URL(") and len(args) == 1 and args[0] is Str(_) then some(unquote(args[0].text)) else none
-      }
-      _ => none
-    }
-    match spec {
-      none => none
-      some(s) => {
-        if any Func(FuncName("layer("), ...) | Func(FuncName("supports("), ...) | Ident("layer") in comps: true {
-          panic "@import with layer() or supports() is not implemented yet"
-        }
-        let after = first i in 0..len(parts): if parts[i].lo == comps[0].lo then some(i + 1) else none
-        some(Import(spec: s, media: trimmed(parts[after ?? len(parts)..len(parts)])))
-      }
-    }
+  AtRule(AtName("@import"), List(parts...), AtSemi()) => match without-space(parts) {
+    [head, ...] as comps => first s in import-spec(head): import-at(s, parts, comps)
+    _ => none
   }
   _ => none
 }
 
-fn trimmed(xs: [Node]) -> [Node] {
-  let from = len([x for x in xs while space?(x)])
-  xs[from..max(from, len(xs) - len([x for x in reversed(xs) while space?(x)]))]
+fn import-spec(n: Node) -> Text? = match n {
+  Str(raw) => some(unquote(raw))
+  Url(raw) => some(url-text(raw))
+  Func(FuncName(f), List(inner...)) => url-arg(f, inner)
+  _ => none
 }
+
+# `url("x")`: what it names.
+fn url-arg(f: Text, inner: [Node]) -> Text? = match f, without-space(inner) {
+  "url(" | "URL(", [Str(raw)] => some(unquote(raw))
+  _, _ => none
+}
+
+# The import, and the media query after what it names. One with a layer or a condition is not done yet.
+fn import-at(spec: Text, parts: [Node], comps: [Node]) -> Import = match comps {
+  _ if any Func(FuncName("layer("), ...) | Func(FuncName("supports("), ...) | Ident("layer") in comps: true =>
+    panic "@import with layer() or supports() is not implemented yet"
+  [head, ...] => Import(spec: spec, media: trimmed([p for p in parts if p.lo > head.lo]))
+}
+
+fn trimmed(xs: [Node]) -> [Node] = xs[from..max(from, len(xs) - len([x for x in reversed(xs) while space?(x)]))]
+  where from = len([x for x in xs while space?(x)])
 
 # `url(  a.png )`: what it names.
 fn url-text(raw: Text) -> Text = trim-bytes(raw[4..len(raw) - 1], " \t\n")
@@ -68,39 +66,39 @@ fn url-text(raw: Text) -> Text = trim-bytes(raw[4..len(raw) - 1], " \t\n")
 fn charset-rule?(n: Node) -> Bool = n is AtRule(AtName("@charset"), ...)
 
 # The `@import`s at the start of a file. Any later one is not an import, and stays as written.
-fn leading-imports(sheet: Node) -> [Node] {
+fn leading-imports(sheet: Node) -> [Node] =
   [item for item in items-of(sheet)
-         while is-some(import-of(item)) or space?(item) or charset-rule?(item) or item is Cdo() | Cdc()
-         if is-some(import-of(item))]
+        while is-some(import-of(item)) or space?(item) or charset-rule?(item) or item is Cdo() | Cdc()
+        if is-some(import-of(item))]
+
+fn css-spec(spec: Text) -> Text = match spec {
+  "./" ++ _ | "../" ++ _ | "/" ++ _ => spec
+  _ => "./" ++ spec
 }
 
-fn css-spec(spec: Text) -> Text =
-  if starts-with(spec, "./") or starts-with(spec, "../") or starts-with(spec, "/") then spec else "./" ++ spec
-
-# Every file in the order its rules apply. A file imported twice counts where it last appears, which
-# is where its rules would win.
-# A stylesheet after what it imports, those after theirs.
-fn visit(path: Text, media: [Node]) -> [Placed] {
-  let sheet = tree-of(path)
-  [imported(path, media, imp)... for item in leading-imports(sheet) if let some(imp) = import-of(item)
+# Every file in the order its rules apply: a stylesheet after what it imports, those after theirs.
+fn visit(path: Text, media: [Node]) -> [Placed] =
+  [imported(path, media, imp)... for item in leading-imports(tree-of(path)) if let some(imp) = import-of(item)
    if not external-url?(imp.spec)] ++ [Placed(path: path, media: media)]
+
+fn imported(path: Text, media: [Node], imp: Import) -> [Placed] =
+  visit(res.resolve(css-spec(imp.spec), path).path, inner-media(path, media, imp.media))
+
+fn inner-media(path: Text, outer: [Node], inner: [Node]) -> [Node] = match inner, outer {
+  [], _ => outer
+  _, [] => inner
+  _, _ => panic "{}: an import with a media query inside another is not implemented yet", path
 }
 
-fn imported(path: Text, media: [Node], imp: Import) -> [Placed] {
-  let target = res.resolve(css-spec(imp.spec), path).path
-  let inner = if len(imp.media) == 0 then media else if len(media) == 0 then imp.media
-              else panic "{}: an import with a media query inside another is not implemented yet", path
-  visit(target, inner)
-}
-
-# Each stylesheet once, where it last appears.
-fn order-of(entries: [Text]) -> [Placed] {
-  let all = [visit(e, [])... for e in entries]
+# Each stylesheet once, where it last appears, which is where its rules would win.
+fn order-of(entries: [Text]) -> [Placed] =
   [all[i] for i in 0..len(all) if not (any j in i + 1..len(all): all[j].path == all[i].path)]
-}
+  where all = [visit(e, [])... for e in entries]
 
-fn external-url?(s: Text) -> Bool =
-  starts-with(s, "data:") or starts-with(s, "http:") or starts-with(s, "https:") or starts-with(s, "//") or starts-with(s, "#")
+fn external-url?(s: Text) -> Bool = match s {
+  "data:" ++ _ | "http:" ++ _ | "https:" ++ _ | "//" ++ _ | "#" ++ _ => true
+  _ => false
+}
 
 # ---------------------------------------------------------------- url()
 
@@ -109,32 +107,43 @@ fn loader-for(path: Text) -> Text = loaders[path-ext(path)] ?? ""
 # A file that a stylesheet or a module names, put where the output can reach it.
 fn asset-url(path: Text, out-dir: Text, from-file: Text) -> Text = match loader-for(path) {
   "dataurl" => host.data-url-of(read-file(path), host.mime-of(path))
-  "file" => file-asset(path, out-dir, from-file)
+  "file" => file-url(path)
   "" => panic "{}: no loader is configured for \"{}\" files", from-file, path-ext(path)
   other => panic "{}: the {} loader cannot be used from CSS", from-file, other
 }
 
-fn file-asset(path: Text, out-dir: Text, from-file: Text) -> Text {
-  let text = read-file(path)
-  let name = path-stem(path) ++ "-" ++ host.content-hash(text) ++ path-ext(path)
-  let to = out-dir ++ "/" ++ name
-  if not (any a in assets: a.to == to) { assets += Asset(from: path, to: to) }
-  "./" ++ name
-}
+# A file copied beside the output, named for what is in it.
+memo fn asset-name(path: Text) -> Text = path-stem(path) ++ "-" ++ host.content-hash(read-file(path)) ++ path-ext(path)
+
+fn file-url(path: Text) -> Text = "./" ++ asset-name(path)
+
+fn asset-of(path: Text, out-dir: Text) -> Asset = Asset(from: path, to: out-dir ++ "/" ++ asset-name(path))
 
 everywhere fn rewritten-urls(n: Node, file: Text, out-dir: Text) -> Node = match n {
-  Url(raw) => {
-    let target = url-text(raw)
-    if external-url?(target) then n else url-func(asset-url(path-normalize(dir-of(file) ++ "/" ++ target), out-dir, file))
+  Url(raw) => url-rewritten(n, url-text(raw), file, out-dir)
+  Func(FuncName(f), List(inner...)) => match url-arg(f, inner) {
+    some(target) => url-rewritten(n, target, file, out-dir)
+    none => n with { args: rewritten-urls(n.args, file, out-dir) }
   }
-  Func(FuncName(f), List(inner...)) => {
-    let args = without-space(inner)
-    if (f == "url(" or f == "URL(") and len(args) == 1 and args[0] is Str(_) {
-      let target = unquote(args[0].text)
-      if external-url?(target) then n else url-func(asset-url(path-normalize(dir-of(file) ++ "/" ++ target), out-dir, file))
-    } else {
-      n with { args: rewritten-urls(n.args, file, out-dir) }
-    }
+}
+
+fn url-rewritten(n: Node, target: Text, file: Text, out-dir: Text) -> Node = match local-url(target, file) {
+  [path] => url-func(asset-url(path, out-dir, file))
+  _ => n
+}
+
+# Where a url names a file of the build's: beside the stylesheet, unless it is elsewhere.
+fn local-url(target: Text, file: Text) -> [Text] = match target {
+  _ if external-url?(target) => []
+  _ => [path-normalize(dir-of(file) ++ "/" ++ target)]
+}
+
+# The files a stylesheet's urls name.
+everywhere fn urls-in(n: Node, file: Text) -> [Text] = match n {
+  Url(raw) => local-url(url-text(raw), file)
+  Func(FuncName(f), List(inner...)) => match url-arg(f, inner) {
+    some(target) => local-url(target, file)
+    none => urls-in(n.args, file)
   }
 }
 
@@ -152,11 +161,13 @@ fn tight?(n: Node) -> Bool = match n {
 
 # Space in a list of tokens: none at either end, one byte where it is kept, and none beside a comma,
 # or beside a combinator in a selector. Inside `calc()` a `+` needs its spaces.
-fn squeezed(xs: [Node], selector: Bool) -> [Node] {
-  let ts = trimmed(xs)
-  fold out = [] for i in 0..len(ts):
-    out ++ (if not space?(ts[i]) then [minified(ts[i], false)]
-            else if space-kept?(last(out), ts[i + 1], selector) then [Ws(" ")] else [])
+fn squeezed(xs: [Node], selector: Bool) -> [Node] = fold out = [] for i in 0..len(ts): out ++ squeezed-at(ts, i, out, selector)
+  where ts = trimmed(xs)
+
+fn squeezed-at(ts: [Node], i: Int, out: [Node], selector: Bool) -> [Node] = match ts[i] {
+  t if not space?(t) => [minified(t, false)]
+  _ if space-kept?(last(out), ts[i + 1], selector) => [Ws(" ")]
+  _ => []
 }
 
 fn space-kept?(before: Node, after: Node, selector: Bool) -> Bool =
@@ -178,10 +189,13 @@ fn minified(n: Node, selector: Bool) -> Node = match n {
 }
 
 # A block's items: no space, no empty rule, and no `;` the `}` makes unneeded.
-fn block-items(xs: [Node]) -> [Node] {
-  let out = [minified(x, x is Rule(_, Block(_))) for x in xs if kept-in-block?(x)]
-  # Declarations are separated by `;`: put them back between items that need them.
-  [(if i + 1 < len(out) and (out[i] is Decl(...) | CustomDecl(...)) then [out[i], Semi()] else [out[i]])... for i in 0..len(out)]
+fn block-items(xs: [Node]) -> [Node] = [separated(out, i)... for i in 0..len(out)]
+  where out = [minified(x, x is Rule(_, Block(_))) for x in xs if kept-in-block?(x)]
+
+# Declarations are separated by `;`, put back between items that need them.
+fn separated(out: [Node], i: Int) -> [Node] = match out[i] {
+  Decl(...) | CustomDecl(...) if i + 1 < len(out) => [out[i], Semi()]
+  x => [x]
 }
 
 fn kept-in-block?(x: Node) -> Bool = match x {
@@ -192,58 +206,66 @@ fn kept-in-block?(x: Node) -> Bool = match x {
 
 # ---------------------------------------------------------------- the bundle
 
-fn wrapped-in-media(items: [Node], media: [Node]) -> [Node] =
-  if len(media) == 0 then items
-  else [AtRule(AtName("@media"), list-of([Ws(" ")] ++ media ++ [Ws(" ")]), Block(List(items...)))]
-
-fn body-items(path: Text) -> [Node] {
-  let leading = leading-imports(tree-of(path))
-  [x for x in items-of(tree-of(path)) if not (charset-rule?(x) or (any l in leading: l.lo == x.lo and l is AtRule(...)))]
+fn wrapped-in-media(items: [Node], media: [Node]) -> [Node] = match media {
+  [] => items
+  _ => [AtRule(AtName("@media"), list-of([Ws(" ")] ++ media ++ [Ws(" ")]), Block(List(items...)))]
 }
+
+fn body-items(path: Text) -> [Node] =
+  [x for x in items-of(tree-of(path)) if not (charset-rule?(x) or (any l in leading: l.lo == x.lo and l is AtRule(...)))]
+  where leading = leading-imports(tree-of(path))
+
+# What bundling stylesheets makes: the text, the legal comments' own file when they have one, and
+# the files its urls name, copied beside it.
+record Bundled { text: Text, legal: Text, assets: [Asset] }
 
 # The stylesheet for these entry files, written to `outfile`.
-fn bundle(entries: [Text], outfile: Text, minify: Bool, pretty: Bool, legal-mode: Text) -> Text {
-  let out-dir = dir-of(outfile)
-  let order = order-of(entries)
-  let items = [i for p in order
-                 for i in wrapped-in-media([without-notes(rewritten-urls(x, p.path, out-dir)) for x in body-items(p.path)], p.media)]
-  let notes = [t for p in order for x in body-items(p.path) for t in notes-in(x)]
-  let whole = Sheet(List(items...))
-  let sheet = if minify then minified(whole, false) else whole
-  let charset = any p in order: any item in items-of(tree-of(p.path)): charset-rule?(item)
-  let head = if charset then (if minify then "@charset \"UTF-8\";" else "@charset \"UTF-8\";\n") else ""
-  let kept = if minify then legal.once-last(notes) else legal.once(notes)
-  let placement = legal.placed(legal-mode, legal.notes-of(kept), outfile)
-  if len(placement.file) > 0 { write-file(outfile ++ ".LEGAL.txt", placement.file) }
-  head ++ css.render(sheet, pretty and not minify) ++ "\n" ++ placement.tail
-}
+fn bundle(entries: [Text], outfile: Text, minify: Bool, pretty: Bool, legal-mode: Text) -> Bundled =
+  Bundled(text: head ++ css.render(sheet, pretty and not minify) ++ "\n" ++ placement.tail,
+          legal: placement.file,
+          assets: [asset-of(u, out-dir) for p in order for x in body-items(p.path) for u in urls-in(x, p.path)
+                   if loader-for(u) == "file"])
+  where out-dir = dir-of(outfile),
+        order = order-of(entries),
+        items = [i for p in order
+                   for i in wrapped-in-media([without-notes(rewritten-urls(x, p.path, out-dir)) for x in body-items(p.path)], p.media)],
+        notes = [t for p in order for x in body-items(p.path) for t in notes-in(x)],
+        sheet = match minify {
+          true => minified(Sheet(List(items...)), false)
+          false => Sheet(List(items...))
+        },
+        charset = any p in order: any item in items-of(tree-of(p.path)): charset-rule?(item),
+        head = match charset, minify {
+          true, true => "@charset \"UTF-8\";"
+          true, false => "@charset \"UTF-8\";\n"
+          false, _ => ""
+        },
+        kept = match minify {
+          true => legal.once-last(notes)
+          false => legal.once(notes)
+        },
+        placement = legal.placed(legal-mode, legal.notes-of(kept), outfile)
 
 # Whitespace as comments and what is between them.
 fn spaced(t: Text) -> [cm.Node] = match cm.parse(t, "<comments>") {
   cm.Scan(List(pieces...)) => pieces
-  _ => panic "whitespace scans to pieces"
 }
 
 fn legal-note?(p: cm.Node) -> Bool = p is cm.Comment(_) and legal.legal?(p.text)
 
 # Legal comments leave the space they were in, for the end of the file.
 everywhere fn without-notes(n: Node) -> Node = match n {
-  Ws(t) if legal.worth-looking?(t) => {
-    let rest = join([p.text for p in spaced(t) if not legal-note?(p)], "")
-    Ws(if len(rest) == 0 then " " else rest) with { lo: n.lo, hi: n.hi }
-  }
+  Ws(t) if legal.worth-looking?(t) => Ws(match join([p.text for p in spaced(t) if not legal-note?(p)], "") {
+    "" => " "
+    rest => rest
+  }) with { lo: n.lo, hi: n.hi }
 }
 
 everywhere fn notes-in(n: Node) -> [Text] = match n {
   Ws(t) if legal.worth-looking?(t) => [p.text for p in spaced(t) if legal-note?(p)]
 }
 
-fn write-assets() -> Void {
-  for a in assets { write-file(a.to, read-file(a.from)) }
-}
-
-fn reset(ls: {Text:Text}) -> Void {
-  forget-memos!()
-  assets = []
-  loaders = ls
+# Each copied file written once.
+fn write-assets(assets: [Asset]) -> Void {
+  for a in [x for x in assets distinct x.to] { write-file(a.to, read-file(a.from)) }
 }
