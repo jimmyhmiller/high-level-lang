@@ -32,18 +32,19 @@ record Format {
   suffix: Text,
   exports: Text,
   export-names: Bool,
-  hoist-externals: Bool,
+  # ES module output: an import of an outside module stays an import statement.
+  es-module: Bool,
   # Whatever runs the output has `require`, as CommonJS does: an outside module is loaded with it
   # directly, and otherwise through esbuild's `__require`, which says what is missing.
   native-require: Bool
 }
 
 fn iife-format() -> Format =
-  Format(prefix: "(()=>{", suffix: "})();\n", exports: "", export-names: false, hoist-externals: false, native-require: false)
+  Format(prefix: "(()=>{", suffix: "})();\n", exports: "", export-names: false, es-module: false, native-require: false)
 fn cjs-format() -> Format =
-  Format(prefix: "", suffix: "\n", exports: "module.exports=%;", export-names: false, hoist-externals: false, native-require: true)
+  Format(prefix: "", suffix: "\n", exports: "module.exports=%;", export-names: false, es-module: false, native-require: true)
 fn esm-format() -> Format =
-  Format(prefix: "", suffix: "\n", exports: "", export-names: true, hoist-externals: true, native-require: false)
+  Format(prefix: "", suffix: "\n", exports: "", export-names: true, es-module: true, native-require: false)
 
 record DefineText { key: Text, value: Text }
 
@@ -237,12 +238,12 @@ fn entry-value() -> Node = match m.modules[m.entry] {
 # hold, which come first.
 fn esm-exports() -> [Node] = exports-of-root(m.entry)
 
-fn exports-of-root(root: Int) -> [Node] = match m.db.dynamic(root) {
-  true => panic "{}: `export *` from a CommonJS or external module in the entry point of ES module output is not implemented yet", m.modules[root].path
-  false => [h for x in found for h in x.hoisted] ++ [ExportNamed(List([x.spec for x in found]...)) for f in [found] if len(f) > 0]
-    where found = [exported(name-of(m.names, n), s) for n in [n for m.db.resolved(root, ?n, _) distinct n]
-                   if let some(s) = e.resolved-export(root, n)]
-}
+# The entry's names, as ES module exports. Those `export *` from CommonJS adds are only known at run
+# time, so only the namespace object has them, as esbuild has it.
+fn exports-of-root(root: Int) -> [Node] =
+  [h for x in found for h in x.hoisted] ++ [ExportNamed(List([x.spec for x in found]...)) for f in [found] if len(f) > 0]
+  where found = [exported(name-of(m.names, n), s) for n in [n for m.db.resolved(root, ?n, _) distinct n]
+                 if let some(s) = e.resolved-export(root, n)]
 
 # An export of the entry: its specifier, after a variable holding it when what it reads is no name.
 record Exported { hoisted: [Node], spec: Node }
@@ -580,12 +581,12 @@ fn loading-of(o: Options, out-dir: Text) -> m.Loading =
 
 fn linking-of(o: Options, entry-namespace: Bool, splitting: Bool, f: Format) -> an.Linking =
   an.Linking(entry-namespace: entry-namespace, tree-shaking: o.tree-shaking,
-             splitting: splitting, esm-output: f.hoist-externals, native-require: f.native-require, compact: o.minify-identifiers,
+             splitting: splitting, esm-output: f.es-module, native-require: f.native-require, compact: o.minify-identifiers,
              pure-names: o.pure,
              facts-threads: o.plan.facts-threads)
 
 fn emitting-of(o: Options, f: Format) -> e.Emitting =
-  e.Emitting(void-undefined: o.minify-syntax, esm-output: f.hoist-externals, native-require: f.native-require,
+  e.Emitting(void-undefined: o.minify-syntax, native-require: f.native-require,
              drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
 
 # The names esbuild gives output files: the entry's path below the entries' common directory.
@@ -761,8 +762,8 @@ fn named-built(o: Options, f: Format) -> [Written] =
           true => finished-output(o, f, p)
           false => wrap-format(o, f, p)
         },
-        # The banner and hoisted external imports come first, ahead of everything the map describes.
-        head = (match o.banner { "" => ""  b => b ++ "\n" }) ++ join(emission.externals, ""),
+        # The banner comes first, ahead of everything the map describes.
+        head = match o.banner { "" => ""  b => b ++ "\n" },
         footer = match o.footer { "" => ""  t => t ++ "\n" },
         notes = legal.placed(o.legal-comments, legal-of-modules(none), o.outfile),
         full = timed(o.timing, "print", head ++ out0.text ++ footer ++ notes.tail),
@@ -796,15 +797,14 @@ fn chunk-root-statements(c: chunks.Chunk) -> [Node] = match c.root {
 
 # The body of one chunk, as text with placeholders in it.
 fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk]) -> Printed =
-  Printed(text: head ++ r.text ++ "\n", base: len(head), marks: r.marks)
+  Printed(text: r.text ++ "\n", base: 0, marks: r.marks)
   where emission = with e.chunk-parts = some(c.parts) { e.program() },
         p = for-target(o, match o.minify-syntax {
           true => o.optimize(emission.tree)
           false => fold.run(emission.tree)
         }),
         stmts = chunks.imports-of(c, all) ++ p.body.kids ++ chunk-root-statements(c) ++ chunks.exports-of(c, all),
-        r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap),
-        head = join(emission.externals, "")
+        r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
 
 fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text = match c.root {
   r if r < 0 => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"

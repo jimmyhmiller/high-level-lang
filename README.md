@@ -400,8 +400,6 @@ Being explicit, because "everything esbuild does" is a lot:
 - **Not built:** watch and serve, CSS modules, CSS nesting and other CSS lowering, JavaScript
   (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
   and inlining enum values across files.
-- **Hard errors for now:** `export *` from a CommonJS or external module in the entry point of ES
-  module output.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside
   another, stylesheets with `--splitting`, `--legal-comments=inline`, the automatic JSX runtime in a
   CommonJS module, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`

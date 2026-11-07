@@ -413,6 +413,17 @@ put("u.js", 'import {unused} from "dep"\nimport "dep2"\nconsole.log(1)\n')
 sh([ESB, f"{OUT}/u.js", "--format=esm", "--minify-syntax", f"--outfile={OUT}/u.mjs"] + ext)
 check(re.search(r'import\s*"dep"', open(f"{OUT}/u.mjs").read()) is not None, "--minify-syntax leaves out an import's unused names, as esbuild does")
 # A package left external takes its subpaths with it; one `*` stands for anything.
+# `export *` from an outside module: kept in an entry, copied at run time from a module inside.
+put("star-entry.js", 'export * from "dep"\nexport const own = 1\n')
+put("star-mid.js", 'export * from "dep"\nexport const inner = 2\n')
+put("star-user.js", 'import * as mid from "./star-mid.js"\nconsole.log(JSON.stringify([mid.x, mid.z, mid.inner]))\n')
+put("star-run.mjs", 'import * as m from "./star.mjs"; console.log(JSON.stringify([m.x, m.own, m.default]))')
+code, out = sh([ESB, f"{OUT}/star-entry.js", "--format=esm", f"--outfile={OUT}/star.mjs"] + ext)
+ran = sh(["node", f"{OUT}/star-run.mjs"], 15)[1].strip()
+check(code == 0 and ran == '[1,1,null]', f"export * from an outside module in an ES module entry stays, as esbuild has it: {ran or out[:80]}")
+code, out = sh([ESB, f"{OUT}/star-user.js", "--format=esm", f"--outfile={OUT}/star-user.mjs"] + ext)
+ran = sh(["node", f"{OUT}/star-user.mjs"], 15)[1].strip()
+check(code == 0 and ran == '[1,3,2]', f"export * from an outside module inside the bundle copies it at run time: {ran or out[:80]}")
 for flag in ["--external:dep2", "--external:dep*"]:
     code, out = sh([ESB, f"{OUT}/a.js", "--format=esm", f"--outfile={OUT}/out.mjs", "--external:dep", flag])
     check(code == 0 and "dep2/sub.js" in open(f"{OUT}/out.mjs").read(), f"{flag} leaves dep2/sub.js external too")

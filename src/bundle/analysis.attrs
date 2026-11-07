@@ -486,6 +486,13 @@ fn module-made(mo: m.Module, wrapped: {Int:Bool}) -> [Made] = match mo.kind {
 fn made-of(purpose: Purpose, mo: m.Module, name: Text) -> Made =
   Made(purpose: purpose, owner: mo.id, exported: "", scope: m.bundle-scope, name: name)
 
+# What `export *` from an opaque module holds it in: an outside module kept as an ES import is
+# `y_star`, as esbuild names it.
+fn star-made(mo: m.Module, t: Int) -> Made = match kept?(m.modules[t]) {
+  true => import-made(mo, t) with { name: m.modules[t].base ++ "_star" }
+  false => import-made(mo, t)
+}
+
 fn import-made(mo: m.Module, t: Int) -> Made =
   Made(purpose: ImportVar, owner: import-key(mo, t), exported: "", scope: mo.root, name: "import_" ++ m.modules[t].base)
 
@@ -503,7 +510,7 @@ fn made-for(made: [Made], first: Int, purpose: Purpose) -> {Int:Int} =
 # from it.
 fn statement-made(mo: m.Module, s: Node) -> [Made] = match s {
   Import(_, from) | ImportBare(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
-  ExportAll(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
+  ExportAll(from) => [star-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t]) and not kept-star?(mo, m.modules[t])]
   ExportAllAs(_, from) | ExportFrom(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
     ++ [Made(purpose: ReexportName, owner: mo.id, exported: r.exported, scope: mo.root, name: reexport-name(r))
         for r in statement-reexports(mo, s)]
@@ -538,7 +545,14 @@ fn synthetic(mo: m.Module, wrapped: {Int:Bool}) -> [Node] = match mo.kind, mo.id
 }
 
 # `export * from` CommonJS: names only known at run time.
-fn dynamic-star?(mo: m.Module, s: Node) -> Bool = s is ExportAll(from) and opaque?(m.modules[known-dep(mo, from)])
+fn dynamic-star?(mo: m.Module, s: Node) -> Bool = match s {
+  ExportAll(from) => opaque?(t) and not kept-star?(mo, t) where t = m.modules[known-dep(mo, from)]
+  _ => false
+}
+
+# `export * from` an outside module, in an entry of ES module output, stays as it is, as esbuild
+# leaves it: the runtime links the names, which the bundle cannot know.
+fn kept-star?(mo: m.Module, t: m.Module) -> Bool = kept?(t) and mo.id in m.entries
 
 # What linking works out, from each module's `import()` and `require` calls, before any fact. What a
 # module loads on demand is wrapped, or with splitting, the root of a chunk of its own. The symbols
@@ -768,6 +782,9 @@ fn bare-import-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match hel
 
 # `export *`: from CommonJS, copied at run time onto the namespace object.
 fn star-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match opaque?(m.modules[t]) {
+  true if kept-star?(mo, m.modules[t]) => [link.fact-effect(part)]
+  true if kept?(m.modules[t]) => [link.fact-declares(part, known-import-var(mo, t)), link.fact-effect(part), link.fact-dyn-star(mo.id, t),
+                                  link.fact-mentions(part, helper("__reExport")), link.fact-mentions(part, ns-sym(mo))]
   true => reexport-import(mo, part, t) ++ [link.fact-dyn-star(mo.id, t), link.fact-mentions(part, helper("__reExport")),
                                        link.fact-mentions(part, ns-sym(mo))]
   false => [link.fact-star(mo.id, t)]

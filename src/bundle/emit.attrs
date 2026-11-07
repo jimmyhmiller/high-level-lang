@@ -11,9 +11,9 @@ use bundle.naming as nm
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
-# How the build emits: `undefined` as `void 0`, ES module output, the names a kept import binds
+# How the build emits: `undefined` as `void 0`, `require` native or not, the names a kept import binds
 # that nothing reads left out, nodes stamped for a source map, and how many threads emit modules.
-record Emitting { void-undefined: Bool, esm-output: Bool, native-require: Bool, drop-unused-imports: Bool, sourcemap: Bool,
+record Emitting { void-undefined: Bool, native-require: Bool, drop-unused-imports: Bool, sourcemap: Bool,
                   emit-threads: Int }
 
 setting emitting: Emitting
@@ -223,30 +223,11 @@ fn init-call(t: m.Module) -> Node? = match an.wrapped?(t) {
   false => none
 }
 
-# An external module, as an expression: `require("x")`, or in ES module output the namespace of an
-# `import * as` hoisted to the top of the file.
-fn external-object(t: m.Module) -> Node = match emitting.esm-output {
-  true => Ident(external-name(t))
-  false => external-required(t)
-}
-
 # `require("x")` where the output's runner has `require`, and esbuild's `__require("x")` elsewhere.
 fn external-required(t: m.Module) -> Node = match emitting.native-require {
   true => exp`require($path)`
   false => exp`$load($path)` where load = helper-name("__require")
 } where path = Str(quote-text(t.path))
-
-fn external-name(t: m.Module) -> Text = "__external_" ++ t.base
-
-# What a statement needs hoisted, in ES module output: the `import * as` of the external module an
-# `export *` copies from at run time. Every other import of one stays a statement.
-fn externals-of(s: Node) -> [Text] = match s {
-  ExportAll(from) => [x for t in [m.modules[an.known-dep(here, from)]] if an.opaque?(t) for x in external-lines(t)]
-  _ => []
-}
-
-fn external-lines(t: m.Module) -> [Text] =
-  ["import * as " ++ external-name(t) ++ " from \"" ++ t.path ++ "\";" for x in [t] if emitting.esm-output and x.kind == External]
 
 # `var import_x = __toESM(require_x(), 1);` Files in node mode (.mjs, or a package with
 # "type": "module") get the second argument, so `default` is module.exports.
@@ -259,7 +240,7 @@ fn to-esm-call(t: m.Module) -> Node = match m.node-mode?(here.path) {
   false => exp`$to_esm($object)`
 } where to-esm = helper-name("__toESM"),
         object = match t.kind {
-          External => external-object(t)
+          External => external-required(t)
           _ => require-of(t)
         }
 
@@ -268,6 +249,13 @@ fn reexport-all(t: m.Module) -> Node = stmt`$re($ns, $value);`
   where re = helper-name("__reExport"),
         ns = final-of(an.ns-sym(here)),
         value = to-esm-call(t)
+
+# In ES module output, `export *` from an outside module copies its namespace, imported where the
+# statement stands, as esbuild writes it: `__reExport(x_exports, y_star); import * as y_star from "y";`.
+fn reexport-kept(t: m.Module) -> [Node] = [stmt`$re($ns, $star);`, Import(ImportNamespace(BindName(star)), path-of(t))]
+  where re = helper-name("__reExport"),
+        ns = final-of(an.ns-sym(here)),
+        star = final-of(an.known-import-var(here, t.id))
 
 fn import-or-init(t: m.Module) -> Node? = match an.opaque?(t) {
   true => some(import-cjs-stmt(t))
@@ -279,10 +267,12 @@ fn part-output(s: Node) -> Node? = match s {
   ImportBare(from) => match t.kind {
     Cjs => some(import-cjs-stmt(t))
     External if an.kept?(t) => some(ImportBare(path-of(t)))
-    External => some(stmt`var $v = $object;`) where v = final-of(an.known-import-var(here, t.id)), object = external-object(t)
+    External => some(stmt`var $v = $object;`) where v = final-of(an.known-import-var(here, t.id)), object = external-required(t)
     _ => init-call(t)
   } where t = m.modules[an.known-dep(here, from)]
   ExportAll(from) => match an.opaque?(t) {
+    true if an.kept-star?(here, t) => some(ExportAll(path-of(t)))
+    true if an.kept?(t) => some(List(reexport-kept(t)...))
     true => some(reexport-all(t))
     false => init-call(t)
   } where t = m.modules[an.known-dep(here, from)]
@@ -510,7 +500,7 @@ fn any-part-here?(id: Int) -> Bool = any p in parts-of(id): in-this-chunk?(p)
 
 # One module's statements, its namespace object's, and the imports it needs hoisted. Each module
 # is emitted on its own: they read what linking and naming decided, and change nothing shared.
-record Emitted { body: [Node], namespace: [Node], externals: [Text] }
+record Emitted { body: [Node], namespace: [Node] }
 
 # What is emitted, or counted for names, at once: some of a module's parts. `first`: the unit that
 # counts for the module as a whole, once.
@@ -596,40 +586,44 @@ fn piece-units(pc: Piece, first: Bool) -> [Unit] = match m.modules[pc.module] {
 } where n = len(pc.parts)
 
 fn unit-emitted(u: Unit) -> Emitted = match included?(u.module) and any-part-here?(u.module) {
-  false => Emitted(body: [], namespace: [], externals: [])
+  false => Emitted(body: [], namespace: [])
   true => with here = m.modules[u.module] { module-emitted(u) }
 }
 
 fn module-emitted(u: Unit) -> Emitted = match here.kind {
-  Cjs => Emitted(body: [cjs-part()], namespace: [], externals: [])
+  Cjs => Emitted(body: [cjs-part()], namespace: [])
   # Each part in order, as what it adds to the namespace object or to the body.
   # An import statement cannot be inside the wrapper: it goes before it, where it still loads first.
   _ => Emitted(body: match an.wrapped?(here) {
                        true => [s for s in outputs if import-statement?(s)] ++ wrapped-module([s for s in outputs if not import-statement?(s)])
                        false => outputs
                      },
-               namespace: [s for pc in pieces for s in pc.namespace],
-               externals: [x for pc in pieces for x in pc.externals distinct x])
+               namespace: [s for pc in pieces for s in pc.namespace])
     where pieces = [part-emitted(p) for p in u.parts if live?(p) and in-this-chunk?(p)],
           outputs = [s for pc in pieces for s in pc.body]
+}
+
+fn statements-of(o: Node) -> [Node] = match o {
+  List(xs...) => xs
+  _ => [o]
 }
 
 fn import-statement?(s: Node) -> Bool = s is Import(...) or s is ImportBare(...)
 
 fn part-emitted(p: Int) -> Emitted = match an.linked.part-stmt[p] {
-  None() => Emitted(body: [], namespace: namespace-stmts(), externals: [])
-  Flag() => Emitted(body: [], namespace: [], externals: [])
-  s => Emitted(body: [stamped(o) for some(o) in [part-output(s)]], namespace: [], externals: externals-of(s))
+  None() => Emitted(body: [], namespace: namespace-stmts())
+  Flag() => Emitted(body: [], namespace: [])
+  # A part may stand for several statements, as a list of them.
+  s => Emitted(body: [stamped(x) for some(o) in [part-output(s)] for x in statements-of(o)], namespace: [])
 }
 
 # The program, and the imports to hoist above it, each once.
-record Emission { tree: Node, externals: [Text] }
+record Emission { tree: Node }
 
 # Every live statement, in the units' order. The namespace objects go after the runtime's statements
 # and before everything else.
 fn program() -> Emission =
-  Emission(tree: Program(None(), List((runtime ++ [s for em in emitted for s in em.namespace] ++ rest)...)),
-           externals: [line for em in emitted for line in em.externals distinct line])
+  Emission(tree: Program(None(), List((runtime ++ [s for em in emitted for s in em.namespace] ++ rest)...)))
   where emitted = parallel-map(units, unit-emitted, emitting.emit-threads),
         runtime-units = (last i in 0..len(units) if units[i].module == 0: i + 1) ?? 0,
         runtime = [s for em in emitted[0..runtime-units] for s in em.body],
