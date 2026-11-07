@@ -696,15 +696,17 @@ memo fn piece-of(item: Text) -> PieceTree {
 # parsed, the program as analysed (its top level normalised one piece at a time), and a table that
 # holds the program's own names. Not `whole` when a piece is no program by itself.
 # `raw`: each piece's statements as parsed, which early errors are checked on.
+# `wrapper`: the scope of CommonJS's (exports, module) wrapper the program was declared under, when
+# a script names them and so is probably CommonJS; -1 when it was not.
 record Prepared { whole: Bool, tree0: Node, tree: Node, parts: [[Node]], raw: [[Node]], scopes: sym.Table, root: Int,
-                  esm: Bool, mentions: Bool, exportable: [Text] }
+                  esm: Bool, mentions: Bool, exportable: [Text], wrapper: Int }
 
 memo fn prepared-of(path: Text) -> Prepared {
   let sp = split-source(path)
   let pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
   if any t in pieces: is-none(t) {
     return Prepared(whole: false, tree0: None(), tree: None(), parts: [], raw: [], scopes: sym.table-new(), root: -1,
-                    esm: false, mentions: false, exportable: [])
+                    esm: false, mentions: false, exportable: [], wrapper: -1)
   }
   let trees = [t for some(t) in pieces]
   let stmts = [s for t in trees for s in t.body.kids]
@@ -715,10 +717,12 @@ memo fn prepared-of(path: Text) -> Prepared {
   let raw = [t.body.kids for t in trees]
   let parts = [normalized-tree(t, base).body.kids for t in trees]
   let tree = Program(tree0.hashbang, List([s for part in parts for s in part]...))
-  let own = scope.declared(tree)
+  let esm = early.program-has-module-syntax?(tree0)
+  let wrapped = not esm and (any name in ["module", "exports", "require"]: contains-text?(sp.src, name))
+  let own = scope.declared(tree, if wrapped then ["exports", "module"] else [])
   Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, raw: raw, scopes: own.table, root: own.root,
-           esm: early.program-has-module-syntax?(tree0), mentions: mentions-define?(sp.src),
-           exportable: early.exportable-of(tree0))
+           esm: esm, mentions: mentions-define?(sp.src), exportable: early.exportable-of(tree0),
+           wrapper: if wrapped then sym.scope-at(own.table, own.root).parent else -1)
 }
 
 # One part's walk, in a table of its own under the program's scope.
@@ -774,15 +778,25 @@ fn finished-file(path: Text) -> Parsed {
   if let some(at) = problem {
     panic "{}:{}:{}: {}", path, line-of(sp.src, at.at), col-of(sp.src, at.at), at.message
   }
-  let cjs = not pr.esm and (sym.has-free?(own, "module") or sym.has-free?(own, "exports") or sym.has-free?(own, "require"))
-  if cjs or p.jsx-imports or (any w in walks: w.defined) {
+  # CommonJS names `module`, `exports` or `require` without declaring them: free, or under the
+  # wrapper, the wrapper's. A file prepared for the wrapper that turns out not to be CommonJS, or one
+  # prepared without it that is, is analysed again whole, as is code a define changes.
+  let cjs = not pr.esm and (sym.has-free?(own, "require")
+                            or (if pr.wrapper >= 0 then wrapper-used?(own, pr.wrapper, "module") or wrapper-used?(own, pr.wrapper, "exports")
+                                else sym.has-free?(own, "module") or sym.has-free?(own, "exports")))
+  if cjs != (pr.wrapper >= 0) or p.jsx-imports or (any w in walks: w.defined) {
     let q = analysed-file(p)
     return q with { targets: {spec: t for spec in q.specs if let some(t) = targets[spec]} }
   }
   let real-free = [f for f in sym.free-names(own) if not (f in p.helpers)]
-  let a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: real-free, cjs: false, shift: 0, defined: false)
+  let a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: real-free, cjs: cjs, shift: 0, defined: false)
   let calls = [r for w in walks for r in w.requires] ++ [r for w in walks for r in w.imports]
   p with { analysed: true, scopes: own, analysis: a, calls: calls, targets: targets }
+}
+
+fn wrapper-used?(t: sym.Table, wrapper: Int, name: Text) -> Bool = match sym.scope-at(t, wrapper).names[name] {
+  some(s) => sym.symbol-at(t, s).uses > 0
+  none => false
 }
 
 # Early errors, which `parse-file` checks of a file parsed whole.
