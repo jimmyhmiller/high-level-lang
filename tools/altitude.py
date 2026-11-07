@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
-# How much of the bundler's .rules and .attrs is written at a low level: loops over indices,
-# variables updated in place, global state, children read by position, byte scanning. A
-# function counts as low-level if any of these appear in it. It is a measure of the
-# source, by pattern, not a proof; run it before and after a change to see the change.
+# How much of the bundler's .rules and .attrs is imperative rather than declarative. A function,
+# `on` block or rewrite counts as imperative, all its lines, if its code has any statement: a block
+# body of steps, `let`, `var`, an `if`, a `for` or `while` statement, `return`, an assignment, or a
+# call made for its effect (`assert`, `f!(…)`). Declarative is what is left: one expression made of
+# matches, rewrites, attribute equations (`child.attr = value` in an `on` block), comprehensions and
+# queries, with guards on rules, arms and comprehension clauses. It is a measure of the source, by
+# pattern, not a proof; run it before and after a change to see the change.
 #   usage: altitude.py [--fns] [files...]   (default: src/bundle/*.rules *.attrs)
 import collections, glob, os, re, sys
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src/bundle")
-PATTERNS = collections.OrderedDict([
-    ("while",   re.compile(r"^\s*while\b[^\n]*\{\s*$", re.M)),
-    ("var",     re.compile(r"^\s*var ", re.M)),
-    ("kids[i]", re.compile(r"\.kids\[")),
-    ("bytes",   re.compile(r"'\\?.'")),
-    ("buf",     re.compile(r"\bbuf-")),
-    ("out-arg", re.compile(r"\bmut \[")),
+DECL = re.compile(r"\n(?=(?:everywhere |memo )?fn |on |rewrite |const |record |state |task state |context "
+                  r"|enum |inh |syn |given |collect |input |use |rules |attrs |include |#)")
+UNIT = re.compile(r"(?:everywhere |memo )?fn |on |rewrite ")
+IMPERATIVE = collections.OrderedDict([
+    ("block",  re.compile(r"^(?:everywhere |memo )?fn [^\n]*\)\s*(?:->[^\n=]*)?\{\s*$", re.M)),
+    ("let",    re.compile(r"^\s+let ", re.M)),
+    ("var",    re.compile(r"^\s*var ", re.M)),
+    ("if",     re.compile(r"\bif\b")),
+    ("for",    re.compile(r"^\s*for [^\n]*\{\s*$", re.M)),
+    ("while",  re.compile(r"^\s*while\b", re.M)),
+    ("return", re.compile(r"\breturn\b")),
+    ("assign", re.compile(r"^\s*[a-z][\w\-?!.\[\]]*\s*(?:=|\+=|\+\+=)\s", re.M)),
+    ("effect", re.compile(r"^\s*(?:assert |[a-z][\w.\-]*!\()", re.M)),
 ])
-DECL = re.compile(r"\n(?=(?:memo )?fn |on |rewrite |const |record |state |task state |enum |inh |given |collect |input |use |rules |attrs |#)")
-STATE = re.compile(r"^(?:task )?state ([a-z][\w\-?!]*)", re.M)
-# A context is bound for a scope with `with`; written to any other way it is state like the rest.
-CONTEXT = re.compile(r"^context ([a-z][\w\-?!]*)", re.M)
+# Guards are declarative: a comprehension's or query's `if`, a rewrite's, a match arm's.
+GUARDS = [
+    (re.compile(r"(\bfor\b[^\]\n]*?)\bif\b"), r"\1WHERE"),
+    (re.compile(r"(^rewrite[^\n]*?)\bif\b", re.M), r"\1WHERE"),
+    (re.compile(r"\bif\b(?=[^\n]*=>)"), "WHERE"),
+]
+# In an `on` block, `target.attr = value` is an equation.
+EQUATION = re.compile(r"^\s*[\w\-]+\.[\w\-]+\s*=\s", re.M)
 
 
 def code_lines(chunk):
@@ -29,45 +42,42 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     show = "--fns" in sys.argv
     files = args or sorted(glob.glob(os.path.join(ROOT, "*.rules")) + glob.glob(os.path.join(ROOT, "*.attrs")))
-    fns = collections.Counter()
     lines = collections.Counter()
     per_file = []
-    total_lines = total_fns = 0
-    states = 0
+    total_lines = total_units = imperative_units = 0
     for path in files:
-        src = open(path).read()
-        names = STATE.findall(src)
-        states += len(names)
-        names += CONTEXT.findall(src)
-        writes = [re.compile(r"(?:^|\{)\s*" + re.escape(n) + r"(\[[^\]]*\])?\s*(=|\+=|\+\+=)[^=>]", re.M) for n in names]
-        low_here = all_here = 0
-        for chunk in DECL.split(src):
-            if not re.match(r"(memo )?fn |on |rewrite ", chunk):
+        all_here = imp_here = 0
+        for chunk in DECL.split(open(path).read()):
+            if not UNIT.match(chunk):
                 continue
-            n = len(code_lines(chunk))
+            code = code_lines(chunk)
+            n = len(code)
+            body = "\n".join(code)
+            if chunk.startswith("on "):
+                body = EQUATION.sub("  EQ ", body)
+            for r, to in GUARDS:
+                body = r.sub(to, body)
+            hits = [k for k, r in IMPERATIVE.items() if r.search(body)]
             total_lines += n
-            total_fns += 1
+            total_units += 1
             all_here += n
-            hits = [k for k, r in PATTERNS.items() if r.search(chunk)]
-            if any(w.search(chunk) for w in writes):
-                hits.append("global")
             for k in hits:
-                fns[k] += 1
                 lines[k] += n
             if hits:
-                fns["any"] += 1
-                lines["any"] += n
-                low_here += n
+                imperative_units += 1
+                imp_here += n
                 if show:
-                    head = chunk.split("\n")[0][:70]
-                    print(f"  {os.path.basename(path)}: {head}  [{', '.join(hits)}]")
-        per_file.append((os.path.basename(path), all_here, low_here))
-    print(f"{total_fns} functions, `on` blocks and rewrites, {total_lines} lines of code; {states} global state declarations")
-    for k in list(PATTERNS) + ["global", "any"]:
-        print(f"  {k:8} {fns[k]:4} functions  {lines[k]:5} lines  {100 * lines[k] // max(total_lines, 1):3}%")
-    print("by file (lines of code, of which low-level):")
-    for name, a, l in sorted(per_file, key=lambda x: -x[2]):
-        print(f"  {name:18} {a:5} {l:5}  {100 * l // max(a, 1):3}%")
+                    print(f"  {os.path.basename(path)}: {code[0][:70]}  [{', '.join(hits)}]")
+        per_file.append((os.path.basename(path), all_here, imp_here))
+    imp = sum(i for _, _, i in per_file)
+    print(f"{total_units} functions, `on` blocks and rewrites, {total_lines} lines of code")
+    print(f"imperative: {imperative_units} of them, {imp} lines, {100 * imp // max(total_lines, 1)}%")
+    print("lines in units with each (a unit can have several):")
+    for k in IMPERATIVE:
+        print(f"  {k:8} {lines[k]:5} lines  {100 * lines[k] // max(total_lines, 1):3}%")
+    print("by file (lines of code, of which imperative):")
+    for name, a, i in sorted(per_file, key=lambda x: -x[2]):
+        print(f"  {name:18} {a:5} {i:5}  {100 * i // max(a, 1):3}%")
 
 
 main()

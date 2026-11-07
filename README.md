@@ -105,12 +105,12 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 }
 ```
 
-It is closer to a small ML than to a one-purpose language, and some of it is still written at a low
-level: `tools/altitude.py` counts 14% of the lines of `.rules` and `.attrs` in functions with
-loops over indices, variables updated in place, global or context state written to, or byte
-scanning (67% on 2026-11-05). What is left is mostly the registries a build fills as it loads and
-links (modules, parts, symbols), the supplies of fresh names, and byte-level spelling of numbers
-and strings. `tools.langtest` (`src/tools/langtest.rules`) checks what the collection forms mean.
+It is closer to a small ML than to a one-purpose language, and most of it is still written
+imperatively: `tools/altitude.py` counts 81% of the lines of `.rules` and `.attrs` in functions
+with a statement of any kind (`let`, `if`, `return`, a loop, an assignment, a call made for its
+effect) rather than one expression of matches, rewrites, attribute equations and queries
+(2026-11-06). The goal is none: every part of the bundler said as patterns, rules, derived facts
+and grammars. `tools.langtest` (`src/tools/langtest.rules`) checks what the collection forms mean.
 
 Where a big file can be cut for parsing in parallel is a grammar too (`coarse.syntax`), all of it
 fragments, so it builds one node for each stretch between cuts, and a repetition of single bytes
