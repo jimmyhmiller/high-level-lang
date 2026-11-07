@@ -36,6 +36,9 @@
 (import "hl.syntax" :as syntax)
 (import "hl.grammars.rules" :as g)
 (import "hl.grammars.facts" :as gf)
+(import "hl.grammars.rewrite" :as grw)
+(import "hl.grammars.scopes" :as gsc)
+(import "hl.grammars.pipeline" :as gpl)
 
 (reader-provider "hl.rules" read-rules)
 
@@ -185,8 +188,14 @@
 (defn fn? [(t (slice u8))] (-> bool)
   (rt/at? t 0 "Fn("))
 
+;;; `T?`; an optional function is `(Fn(A)->R)?`, since `Fn(A)->R?` returns an option.
+(defn opt-type [(t (slice u8))] (-> (slice u8))
+  (if (fn? t) (cat3 "(" t ")?") (cat t "?")))
+
 (defn opt-of [(t (slice u8))] (-> (slice u8))
-  (subslice t 0 (- (len t) 1)))
+  (if (rt/at? t 0 "(Fn(")
+      (subslice t 1 (- (len t) 2))
+      (subslice t 0 (- (len t) 1))))
 
 (defn elem-of [(t (slice u8))] (-> (slice u8))
   (subslice t 1 (- (len t) 1)))
@@ -254,7 +263,8 @@
   (cond (= t "Int") `i64
         (= t "Bool") `bool
         (= t "Text") `(slice u8)
-        (or (= t "Void") (= t "Never")) `void
+        (= t "Void") `void
+        (= t "Never") `never
         (opt? t) `(Option ~(coil-type (mut k) (opt-of t)))
         (list? t) `(ArrayList ~(coil-type (mut k) (elem-of t)))
         (map? t)
@@ -357,7 +367,7 @@
                                  n
                                  (cat4 target " has no type named " name "")))
                           (cat3 target "." name)))))
-      (g/KTOpt [] (cat (resolve-type (mut k) m (kid n 0)) "?"))
+      (g/KTOpt [] (opt-type (resolve-type (mut k) m (kid n 0))))
       (g/KTList [] (cat3 "[" (resolve-type (mut k) m (kid n 0)) "]"))
       (g/KTMap []
                (cat4 "{"
@@ -1099,21 +1109,28 @@
       (push! (mut (.funcs m)) f))
     m))
 
+;;; A `.rewrite`, `.scopes` or `.pipeline` file read by its own grammar, for what its header names.
+(defn rewrite-tree [(path (slice u8))] (-> grw/Node)
+  (match (grw/parse-result (rt/read-all path) path 0)
+    (Ok [t] t)
+    (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
+
+(defn scopes-tree [(path (slice u8))] (-> gsc/Node)
+  (match (gsc/parse-result (rt/read-all path) path 0)
+    (Ok [t] t)
+    (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
+
+(defn pipeline-tree [(path (slice u8))] (-> gpl/Node)
+  (match (gpl/parse-result (rt/read-all path) path 0)
+    (Ok [t] t)
+    (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
+
 (defn rewrite-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))]
   (-> Mod)
   (let [(mut m) (mod-new module (SRewrite) "")
-        src (rt/read-all path)
         ;; The file's own header names its grammar.
-        start
-          (let [(mut i) 0]
-            (while (and (< i (len src)) (not (rt/at? src i "rewrite ")))
-              (set! i (+ i 1)))
-            (+ i 8))
-        (mut end) start]
-    (while (and (< end (len src)) (!= (get src end) #\newline))
-      (set! end (+ end 1)))
-    (let [grammar (subslice src start end)
-          node (cat grammar ".Node")
+        grammar (.text (get (.kids (rewrite-tree path)) 0))]
+    (let [node (cat grammar ".Node")
           (mut f) (func-of "run" node)]
       (ensure-loaded! (mut k) grammar)
       (param (mut f) "n" node false)
@@ -1124,19 +1141,8 @@
 (defn pipeline-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))]
   (-> Mod)
   (let [(mut m) (mod-new module (SRewrite) "")
-        src (rt/read-all path)
-        start
-          (let [(mut i) 0]
-            (while (and (< i (len src)) (not (rt/at? src i "fills ")))
-              (set! i (+ i 1)))
-            (+ i 6))
-        (mut end) start]
-    (while (and (< end (len src))
-                (!= (get src end) #\newline)
-                (!= (get src end) #\space))
-      (set! end (+ end 1)))
-    (let [fills (subslice src start end)
-          (mut slash) 0]
+        fills (.text (get (.kids (pipeline-tree path)) 1))]
+    (let [(mut slash) 0]
       (for i (range 0 (len fills)) (when (= (get fills i) #\/) (set! slash i)))
       (let [record-module (subslice fills 0 slash)
             record
@@ -1150,17 +1156,8 @@
 
 (defn scopes-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
   (let [(mut m) (mod-new module (SScopes) "")
-        src (rt/read-all path)
-        start
-          (let [(mut i) 0]
-            (while (and (< i (len src)) (not (rt/at? src i "scopes ")))
-              (set! i (+ i 1)))
-            (+ i 7))
-        (mut end) start]
-    (while (and (< end (len src)) (!= (get src end) #\newline))
-      (set! end (+ end 1)))
-    (let [grammar (subslice src start end)
-          node (cat grammar ".Node")
+        grammar (.text (get (.kids (scopes-tree path)) 0))]
+    (let [node (cat grammar ".Node")
           kind (cat grammar ".Kind")]
       (ensure-loaded! (mut k) grammar)
       (let [(mut f) (func-of "analyze" "Int")]
@@ -3973,6 +3970,12 @@
     (g/KGroup [] (is-place? (kid e 0)))
     (_ false)))
 
+;;; A named function as a value, as the pointer its type says. A Coil function takes a struct by
+;;; reference, and `fnptr-of` gives the entry that takes it by value only when it knows the pointer
+;;; type wanted: a map or list of functions would otherwise hold the other kind.
+(defn fn-value [(k (mut Comp)) (ptr Code) (f Func)] (-> Code)
+  `(: ~ptr ~(coil-type (mut k) (func-type f))))
+
 (defn fn-value-call [(k (mut Comp))
                      (n g/Node)
                      (f Code)
@@ -4933,7 +4936,7 @@
     (g/KSomeE []
               (let [inner
                       (expr (mut k) (kid n 0) (if (opt? want) (opt-of want) ""))]
-                (te `(Some ~(.code inner)) (cat (.ty inner) "?"))))
+                (te `(Some ~(.code inner)) (opt-type (.ty inner)))))
     (g/KGroup [] (expr (mut k) (kid n 0) want))
     (g/KName []
              (match (find-local (mut k) (.text n))
@@ -4945,7 +4948,7 @@
                          (None []
                                (match (find-func m (.text n))
                                  (Some [f]
-                                       (te `(fnptr-of ~(sym (.coil f)))
+                                       (te (fn-value (mut k) `(fnptr-of ~(sym (.coil f))) f)
                                            (func-type f)))
                                  (None []
                                        (die (mut k)
@@ -4989,9 +4992,11 @@
                              (None []
                                    (match (find-func mo field)
                                      (Some [f]
-                                           (te `(fnptr-of ~(sym (qualified (mut k)
-                                                                           module
-                                                                           (.coil f))))
+                                           (te (fn-value (mut k)
+                                                         `(fnptr-of ~(sym (qualified (mut k)
+                                                                                     module
+                                                                                     (.coil f))))
+                                                         f)
                                                (func-type f)))
                                      (None []
                                            (die (mut k)
@@ -5031,7 +5036,7 @@
                                         (expr (mut k) (kid n 1) (map-key t))
                                         (map-key t))]
                           (te `(get ~(.code b) ~(.code i))
-                              (cat (map-val t) "?")))
+                              (opt-type (map-val t))))
                       (= t "Text")
                         (let [i
                                 (expect (mut k)
@@ -5145,7 +5150,7 @@
                       (expr (mut k)
                             (kid n 2)
                             (if (and endless (> (len want) 0) (not (opt? want)))
-                                (cat want "?")
+                                (opt-type want)
                                 want))
                     label (primitive/code-symbol ":" (fresh (mut k) "q"))
                     x (fresh (mut k) "x")
@@ -5177,7 +5182,7 @@
                              ~label
                              ~code
                              (None [~(coil-type (mut k) found)]))
-                          (cat found "?"))))))
+                          (opt-type found))))))
     ;; The last some(…), or value, every item looked at.
     (g/KLast []
              (let [_ (bounded! (mut k) (kid n 0))
@@ -5205,7 +5210,7 @@
                  (te `(let [(mut ~(sym o)) (None [~(coil-type (mut k) found)])]
                         ~code
                         ~(sym o))
-                     (cat found "?")))))
+                     (opt-type found)))))
     (g/KSort []
              (let [mark (locals-mark (mut k))
                    items (expr (mut k) (kid n 1) "")
@@ -5371,7 +5376,7 @@
                         (expr (mut k)
                               (kid n 0)
                               (if (> (len want) 0)
-                                  (if (opt? want) want (cat want "?"))
+                                  (if (opt? want) want (opt-type want))
                                   ""))]
                   (unless (opt? (.ty a))
                     (die (mut k)

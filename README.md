@@ -5,7 +5,7 @@ languages, each one a Coil reader metaprogram. It is checked against esbuild on 
 other real libraries.
 
 ```
-build.bundler        targets, formats, defines, loaders, hooks      → the build program
+build.bundler        targets, formats, defines, loaders, hooks      → data, given meaning by spec.rules
 build.pipeline       stages, and plans of how many threads run them → plans, checked for shared state
 ├── js.syntax        JavaScript as a scannerless PEG                → parser, AST, printer, node table
 ├── literal.syntax   the inside of strings and templates            → a parser for escapes
@@ -24,25 +24,36 @@ Every language except `.syntax` is defined by a `.syntax` grammar in `src/langua
 ## The split
 
 There is no bundler logic in Coil. Everything written in the languages is under `src/`, which
-holds no `.coil` file at all, and the Coil under `compiler/` knows nothing about JavaScript or
-bundling: it is grammars, types,
-tables, Datalog and rewriting in general, plus a runtime of buffers, files and Unicode.
+holds no `.coil` file at all, and the Coil under `compiler/` knows nothing about bundling and
+names no JavaScript node: it is grammars, types, tables, Datalog and rewriting in general, plus a
+runtime of buffers, files and Unicode. Two places still lean on JavaScript. `.scopes` takes node
+names as parameters, but its tables are JavaScript's binding forms (`var` hoisting, `let`, named
+function expressions, `with` and `eval`), and it cannot say a scope rule JavaScript lacks, such as
+ML's `let x = x + 1 in …`, whose initializer sees the outer `x`: say that with an attribute grammar.
+And the grammar language's printer directives (`nomix`, `keepforbid`, a soft `;`) are general, but
+each exists for one of JavaScript's quirks.
+
+A build spec (`build.bundler`) is data, like `package.json`: `spec.syntax` reads it and
+`spec.rules` says what each setting means, as a match from setting to options, with each error
+located in the spec. The steps it names (rewrites, resolve and load hooks) are code, so the program
+running it offers them by name (`src/app/build.rules`); a name it does not offer is an error at
+that name in the spec. `out/bin/spec FILE` builds any spec with those steps.
 
 | Language | Lines | What it says |
 |---|---|---|
-| `.rules` | 5,645 | Resolution, modules, TypeScript, tsconfig, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, the tools |
-| `.attrs` | 2,654 | Early errors, what a file loads, JSX, what each statement declares, emit's renaming: attribute grammars, computed in one traversal |
-| `.syntax` | 815 | JavaScript with JSX and TypeScript, CSS, literals, comments, where a big file can be cut, package.json and tsconfig.json |
+| `.rules` | 5,719 | Resolution, modules, TypeScript, tsconfig, naming, chunks, lowering, CSS bundling, legal comments, source maps, the build, what a build spec means, the tools |
+| `.attrs` | 2,438 | Early errors, what a file loads, JSX, what each statement declares, emit's renaming: attribute grammars, computed in one traversal |
+| `.syntax` | 879 | JavaScript with JSX and TypeScript, CSS, literals, comments, where a big file can be cut, package.json and tsconfig.json, build specs |
 | `.rewrite` | 157 | Minification, constant folding, dead code |
-| `.facts` | 114 | Linking, tree shaking, and which root reaches what for code splitting |
+| `.facts` | 126 | Linking, tree shaking, and which root reaches what for code splitting |
 | `.js` | 171 | The bundle's runtime helpers, and those lowering adds |
-| `.bundler` | 70 | A demo build |
+| `.bundler` | 64 | A demo build: data, read with `spec.syntax` |
 | `.pipeline` | 48 | Which stages may run in parallel, and five plans for running them |
 | `.scopes` | 26 | Scoping |
 | `.coil` | 15 | Four `main` functions, because a package's entry must be plain Coil |
 
-The compilers for those languages are about 8,600 lines of Coil and 400 of grammars, with a runtime
-of 1,900 (text, paths, tables, threads).
+The compilers for those languages are about 12,100 lines of Coil and 240 of grammars, with a runtime
+of 2,100 (text, paths, tables, threads), counting neither comments nor blank lines.
 
 `.rules` is the least specific of these languages: a typed language over the grammar's nodes, with
 pattern matching, relations, dynamic scope and code templates written in JavaScript's own syntax:
@@ -178,6 +189,7 @@ python3 tools/guard.py 9500 500 tools/build-tools.sh -O3      # out/bin/{esb,jsp
 out/bin/esb tests/apps/named.js --minify --outfile=out/app.js  # command line, esbuild style
 python3 tools/verify.py out/bin/esb out/bin/jsparse           # every claim below
 (cd tests && ../out/bin/spec)                                 # the build build.bundler describes
+(cd tests && ../out/bin/spec other.bundler)                   # another spec, with the same steps
 ```
 
 `tools/same.py` compares a new build with a frozen one, byte for byte, across 189 outputs. That is
@@ -408,9 +420,10 @@ Everything written in the languages is under `src/`; everything in Coil under `c
 - `src/languages/`: the grammars of the languages themselves, and the `.rules` prelude.
 - `src/bundle/`: the bundler, in those languages.
 - `src/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map` gives the serial answer, in `.rules`.
-- `src/app/`: a demo spec with four targets, a format, a loader and plugins, and the pipeline.
+- `src/app/`: a demo spec with six targets, a format, a loader and plugins; the program that offers
+  it its steps (`build.rules`); and the pipeline.
 - `compiler/hl/`: the languages' compilers. `syntax`, `rules`, `rewrite`, `facts`, `scopes`,
-  `bundler` and `pipeline` are readers; `rt` and `symtab` are their domain-free runtime;
+  and `pipeline` are readers; `rt` and `symtab` are their domain-free runtime;
   `grammars/` turns each grammar in `src/languages/` into its parser.
 - `compiler/boot/`: five `main` functions, because a package's entry must be plain Coil.
 - `tests/apps/`: the apps and fixtures the checks build; `tests/oracles/` the Node scripts that

@@ -318,6 +318,18 @@ check(got == '["a",{"x":"1"},["b"]]', f"a spec's JSX settings: {got}")
 old = sh(["node", "oracles/check-target.mjs", "../out/spec/old.js", "2017"], 30)[1].strip()
 ran = sh(["node", "../out/spec/old.js"], 30)[1].strip()
 check(old == "ok" and ran == "4 4", f"a spec's syntax target: {old}, {ran}")
+# A spec is data: the same program builds another one, and a step it does not offer is an error
+# in the spec, at the name.
+other = f"{SCRATCH}/other.bundler"
+with open(other, "w") as f:
+    f.write('bundler\nformat f\n  prefix "\\x41\\u{42}\\t"\nend\n'
+            f'target a\n  entry "apps/lib.js"\n  outfile "{SCRATCH}/other.js"\n  format f\nend\n')
+code, _ = sh([SPEC, other], 60)
+check(code == 0 and open(f"{SCRATCH}/other.js").read().startswith("AB\t"), "another spec, read when the program runs, its strings unescaped")
+with open(other, "w") as f:
+    f.write('bundler\ntarget a\n  entry "apps/lib.js"\n  outfile "x.js"\n  transform strip-debug nope\nend\n')
+code, out = sh([SPEC, other], 60)
+check(code != 0 and f"{other}:5:25: no pass named nope" in out, f"a step the program does not offer: {out.strip().splitlines()[0] if out.strip() else ''}")
 
 print("== the rules language")
 code, out = sh([os.path.join(os.path.dirname(ESB), "langtest")], 30)

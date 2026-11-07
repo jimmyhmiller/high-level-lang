@@ -1,0 +1,127 @@
+# What a build spec (`.bundler`, the grammar `spec.syntax`) means: each target's settings folded
+# into the options `api.build` takes. A spec is data. The steps it names (rewrites, hooks) are code,
+# so a program offers them to it by name, and a name it does not offer is an error in the spec.
+rules bundle.spec over bundle.spec-file
+use bundle.spec-file as sf
+use bundle.api as api
+use bundle.js as js
+use bundle.literal as lit
+use bundle.minhost as host
+
+# The steps a program lets its spec name.
+record Steps {
+  passes: {Text:Fn(js.Node)->js.Node},
+  resolvers: {Text:Fn(Text,Text)->Text?},
+  loaders: {Text:Fn(Text)->Text?}
+}
+
+# The spec being read, for its errors.
+setting path: Text
+setting source: Text
+# What `transform` and `optimize` name for the target being built, in order.
+setting transforms: [Fn(js.Node)->js.Node]
+setting optimizes: [Fn(js.Node)->js.Node]
+
+# Every target a spec describes, built, and their files written.
+fn build-all(text: Text, file: Text, steps: Steps) -> Void =
+  with path = file, source = text { api.written(files(sf.parse(text, file), steps)) }
+
+fn files(spec: Node, steps: Steps) -> [api.Written] = [files-of(t, formats, steps)... for t in spec.targets.kids]
+  where formats = {"iife": api.iife-format(), "esm": api.esm-format(), "cjs": api.cjs-format()}
+                  ++ {d.name.text: format-of(d) for d in spec.formats.kids}
+
+fn files-of(t: Node, formats: {Text:api.Format}, steps: Steps) -> [api.Written] =
+  with transforms = [pass(steps, w) for Transform(ws) in t.settings.kids for w in ws.kids],
+       optimizes = [pass(steps, w) for Optimize(ws) in t.settings.kids for w in ws.kids] {
+    api.files(checked(t, settled))
+  }
+  where settled = fold o = api.options-new("", "") for s in t.settings.kids: applied(o, s, formats, steps)
+
+# A target must say where it starts and what it writes.
+fn checked(t: Node, o: api.Options) -> api.Options = match o.entry, o.outfile {
+  "", _ => fail(t.name, "target " ++ t.name.text ++ " has no entry")
+  _, "" => fail(t.name, "target " ++ t.name.text ++ " has no outfile")
+  _, _ => o
+}
+
+fn applied(o: api.Options, s: Node, formats: {Text:api.Format}, steps: Steps) -> api.Options = match s {
+  Entry(p) => o with { entry: text(p), entries: [text(p)] }
+  Outfile(p) => o with { outfile: text(p) }
+  Format(f) => o with { format: formats[f.text] ?? fail(f, "no format named " ++ f.text ++ "; define one with `format … end`") }
+  Global(g) => o with { global-name: text(g) }
+  Define(key, value) => api.with-define(o, key.text, value.text)
+  MainFields(ws) => o with { main-fields: words(ws) }
+  Conditions(ws) => o with { conditions: words(ws) }
+  Minify(List()) => o with { minify-identifiers: true, minify-syntax: true }
+  Minify(ws) => fold p = o for w in ws.kids: minified(p, w)
+  Pretty() => o with { pretty: true }
+  Sourcemap() => o with { sourcemap: true }
+  Platform(Name("node")) => api.on-node(o)
+  Platform(Name("browser")) => o
+  Platform(n) => fail(n, "the platform is browser or node")
+  External(ws) => o with { external: o.external ++ words(ws) }
+  Alias(from, to) => api.with-alias(o, text(from), text(to))
+  Loader(e, Name(k)) if k in api.loader-kinds => api.with-loader(o, text(e), k)
+  Loader(_, k) => fail(k, "the loader is " ++ join(api.loader-kinds, ", "))
+  Banner(b) => o with { banner: text(b) }
+  Footer(f) => o with { footer: text(f) }
+  TreeShaking(Name("on")) => o
+  TreeShaking(Name("off")) => o with { tree-shaking: false }
+  TreeShaking(n) => fail(n, "tree-shaking is on or off")
+  Jsx(r) => api.with-jsx(o, o.jsx with { runtime: api.jsx-runtime(r.text) ?? fail(r, "jsx is transform, automatic or preserve") })
+  JsxFactory(x) => api.with-jsx-factory(o, text(x))
+  JsxFragment(x) => api.with-jsx-fragment(o, text(x))
+  JsxImportSource(x) => api.with-jsx-import-source(o, text(x))
+  JsxDev() => api.with-jsx-dev(o)
+  SyntaxTarget(y) => o with { target: api.target-year(y.text) ?? fail(y, "the language is esnext, es6 or a year such as es2017") }
+  OnResolve(ws) => o with { on-resolve: o.on-resolve ++ [steps.resolvers[w.text] ?? unoffered(w, "resolve hook", keys(steps.resolvers)) for w in ws.kids] }
+  OnLoad(ws) => o with { on-load: o.on-load ++ [steps.loaders[w.text] ?? unoffered(w, "load hook", keys(steps.loaders)) for w in ws.kids] }
+  Transform(_) => o with { has-transform: true, transform: transformed }
+  Optimize(_) => o with { has-optimize: true, optimize: optimized }
+}
+
+fn minified(o: api.Options, w: Node) -> api.Options = match w.text {
+  "identifiers" => o with { minify-identifiers: true }
+  "syntax" => o with { minify-syntax: true }
+  _ => fail(w, "minify takes identifiers and syntax, or nothing for both")
+}
+
+fn format-of(d: Node) -> api.Format = fold f = blank for p in d.parts.kids: format-part(f, p)
+  where blank = api.Format(prefix: "", suffix: "", exports: "", export-names: false, hoist-externals: false)
+
+fn format-part(f: api.Format, p: Node) -> api.Format = match p {
+  Prefix(t) => f with { prefix: text(t) }
+  Suffix(t) => f with { suffix: text(t) }
+  ExportsVia(t) => f with { exports: text(t) }
+  ExportsNames() => f with { export-names: true }
+  HoistExternals() => f with { hoist-externals: true }
+}
+
+# The steps the target names, in order: what its `transform` and `optimize` run.
+fn transformed(n: js.Node) -> js.Node = fold t = n for f in transforms: f(t)
+fn optimized(n: js.Node) -> js.Node = fold t = n for f in optimizes: f(t)
+
+fn pass(steps: Steps, w: Node) -> Fn(js.Node)->js.Node = steps.passes[w.text] ?? unoffered(w, "pass", keys(steps.passes))
+
+fn unoffered(w: Node, what: Text, offered: [Text]) -> Never =
+  fail(w, "no " ++ what ++ " named " ++ w.text ++ "; the program offers " ++ join(offered, ", "))
+
+fn words(ws: Node) -> [Text] = [w.text for w in ws.kids]
+
+# A string's value: its escapes resolved, as JavaScript reads them.
+fn text(s: Node) -> Text = join([piece-text(s, p) for p in host.pieces(unquote(s.text))], "")
+
+fn piece-text(s: Node, p: lit.Node) -> Text = match p {
+  lit.Plain(t) => t
+  lit.EscOther("\\n") => "\n"
+  lit.EscOther("\\t") => "\t"
+  lit.EscOther("\\r") => "\r"
+  lit.EscOther(e) => e[1..len(e)]
+  lit.EscHex(t) => text-of-points([digits-number(t[2..4], 16, 256) ?? 0])
+  lit.EscUni(t) => text-of-points([digits-number(t[2..6], 16, 65536) ?? 0])
+  lit.EscBrace(t) => text-of-points([digits-number(t[3..len(t) - 1], 16, 1114112) ?? 0])
+  _ => fail(s, "a spec's strings have no octal escapes: " ++ p.text)
+}
+
+fn fail(at: Node, message: Text) -> Never =
+  panic "{}:{}:{}: {}", path, line-of(source, at.lo), col-of(source, at.lo), message
