@@ -674,20 +674,142 @@ fn blank-parsed(path: Text) -> Parsed =
 # ---------------------------------------------------------------- big files, in pieces
 
 # A big file of plain JavaScript is parsed in pieces, on several threads. A piece starts on a line
-# that begins a declaration in its first column, outside every bracket, string, template, comment
-# and regular expression, as the coarse grammar (coarse.syntax) reads them. It can be wrong only one
-# way that matters: a piece before a wrong start is no program by itself, and then the file is
-# parsed whole.
+# that begins a declaration, outside every bracket, string, template, comment and regular
+# expression, as the coarse grammar (coarse.syntax) reads them. It can be wrong only one way that
+# matters: a piece before a wrong start is no program by itself, and then the file is parsed whole.
 const piece-bytes: Int = 8192
 
-record Parts { src: Text, starts: [Int] }
+# A file's text and where its pieces start. A library inside one function is cut inside that
+# function's body, from `open`, its `{`, up to `close`, its `}`; -1 when the file is cut at its
+# own top level.
+record Parts { src: Text, starts: [Int], open: Int, close: Int }
 
-# A file's text, and where its pieces start: at 0 alone unless it is big plain JavaScript.
+# At 0 alone unless it is big plain JavaScript.
 memo fn split-source(path: Text) -> Parts {
   let src = module-text(read-file(path), path)
-  if loading.has-transform or loader-of(path) != "js" or len(src) < 2 * piece-bytes { return Parts(src: src, starts: [0]) }
-  Parts(src: src, starts: [0] ++ piece-starts(src))
+  if loading.has-transform or loader-of(path) != "js" or len(src) < 2 * piece-bytes { return Parts(src: src, starts: [0], open: -1, close: -1) }
+  parts-of-source(src)
 }
+
+fn parts-of-source(src: Text) -> Parts {
+  let whole = Parts(src: src, starts: [0], open: -1, close: -1)
+  # A file with no declaration at the start of a line has nowhere to cut at its top level.
+  let cuts = if len(occurrences(src, ["\n" ++ k for k in declaration-words])) > 0 then piece-starts(src) else []
+  if len(cuts) > 0 { return whole with { starts: [0] ++ cuts } }
+  let starts = line-starts(src)
+  let lines = Lines(starts: starts, indents: line-indents(src, starts))
+  match body-span(src, lines) {
+    some(b) => {
+      let inner = body-cuts(src, lines, b)
+      if len(inner) == 0 then whole else Parts(src: src, starts: [b.open + 1] ++ inner, open: b.open, close: b.close)
+    }
+    none => whole
+  }
+}
+
+record Span { open: Int, close: Int }
+
+# A library inside one function is cut by how its code is laid out, which is how it was written:
+# the function's body is the lines inside it, the body's statements start at its indentation, and
+# a block in it runs from a line there that ends with `{` to the next there that starts with `}`.
+# A wrong guess is no function body, or a piece that is no program, and the file is parsed whole.
+
+# Where each line starts, and how far it is indented (-1 when it is blank).
+record Lines { starts: [Int], indents: [Int] }
+
+# The body of a function that is nearly all of the file: from the first line to end with `{` to
+# the last line to start with `}`. Then, as long as one block in it holds most of it, as a
+# library's own function inside the wrapper does, that block's.
+fn body-span(src: Text, lines: Lines) -> Span? = match index-of(src, "{\n") {
+  some(open) => match last-index-of(src, "\n}") {
+    some(nl) => if nl > open and (nl + 1 - open) * 10 >= len(src) * 9 then some(innermost(src, lines, Span(open: open, close: nl + 1))) else none
+    none => none
+  }
+  none => none
+}
+
+fn innermost(src: Text, lines: Lines, s: Span) -> Span = match dominant-block(src, lines, s) {
+  some(inner) => innermost(src, lines, inner)
+  none => s
+}
+
+# The lines of a body at its own indentation, and that indentation.
+record Level { depth: Int, starts: [Int] }
+
+fn level-of(lines: Lines, s: Span) -> Level {
+  let from = bisect(lines.starts, s.open)
+  let to = bisect(lines.starts, s.close - 1)
+  let depth = (first i in from..to: if lines.indents[i] >= 0 then some(lines.indents[i]) else none) ?? 0
+  Level(depth: depth, starts: [lines.starts[i] for i in from..to if lines.indents[i] == depth])
+}
+
+# The biggest block at a body's own indentation, when it is at least half the body.
+fn dominant-block(src: Text, lines: Lines, s: Span) -> Span? {
+  let level = level-of(lines, s)
+  if level.depth <= 0 { return none }
+  let ls = level.starts
+  let blocks = [Span(open: end - 1, close: c + level.depth)
+                for i in 0..len(ls) if let some(end) = line-end(lines, ls[i]) if at?(src, end - 1, "{")
+                if let some(c) = (first j in i + 1..len(ls): if at?(src, ls[j] + level.depth, "}") then some(ls[j]) else none)]
+  let biggest = fold best = -1 for b in blocks: max(best, b.close - b.open)
+  if biggest * 2 < s.close - s.open { return none }
+  first b in blocks: if b.close - b.open == biggest then some(b) else none
+}
+
+# Where the line starting at `at` ends: its line break.
+fn line-end(lines: Lines, at: Int) -> Int? {
+  let next = bisect(lines.starts, at)
+  if next < len(lines.starts) then some(lines.starts[next] - 1) else none
+}
+
+const declaration-words: [Text] = ["function ", "function*", "async function", "class ", "var ", "let ", "const "]
+
+# The body's statements that start a declaration, as cuts a piece's size apart.
+fn body-cuts(src: Text, lines: Lines, b: Span) -> [Int] {
+  let level = level-of(lines, b)
+  if level.depth <= 0 { return [] }
+  fold cuts = [] for l in level.starts if (any k in declaration-words: at?(src, l + level.depth, k)) if b.close - (l + level.depth) >= piece-bytes:
+    if l + level.depth - (if len(cuts) == 0 then b.open + 1 else last(cuts)) >= piece-bytes then cuts ++ [l + level.depth] else cuts
+}
+
+# Where piece `k` ends.
+fn piece-end(sp: Parts, k: Int) -> Int =
+  if k + 1 < len(sp.starts) then sp.starts[k + 1] else if sp.open >= 0 then sp.close else len(sp.src)
+
+# A function's body put together from its pieces: the file parsed with only the body's line breaks
+# left of it, what follows moved back where it was, and the pieces' statements in the body. Nothing
+# when that is not exactly one empty function body, or a piece has import or export syntax, which
+# a function body cannot.
+fn assembled(sp: Parts, path: Text, pieces: [Node]) -> Node? {
+  if any t in pieces: early.program-has-module-syntax?(t) { return none }
+  let stmts = [s for t in pieces for s in t.body.kids]
+  let breaks = count-byte(sp.src, sp.open + 1, sp.close, '\n')
+  let tail = sp.open + 1 + breaks
+  let outer-src = sp.src[0..sp.open + 1] ++ repeated("\n", breaks) ++ sp.src[sp.close..len(sp.src)]
+  match js.parse-opt(outer-src, path, 0) {
+    some(parsed) => {
+      let outer = moved(parsed, tail, sp.close - tail)
+      if body-count(outer, sp.open, sp.close + 1) == 1 then some(filled-body(outer, sp.open, sp.close + 1, stmts, pieces)) else none
+    }
+    none => none
+  }
+}
+
+# Everything from `from` on moved `by`.
+fn moved(n: Node, from: Int, by: Int) -> Node =
+  if n.hi < from then n
+  else n with { lo: if n.lo >= from then n.lo + by else n.lo, hi: n.hi + by, kids: [moved(k, from, by) for k in n.kids] }
+
+# How many empty function bodies span exactly `lo` to `hi`.
+fn body-count(n: Node, lo: Int, hi: Int) -> Int =
+  if n is FuncBody(List()) and n.lo == lo and n.hi == hi then 1
+  else sum k in n.kids: if k.lo <= lo and hi <= k.hi then body-count(k, lo, hi) else 0
+
+fn filled-body(n: Node, lo: Int, hi: Int, stmts: [Node], pieces: [Node]) -> Node =
+  if n is FuncBody(List()) and n.lo == lo and n.hi == hi
+  then n with { stmts: n.stmts with { kids: stmts, lo: pieces[0].body.lo, hi: last(pieces).body.hi } }
+  else if n.lo <= lo and hi <= n.hi and len(n.kids) > 0 then n with { kids: [filled-body(k, lo, hi, stmts, pieces) for k in n.kids] }
+  else n
 
 record PieceTree { tree: Node?, specs: [Text], targets: {Text:Text} }
 
@@ -696,9 +818,7 @@ memo fn piece-of(item: Text) -> PieceTree {
   let path = text-before(item, "\n")
   let k = parse-int(text-after(item, "\n"))
   let sp = split-source(path)
-  let from = sp.starts[k]
-  let to = if k + 1 < len(sp.starts) then sp.starts[k + 1] else len(sp.src)
-  match js.parse-piece(sp.src[0..to], path, 0, from) {
+  match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
     none => PieceTree(tree: none, specs: [], targets: {})
     some(tree) => {
       let imported = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)]
@@ -721,7 +841,8 @@ record Prepared { whole: Bool, tree0: Node, tree: Node, parts: [[Node]], raw: [[
 memo fn prepared-of(path: Text) -> Prepared {
   let sp = split-source(path)
   let pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
-  if any t in pieces: is-none(t) {
+  # A function's body is put together and analysed whole.
+  if sp.open >= 0 or (any t in pieces: is-none(t)) {
     return Prepared(whole: false, tree0: None(), tree: None(), parts: [], raw: [], scopes: sym.table-new(), root: -1,
                     esm: false, mentions: false, exportable: [], wrapper: -1)
   }
@@ -777,10 +898,29 @@ memo fn from-of(path: Text) -> Parsed {
 # The big file, analysed: its parts' tables grafted in order, as one walk would have filled the
 # table, ids and all. CommonJS, and code a define changes, are analysed again whole, as
 # `analysis-of` does.
+# A library inside one function, its body parsed in pieces and put together, then checked as the
+# whole file would be.
+fn nested-file(path: Text) -> Parsed? {
+  let sp = split-source(path)
+  if sp.open < 0 { return none }
+  let pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
+  if any t in pieces: is-none(t) { return none }
+  match assembled(sp, path, [t for some(t) in pieces]) {
+    some(tree) => {
+      let found = early.run(tree, false, true, false, false, false, [])
+      match found.problem {
+        none => some(parsed-with(path, sp.src, tree, none, some(Checked(tree: tree, requires: found.requires, imports: found.imports))))
+        some(p) => panic "{}:{}:{}: {}", path, line-of(sp.src, p.at), col-of(sp.src, p.at), p.message
+      }
+    }
+    none => none
+  }
+}
+
 fn finished-file(path: Text) -> Parsed {
   let pr = prepared-of(path)
   let sp = split-source(path)
-  if not pr.whole { return targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true)))) }
+  if not pr.whole { return targets-of(analysed-file(nested-file(path) ?? parsed-file(Pending(path: path, text: sp.src, ready: true)))) }
   let p = from-of(path)
   let found = [piece-of(path ++ "\n" ++ int-text(k)).targets for k in 0..len(sp.starts)]
   let targets = {spec: t for pt in found for spec in keys(pt) if let some(t) = pt[spec]}

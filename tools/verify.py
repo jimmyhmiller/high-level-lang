@@ -50,6 +50,11 @@ for name in ["fail", "early"]:
     m = re.match(r"parsed (\d+) failed (\d+)", tail)
     print(f"  info test262 {name}/: rejected {m.group(2)} of {int(m.group(1)) + int(m.group(2))}")
 
+# A library inside one function is parsed in pieces of its body: put together, the same tree.
+code, out = sh([PARSE, "pieces", "node_modules/lodash/lodash.js"], 60)
+check(code == 0 and "inside the function body" in out and "the same tree as parsing it whole" in out,
+      "lodash.js in pieces of its function's body: " + (out.strip().split("\n")[-1] if out.strip() else "no output"))
+
 print("== bundles against esbuild")
 for a in "named all cjs features three zod rx datefns preact immer react d3 reexport".split():
     theirs, ours = f"{SCRATCH}/{a}.esb.min.js", f"{SCRATCH}/{a}.min.js"
