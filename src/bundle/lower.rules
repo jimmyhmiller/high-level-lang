@@ -367,31 +367,42 @@ fn outer-parameter-count(params: Node) -> Int = len([p for p in params.items.kid
 
 # `function f(x) { await x; }` is `function f(x) { return __async(this, null, function* () { yield x; }); }`.
 # Parameters that run code must run inside, so that they reject the promise.
-fn wrapped-in-generator(params: Node, body: Node, self: Node, driver: Text, generator: Bool) -> Wrapped {
-  if mentions-super?(body) { panic "`super` in an async function is not implemented for this target" }
-  let stmts = [if generator then replaced-await-in-generator(s) else replaced-await(s) for s in body-statements(body)]
-  let simple = simple-parameters?(params)
-  let inner-params = if simple then Params(List()) else params-node(params)
-  let outer-params = if simple then params-node(params) else {
-    let names = [Param(BindName(fresh-name("_")), None()) for i in 0..outer-parameter-count(params)]
-    Params(List(names...))
-  }
-  let pass = if not simple or mentions-arguments?(body) then Ident("arguments") else Null()
-  let inner = GenExpr(None(), inner-params, FuncBody(List(stmts...)))
-  let driven = helper-call(driver, [self, pass, inner])
-  Wrapped(params: outer-params, body: FuncBody(List(Return(driven))))
+fn wrapped-in-generator(params: Node, body: Node, self: Node, driver: Text, generator: Bool) -> Wrapped = match body {
+  _ if mentions-super?(body) => panic "`super` in an async function is not implemented for this target"
+  _ => Wrapped(params: outer-params, body: FuncBody(List(Return(driven))))
+    where stmts = [awaits-replaced(s, generator) for s in body-statements(body)],
+          simple = simple-parameters?(params),
+          inner-params = match simple {
+            true => Params(List())
+            false => params-node(params)
+          },
+          outer-params = match simple {
+            true => params-node(params)
+            false => Params(List([Param(BindName(fresh-name("_")), None()) for i in 0..outer-parameter-count(params)]...))
+          },
+          pass = match not simple or mentions-arguments?(body) {
+            true => Ident("arguments")
+            false => Null()
+          },
+          driven = helper-call(driver, [self, pass, GenExpr(None(), inner-params, FuncBody(List(stmts...)))])
 }
 
-fn arrow-self(body: Node) -> Node = if mentions-this?(body) then This() else Null()
+fn awaits-replaced(s: Node, generator: Bool) -> Node = match generator {
+  true => replaced-await-in-generator(s)
+  false => replaced-await(s)
+}
+
+fn arrow-self(body: Node) -> Node = match mentions-this?(body) {
+  true => This()
+  false => Null()
+}
 
 fn rest-prologue(params: Node) -> Wrapped = match params {
-  Params(List(ps...)) => {
-    let each = [rest-taken(p) for p in ps]
-    let kept = [e.param for e in each]
-    let decls = [d for e in each for d in e.decls]
-    let stmts: [Node] = if len(decls) > 0 then [VarDecl(List(decls...))] else []
-    Wrapped(params: Params(List(kept...)) with { lo: params.lo, hi: params.hi }, body: FuncBody(List(stmts...)))
-  }
+  Params(List(ps...)) =>
+    Wrapped(params: Params(List([e.param for e in each]...)) with { lo: params.lo, hi: params.hi },
+            body: FuncBody(List([VarDecl(List(decls...)) for x in [decls] if len(x) > 0]...)))
+    where each = [rest-taken(p) for p in ps],
+          decls = [d for e in each for d in e.decls]
   _ => Wrapped(params: params, body: FuncBody(List()))
 }
 
@@ -399,46 +410,42 @@ fn rest-prologue(params: Node) -> Wrapped = match params {
 record Taken { param: Node, decls: [Node] }
 
 fn rest-taken(p: Node) -> Taken = match p {
-  Param(t, init) if top-rest?(t) => {
-    let name = fresh-name("_")
-    Taken(param: Param(BindName(name), init) with { lo: p.lo, hi: p.hi }, decls: rest-declarators(t, Ident(name), p))
-  }
+  Param(t, init) if top-rest?(t) => Taken(param: Param(BindName(name), init) with { lo: p.lo, hi: p.hi }, decls: rest-declarators(t, Ident(name), p))
+    where name = fresh-name("_")
   _ => Taken(param: p, decls: [])
 }
 
 fn arrow?(n: Node) -> Bool = n is Arrow(...) | AsyncArrow(...)
 
 # Lower a function: its parameters belong to the function around it, its body to itself.
-fn function-node(n: Node) -> Node {
-  let split = first k in n.kids:
-    if k is Params(_) then some(if before?(2018) then rest-prologue(k) else Wrapped(params: k, body: FuncBody(List()))) else none
-  let params = match split {
-    some(s) => generic(s.params)
-    none => (first k in n.kids: if k is BindName(_) and arrow?(n) then some(k) else none) ?? None()
-  }
-  let prologue = match split {
-    some(s) => s.body.stmts.kids
-    none => []
-  }
-  let body = (first k in n.kids: if k is FuncBody(_) | ExprBody(_) then some(k) else none) ?? None()
-  rebuilt-function(n, params, lowered-body(body, prologue))
+fn function-node(n: Node) -> Node = rebuilt-function(n, params, lowered-body(body, prologue))
+  where split = first k in n.kids if k is Params(_): parameters-split(k),
+        params = match split {
+          some(s) => generic(s.params)
+          none => (first k in n.kids if k is BindName(_) and arrow?(n): k) ?? None()
+        },
+        prologue = (first s in split: s.body.stmts.kids) ?? [],
+        body = (first k in n.kids if k is FuncBody(_) | ExprBody(_): k) ?? None()
+
+# Parameters, and before ES2018 the declarations that take their rest elements apart.
+fn parameters-split(k: Node) -> Wrapped = match before?(2018) {
+  true => rest-prologue(k)
+  false => Wrapped(params: k, body: FuncBody(List()))
 }
 
 # A function's body lowered, with the temporaries it needs declared at its top. Its parameters
 # were lowered already: what they need belongs to the function around it.
-fn lowered-body(body: Node, prologue: [Node]) -> Node {
-  with temps = [] {
-    match body {
-      FuncBody(List(ss...)) => body with { kids: [list-of(with-temps(lowered-list(prologue ++ ss), temps))] }
-      ExprBody(e) =>
-        if len(prologue) > 0 then FuncBody(list-of(with-temps(lowered-list(prologue ++ [Return(e)]), temps)))
-        else {
-          let x = lowered(e)
-          if len(temps) == 0 then body with { kids: [x] } else FuncBody(list-of(with-temps([Return(x)], temps)))
-        }
-      _ => body with { kids: [list-of(with-temps([], temps))] }
-    }
-  }
+fn lowered-body(body: Node, prologue: [Node]) -> Node = with temps = [] { body-with-temps(body, prologue) }
+
+# The temporaries are those lowering the body made, read once it is lowered.
+fn body-with-temps(body: Node, prologue: [Node]) -> Node = match body, prologue {
+  FuncBody(List(ss...)), _ => body with { kids: [list-of(with-temps(lowered, temps))] } where lowered = lowered-list(prologue ++ ss)
+  ExprBody(e), [_, ...] => FuncBody(list-of(with-temps(lowered, temps))) where lowered = lowered-list(prologue ++ [Return(e)])
+  ExprBody(e), [] => match temps {
+    [] => body with { kids: [x] }
+    _ => FuncBody(list-of(with-temps([Return(x)], temps)))
+  } where x = lowered(e)
+  _, _ => body with { kids: [list-of(with-temps([], temps))] }
 }
 
 fn function-part(k: Node, params: Node, body: Node) -> Node = match k {
@@ -489,28 +496,7 @@ fn rebuilt-function(n: Node, params: Node, body: Node) -> Node {
 
 # The loop esbuild writes: drive the iterator by hand, and close it however the body ends.
 fn for-await(n: Node) -> Node = match n {
-  ForOf(_, left, right, body) => {
-    let iter = temp()
-    let more = temp()
-    let cell = temp()
-    let failed = temp()
-    let source = lowered(right)
-    let inner = lowered(body)
-    let bound: Node = match left {
-      VarLeft(t) => stmt`var $t = $cell.value;`
-      LetLeft(t) => stmt`let $t = $cell.value;`
-      ConstLeft(t) => stmt`const $t = $cell.value;`
-      _ => {
-        let target = lowered(left)
-        stmt`$target = $cell.value;`
-      }
-    }
-    let start = helper-call("__forAwait", [source])
-    let stmts = [bound, inner]
-    # `await` is not a word a template can parse: templates are scripts.
-    let stepped = Await(exp`$iter.next()`)
-    let closed = Await(exp`$cell.call($iter)`)
-    stmt`try {
+  ForOf(_, left, right, body) => stmt`try {
       for ($iter = $start, $more = false, $failed = false; $more = !($cell = $stepped).done; $more = false) {
         $$stmts
       }
@@ -523,7 +509,23 @@ fn for-await(n: Node) -> Node = match n {
         if ($failed) throw $failed[0];
       }
     }`
-  }
+    where iter = temp(),
+          more = temp(),
+          cell = temp(),
+          failed = temp(),
+          source = lowered(right),
+          inner = lowered(body),
+          bound = match left {
+            VarLeft(t) => stmt`var $t = $cell.value;`
+            LetLeft(t) => stmt`let $t = $cell.value;`
+            ConstLeft(t) => stmt`const $t = $cell.value;`
+            _ => stmt`$target = $cell.value;` where target = lowered(left)
+          },
+          start = helper-call("__forAwait", [source]),
+          stmts = [bound, inner],
+          # `await` is not a word a template can parse: templates are scripts.
+          stepped = Await(exp`$iter.next()`),
+          closed = Await(exp`$cell.call($iter)`)
   _ => panic "expected a for-of loop"
 }
 
@@ -546,34 +548,29 @@ fn private-key(m: Node) -> Text? = match inner-member(m) {
 
 fn private-member?(m: Node) -> Bool = is-some(private-key(m))
 
-fn private-get(o: Node, name: Text) -> Node {
-  let p = privates[name] ?? panic "no private name {} in scope", name
-  if len(p.getter) > 0 then helper-call("__privateGet", [o, Ident(p.holder), Ident(p.getter)])
-  else if len(p.method) > 0 then helper-call("__privateMethod", [o, Ident(p.holder), Ident(p.method)])
-  else helper-call("__privateGet", [o, Ident(p.holder)])
+fn private-get(o: Node, name: Text) -> Node = match privates[name] ?? panic "no private name {} in scope", name {
+  p if p.getter != "" => helper-call("__privateGet", [o, Ident(p.holder), Ident(p.getter)])
+  p if p.method != "" => helper-call("__privateMethod", [o, Ident(p.holder), Ident(p.method)])
+  p => helper-call("__privateGet", [o, Ident(p.holder)])
 }
 
-fn private-set(o: Node, name: Text, value: Node) -> Node {
-  let p = privates[name] ?? panic "no private name {} in scope", name
-  if len(p.setter) > 0 then helper-call("__privateSet", [o, Ident(p.holder), value, Ident(p.setter)])
-  else helper-call("__privateSet", [o, Ident(p.holder), value])
+fn private-set(o: Node, name: Text, value: Node) -> Node = match privates[name] ?? panic "no private name {} in scope", name {
+  p if p.setter != "" => helper-call("__privateSet", [o, Ident(p.holder), value, Ident(p.setter)])
+  p => helper-call("__privateSet", [o, Ident(p.holder), value])
 }
 
 fn private-assignment(t: Node, op: Text, v: Node) -> Node = match t {
-  Member(o, PrivateName(x)) => {
-    let inner = lowered(o)
-    let value = lowered(v)
-    if op == "=" { return private-set(inner, x, value) }
-    let self = if repeatable?(inner) then inner else Ident(temp())
-    let first = if repeatable?(inner) then inner else assign(self, inner)
-    let read = private-get(first, x)
-    match op {
-      "||=" => Or(read, private-set(self, x, value))
-      "&&=" => And(read, private-set(self, x, value))
-      "??=" => coalesced(read, private-set(self, x, value))
-      _ => private-set(self, x, compound-value(op, read, value))
-    }
-  }
+  Member(o, PrivateName(x)) => match op {
+    "=" => private-set(inner, x, value)
+    _ => match op {
+      "||=" => Or(read, private-set(held.after, x, value))
+      "&&=" => And(read, private-set(held.after, x, value))
+      "??=" => coalesced(read, private-set(held.after, x, value))
+      _ => private-set(held.after, x, compound-value(op, read, value))
+    } where held = held-once(inner),
+            read = private-get(held.first, x)
+  } where inner = lowered(o),
+          value = lowered(v)
   _ => panic "expected a private member"
 }
 
@@ -583,7 +580,8 @@ fn compound-value(op: Text, a: Node, b: Node) -> Node = match op {
   "*=" => Mul(a, b)
   "/=" => Div(a, b)
   "%=" => Mod(a, b)
-  "**=" => if before?(2016) then helper-call("__pow", [a, b]) else Pow(a, b)
+  "**=" if before?(2016) => helper-call("__pow", [a, b])
+  "**=" => Pow(a, b)
   "<<=" => Shl(a, b)
   ">>=" => Shr(a, b)
   ">>>=" => Ushr(a, b)
@@ -611,14 +609,14 @@ record Keyed { key: Node, setup: [Node] }
 fn field-key(k: Node) -> Keyed = match k {
   PropName(x) => Keyed(key: string-of(x), setup: [])
   Str(_) | Num(_) => Keyed(key: k, setup: [])
-  Computed(e) => {
-    let held = Ident(temp())
-    Keyed(key: held, setup: [assign(held, lowered(e))])
-  }
+  Computed(e) => Keyed(key: held, setup: [assign(held, lowered(e))]) where held = Ident(temp())
   _ => panic "unexpected field name"
 }
 
-fn field-init(v: Node) -> Node = if v is None() then undefined-value() else v
+fn field-init(v: Node) -> Node = match v {
+  None() => undefined-value()
+  _ => v
+}
 
 record ClassParts { body: Node, before: [Node], after: [Node], statics: [Node] }
 
@@ -633,11 +631,9 @@ fn function-expr-of(m: Node) -> Node = match m {
 # A class's private names, its own over those outside, and the statements that make their holders.
 record Privates { table: {Text:Private}, setup: [Node] }
 
-fn scan-privates(members: [Node], outer: {Text:Private}) -> Privates {
-  let s = fold s = Scanned(table: outer, setup: [], instances: "", statics: "")
-          for m in members if let some(name) = private-key(m): private-scanned(s, m, name)
-  Privates(table: s.table, setup: s.setup)
-}
+fn scan-privates(members: [Node], outer: {Text:Private}) -> Privates = Privates(table: s.table, setup: s.setup)
+  where s = fold so-far = Scanned(table: outer, setup: [], instances: "", statics: "")
+            for m in members if let some(name) = private-key(m): private-scanned(so-far, m, name)
 
 # The private names so far, and the sets the instance and the static methods are in once made.
 record Scanned { table: {Text:Private}, setup: [Node], instances: Text, statics: Text }
@@ -645,103 +641,100 @@ record Scanned { table: {Text:Private}, setup: [Node], instances: Text, statics:
 # A private field is held in a WeakMap of its own. Private methods and accessors are functions, and
 # the instance ones are vouched for by one WeakSet, the static ones by another, made at the first.
 fn private-scanned(s: Scanned, m: Node, name: Text) -> Scanned = match inner-member(m) {
-  Field(...) | StaticField(...) => {
-    let holder = temp()
-    s with { setup: s.setup ++ [assign(Ident(holder), NewExpr(Ident("WeakMap"), Args(List())))],
-             table: s.table ++ {name: Private(holder: holder, method: "", getter: "", setter: "")} }
-  }
-  inner => {
-    let is-static = m is StaticMethod(_) | StaticField(...)
-    let existing = if is-static then s.statics else s.instances
-    let holder = if len(existing) > 0 then existing else temp()
-    let made: [Node] = if len(existing) > 0 then [] else [assign(Ident(holder), NewExpr(Ident("WeakSet"), Args(List())))]
-    let f = temp()
-    let known = s.table[name] ?? Private(holder: holder, method: "", getter: "", setter: "")
-    let p = match inner {
-      Getter(...) => known with { getter: f }
-      Setter(...) => known with { setter: f }
-      _ => known with { method: f }
-    }
-    s with { setup: s.setup ++ made, table: s.table ++ {name: p},
-             instances: if is-static then s.instances else holder, statics: if is-static then holder else s.statics }
-  }
+  Field(...) | StaticField(...) => s with { setup: s.setup ++ [assign(Ident(holder), NewExpr(Ident("WeakMap"), Args(List())))],
+                                            table: s.table ++ {name: Private(holder: holder, method: "", getter: "", setter: "")} }
+    where holder = temp()
+  inner => s with { setup: s.setup ++ made, table: s.table ++ {name: p},
+                    instances: match is-static {
+                      true => s.instances
+                      false => holder
+                    },
+                    statics: match is-static {
+                      true => holder
+                      false => s.statics
+                    } }
+    where is-static = m is StaticMethod(_) | StaticField(...),
+          existing = match is-static {
+            true => s.statics
+            false => s.instances
+          },
+          holder = match existing {
+            "" => temp()
+            _ => existing
+          },
+          made = [assign(Ident(holder), NewExpr(Ident("WeakSet"), Args(List()))) for e in [existing] if e == ""],
+          f = temp(),
+          known = s.table[name] ?? Private(holder: holder, method: "", getter: "", setter: ""),
+          p = match inner {
+            Getter(...) => known with { getter: f }
+            Setter(...) => known with { setter: f }
+            _ => known with { method: f }
+          }
 }
 
-fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Text] {
+fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Text] =
   [(table[name] ?? panic "lost a private name").holder
    for m in members if let some(name) = private-key(m)
    if not (inner-member(m) is Field(...) | StaticField(...)) and (m is StaticMethod(_)) == want-static
    distinct (table[name] ?? panic "lost a private name").holder]
-}
 
-fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> ClassParts {
-  let members = body.members.kids
-  let scanned = scan-privates(members, privates)
-  let table = scanned.table
-  let holders = [ExprStmt(helper-call("__privateAdd", [This(), Ident(h)])) for h in set-holders(members, table, false)]
-  let static-holders = [ExprStmt(helper-call("__privateAdd", [ref, Ident(h)])) for h in set-holders(members, table, true)]
-  let each = members-lowered(members, table, ref, inner-name)
-  let fields = holders ++ [s for l in each for s in l.fields]
-  let constructor = last l in each: l.constructor
-  let made: [Node] = if len(fields) > 0 or is-some(constructor) then [constructor-with-fields(constructor, fields, derived)] else []
+fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> ClassParts =
   ClassParts(body: body with { kids: [List((made ++ [s for l in each for s in l.kept])...)] },
              before: scanned.setup ++ [s for l in each for s in l.setup], after: [s for l in each for s in l.after],
              statics: static-holders ++ [s for l in each for s in l.statics])
-}
+  where members = body.members.kids,
+        scanned = scan-privates(members, privates),
+        table = scanned.table,
+        holders = [ExprStmt(helper-call("__privateAdd", [This(), Ident(h)])) for h in set-holders(members, table, false)],
+        static-holders = [ExprStmt(helper-call("__privateAdd", [ref, Ident(h)])) for h in set-holders(members, table, true)],
+        each = members-lowered(members, table, ref, inner-name),
+        fields = holders ++ [s for l in each for s in l.fields],
+        constructor = last l in each: l.constructor,
+        made = [constructor-with-fields(constructor, fields, derived) for x in [fields] if len(x) > 0 or is-some(constructor)]
 
 # What one member becomes, wherever it goes: instance fields, static fields, statements after the
 # class, the members it keeps, its constructor, and statements before it all.
 record Lowered { fields: [Node], statics: [Node], after: [Node], kept: [Node], constructor: Node?, setup: [Node] }
 
-fn members-lowered(members: [Node], table: {Text:Private}, ref: Node, inner-name: Text) -> [Lowered] {
+fn members-lowered(members: [Node], table: {Text:Private}, ref: Node, inner-name: Text) -> [Lowered] =
   with privates = table { [member-lowered(m, table, ref, inner-name) for m in members] }
-}
 
 fn nothing-lowered() -> Lowered = Lowered(fields: [], statics: [], after: [], kept: [], constructor: none, setup: [])
 
 fn member-lowered(m: Node, table: {Text:Private}, ref: Node, inner-name: Text) -> Lowered = match m {
   ClassEmpty() => nothing-lowered()
-  Field(PrivateName(x), v) => {
-    let p = table[x] ?? panic "lost a private name"
+  Field(PrivateName(x), v) =>
     nothing-lowered() with { fields: [ExprStmt(helper-call("__privateAdd", [This(), Ident(p.holder), field-init(lowered(v))]))] }
-  }
-  Field(key, v) => {
-    let k = field-key(key)
+    where p = table[x] ?? panic "lost a private name"
+  Field(key, v) =>
     nothing-lowered() with { fields: [ExprStmt(helper-call("__publicField", [This(), k.key, field-init(lowered(v))]))], setup: k.setup }
-  }
-  StaticField(PrivateName(x), v) => {
-    let p = table[x] ?? panic "lost a private name"
+    where k = field-key(key)
+  StaticField(PrivateName(x), v) =>
     nothing-lowered() with { statics: [ExprStmt(helper-call("__privateAdd", [ref, Ident(p.holder), as-class(field-init(lowered(v)), ref, inner-name)]))] }
-  }
-  StaticField(key, v) => {
-    let k = field-key(key)
+    where p = table[x] ?? panic "lost a private name"
+  StaticField(key, v) =>
     nothing-lowered() with { statics: [ExprStmt(helper-call("__publicField", [ref, k.key, as-class(field-init(lowered(v)), ref, inner-name)]))],
                              setup: k.setup }
-  }
-  StaticBlock(b) => {
-    let f = Arrow(Params(List()), lowered-function-body(b))
-    nothing-lowered() with { statics: [ExprStmt(CallExpr(as-class(f, ref, inner-name), Args(List())))] }
-  }
-  _ => {
-    if constructor-method?(m) { return nothing-lowered() with { constructor: some(lowered(m)) } }
-    match private-key(m) {
-      some(name) => {
-        let p = table[name] ?? panic "lost a private name"
-        let inner = lowered(inner-member(m))
-        let slot = match inner-member(m) {
-          Getter(...) => p.getter
-          Setter(...) => p.setter
-          _ => p.method
-        }
-        nothing-lowered() with { after: [as-class-name(ExprStmt(assign(Ident(slot), function-expr-of(inner))), ref, inner-name)] }
-      }
-      none => nothing-lowered() with { kept: [lowered(m)] }
-    }
+    where k = field-key(key)
+  StaticBlock(b) => nothing-lowered() with { statics: [ExprStmt(CallExpr(as-class(f, ref, inner-name), Args(List())))] }
+    where f = Arrow(Params(List()), lowered-function-body(b))
+  _ if constructor-method?(m) => nothing-lowered() with { constructor: some(lowered(m)) }
+  _ => match private-key(m) {
+    some(name) => nothing-lowered() with { after: [as-class-name(ExprStmt(assign(Ident(slot), function-expr-of(inner))), ref, inner-name)] }
+      where p = (table[name] ?? panic "lost a private name"),
+            inner = lowered(inner-member(m)),
+            slot = match inner-member(m) {
+              Getter(...) => p.getter
+              Setter(...) => p.setter
+              _ => p.method
+            }
+    none => nothing-lowered() with { kept: [lowered(m)] }
   }
 }
 
 everywhere fn as-class-name(n: Node, ref: Node, inner-name: Text) -> Node = match n {
-  Ident(x) => if len(inner-name) > 0 and x == inner-name then ref else n
+  Ident(x) if inner-name != "" and x == inner-name => ref
+  Ident(_) => n
 }
 
 fn lowered-function-body(b: Node) -> Node {
