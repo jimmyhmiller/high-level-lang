@@ -105,12 +105,20 @@ everywhere fn super-through(n: Node, name: Text) -> Node = match n {
 }
 ```
 
-It is closer to a small ML than to a one-purpose language, and most of it is still written
-imperatively: `tools/altitude.py` counts 81% of the lines of `.rules` and `.attrs` in functions
-with a statement of any kind (`let`, `if`, `return`, a loop, an assignment, a call made for its
-effect) rather than one expression of matches, rewrites, attribute equations and queries
-(2026-11-06). The goal is none: every part of the bundler said as patterns, rules, derived facts
-and grammars. `tools.langtest` (`src/tools/langtest.rules`) checks what the collection forms mean.
+It is closer to a small ML than to a one-purpose language. The goal is that every part of the
+bundler is said as patterns, rules, derived facts and grammars, with no statements at all:
+`tools/altitude.py` counts the lines of `.rules` and `.attrs` in functions with a statement of any
+kind (`let`, an `if` statement or `if … then`, a loop, `return`, an assignment, a call made for its
+effect). That was 81% on 2026-11-06 and is 13% on 2026-11-07. Functions are matches: on text
+(`"./" ++ rest`, `stem ++ ".js"`, `m ++ "e" ++ x`), lists (`[x, rest...]`), records
+(`Options(explicit: true, ...)`) and several values at once (`match a, b { … }`), with guards whose
+`is` patterns bind names; quantifiers take clauses (`first p in xs if file?(p): p`); `where` names
+what an expression, an arm or an `on` block is made of; `on` blocks take guards; a fold over a
+record changes its fields in place. A module's settings (resolve options, loaders, the chosen
+names) are declared `setting` and given for a call's extent by `with`. What is still written
+imperatively is the core that holds state: the facts linking asserts, the parallel loading walk,
+the build's file writes, and the supplies of fresh names for lowering.
+`tools.langtest` (`src/tools/langtest.rules`) checks what the language's forms mean.
 
 Where a big file can be cut for parsing in parallel is a grammar too (`coarse.syntax`), all of it
 fragments, so it builds one node for each stretch between cuts, and a repetition of single bytes
