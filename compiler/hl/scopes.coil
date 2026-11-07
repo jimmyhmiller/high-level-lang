@@ -87,7 +87,9 @@
     (dsl/render
       `(do
          (import "hl.symtab" :as sym)
-         (import "coil.hashmap" :use [HashMap])
+         (import "coil.hashmap" :use [HashMap i64-keyops])
+         (import "coil.arraylist" :use [ArrayList])
+         (import "coil.alloc" :use [malloc-allocator])
          (import ~grammar :as syn)
 
          (defn ref? [(k syn/Kind)] (-> bool) ~(kind-test ref))
@@ -195,7 +197,42 @@
          ;;; What it then does for each part of the program, in a table whose scope 0 stands for
          ;;; the program's (`table-under`): so parts can be walked at once, and grafted in order.
          (defn walk-part [(n syn/Node) (t (mut sym/Table)) (b (mut (HashMap i64 i64)))] (-> void)
-           (walk n (mut t) 0 (mut b)))))))
+           (walk n (mut t) 0 (mut b)))
+
+         ;;; Under a function scope, and with `outer` names, under one more function scope that
+         ;;; declares them: a wrapper's parameters, say.
+         (defn outer-scope! [(t (mut sym/Table)) (outer (ArrayList (slice u8)))] (-> i64)
+           (let [top (sym/new-scope! (mut t) -1 true)]
+             (if (= (len outer) 0)
+                 top
+                 (let [w (sym/new-scope! (mut t) top true)]
+                   (for (ref name) outer (sym/declare! (mut t) w name))
+                   w))))
+
+         (defn no-bindings [] (-> (HashMap i64 i64)) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
+
+         ;;; A whole program analysed in a table of its own.
+         (defn analysis [(tree syn/Node) (outer (ArrayList (slice u8)))] (-> sym/Analysis)
+           (let [(mut t) (sym/table-new)
+                 scope (outer-scope! (mut t) outer)
+                 (mut b) (no-bindings)
+                 root (analyze tree (mut t) scope (mut b))]
+             (sym/Analysis :table t :root root :bindings b :free (sym/free-names t))))
+
+         ;;; Only the program's own names, declared in its root scope before any of it is walked.
+         (defn declarations [(tree syn/Node) (outer (ArrayList (slice u8)))] (-> sym/Analysis)
+           (let [(mut t) (sym/table-new)
+                 root (sym/new-scope! (mut t) (outer-scope! (mut t) outer) true)]
+             (declare-program! tree (mut t) root)
+             (sym/Analysis :table t :root root :bindings (no-bindings) :free (ArrayList::new [(slice u8)] (malloc-allocator)))))
+
+         ;;; Parts of a program walked in a table of their own under `scope` of `t` (`table-under`),
+         ;;; at once with others walked the same way; `grafted` puts the tables back.
+         (defn part-analysis [(t sym/Table) (scope i64) (parts (ArrayList syn/Node))] (-> sym/Analysis)
+           (let [(mut own) (sym/table-under t scope)
+                 (mut b) (no-bindings)]
+             (for (ref part) parts (walk-part part (mut own) (mut b)))
+             (sym/Analysis :table own :root 0 :bindings b :free (ArrayList::new [(slice u8)] (malloc-allocator)))))))))
 
 (defn read-scopes [(context Code)] (-> Code)
   (primitive/code-read (module-text context) `(reader-config)))

@@ -30,9 +30,12 @@ GUARDS = [
     (re.compile(r"(\b(?:first|last|any|all|count|sum)\b[^:\n]*?)\bif\b"), r"\1WHERE"),
     (re.compile(r"(^rewrite[^\n]*?)\bif\b", re.M), r"\1WHERE"),
     (re.compile(r"\bif\b(?=[^\n]*=>)"), "WHERE"),
+    # `[x if let some(y) = e]`: a comprehension's pattern clause, which has no block.
+    (re.compile(r"\bif let\b(?![^\n]*\{\s*$)"), "WHERE"),
 ]
-# In an `on` block, `target.attr = value` is an equation.
-EQUATION = re.compile(r"^\s*[\w\-]+\.[\w\-]+\s*=\s", re.M)
+# In an `on` block, `target.attr = value` is an equation, and `collected += value` what the node
+# gives a collected attribute.
+EQUATION = re.compile(r"^\s*(?:[\w\-]+\.[\w\-]+\s*=|[\w\-]+\s*\+=)\s", re.M)
 
 
 def code_lines(chunk):
