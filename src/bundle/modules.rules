@@ -97,13 +97,19 @@ fn name-id(s: Text) -> Int {
 }
 
 # `node_modules/lodash-es/_root.js` -> `root`, as esbuild names things.
-fn base-name(path: Text) -> Text {
-  let stem = path-stem(path)
-  let raw = if stem == "index" and dir-of(path) != "." then base-name(dir-of(path)) else stem
-  # What can start a name starts it; past that, what cannot be in one becomes `_`.
-  let start = (first i in 0..len(raw): if name-start?(raw[i]) then some(i) else none) ?? len(raw)
-  let out = text-of-bytes([if host.name-byte?(c) then c else '_' for c in raw[start..len(raw)]])
-  if len(out) == 0 then "module" else out
+fn base-name(path: Text) -> Text = match text-of-bytes([name-byte(c) for c in raw[start..len(raw)]]) {
+  "" => "module"
+  out => out
+} where raw = match path-stem(path) {
+          "index" if dir-of(path) != "." => base-name(dir-of(path))
+          stem => stem
+        },
+        # What can start a name starts it; past that, what cannot be in one becomes `_`.
+        start = (first i in 0..len(raw) if name-start?(raw[i]): i) ?? len(raw)
+
+fn name-byte(c: Int) -> Int = match c {
+  _ if host.name-byte?(c) => c
+  _ => '_'
 }
 
 fn name-start?(c: Int) -> Bool = host.name-byte?(c) and c != '_' and not digit-byte?(c)
@@ -128,48 +134,49 @@ fn var-of(name: Node, init: Node) -> Node = VarDecl(List(Declarator(name, init) 
 
 fn normalize-stmt(s: Node, base: Text) -> Node = match s {
   ExportDefault(e) => var-of(default-binding(base), e)
-  ExportDefaultDecl(d) => {
-    let name = d.name
-    let bound = if name is None() then default-binding(base) else name
-    match d {
-      FuncExpr(_, ps, b) => at-source(FuncDecl(bound, ps, b), d)
-      GenExpr(_, ps, b) => at-source(GenDecl(bound, ps, b), d)
-      AsyncFuncExpr(_, ps, b) => at-source(AsyncFuncDecl(bound, ps, b), d)
-      AsyncGenExpr(_, ps, b) => at-source(AsyncGenDecl(bound, ps, b), d)
-      ClassExpr(_, h, b) => at-source(ClassDecl(bound, h, b), d)
-      _ => panic "unexpected export default declaration: {}", js.kind-name(d.kind)
+  ExportDefaultDecl(d) => match d {
+    FuncExpr(_, ps, b) => at-source(FuncDecl(bound, ps, b), d)
+    GenExpr(_, ps, b) => at-source(GenDecl(bound, ps, b), d)
+    AsyncFuncExpr(_, ps, b) => at-source(AsyncFuncDecl(bound, ps, b), d)
+    AsyncGenExpr(_, ps, b) => at-source(AsyncGenDecl(bound, ps, b), d)
+    ClassExpr(_, h, b) => at-source(ClassDecl(bound, h, b), d)
+    _ => panic "unexpected export default declaration: {}", js.kind-name(d.kind)
+  } where bound = match d.name {
+      None() => default-binding(base)
+      name => name
     }
-  }
   _ => s
 }
 
 fn default-of(s: Node) -> Text? = match s {
   ExportDefault(_) => some("")
-  ExportDefaultDecl(d) => some(if d.name is None() then "" else d.name.text)
+  ExportDefaultDecl(d) => some(match d.name {
+    None() => ""
+    name => name.text
+  })
   _ => none
 }
 
 # Offsets of the tokens that `/* @__PURE__ */` or `/* #__PURE__ */` comments precede. A match inside
 # a string only records an offset no call starts at, unless one really does follow: esbuild makes
 # the same call about annotations being advice.
-fn pure-annotations(src: Text) -> {Int:Bool} {
-  if not contains-text?(src, "__PURE__") { return {} }
-  let parts = match cm.parse(src, "<comments>") {
-    cm.Scan(List(ps...)) => ps
-    _ => panic "a source scans to pieces"
+fn pure-annotations(src: Text) -> {Int:Bool} = match src {
+  _ if not contains-text?(src, "__PURE__") => {}
+  _ => match cm.parse(src, "<comments>") {
+    cm.Scan(List(parts...)) =>
+      {annotated-token(parts, i + 1, parts[i].hi): true
+       for i in 0..len(parts) if parts[i] is cm.Comment(_) and ("@__PURE__" in parts[i].text or "#__PURE__" in parts[i].text)}
   }
-  {annotated-token(parts, i + 1, parts[i].hi): true
-   for i in 0..len(parts) if parts[i] is cm.Comment(_) and ("@__PURE__" in parts[i].text or "#__PURE__" in parts[i].text)}
 }
 
 # Past space and further comments, to the token an annotation applies to.
 fn annotated-token(parts: [cm.Node], from: Int, end: Int) -> Int =
-  (first j in from..len(parts): token-start(parts[j])) ?? (if from < len(parts) then parts[len(parts) - 1].hi else end)
+  (first j in from..len(parts): token-start(parts[j])) ?? (last p in parts[min(from, len(parts))..len(parts)]: p.hi) ?? end
 
 # Where a piece of the scan has the next token, if it has one. The pieces cover the source.
 fn token-start(p: cm.Node) -> Int? = match p {
   cm.Comment(_) => none
-  cm.Gap(t) => if span-of(t, 0, " \n\t\r") < len(t) then some(p.lo + span-of(t, 0, " \n\t\r")) else none
+  cm.Gap(t) => first lead in [span-of(t, 0, " \n\t\r")] if lead < len(t): p.lo + lead
   _ => some(p.lo)
 }
 
@@ -184,27 +191,29 @@ fn mentions-name?(n: Node, name: Text) -> Bool = match n {
 # Inside the class its name means the inner binding, which esbuild calls `_Name`. That is what
 # `this.constructor.name` says, so it is part of what the program does.
 everywhere fn renamed-inside(n: Node, from: Text, to: Text) -> Node = match n {
-  Ident(x) => if x == from then Ident(to) with { lo: n.lo, hi: n.hi } else n
-  Shorthand(Ident(x)) => if x == from then Prop(PropName(x), Ident(to)) with { lo: n.lo, hi: n.hi } else n
+  Ident(x) if x == from => Ident(to) with { lo: n.lo, hi: n.hi }
+  Ident(_) => n
+  Shorthand(Ident(x)) if x == from => Prop(PropName(x), Ident(to)) with { lo: n.lo, hi: n.hi }
   _ if len(n.kids) > 0 and from in ts.shadowed-by(n) => n
 }
 
 fn declarator-of-class(c: Node) -> Node = match c {
-  ClassDecl(name, h, b) => {
-    let own = name.text
-    let says = mentions-name?(h, own) or mentions-name?(b, own)
-    let inner-name = "_" ++ own
-    let inner = if says then BindName(inner-name) with { lo: c.lo, hi: c.lo } else None()
-    let heritage = if says then renamed-inside(h, own, inner-name) else h
-    let body = if says then renamed-inside(b, own, inner-name) else b
-    let init = at-source(ClassExpr(inner, heritage, body), c)
-    Declarator(name, init) with { lo: name.lo, hi: init.hi }
-  }
+  ClassDecl(name, h, b) => Declarator(name, init) with { lo: name.lo, hi: init.hi }
+    where own = name.text,
+          inner-name = "_" ++ own,
+          init = match mentions-name?(h, own) or mentions-name?(b, own) {
+            true => at-source(ClassExpr(BindName(inner-name) with { lo: c.lo, hi: c.lo },
+                                        renamed-inside(h, own, inner-name), renamed-inside(b, own, inner-name)), c)
+            false => at-source(ClassExpr(None(), h, b), c)
+          }
   _ => panic "expected a class declaration"
 }
 
 fn split-decl(n: Node, exported: Bool) -> [Node] =
-  [at-source(if exported then ExportVar(List(d)) else VarDecl(List(d)), d) for d in n.declarators.kids]
+  [at-source(match exported {
+     true => ExportVar(List(d))
+     false => VarDecl(List(d))
+   }, d) for d in n.declarators.kids]
 
 # One declarator per statement, so each can be tree-shaken on its own. A bundle's top level has no
 # TDZ worth paying for, so `let`, `const` and classes become `var`.
@@ -214,7 +223,7 @@ fn normalized-tree(tree: Node, base: Text) -> Node =
 fn normalized(n: Node) -> [Node] = match n {
   VarDecl(_) | LetDecl(_) | ConstDecl(_) => split-decl(n, false)
   ExportVar(_) => split-decl(n, true)
-  ExportLexical(inner) => if inner is LetDecl(_) | ConstDecl(_) then split-decl(inner, true) else [n]
+  ExportLexical(LetDecl(_) | ConstDecl(_) as inner) => split-decl(inner, true)
   Empty() => []
   ClassDecl(...) => [at-source(VarDecl(List(declarator-of-class(n))), n)]
   ExportClass(c) => [at-source(ExportVar(List(declarator-of-class(c))), n)]
@@ -224,25 +233,18 @@ fn normalized(n: Node) -> [Node] = match n {
 # ---------------------------------------------------------------- dependencies
 
 # What a final tree loads at run time: its `require`s, then its `import()`s, in source order.
-fn calls-in(tree: Node) -> [Text] {
-  let found = calls.run(tree)
-  found.requires ++ found.imports
-}
+fn calls-in(tree: Node) -> [Text] = found.requires ++ found.imports where found = calls.run(tree)
 
-fn loads-of(tree: Node) -> Checked {
-  let found = calls.run(tree)
-  Checked(tree: tree, requires: found.requires, imports: found.imports)
-}
+fn loads-of(tree: Node) -> Checked = Checked(tree: tree, requires: found.requires, imports: found.imports)
+  where found = calls.run(tree)
 
 # ---------------------------------------------------------------- defines
 
 # A Member chain rooted at a free identifier, as dotted text: `process.env.NODE_ENV`.
 fn dotted-name(n: Node, b: {Int:Int}) -> Text? = match n {
-  Ident(x) => if n.lo in b then none else some(x)
-  Member(o, p) => match dotted-name(o, b) {
-    some(base) => some(base ++ "." ++ p.text)
-    none => none
-  }
+  Ident(x) if n.lo in b => none
+  Ident(x) => some(x)
+  Member(o, p) => first base in dotted-name(o, b): base ++ "." ++ p.text
   _ => none
 }
 
@@ -252,31 +254,22 @@ fn mentions-define?(src: Text) -> Bool = any d in loading.defines: contains-text
 
 # Whether `substitute` would replace anything here: a free name, or a chain from one, that a define
 # names. A file can mention a define's name, in a comment or as a property, and use none.
-fn defines-apply?(n: Node, b: {Int:Int}) -> Bool {
-  if n is Ident(_) | Member(...) {
-    if let some(key) = dotted-name(n, b) {
-      if is-some(define-of(key)) { return true }
-    }
-  }
-  any k in n.kids: defines-apply?(k, b)
-}
+fn defines-apply?(n: Node, b: {Int:Int}) -> Bool = is-some(defined(n, b)) or (any k in n.kids: defines-apply?(k, b))
 
-fn define-of(key: Text) -> Node? = last d in loading.defines: if d.key == key then some(d.value) else none
+fn define-of(key: Text) -> Node? = last d in loading.defines if d.key == key: d.value
+
+# What a define replaces this node with: a free name, or a chain from one, that a define names.
+fn defined(n: Node, b: {Int:Int}) -> Node? = match n {
+  Ident(_) | Member(...) => first key in dotted-name(n, b): define-of(key)
+  _ => none
+}
 
 # Replace defined names. This needs the scope analysis, because a local with the same name is not
 # the define.
-fn substitute(n: Node, b: {Int:Int}) -> Node {
-  let replaced: Node? =
-    if n is Ident(_) | Member(...) {
-      match dotted-name(n, b) {
-        some(key) => define-of(key)
-        none => none
-      }
-    } else { none }
-  match replaced {
-    some(v) => v
-    none => if len(n.kids) == 0 then n else n with { kids: [substitute(k, b) for k in n.kids] }
-  }
+fn substitute(n: Node, b: {Int:Int}) -> Node = match defined(n, b) {
+  some(v) => v
+  none if len(n.kids) == 0 => n
+  none => n with { kids: [substitute(k, b) for k in n.kids] }
 }
 
 # ---------------------------------------------------------------- loading
@@ -286,36 +279,36 @@ record Checked { tree: Node, requires: [Text], imports: [Text] }
 
 # Parse and check a file. A file with import or export syntax is a module; anything else may be
 # CommonJS, whose top level is a function body.
-fn parse-file(src: Text, path: Text) -> Checked {
-  let loader = loader-of(path)
-  let syntax = (if loader == "jsx" or loader == "tsx" then js.flag-bit("jsx") else 0)
-             + (if loader == "ts" or loader == "tsx" then js.flag-bit("ts") else 0)
-  let tree = js.parse-tries(src, path, syntax, js.flag-bit("await"))
-  let is-module = early.program-has-module-syntax?(tree)
-  let found = early.run(tree, is-module, not is-module, loader == "ts" or loader == "tsx", false, false, [])
-  match found.problem {
-    none => Checked(tree: tree, requires: found.requires, imports: found.imports)
-    some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
-  }
-}
+fn parse-file(src: Text, path: Text) -> Checked = match found.problem {
+  none => Checked(tree: tree, requires: found.requires, imports: found.imports)
+  some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
+} where loader = loader-of(path),
+        syntax = sum flag in [x for x in ["jsx"] if loader == "jsx" or loader == "tsx"]
+                             ++ [x for x in ["ts"] if loader == "ts" or loader == "tsx"]: js.flag-bit(flag),
+        tree = js.parse-tries(src, path, syntax, js.flag-bit("await")),
+        is-module = early.program-has-module-syntax?(tree),
+        found = early.run(tree, is-module, not is-module, loader == "ts" or loader == "tsx", false, false, [])
 
 # Lowering JSX or TypeScript makes another tree of a file's.
 fn lowered-loader?(loader: Text) -> Bool = loader == "jsx" or loader == "tsx" or loader == "ts"
 
 # A project's JSX settings, unless the build gave its own.
-fn configured-jsx(o: jsx.Options, c: tsc.Config) -> jsx.Options {
-  if o.explicit { return o }
-  let runtime = match c.jsx {
-    "react" => jsx.Classic
-    "react-jsx" | "react-jsxdev" => jsx.Automatic
-    "preserve" | "react-native" => jsx.Preserve
-    _ => o.runtime
-  }
-  o with { runtime: runtime, dev: o.dev or c.jsx == "react-jsxdev", factory: or-else(c.jsx-factory, o.factory),
-           fragment: or-else(c.jsx-fragment, o.fragment), import-source: or-else(c.jsx-import-source, o.import-source) }
+fn configured-jsx(o: jsx.Options, c: tsc.Config) -> jsx.Options = match o.explicit {
+  true => o
+  false => o with { runtime: runtime, dev: o.dev or c.jsx == "react-jsxdev", factory: or-else(c.jsx-factory, o.factory),
+                    fragment: or-else(c.jsx-fragment, o.fragment), import-source: or-else(c.jsx-import-source, o.import-source) }
+    where runtime = match c.jsx {
+      "react" => jsx.Classic
+      "react-jsx" | "react-jsxdev" => jsx.Automatic
+      "preserve" | "react-native" => jsx.Preserve
+      _ => o.runtime
+    }
 }
 
-fn or-else(given: Text, otherwise: Text) -> Text = if len(given) > 0 then given else otherwise
+fn or-else(given: Text, otherwise: Text) -> Text = match given {
+  "" => otherwise
+  _ => given
+}
 
 # Is this file in node compatibility mode: `.mjs`, or under "type": "module"?
 fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-module?(path)
@@ -336,12 +329,13 @@ fn external-module(spec: Text) -> Int {
 }
 
 # An alias replaces a package name, and carries any subpath along.
-fn aliased(spec: Text) -> Text {
-  for a in loading.aliases {
-    if spec == a.key { return a.value }
-    if starts-with(spec, a.key ++ "/") { return a.value ++ spec[len(a.key)..len(spec)] }
-  }
-  spec
+fn aliased(spec: Text) -> Text = (first a in loading.aliases: alias-of(a, spec)) ?? spec
+
+# What an alias makes of a specifier: the package it names, and any subpath along with it.
+fn alias-of(a: TextPair, spec: Text) -> Text? = match spec {
+  _ if spec == a.key => some(a.value)
+  _ if starts-with(spec, a.key ++ "/") => some(a.value ++ spec[len(a.key)..len(spec)])
+  _ => none
 }
 
 # What a resolve hook says about this import. Asked once per place it could appear from.
@@ -364,33 +358,30 @@ fn package-spec?(spec: Text, importer: Text) -> Bool =
   not (res.relative?(spec) or starts-with(spec, "/") or starts-with(spec, "#")) and is-none(configured-path(spec, importer))
 
 # A project's `paths` and `baseUrl` come before node_modules, for a bare specifier.
-fn configured-path(spec: Text, importer: Text) -> Text? {
-  if res.relative?(spec) or starts-with(spec, "/") { return none }
-  let c = tsc.for-file(importer)
-  for candidate in tsc.path-candidates(c, spec) {
-    if let some(p) = res.try-path(candidate) { return some(p) }
-  }
-  if len(c.base-url) > 0 { return res.try-path(c.base-url ++ "/" ++ spec) }
-  none
+fn configured-path(spec: Text, importer: Text) -> Text? = match spec {
+  _ if res.relative?(spec) or starts-with(spec, "/") => none
+  _ => (first candidate in tsc.path-candidates(c, spec): res.try-path(candidate))
+       ?? (first base in [c.base-url] if base != "": res.try-path(base ++ "/" ++ spec))
+    where c = tsc.for-file(importer)
 }
 
 # Where an import leads: resolve hooks first, then the project's paths, then the search. A worker
 # that parsed the importer ahead may have found the answer already.
-fn resolve-import(spec: Text, importer: Text) -> res.Resolved {
-  if let some(ahead) = parsed-ahead[importer] {
-    if let some(t) = ahead.targets[spec] { return res.Resolved(path: t, side-effects: res.side-effects-of(t)) }
-  }
-  let wanted = aliased(spec)
-  match hook-path(wanted, importer) {
-    some(p) => res.Resolved(path: p, side-effects: true)
-    none if is-some(configured-path(wanted, importer)) => {
-      let p = configured-path(wanted, importer) ?? panic "lost a configured path"
-      res.Resolved(path: p, side-effects: res.side-effects-of(p))
-    }
+fn resolve-import(spec: Text, importer: Text) -> res.Resolved =
+  (first ahead in parsed-ahead[importer] for t in ahead.targets[spec]: res.Resolved(path: t, side-effects: res.side-effects-of(t)))
+  ?? resolved-now(spec, importer)
+
+fn resolved-now(spec: Text, importer: Text) -> res.Resolved = match hook-path(wanted, importer) {
+  some(p) => res.Resolved(path: p, side-effects: true)
+  none => match configured-path(wanted, importer) {
+    some(p) => res.Resolved(path: p, side-effects: res.side-effects-of(p))
     # A relative alias is relative to where the build runs, not to the importing file.
-    none => res.resolve(wanted, if wanted != spec and res.relative?(wanted) then "alias" else importer)
+    none => res.resolve(wanted, match wanted != spec and res.relative?(wanted) {
+      true => "alias"
+      false => importer
+    })
   }
-}
+} where wanted = aliased(spec)
 
 fn dep-add(m: Int, spec: Text, path: Text) -> Int {
   let d = if stays-external?(spec, path) then external-module(aliased(spec)) else {
@@ -401,26 +392,22 @@ fn dep-add(m: Int, spec: Text, path: Text) -> Int {
   d
 }
 
-fn loader-of(path: Text) -> Text {
-  for l in loading.loaders {
-    if ends-with(path, l.key) { return l.value }
-  }
-  default-loader(path)
+fn loader-of(path: Text) -> Text = (first l in loading.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
+
+fn default-loader(path: Text) -> Text = match path {
+  _ ++ ".json" => "json"
+  _ ++ ".jsx" => "jsx"
+  _ ++ ".tsx" => "tsx"
+  _ ++ ".css" => "css"
+  _ ++ ".ts" | _ ++ ".mts" | _ ++ ".cts" => "ts"
+  _ => "js"
 }
 
-fn default-loader(path: Text) -> Text =
-  if ends-with(path, ".json") then "json"
-  else if ends-with(path, ".jsx") then "jsx"
-  else if ends-with(path, ".tsx") then "tsx"
-  else if ends-with(path, ".css") then "css"
-  else if ends-with(path, ".ts") or ends-with(path, ".mts") or ends-with(path, ".cts") then "ts"
-  else "js"
-
-
 # A file's text as a module, by what its loader says it is.
-fn as-module(text: Text, path: Text) -> Text =
-  if loader-of(path) == "file" then "export default " ++ host.js-string(public-url(cssb.file-url(path))) ++ ";"
-  else module-text(text, path)
+fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
+  "file" => "export default " ++ host.js-string(public-url(cssb.file-url(path))) ++ ";"
+  _ => module-text(text, path)
+}
 
 # A load hook may supply a file's text, or the file does.
 fn source-of(path: Text) -> Text = (first hook in loading.on-load: hook(path)) ?? read-file(path)
