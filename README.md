@@ -290,6 +290,21 @@ then walked for scopes in a table of its own, at the same time as early errors a
 The last of those grafts the parts' tables back in order, giving the same symbol and scope ids a
 single walk would. A file with many imports resolves each as an item of its own.
 
+A library inside one function, as lodash is, has no top-level place to cut, so it is cut inside
+that function: the body holding most of the file is found by its indentation, the rest of the file
+is parsed with only that body's line breaks left in it, and the pieces' statements go into the
+body (`jsparse pieces FILE` shows the cut, and checks the tree is the one a whole parse gives). A
+script that names `module`, `exports` or `require` is declared under CommonJS's wrapper before its
+parts are walked, so a CommonJS file is analysed once. Looking ahead follows only what defines
+leave of a file, so the development builds behind `process.env.NODE_ENV` are never parsed.
+
+A CommonJS module is a single statement of the output, its wrapper, which nothing could cut. For
+minifying and printing, the body of a statement heavier than a part's share is taken out, leaving
+a hole, and cut into parts as the top level is; the parts fill the hole again, as trees or as text
+with their source map marks moved. A body that a rule for a function's end would have changed is
+done whole instead. `tools/same-plans.py` checks every plan against the serial one, maps included,
+across 18 apps and 11 kinds of build.
+
 Every plan gives the same output, byte for byte, as the serial build. That holds for 12 apps,
 plain, minified, pretty and with source maps, and the verify suite passes under the `full` plan.
 Parts are cut by weight and only after declarations, which no minification rule merges across.
@@ -307,7 +322,9 @@ laptop shared with other work:
 | d3 | 50.5 | 22.8 | 47.8 | 32.9 | **16.7** | 17.0 | 0.98 |
 | zod | 72.0 | 50.3 | 52.9 | 45.2 | **20.2** | 17.2 | 1.17 |
 
-Zod is the closest: 1.17 in this run and 1.21 in the next, so at the edge of 20%. What got it there
+CommonJS-heavy builds were the slowest and are now in line: react (`react-dom/server`, two 270 KB
+CommonJS files) from 2.25 of esbuild's time to 1.02–1.05, and lodash as CommonJS from 1.54 to
+1.06–1.10. Zod is the closest: 1.17 in this run and 1.21 in the next, so at the edge of 20%. What got it there
 from 1.45, besides what is above: linking's liveness reads `mentions` directly instead of a copy,
 `visits` is kept only for modules that forward names, and what a part mentions of its imports is
 joined once (link went from 4.4 to 2.7 ms); relations are made big enough for the facts about to be
