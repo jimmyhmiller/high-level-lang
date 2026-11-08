@@ -1499,23 +1499,15 @@
       (set! i (+ i 1)))
     same))
 
-;;; A tree's identity: see `node-key` in the grammars.
+;;; A tree's identity: see `node-key` in the grammars. Its seven numbers as eight bytes each, a
+;;; key only ever hashed and compared, never read as text.
 (defn node-identity [(kind i64) (lo i64) (hi i64) (text (slice u8)) (kids i64) (count i64)] (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
-    (push-str! (mut b) (num-text kind))
-    (push-str! (mut b) ":")
-    (push-str! (mut b) (num-text lo))
-    (push-str! (mut b) ":")
-    (push-str! (mut b) (num-text hi))
-    (push-str! (mut b) ":")
-    (push-str! (mut b) (num-text (primitive/cast i64 (data text))))
-    (push-str! (mut b) ":")
-    (push-str! (mut b) (num-text (len text)))
-    (push-str! (mut b) ":")
-    (push-str! (mut b) (num-text kids))
-    (push-str! (mut b) ":")
-    (push-str! (mut b) (num-text count))
-    (finish! (mut b))))
+  (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+    (reserve! (mut b) 56)
+    (for v [kind lo hi (primitive/cast i64 (data text)) (len text) kids count]
+      (for i (range 0 8)
+        (push! (mut b) (cast u8 (& (>> v (* i 8)) 255)))))
+    (slice b)))
 
 ;;; A key `memo-key-of` made, back into its parts.
 (defn memo-key-parts [(key (slice u8))] (-> (ArrayList (slice u8)))
@@ -2501,10 +2493,45 @@
 ;;; in a loop is checked without hashing.
 (defstruct DepFrame
   [(notes (ArrayList i64))
-   (seen (HashMap i64 i64))
+   (seen IntTable)
    (literals (ArrayList i64))
-   ;; Elements read by index, by site and index, each once.
-   (elements (HashMap i64 i64))])
+   ;; Elements read by index, by site and index, each once; and their keys, in the order read. A
+   ;; note -1 - i stands for the element `pending[i]`, whose node is found when the frame closes,
+   ;; under the lock taken then anyway, rather than once per read.
+   (elements IntTable)
+   (pending (ArrayList i64))
+   ;; Whether a numbered node was noted by its id, as what other threads read is: then an element
+   ;; pending may be one noted already.
+   (mixed bool)])
+
+;;; A frame that closed: its tables freed, its notes kept.
+(defn frame-free! [(f (mut DepFrame))] (-> void)
+  (free! (mut (.keys (.seen f))))
+  (free! (mut (.vals (.seen f))))
+  (free! (mut (.keys (.elements f))))
+  (free! (mut (.vals (.elements f))))
+  (free! (mut (.literals f)))
+  (free! (mut (.pending f)))
+  0)
+
+;;; A closing frame's notes with each element read by index replaced by its node, made when it
+;;; has none, and still each once. Under the lock.
+(defn frame-resolve! [(d (ptr Deps)) (f (mut DepFrame))] (-> void)
+  (when (> (len (.pending f)) 0)
+    (let [(mut out) (ArrayList::new [i64] (malloc-allocator))]
+      (reserve! (mut out) (len (.notes f)))
+      (for x (.notes f)
+        (if (>= x 0)
+            (push! (mut out) x)
+            (let [key (get (.pending f) (- -1 x))
+                  site (/ key 4294967296)
+                  id (dep-element! d site (- key (* site 4294967296)))]
+              ;; Elements pending are each a different node; only one noted by id could repeat.
+              (when (or (not (.mixed f)) (< (int-get (mut (.seen f)) id) 0))
+                (push! (mut out) id)))))
+      (free! (mut (.notes f)))
+      (set! (.notes f) out)))
+  0)
 
 ;;; The lock word comes first. `depth-key`: a thread-specific value holding how many frames the
 ;;; thread has open.
@@ -2520,8 +2547,12 @@
    (reads (ArrayList (ArrayList i64)))
    ;; Who read each node, and whether a node may have changed since it was last current: a
    ;; change marks all that read it, through any number of answers, so an answer nothing marked is
-   ;; current without a look at what it read.
-   (dependents (ArrayList (ArrayList i64)))
+   ;; current without a look at what it read. Who read a node is a chain of edges from its head,
+   ;; through `edge-next`, each naming the reader in `edge-to`: one store for all of them, so a
+   ;; node costs no allocation of its own.
+   (dep-heads (ArrayList i64))
+   (edge-to (ArrayList i64))
+   (edge-next (ArrayList i64))
    (dirty (ArrayList bool))
    (prints (ArrayList (slice u8)))
    ;; A file input's size and modification time when its print was taken: while they stay, the
@@ -2537,15 +2568,19 @@
    (site-settings (ArrayList i64))
    (site-prefixes (ArrayList (slice u8)))
    (site-suffixes (ArrayList (slice u8)))
-   ;; Each site's elements read, as (index, node) pairs; a query site's relation and column; the
-   ;; sites of each setting; and for a numbered node its site and index (-1 for a node with text).
-   (site-nodes (ArrayList (ArrayList i64)))
+   ;; A query site's relation and column; and the sites of each setting.
    (site-rels (ArrayList (slice u8)))
    (site-cols (ArrayList i64))
    (setting-sites (HashMap (slice u8) (ArrayList i64)))
-   (node-sites (ArrayList i64))
-   (node-indexes (ArrayList i64))
-   (elements (HashMap i64 i64))
+   ;; Numbered nodes, the elements read by index: leaves that only change and are read, so each
+   ;; keeps just that, its site and its index, apart from the nodes with text. Their ids carry
+   ;; `numbered-tag`, and the rest is the place in these.
+   (num-changed (ArrayList i64))
+   (num-heads (ArrayList i64))
+   (num-sites (ArrayList i64))
+   (num-indexes (ArrayList i64))
+   ;; Each site's nodes by index, in pages of 1024 made as an index in one is first read (-1: none).
+   (site-pages (ArrayList (ArrayList (ArrayList i64))))
    (ensurers (HashMap (slice u8) (fnptr (cc/C) [(slice u8)] i64)))
    (paths (HashMap (slice u8) (ArrayList (slice u8))))
    (stacks (ArrayList (ArrayList DepFrame)))
@@ -2563,7 +2598,9 @@
         (set! (.changed d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.verified d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.reads d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
-        (set! (.dependents d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
+        (set! (.dep-heads d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.edge-to d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.edge-next d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.dirty d) (ArrayList::new [bool] (malloc-allocator)))
         (set! (.prints d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.stamps d) (ArrayList::new [(slice u8)] (malloc-allocator)))
@@ -2572,13 +2609,14 @@
         (set! (.site-settings d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.site-prefixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-suffixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
-        (set! (.site-nodes d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
         (set! (.site-rels d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-cols d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.setting-sites d) (HashMap::new [(slice u8) (ArrayList i64)] (malloc-allocator) (str/keyops)))
-        (set! (.node-sites d) (ArrayList::new [i64] (malloc-allocator)))
-        (set! (.node-indexes d) (ArrayList::new [i64] (malloc-allocator)))
-        (set! (.elements d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
+        (set! (.num-changed d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.num-heads d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.num-sites d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.num-indexes d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.site-pages d) (ArrayList::new [(ArrayList (ArrayList i64))] (malloc-allocator)))
         (set! (.ensurers d) (HashMap::new [(slice u8) (fnptr (cc/C) [(slice u8)] i64)] (malloc-allocator) (str/keyops)))
         (set! (.paths d) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops)))
         (set! (.stacks d) (ArrayList::new [(ArrayList DepFrame)] (malloc-allocator)))
@@ -2608,38 +2646,55 @@
             (push! (mut (.changed d)) 0)
             (push! (mut (.verified d)) 0)
             (push! (mut (.reads d)) (ArrayList::new [i64] (malloc-allocator)))
-            (push! (mut (.dependents d)) (ArrayList::new [i64] (malloc-allocator)))
+            (push! (mut (.dep-heads d)) -1)
             (push! (mut (.dirty d)) false)
             (push! (mut (.prints d)) "")
             (push! (mut (.stamps d)) "")
-            (push! (mut (.node-sites d)) -1)
-            (push! (mut (.node-indexes d)) 0)
             id))))
+
+;;; The bit a numbered node's id has.
+(defn numbered-tag [] (-> i64) 4611686018427387904)
+
+(defn numbered? [(id i64)] (-> bool) (>= id (numbered-tag)))
+
+;;; The first edge of who read node `id`, -1 for none. Under the lock.
+(defn dep-head [(d (ptr Deps)) (id i64)] (-> i64)
+  (if (numbered? id)
+      (get (.num-heads d) (- id (numbered-tag)))
+      (get (.dep-heads d) id)))
+
+;;; The revision node `id` last changed in. Under the lock.
+(defn dep-changed-at [(d (ptr Deps)) (id i64)] (-> i64)
+  (if (numbered? id)
+      (get (.num-changed d) (- id (numbered-tag)))
+      (get (.changed d) id)))
+
+;;; Node `to` read node `from`. Under the lock.
+(defn dep-edge! [(d (ptr Deps)) (from i64) (to i64)] (-> void)
+  (push! (mut (.edge-to d)) to)
+  (push! (mut (.edge-next d)) (dep-head d from))
+  (if (numbered? from)
+      (set! (mut (.num-heads d)) (- from (numbered-tag)) (- (len (.edge-to d)) 1))
+      (set! (mut (.dep-heads d)) from (- (len (.edge-to d)) 1)))
+  0)
 
 ;;; A numbered node, element `index` of `site`: no text, which only tracing makes. Under the lock.
 (defn dep-new-numbered! [(d (ptr Deps)) (site i64) (index i64)] (-> i64)
-  (let [id (len (.texts d))]
-    (push! (mut (.texts d)) "")
-    (push! (mut (.changed d)) 0)
-    (push! (mut (.verified d)) 0)
-    (push! (mut (.reads d)) (ArrayList::new [i64] (malloc-allocator)))
-    (push! (mut (.dependents d)) (ArrayList::new [i64] (malloc-allocator)))
-    (push! (mut (.dirty d)) false)
-    (push! (mut (.prints d)) "")
-    (push! (mut (.stamps d)) "")
-    (push! (mut (.node-sites d)) site)
-    (push! (mut (.node-indexes d)) index)
-    (push! (mut (elem (mut (.site-nodes d)) site)) index)
-    (push! (mut (elem (mut (.site-nodes d)) site)) id)
-    id))
+  (let [n (len (.num-changed d))]
+    (push! (mut (.num-changed d)) 0)
+    (push! (mut (.num-heads d)) -1)
+    (push! (mut (.num-sites d)) site)
+    (push! (mut (.num-indexes d)) index)
+    (+ (numbered-tag) n)))
 
 ;;; A node's text: its own, or a numbered one's made from its site. Under the lock.
 (defn dep-node-text [(d (ptr Deps)) (id i64)] (-> (slice u8))
-  (let [site (get (.node-sites d) id)]
-    (if (< site 0)
-        (get (.texts d) id)
+  (if (numbered? id)
+      (let [n (- id (numbered-tag))
+            site (get (.num-sites d) n)]
         (join (get (.sites d) site)
-              (join (num-text (get (.node-indexes d) id)) (get (.site-suffixes d) site))))))
+              (join (num-text (get (.num-indexes d) n)) (get (.site-suffixes d) site))))
+      (get (.texts d) id)))
 
 ;;; Dependencies are tracked from here on, which only a program that builds more than once needs.
 ;;; Before any memo has computed anything, since what it computed untracked could never be checked.
@@ -2676,12 +2731,11 @@
         slot (worker-slot)
         top (dep-top d slot)]
     (when (>= top 0)
-      (match (get (.seen (get (get (.stacks d) slot) top)) id)
-        (Some [_] 0)
-        (None []
-              (set! (mut (.seen (elem (mut (elem (mut (.stacks d)) slot)) top))) id 1)
-              (push! (mut (.notes (elem (mut (elem (mut (.stacks d)) slot)) top))) id)
-              0))))
+      (when (numbered? id) (set! (.mixed (elem (mut (elem (mut (.stacks d)) slot)) top)) true))
+      (when (< (int-get (mut (.seen (elem (mut (elem (mut (.stacks d)) slot)) top))) id) 0)
+        (int-put! (mut (.seen (elem (mut (elem (mut (.stacks d)) slot)) top))) id 1)
+        (push! (mut (.notes (elem (mut (elem (mut (.stacks d)) slot)) top))) id)
+        0)))
   0)
 
 ;;; `node` was read by the memo this worker is computing.
@@ -2720,7 +2774,7 @@
             (push! (mut (.site-settings d)) setting-id)
             (push! (mut (.site-prefixes d)) prefix)
             (push! (mut (.site-suffixes d)) suffix)
-            (push! (mut (.site-nodes d)) (ArrayList::new [i64] (malloc-allocator)))
+            (push! (mut (.site-pages d)) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
             ;; `.rel(_,_,` is a query by one column: the relation and which column.
             (let [open (name-end-at prefix 40)
                   query (and (> (len prefix) 0) (= (cast i64 (get prefix 0)) 46) (< open (len prefix)))]
@@ -2750,18 +2804,37 @@
         top (dep-top d slot)]
     (when (and (>= top 0) (>= index 0) (< index 4294967296))
       (let [key (+ (* site 4294967296) index)]
-        (when (match (get (.elements (get (get (.stacks d) slot) top)) key) (Some [_] false) (None [] true))
-          (set! (mut (.elements (elem (mut (elem (mut (.stacks d)) slot)) top))) key 1)
-          (deps-lock! d)
-          (let [id (match (get (.elements d) key)
-                     (Some [i] i)
-                     (None []
-                           (let [i (dep-new-numbered! d site index)]
-                             (set! (mut (.elements d)) key i)
-                             i)))]
-            (deps-unlock! d)
-            (dep-note-id! id))))))
+        (when (< (int-get (mut (.elements (elem (mut (elem (mut (.stacks d)) slot)) top))) key) 0)
+          (int-put! (mut (.elements (elem (mut (elem (mut (.stacks d)) slot)) top))) key 1)
+          (push! (mut (.notes (elem (mut (elem (mut (.stacks d)) slot)) top)))
+                 (- -1 (len (.pending (get (get (.stacks d) slot) top)))))
+          (push! (mut (.pending (elem (mut (elem (mut (.stacks d)) slot)) top))) key)
+          0))))
   0)
+
+;;; Element `index` of `site`'s node, or -1 when none was read. Under the lock.
+(defn dep-element-at [(d (ptr Deps)) (site i64) (index i64)] (-> i64)
+  (let [page (/ index 1024)
+        pages (get (.site-pages d) site)]
+    (if (or (>= page (len pages)) (= (len (get pages page)) 0))
+        -1
+        (get (get pages page) (- index (* page 1024))))))
+
+;;; Element `index` of `site`'s node, made when it has none. Under the lock.
+(defn dep-element! [(d (ptr Deps)) (site i64) (index i64)] (-> i64)
+  (let [page (/ index 1024)
+        at (- index (* page 1024))]
+    (while (<= (len (get (.site-pages d) site)) page)
+      (push! (mut (elem (mut (.site-pages d)) site)) (ArrayList::new [i64] (malloc-allocator))))
+    (when (= (len (get (get (.site-pages d) site) page)) 0)
+      (for _ (range 0 1024)
+        (push! (mut (elem (mut (elem (mut (.site-pages d)) site)) page)) -1)))
+    (let [known (get (get (get (.site-pages d) site) page) at)]
+      (if (>= known 0)
+          known
+          (let [id (dep-new-numbered! d site index)]
+            (set! (mut (elem (mut (elem (mut (.site-pages d)) site)) page)) at id)
+            id)))))
 
 ;;; Whether a memo is computing on this worker, so a part of `setting` it reads is worth naming.
 (defn dep-wants-path? [(setting (slice u8))] (-> bool)
@@ -2792,6 +2865,32 @@
         (dep-note-id! id))))
   0)
 
+;;; The same for a path fixed where it is read (`.linked.any-reexport`): its node found once, and
+;;; kept where `cache` points, since a node, once made, is for as long as the program runs.
+(defn dep-note-fixed! [(cache (ptr i64)) (setting (slice u8)) (path (slice u8))] (-> void)
+  (let [d (deps)]
+    (when (>= (dep-top d (worker-slot)) 0)
+      (let [known (atomic/read cache)]
+        (if (> known 0)
+            (dep-note-id! (- known 1))
+            (let [node (join setting path)]
+              (deps-lock! d)
+              (let [id (match (get (.ids d) node)
+                         (Some [i] i)
+                         (None []
+                               (let [i (dep-id! d node)
+                                     (mut paths) (match (get (.paths d) setting)
+                                                   (Some [ps] ps)
+                                                   (None [] (ArrayList::new [(slice u8)] (malloc-allocator))))]
+                                 (push! (mut paths) path)
+                                 (set! (mut (.paths d)) setting paths)
+                                 (query-index! d setting path i)
+                                 i)))]
+                (deps-unlock! d)
+                (atomic/store cache (+ id 1))
+                (dep-note-id! id)))))))
+  0)
+
 ;;; The numbered sites memos have read a setting at, and each one's fixed text and (index, node) pairs.
 (defn dep-sites [(setting (slice u8))] (-> (ArrayList i64))
   (let [d (deps)
@@ -2817,7 +2916,14 @@
   (let [d (deps)
         (mut out) (ArrayList::new [i64] (malloc-allocator))]
     (deps-lock! d)
-    (for x (get (.site-nodes d) site) (push! (mut out) x))
+    (let [pages (get (.site-pages d) site)]
+      (for p (range 0 (len pages))
+        (let [page (get pages p)]
+          (for j (range 0 (len page))
+            (let [id (get page j)]
+              (when (>= id 0)
+                (push! (mut out) (+ (* p 1024) j))
+                (push! (mut out) id)))))))
     (deps-unlock! d)
     out))
 
@@ -2950,9 +3056,8 @@
                         (for at (range 0 (/ (len rows) n))
                           (let [v (get rows (+ (* at n) col))]
                             (when (and (>= v 0) (< v 4294967296))
-                              (match (get (.elements d) (+ (* site 4294967296) v))
-                                (Some [id] (push! (mut hit) id))
-                                (None [] 0))))))))))
+                              (let [id (dep-element-at d site v)]
+                                (when (>= id 0) (push! (mut hit) id)))))))))))
           (None [] 0))
         (for rows [gone come]
           (for at (range 0 (/ (len rows) n))
@@ -3022,9 +3127,11 @@
     (push! (mut (elem (mut (.stacks d)) slot))
            (DepFrame
              :notes (ArrayList::new [i64] (malloc-allocator))
-             :seen (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))
+             :seen (int-table 0)
              :literals (ArrayList::new [i64] (malloc-allocator))
-             :elements (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))))
+             :elements (int-table 0)
+             :pending (ArrayList::new [i64] (malloc-allocator))
+             :mixed false))
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     0))
 
@@ -3042,11 +3149,13 @@
 (defn dep-end-id! [(me i64) (same bool)] (-> void)
   (let [d (deps)
         slot (worker-slot)
-        frame (match (pop! (mut (elem (mut (.stacks d)) slot)))
-                (Some [f] f)
-                (None [] (panic "a memo finished that never started")))]
+        (mut frame) (match (pop! (mut (elem (mut (.stacks d)) slot)))
+                      (Some [f] f)
+                      (None [] (panic "a memo finished that never started")))]
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     (deps-lock! d)
+    (frame-resolve! d (mut frame))
+    (frame-free! (mut frame))
     (let [now (atomic/read (field d revision))
           before (get (.reads d) me)
           ;; Read just what it read last time, in the same order: its edges are there already.
@@ -3060,13 +3169,17 @@
       ;; last computation read too, whose edges are there already.
       (unless again
         (if (= (len before) 0)
-            (for read (.notes frame) (push! (mut (elem (mut (.dependents d)) read)) me))
-            (let [(mut had) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))]
-              (for read before (set! (mut had) read 1))
+            (for read (.notes frame) (dep-edge! d read me))
+            (let [(mut had) (int-table (int-capacity (len before)))]
+              (for read before (int-put! (mut had) read 1))
               (for read (.notes frame)
-                (match (get had read)
-                  (Some [_] 0)
-                  (None [] (push! (mut (elem (mut (.dependents d)) read)) me) 0))))))
+                (when (< (int-get (mut had) read) 0)
+                  (dep-edge! d read me)))
+              (free! (mut (.keys had)))
+              (free! (mut (.vals had)))
+              0)))
+      ;; Only the worker holding this answer's key reads its list, and that is this one.
+      (let [(mut old) before] (free! (mut old)))
       (set! (mut (.dirty d)) me false)
       (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") (dep-node-text d me)))
       (set! (mut (.verified d)) me now)
@@ -3080,9 +3193,13 @@
 (defn dep-take-notes! [] (-> (ArrayList i64))
   (let [d (deps)
         slot (worker-slot)
-        frame (match (pop! (mut (elem (mut (.stacks d)) slot)))
-                (Some [f] f)
-                (None [] (panic "work for a memo finished that never started")))]
+        (mut frame) (match (pop! (mut (elem (mut (.stacks d)) slot)))
+                      (Some [f] f)
+                      (None [] (panic "work for a memo finished that never started")))]
+    (deps-lock! d)
+    (frame-resolve! d (mut frame))
+    (deps-unlock! d)
+    (frame-free! (mut frame))
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     (.notes frame)))
 
@@ -3118,15 +3235,20 @@
       (let [now (+ (atomic/read (field d revision)) 1)
             (mut todo) (ArrayList::new [i64] (malloc-allocator))]
         (atomic/store (field d revision) now)
-        (set! (mut (.changed d)) id now)
+        (if (numbered? id)
+            (set! (mut (.num-changed d)) (- id (numbered-tag)) now)
+            (set! (mut (.changed d)) id now))
         ;; Everything that read it, through any number of answers, may have changed.
         (push! (mut todo) id)
         (while (> (len todo) 0)
           (let [at (match (pop! (mut todo)) (Some [x] x) (None [] -1))]
-            (for out (get (.dependents d) at)
-              (unless (get (.dirty d) out)
-                (set! (mut (.dirty d)) out true)
-                (push! (mut todo) out))))))
+            (let [(mut e) (dep-head d at)]
+              (while (>= e 0)
+                (let [out (get (.edge-to d) e)]
+                  (unless (get (.dirty d) out)
+                    (set! (mut (.dirty d)) out true)
+                    (push! (mut todo) out)))
+                (set! e (get (.edge-next d) e)))))))
       (deps-unlock! d)
       (when (dep-tracing?) (println "[deps] changed {}" (dep-node-text d id))))
     0))
@@ -3175,6 +3297,12 @@
 ;;; memo's answer through its memo.
 (defn dep-bring-up! [(d (ptr Deps)) (id i64)] (-> i64)
   (deps-lock! d)
+  (if (numbered? id)
+      (let [c (dep-changed-at d id)] (deps-unlock! d) c)
+      (dep-bring-up-text! d id)))
+
+;;; The same for a node with text, under the lock, which it gives up.
+(defn dep-bring-up-text! [(d (ptr Deps)) (id i64)] (-> i64)
   (let [text (get (.texts d) id)
         cut (match (index-of text "\0") (Some [i] i) (None [] -1))]
     (if (< cut 0)
