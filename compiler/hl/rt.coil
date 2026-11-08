@@ -1482,6 +1482,18 @@
     out))
 
 ;;; One text for a memo's several arguments, each told apart by its length, whatever it holds.
+;;; A key `memo-key-of` made, back into its parts.
+(defn memo-key-parts [(key (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut at) 0]
+    (while (< at (len key))
+      (let [(mut colon) at]
+        (while (and (< colon (len key)) (!= (get key colon) (cast u8 58))) (set! colon (+ colon 1)))
+        (let [n (parse-int (subslice key at colon))]
+          (push! (mut out) (subslice key (+ colon 1) (+ colon 1 n)))
+          (set! at (+ colon 1 n)))))
+    out))
+
 (defn memo-key-of [(parts (ArrayList (slice u8)))] (-> (slice u8))
   (let [(mut b) (str/StrBuf::new (malloc-allocator))]
     (for p parts
@@ -2424,39 +2436,40 @@
 
 ;; ---------------------------------------------------------------- dependencies
 
-;;; What each memo's answer was made from, so answers can be kept from one build to the next. A
-;;; node is named by text: a memo's answer (its function, a NUL, its key), a setting ("s:" and its
-;;; name), or an input: a file read ("f:"), a directory listed ("d:"), a path asked about ("e:",
-;;; "r:"). While a memo computes, every node it reads is noted in a frame of its worker's; when it
-;;; is done the notes become edges from each node to it. When a node changes, everything that
-;;; depends on it, through any number of memos, is dead: a memo store drops its dead answers the
-;;; next time it is asked anything, and computes them again when asked for them.
+;;; What each memo's answer was made from, so answers can be kept from one build to the next, and
+;;; what changed can stop where it makes no difference. A node is named by text: a memo's answer (its
+;;; function, a NUL, its key), a setting ("s:" and its name), or an input: a file read ("f:"), a
+;;; directory listed ("d:"), a path asked about ("e:", "r:").
+;;;
+;;; Every change moves the revision on. Each node keeps the revision it last changed in, and a
+;;; memo's answer the revision it was last known current in and the nodes it read, in order. Asked
+;;; for in a later revision, an answer first brings each node it read up to date, in the order it
+;;; read them (a memo's answer through that memo, by its key); only if one of them changed since is
+;;; it computed again, and only if the new answer differs from the old does it count as changed
+;;; itself. So an edit that leaves something's answer the same goes no further than that answer.
 
-;;; A frame's notes: inputs and settings by name, each once (`literals` holds the addresses of names
-;;; given as literals, which are the same each time a place reads them, so a setting read in a loop
-;;; is checked without hashing); memo answers as their function's name and their key, joined only
-;;; when the frame is done.
+;;; A frame's notes: what the memo computing on a worker has read, each once. `literals` holds the
+;;; addresses of names given as literals, the same each time a place reads them, so a setting read
+;;; in a loop is checked without hashing.
 (defstruct DepFrame
   [(notes (ArrayList (slice u8)))
    (seen (HashMap (slice u8) i64))
-   (literals (ArrayList i64))
-   (memo-names (ArrayList (slice u8)))
-   (memo-keys (ArrayList (slice u8)))])
+   (literals (ArrayList i64))])
 
 ;;; The lock word comes first. `depth-key`: a thread-specific value holding how many frames the
-;;; thread has open, so outside any memo a read costs one lookup. `epoch` moves whenever something
-;;; dies.
+;;; thread has open.
 (defstruct Deps
   [(lock i64)
    (depth-key i64)
-   (epoch i64)
+   (revision i64)
    (ready bool)
    (ids (HashMap (slice u8) i64))
    (texts (ArrayList (slice u8)))
-   (dependents (ArrayList (ArrayList i64)))
-   (dead (ArrayList bool))
+   (changed (ArrayList i64))
+   (verified (ArrayList i64))
+   (reads (ArrayList (ArrayList i64)))
    (prints (ArrayList (slice u8)))
-   (edges (HashMap i64 i64))
+   (ensurers (HashMap (slice u8) (fnptr (cc/C) [(slice u8)] i64)))
    (stacks (ArrayList (ArrayList DepFrame)))
    (computed i64)
    (tracking bool)
@@ -2469,15 +2482,16 @@
       (unless (.ready d)
         (set! (.ids d) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
         (set! (.texts d) (ArrayList::new [(slice u8)] (malloc-allocator)))
-        (set! (.dependents d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
-        (set! (.dead d) (ArrayList::new [bool] (malloc-allocator)))
+        (set! (.changed d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.verified d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.reads d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
         (set! (.prints d) (ArrayList::new [(slice u8)] (malloc-allocator)))
-        (set! (.edges d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
+        (set! (.ensurers d) (HashMap::new [(slice u8) (fnptr (cc/C) [(slice u8)] i64)] (malloc-allocator) (str/keyops)))
         (set! (.stacks d) (ArrayList::new [(ArrayList DepFrame)] (malloc-allocator)))
         (for _ (range 0 (max-workers))
           (push! (mut (.stacks d)) (ArrayList::new [DepFrame] (malloc-allocator))))
         (set! (.depth-key d) (key-new))
-        (atomic/store (field d epoch) 0)
+        (atomic/store (field d revision) 1)
         (atomic/store (field d untracked) 0)
         (set! (.ready d) true))
       (init-unlock!))
@@ -2489,7 +2503,7 @@
 (defn deps-unlock! [(d (ptr Deps))] (-> void)
   (spin-unlock! (cast (ptr i64) d)))
 
-;;; A node's id, made when it has none. Under the lock.
+;;; A node's id, made when it has none: changed and known current in no revision yet. Under the lock.
 (defn dep-id! [(d (ptr Deps)) (node (slice u8))] (-> i64)
   (match (get (.ids d) node)
     (Some [id] id)
@@ -2497,13 +2511,14 @@
           (let [id (len (.texts d))]
             (set! (mut (.ids d)) node id)
             (push! (mut (.texts d)) node)
-            (push! (mut (.dependents d)) (ArrayList::new [i64] (malloc-allocator)))
-            (push! (mut (.dead d)) false)
+            (push! (mut (.changed d)) 0)
+            (push! (mut (.verified d)) 0)
+            (push! (mut (.reads d)) (ArrayList::new [i64] (malloc-allocator)))
             (push! (mut (.prints d)) "")
             id))))
 
 ;;; Dependencies are tracked from here on, which only a program that builds more than once needs.
-;;; Before any memo has computed anything, since what it computed untracked could never die.
+;;; Before any memo has computed anything, since what it computed untracked could never be checked.
 (defn dep-track! [] (-> void)
   (let [d (deps)]
     (when (> (atomic/read (field d untracked)) 0)
@@ -2519,6 +2534,9 @@
   (let [d (deps)]
     (unless (.tracking d) (atomic/add (field d untracked) 1))
     0))
+
+(defn dep-revision [] (-> i64)
+  (atomic/read (field (deps) revision)))
 
 ;;; Whether this worker is computing a memo, so what it reads is noted.
 (defn dep-in-frame? [] (-> bool)
@@ -2558,13 +2576,15 @@
 
 ;;; A memo answer, by its function's name and its key, was read by the memo this worker is computing.
 (defn dep-note-memo! [(name (slice u8)) (key (slice u8))] (-> void)
-  (let [d (deps)
-        slot (worker-slot)
-        top (dep-top d slot)]
-    (when (>= top 0)
-      (push! (mut (.memo-names (elem (mut (elem (mut (.stacks d)) slot)) top))) name)
-      (push! (mut (.memo-keys (elem (mut (elem (mut (.stacks d)) slot)) top))) key)))
-  0)
+  (dep-note! (memo-node name key)))
+
+;;; A memo can be asked for an answer by its key's text: what checking an answer that read it calls.
+(defn dep-ensurer! [(name (slice u8)) (f (fnptr (cc/C) [(slice u8)] i64))] (-> void)
+  (let [d (deps)]
+    (deps-lock! d)
+    (set! (mut (.ensurers d)) name f)
+    (deps-unlock! d)
+    0))
 
 ;;; A memo starts computing on this worker.
 (defn dep-begin! [] (-> void)
@@ -2574,38 +2594,28 @@
            (DepFrame
              :notes (ArrayList::new [(slice u8)] (malloc-allocator))
              :seen (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
-             :literals (ArrayList::new [i64] (malloc-allocator))
-             :memo-names (ArrayList::new [(slice u8)] (malloc-allocator))
-             :memo-keys (ArrayList::new [(slice u8)] (malloc-allocator))))
+             :literals (ArrayList::new [i64] (malloc-allocator))))
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     0))
 
-;;; An edge from `from` to `me`, once. Under the lock.
-(defn dep-edge! [(d (ptr Deps)) (from i64) (me i64)] (-> void)
-  (let [edge (+ (* from 4294967296) me)]
-    (match (get (.edges d) edge)
-      (Some [_] 0)
-      (None []
-            (set! (mut (.edges d)) edge 1)
-            (push! (mut (elem (mut (.dependents d)) from)) me)
-            0))))
-
-;;; The memo this worker was computing is done, and is `node`: what it read leads to it, and it
-;;; is alive again.
-(defn dep-end! [(node (slice u8))] (-> void)
+;;; The memo this worker was computing is done, and is `node`: it read what was noted, and is
+;;; current in this revision; changed in it unless its answer is the one it had (`same`).
+(defn dep-end! [(node (slice u8)) (same bool)] (-> void)
   (let [d (deps)
         slot (worker-slot)
         frame (match (pop! (mut (elem (mut (.stacks d)) slot)))
                 (Some [f] f)
-                (None [] (panic "a memo finished that never started")))]
+                (None [] (panic "a memo finished that never started")))
+        (mut reads) (ArrayList::new [i64] (malloc-allocator))]
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     (deps-lock! d)
-    (let [me (dep-id! d node)]
-      (set! (mut (.dead d)) me false)
-      (set! (.computed d) (+ (.computed d) 1))
-      (for read (.notes frame) (dep-edge! d (dep-id! d read) me))
-      (for i (range 0 (len (.memo-names frame)))
-        (dep-edge! d (dep-id! d (memo-node (get (.memo-names frame) i) (get (.memo-keys frame) i))) me)))
+    (let [me (dep-id! d node)
+          now (atomic/read (field d revision))]
+      (for read (.notes frame) (push! (mut reads) (dep-id! d read)))
+      (set! (mut (.reads d)) me reads)
+      (set! (mut (.verified d)) me now)
+      (unless same (set! (mut (.changed d)) me now))
+      (set! (.computed d) (+ (.computed d) 1)))
     (deps-unlock! d)
     0))
 
@@ -2615,45 +2625,72 @@
     (dep-note! node)
     (let [d (deps)]
       (deps-lock! d)
-      (set! (mut (.prints d)) (dep-id! d node) print)
+      (let [id (dep-id! d node)]
+        (when (= (len (get (.prints d) id)) 0)
+          (set! (mut (.changed d)) id (atomic/read (field d revision))))
+        (set! (mut (.prints d)) id print))
       (deps-unlock! d)))
   0)
 
-;;; Every memo answer that depends on `node`, through any number of others, is dead. The edges
-;;; that led there are spent: what is computed again notes its own.
+;;; `node` changed: a new revision, which it changed in.
 (defn dep-changed! [(node (slice u8))] (-> void)
+  (let [d (deps)]
+    (when (.tracking d)
+      (deps-lock! d)
+      (let [now (+ (atomic/read (field d revision)) 1)
+            id (dep-id! d node)]
+        (atomic/store (field d revision) now)
+        (set! (mut (.changed d)) id now))
+      (deps-unlock! d))
+    0))
+
+;;; Whether a memo's answer is known current in this revision.
+(defn dep-current? [(node (slice u8))] (-> bool)
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [out (match (get (.ids d) node)
+                (Some [id] (= (get (.verified d) id) (atomic/read (field d revision))))
+                (None [] false))]
+      (deps-unlock! d)
+      out)))
+
+;;; Whether a memo's answer, computed in an earlier revision, is still what it would be: each node
+;;; it read brought up to date in turn, and none changed since it was last current. If so it is
+;;; current now. Called by the worker that has the answer's key to itself.
+(defn dep-still? [(node (slice u8))] (-> bool)
   (let [d (deps)]
     (deps-lock! d)
     (match (get (.ids d) node)
-      (Some [start]
-            (let [(mut todo) (ArrayList::new [i64] (malloc-allocator))
-                  (mut killed) 0]
-              (push! (mut todo) start)
-              (while (> (len todo) 0)
-                (let [at (match (pop! (mut todo)) (Some [x] x) (None [] -1))
-                      outs (get (.dependents d) at)]
-                  (set! (mut (.dependents d)) at (ArrayList::new [i64] (malloc-allocator)))
-                  (for out outs
-                    (remove! (mut (.edges d)) (+ (* at 4294967296) out))
-                    (unless (get (.dead d) out)
-                      (set! (mut (.dead d)) out true)
-                      (set! killed (+ killed 1))
-                      (push! (mut todo) out)))))
-              (when (> killed 0) (atomic/add (field d epoch) 1))))
-      (None [] 0))
-    (deps-unlock! d)
-    0))
+      (None [] (do (deps-unlock! d) false))
+      (Some [me]
+            (let [since (get (.verified d) me)
+                  reads (get (.reads d) me)]
+              (deps-unlock! d)
+              (block :check
+                     (for read reads
+                       (let [changed (dep-bring-up! d read)]
+                         (when (> changed since) (return-from :check false))))
+                     (deps-lock! d)
+                     (set! (mut (.verified d)) me (atomic/read (field d revision)))
+                     (deps-unlock! d)
+                     true))))))
 
-(defn dep-epoch [] (-> i64)
-  (atomic/read (field (deps) epoch)))
-
-;;; Whether a memo answer is dead. Asked under its store's lock, after the epoch moved.
-(defn dep-dead? [(node (slice u8))] (-> bool)
-  (let [d (deps)]
-    (deps-lock! d)
-    (let [out (match (get (.ids d) node) (Some [id] (get (.dead d) id)) (None [] false))]
-      (deps-unlock! d)
-      out)))
+;;; A node up to date, and the revision it last changed in: an input or setting as it stands, a
+;;; memo's answer through its memo.
+(defn dep-bring-up! [(d (ptr Deps)) (id i64)] (-> i64)
+  (deps-lock! d)
+  (let [text (get (.texts d) id)
+        cut (match (index-of text "\0") (Some [i] i) (None [] -1))]
+    (if (< cut 0)
+        (let [c (get (.changed d) id)] (deps-unlock! d) c)
+        (let [name (subslice text 0 cut)
+              f (match (get (.ensurers d) name)
+                  (Some [f] f)
+                  (None [] (panic "no memo named {} to ask for {}" name text)))]
+          (deps-unlock! d)
+          (f (subslice text (+ cut 1) (len text)))
+          (deps-lock! d)
+          (let [c (get (.changed d) id)] (deps-unlock! d) c)))))
 
 ;;; A memo answer's node: its function's name, a NUL, its key.
 (defn memo-node [(name (slice u8)) (key (slice u8))] (-> (slice u8))
@@ -2696,8 +2733,8 @@
           (= kind 114) (real-path-raw path)
           :else (panic "{} is no input" node))))
 
-;;; The inputs memos have read that say something else now, each marked changed, their dependents
-;;; dead. What they say now is what they said, from here on.
+;;; The inputs memos have read that say something else now, each changed in a new revision. What
+;;; they say now is what they said, from here on.
 (defn dep-changed-inputs! [] (-> (ArrayList (slice u8)))
   (let [d (deps)
         (mut changed) (ArrayList::new [(slice u8)] (malloc-allocator))

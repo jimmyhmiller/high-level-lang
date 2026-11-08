@@ -114,6 +114,7 @@
    (ovr-slots (ArrayList OvrSlot))
    (givens (ArrayList Given))
    (outs (ArrayList Out))  ; in a rewrite, the names whose rewritten form `.out` reads
+   (sames (ArrayList (slice u8)))  ; the types `same-code` has made a comparison of, in this module
    (attrs-from (slice u8))])  ; the attribute grammar whose blocks are being read; "" for this one
 
 ;;; A name a rewrite's pattern binds to a child, or to its node, and that one's rewritten form.
@@ -7498,6 +7499,98 @@
 (defn memo-gen-init [(d g/Node)] (-> Code)
   `(set! (~(primitive/code-symbol "." (memo-near-gen (.text (kid d 0)))) s) -1))
 
+(defn memo-near-rev [(name (slice u8))] (-> (slice u8))
+  (cat "memo-near-rev--" name))
+
+(defn memo-rev-field [(d g/Node)] (-> Code)
+  `(~(sym (memo-near-rev (.text (kid d 0)))) i64))
+
+(defn memo-rev-init [(d g/Node)] (-> Code)
+  `(set! (~(primitive/code-symbol "." (memo-near-rev (.text (kid d 0)))) s) -1))
+
+;;; Whether two values of a rules type are the same, as code: what keeps a memo's recomputed answer
+;;; from counting as changed. Lists, maps and records are compared by helpers made once per type;
+;;; a list whose buffer is the other's is the same without a look inside. Functions, and a foreign
+;;; module's opaque types, cannot be looked into: two of them are never the same.
+(defn same-code [(k (mut Comp)) (t (slice u8)) (a Code) (b Code)] (-> Code)
+  (cond (or (= t "Int") (= t "Bool") (= t "Text")) `(= ~a ~b)
+        (fn? t) `false
+        (opt? t)
+          (let [x (fresh (mut k) "x")
+                y (fresh (mut k) "y")]
+            `(match ~a
+               (Some [~(sym x)] (match ~b (Some [~(sym y)] ~(same-code (mut k) (opt-of t) (sym x) (sym y))) (None [] false)))
+               (None [] (match ~b (Some [_] false) (None [] true)))))
+        (or (list? t) (map? t)) `(~(same-helper (mut k) t) ~a ~b)
+        :else
+          (let [mo (mod-at (mut k) (type-module t))]
+            (cond (and (= (.sort mo) (SGrammar)) (= (type-name t) "Node"))
+                    `(~(sym (qualified (mut k) (type-module t) "node-same?")) ~a ~b)
+                  (is-some? (find-enum-named mo (type-name t))) `(= ~a ~b)
+                  (is-some? (find-rec mo (type-name t))) `(~(same-helper (mut k) t) ~a ~b)
+                  :else `false))))
+
+(defn is-some? [T] [(o (Option T))] (-> bool)
+  (match o (Some [_] true) (None [] false)))
+
+(defn same-name [(t (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) "same--")
+    (for i (range 0 (len t))
+      (let [c (get t i)]
+        (push-str! (mut b)
+                   (cond (= c #\[) "L" (= c #\]) "E" (= c #\{) "M" (= c #\}) "N" (= c #\:) "C" (= c #\?) "O"
+                         (= c #\.) "_" (= c #\,) "S" (= c #\-) "h"
+                         :else (subslice t i (+ i 1))))))
+    (finish! (mut b))))
+
+;;; The helper comparing two values of a list, map or record type, made the first time it is asked for.
+(defn same-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (let [name (same-name t)
+        ty (coil-type (mut k) t)]
+    (unless (has-text? (.sames k) name)
+      (push! (mut (.sames k)) name)
+      (push! (mut (.aux k))
+             (cond (list? t)
+                     `(defn ~(sym name) [(a ~ty) (b ~ty)] (-> bool)
+                        (and (= (len a) (len b))
+                             (or (= (primitive/cast i64 (data (slice a))) (primitive/cast i64 (data (slice b))))
+                                 (block :same
+                                        (for i (range 0 (len a))
+                                          (unless ~(same-code (mut k) (elem-of t) `(get a i) `(get b i))
+                                            (return-from :same false)))
+                                        true))))
+                   (map? t)
+                     `(defn ~(sym name) [(a ~ty) (b ~ty)] (-> bool)
+                        (and (= (len a) (len b))
+                             (block :same
+                                    (for key a
+                                      (match (get b key)
+                                        (Some [y]
+                                              (match (get a key)
+                                                (Some [x] (unless ~(same-code (mut k) (map-val t) `x `y) (return-from :same false)))
+                                                (None [] (return-from :same false))))
+                                        (None [] (return-from :same false))))
+                                    true)))
+                   :else
+                     (let [r (match (find-rec (mod-at (mut k) (type-module t)) (type-name t))
+                               (Some [r] r)
+                               (None [] (panic "rules: no record {}" t)))
+                           (mut tests) (primitive/code-list-new)]
+                       (for f (.fields r)
+                         (push! (mut tests)
+                                (same-code (mut k) (.ty f)
+                                           `(~(primitive/code-symbol "." (.name f)) a)
+                                           `(~(primitive/code-symbol "." (.name f)) b))))
+                       `(defn ~(sym name) [(a ~ty) (b ~ty)] (-> bool)
+                          (and true ~@tests))))))
+    (sym name)))
+
+(defn has-text? [(xs (ArrayList (slice u8))) (x (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for y xs (when (= y x) (set! hit true)))
+    hit))
+
 ;;; The shared table, its lock and generation; the function; the computation under another name.
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
   (let [f (memo-check! (mut k) d)
@@ -7506,45 +7599,36 @@
         store (sym (cat "MemoStore--" name))
         store-fn (sym (cat "memo-store--" name))
         compute (cat "memo-compute--" name)
+        ensure (sym (cat "memo-ensure--" name))
         near (primitive/code-symbol "." (memo-near name))
         near-gen (primitive/code-symbol "." (memo-near-gen name))
-        purge-fn (sym (cat "memo-purge--" name))
+        near-rev (primitive/code-symbol "." (memo-near-rev name))
         qname (cat3 (.self k) "." name)
-        key-ty (coil-type (mut k) (memo-key-type f))
         key-text (if (= (memo-key-type f) "Int") `(rt/num-text key) `key)
         (mut params) (primitive/code-list-new)
         (mut args) (primitive/code-list-new)
+        (mut parsed) (primitive/code-list-new)
         rt (coil-type (mut k) (.ret f))]
     (for i (range 0 (len (.params f)))
       (push! (mut params)
              `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
-      (push! (mut args) (memo-arg i)))
+      (push! (mut args) (memo-arg i))
+      (let [part (if (= (len (.params f)) 1) `text `(get parts ~i))]
+        (push! (mut parsed) (if (= (.ty (get (.params f) i)) "Int") `(rt/parse-int ~part) part))))
     (emit! (mut out) (compile-fn-as (mut k) d compute))
-    ;; The lock word comes first, so the store's address is the word's. `epoch`: the dependency
-    ;; epoch its table was last cleared of dead answers in.
+    ;; The lock word comes first, so the store's address is the word's.
     (emit! (mut out)
            `(defstruct ~store
               [(lock i64)
                (ready bool)
                (gen i64)
-               (epoch i64)
                (table ~(coil-type (mut k) mt))
                (busy ~(coil-type (mut k) (memo-busy-type f)))]))
-    ;; Answers made from something that changed since are dropped, and the workers' near tables
-    ;; with them.
+    ;; An answer asked for by its key's text, as checking an answer that read it asks.
     (emit! (mut out)
-           `(defn ~purge-fn [(s (ptr ~store))] (-> void)
-              (let [word (cast (ptr i64) s)]
-                (rt/spin-lock! word)
-                (let [now (rt/dep-epoch)]
-                  (when (!= (.epoch s) now)
-                    (let [(mut dead) (ArrayList::new [~key-ty] (malloc-allocator))]
-                      (for key (.table s)
-                        (when (rt/dep-dead? (rt/memo-node ~qname ~key-text)) (push! (mut dead) key)))
-                      (for key dead (remove! (mut (.table s)) key))
-                      (set! (.gen s) (rt/next-pass!))
-                      (set! (.epoch s) now))))
-                (rt/spin-unlock! word)
+           `(defn ~ensure [(text (slice u8))] (-> i64)
+              (let [parts ~(if (> (len (.params f)) 1) `(rt/memo-key-parts text) `(rt/memo-key-parts ""))]
+                (~(sym name) ~@parsed)
                 0)))
     (emit! (mut out)
            `(defn ~store-fn [] (-> (ptr ~store))
@@ -7555,22 +7639,31 @@
                     (set! (.table s) ~(new-map (mut k) mt))
                     (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
                     (set! (.gen s) (rt/next-pass!))
-                    (set! (.epoch s) (rt/dep-epoch))
                     (set! (.ready s) true))
-                  (rt/init-unlock!))
+                  (rt/init-unlock!)
+                  (rt/dep-ensurer! ~qname (fnptr-of ~ensure)))
                 s)))
+    ;; While dependencies are tracked, an answer from an earlier revision is current only once each
+    ;; thing it read is shown unchanged, and an answer computed again that is the same as the one
+    ;; it replaces is kept, and does not count as changed.
     (emit! (mut out)
            `(defn ~(sym name) [~@params] (-> ~rt)
               (let [key ~(memo-key-code f)
                     t (rules-task)
                     s (~store-fn)
-                    word (cast (ptr i64) s)]
-                (when (!= (.epoch s) (rt/dep-epoch)) (~purge-fn s))
+                    word (cast (ptr i64) s)
+                    tracking (rt/dep-tracking?)
+                    node (if tracking (rt/memo-node ~qname ~key-text) "")]
                 ;; A memo computing now is made from this answer.
-                (when (rt/dep-in-frame?) (rt/dep-note-memo! ~qname ~key-text))
+                (when (and tracking (rt/dep-in-frame?)) (rt/dep-note! node))
                 (when (!= (~near-gen t) (.gen s))
                   (set! (~near t) ~(new-map (mut k) mt))
                   (set! (~near-gen t) (.gen s)))
+                (when tracking
+                  (let [rev (rt/dep-revision)]
+                    (when (!= (~near-rev t) rev)
+                      (set! (~near t) ~(new-map (mut k) mt))
+                      (set! (~near-rev t) rev))))
                 (match (get (~near t) key)
                   (Some [v] v)
                   (None []
@@ -7579,44 +7672,58 @@
                               (mut go) true]
                           (while go
                             (rt/spin-lock! word)
-                            (match (get (.table s) key)
-                              (Some [x]
-                                    (do
-                                      (rt/spin-unlock! word)
-                                      (set! answer (Some x))
-                                      (set! go false)))
-                              (None []
-                                    (let [owner
-                                            (match (get (.busy s) key)
-                                              (Some [o] o)
-                                              (None [] 0))]
-                                      (cond (= owner me)
-                                              (do
+                            (let [found (get (.table s) key)
+                                  current (match found
+                                            (Some [_] (or (not tracking) (rt/dep-current? node)))
+                                            (None [] false))]
+                              (if current
+                                  (do
+                                    (rt/spin-unlock! word)
+                                    (set! answer found)
+                                    (set! go false))
+                                  (let [owner
+                                          (match (get (.busy s) key)
+                                            (Some [o] o)
+                                            (None [] 0))]
+                                    (cond (= owner me)
+                                            (do
+                                              (rt/spin-unlock! word)
+                                              (panic "memo fn {} asks for its own answer"
+                                                     ~name))
+                                          (> owner 0)
+                                            (do
+                                              (rt/spin-unlock! word)
+                                              (rt/pause!))
+                                          :else
+                                            (do
+                                              (set! (mut (.busy s)) key me)
+                                              (rt/spin-unlock! word)
+                                              (let [made
+                                                      (match found
+                                                        (Some [old]
+                                                              (if (rt/dep-still? node)
+                                                                  old
+                                                                  (do
+                                                                    (rt/dep-begin!)
+                                                                    (let [fresh (~(sym compute) ~@args)
+                                                                          same ~(same-code (mut k) (.ret f) `old `fresh)]
+                                                                      (rt/dep-end! node same)
+                                                                      (if same old fresh)))))
+                                                        (None []
+                                                              (do
+                                                                (when tracking (rt/dep-begin!))
+                                                                (let [fresh (~(sym compute) ~@args)]
+                                                                  (when tracking (rt/dep-end! node false))
+                                                                  (rt/dep-untracked!)
+                                                                  fresh))))]
+                                                (rt/spin-lock! word)
+                                                (set! (mut (.table s))
+                                                      key
+                                                      made)
+                                                (set! (mut (.busy s)) key 0)
                                                 (rt/spin-unlock! word)
-                                                (panic "memo fn {} asks for its own answer"
-                                                       ~name))
-                                            (> owner 0)
-                                              (do
-                                                (rt/spin-unlock! word)
-                                                (rt/pause!))
-                                            :else
-                                              (do
-                                                (set! (mut (.busy s)) key me)
-                                                (rt/spin-unlock! word)
-                                                (when (rt/dep-tracking?) (rt/dep-begin!))
-                                                (let [made
-                                                        (~(sym compute) ~@args)]
-                                                  (when (rt/dep-tracking?)
-                                                    (rt/dep-end! (rt/memo-node ~qname ~key-text)))
-                                                  (rt/dep-untracked!)
-                                                  (rt/spin-lock! word)
-                                                  (set! (mut (.table s))
-                                                        key
-                                                        made)
-                                                  (set! (mut (.busy s)) key 0)
-                                                  (rt/spin-unlock! word)
-                                                  (set! answer (Some made))
-                                                  (set! go false))))))))
+                                                (set! answer (Some made))
+                                                (set! go false))))))))
                           (match answer
                             (Some [v] (do (set! (mut (~near t)) key v) v))
                             (None [] (panic "memo fn {} lost its answer" ~name)))))))))))
@@ -7702,6 +7809,9 @@
         (push! (mut out) (memo-new-map (mut k) d))
         (push! (mut out)
                (primitive/code-symbol ":" (memo-near-gen (.text (kid d 0)))))
+        (push! (mut out) `-1)
+        (push! (mut out)
+               (primitive/code-symbol ":" (memo-near-rev (.text (kid d 0)))))
         (push! (mut out) `-1)))
     (when (inputs? decls)
       (push! (mut out) `:attrs-depth)
@@ -7738,6 +7848,7 @@
             :ovr-slots (ArrayList::new [OvrSlot] (malloc-allocator))
             :givens (ArrayList::new [Given] (malloc-allocator))
             :outs (ArrayList::new [Out] (malloc-allocator))
+            :sames (text-list)
             :attrs-from "")
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)
@@ -7825,8 +7936,10 @@
             (when (= (.kind d) (g/KMemoFn))
               (push! (mut task-fields) (memo-near-field (mut k) d))
               (push! (mut task-fields) (memo-gen-field d))
+              (push! (mut task-fields) (memo-rev-field d))
               (push! (mut task-inits) (memo-near-init (mut k) d))
-              (push! (mut task-inits) (memo-gen-init d))))
+              (push! (mut task-inits) (memo-gen-init d))
+              (push! (mut task-inits) (memo-rev-init d))))
           (when (inputs? decls)
             (push! (mut task-fields) `(attrs-depth i64))
             (push! (mut task-inits) `(set! (.attrs-depth s) 0)))
