@@ -2525,6 +2525,9 @@
    (edges (HashMap i64 i64))
    (dirty (ArrayList bool))
    (prints (ArrayList (slice u8)))
+   ;; A file input's size and modification time when its print was taken: while they stay, the
+   ;; file is not read again to see whether it changed.
+   (stamps (ArrayList (slice u8)))
    ;; Places that read an element of a setting by index: each one's setting and path before the
    ;; index, by the site's number; and the node each site and index is.
    ;; Query paths of database settings, by what a row would have to hold to be seen by one: the
@@ -2534,6 +2537,7 @@
    (sites (ArrayList (slice u8)))
    (site-settings (ArrayList i64))
    (site-prefixes (ArrayList (slice u8)))
+   (site-suffixes (ArrayList (slice u8)))
    (elements (HashMap i64 i64))
    (ensurers (HashMap (slice u8) (fnptr (cc/C) [(slice u8)] i64)))
    (paths (HashMap (slice u8) (ArrayList (slice u8))))
@@ -2556,10 +2560,12 @@
         (set! (.edges d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
         (set! (.dirty d) (ArrayList::new [bool] (malloc-allocator)))
         (set! (.prints d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.stamps d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.queries d) (HashMap::new [(slice u8) (ArrayList i64)] (malloc-allocator) (str/keyops)))
         (set! (.sites d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-settings d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.site-prefixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.site-suffixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.elements d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
         (set! (.ensurers d) (HashMap::new [(slice u8) (fnptr (cc/C) [(slice u8)] i64)] (malloc-allocator) (str/keyops)))
         (set! (.paths d) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops)))
@@ -2593,6 +2599,7 @@
             (push! (mut (.dependents d)) (ArrayList::new [i64] (malloc-allocator)))
             (push! (mut (.dirty d)) false)
             (push! (mut (.prints d)) "")
+            (push! (mut (.stamps d)) "")
             id))))
 
 ;;; Dependencies are tracked from here on, which only a program that builds more than once needs.
@@ -2662,7 +2669,7 @@
 
 ;;; A site that reads elements of `setting` by index, through `prefix` (`#`, or `.field#`): its
 ;;; number, kept where `cache` points, from the first time the site reads.
-(defn dep-site! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8))] (-> i64)
+(defn dep-site! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8)) (suffix (slice u8))] (-> i64)
   (let [known (atomic/read cache)]
     (if (> known 0)
         (- known 1)
@@ -2673,6 +2680,7 @@
             (push! (mut (.sites d)) (join setting prefix))
             (push! (mut (.site-settings d)) setting-id)
             (push! (mut (.site-prefixes d)) prefix)
+            (push! (mut (.site-suffixes d)) suffix)
             (deps-unlock! d)
             (atomic/store cache (+ site 1))
             site)))))
@@ -2681,7 +2689,12 @@
 ;;; computing. Numbers all the way: the element's node and its path's text are made only the first
 ;;; time any memo reads it.
 (defn dep-note-element! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8)) (index i64)] (-> void)
-  (let [site (dep-site! cache setting prefix)
+  (dep-note-numbered! cache setting prefix "" index))
+
+;;; The same for any part of a setting named by one number between a fixed `prefix` and `suffix`:
+;;; `@symbol-at(` 12 `)`, an accessor applied to it; `.live(` 7 `)`, a query by one column.
+(defn dep-note-numbered! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8)) (suffix (slice u8)) (index i64)] (-> void)
+  (let [site (dep-site! cache setting prefix suffix)
         d (deps)
         slot (worker-slot)
         top (dep-top d slot)]
@@ -2693,7 +2706,7 @@
           (let [id (match (get (.elements d) key)
                      (Some [i] i)
                      (None []
-                           (let [path (join (get (.site-prefixes d) site) (num-text index))
+                           (let [path (join (get (.site-prefixes d) site) (join (num-text index) (get (.site-suffixes d) site)))
                                  i (dep-id! d (join setting path))
                                  (mut paths) (match (get (.paths d) setting)
                                                (Some [ps] ps)
@@ -2701,6 +2714,7 @@
                              (push! (mut paths) path)
                              (set! (mut (.paths d)) setting paths)
                              (set! (mut (.elements d)) key i)
+                             (query-index! d setting path i)
                              i)))]
             (deps-unlock! d)
             (dep-note-id! id))))))
@@ -2753,12 +2767,24 @@
     i))
 
 ;;; An accessor call's path: `@name(args)`, its arguments as `memo-key-of` joins them.
-(defn call-path [(name (slice u8)) (parts (ArrayList (slice u8)))] (-> (slice u8))
+(defn call-path-text [(name (slice u8)) (parts (ArrayList (slice u8)))] (-> (slice u8))
   (let [(mut b) (str/StrBuf::new (malloc-allocator))]
     (push-str! (mut b) "@")
     (push-str! (mut b) name)
     (push-str! (mut b) "(")
     (push-str! (mut b) (memo-key-of parts))
+    (push-str! (mut b) ")")
+    (finish! (mut b))))
+
+;;; An accessor call's path when its arguments are numbers and truths: `@name(a,b)`.
+(defn call-path [(name (slice u8)) (parts (ArrayList (slice u8)))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) "@")
+    (push-str! (mut b) name)
+    (push-str! (mut b) "(")
+    (for i (range 0 (len parts))
+      (when (> i 0) (push-str! (mut b) ","))
+      (push-str! (mut b) (get parts i)))
     (push-str! (mut b) ")")
     (finish! (mut b))))
 
@@ -2976,12 +3002,14 @@
 (defn dep-input! [(node (slice u8)) (print (slice u8))] (-> void)
   (when (dep-in-frame?)
     (dep-note! node)
-    (let [d (deps)]
+    (let [d (deps)
+          stamp (if (= (cast i64 (get node 0)) 102) (file-stamp (subslice node 2 (len node))) "")]
       (deps-lock! d)
       (let [id (dep-id! d node)]
         (when (= (len (get (.prints d) id)) 0)
           (set! (mut (.changed d)) id (atomic/read (field d revision))))
-        (set! (mut (.prints d)) id print))
+        (set! (mut (.prints d)) id print)
+        (set! (mut (.stamps d)) id stamp))
       (deps-unlock! d)))
   0)
 
@@ -3112,6 +3140,56 @@
       (set! h (primitive/imul (^ h (cast i64 (get bytes i))) 1099511628211)))
     (num-text h)))
 
+;;; Where `struct stat` keeps a file's size and modification time on the platform compiled for:
+;;; 64-bit Darwin on arm64, and Linux on x86-64 and arm64. Elsewhere -1, and a file is known by
+;;; its contents alone.
+(defn stat-offset [(darwin-arm i64) (linux-x86 i64) (linux-arm i64)] (-> i64)
+  (let [darwin (match (target-arch)
+                 (Aarch64 [] darwin-arm)
+                 (X86_64 [] -1)
+                 (Wasm32 [] -1)
+                 (Wasm64 [] -1)
+                 (Riscv32 [] -1))
+        linux (match (target-arch)
+                (X86_64 [] linux-x86)
+                (Aarch64 [] linux-arm)
+                (Wasm32 [] -1)
+                (Wasm64 [] -1)
+                (Riscv32 [] -1))]
+    (match (target-os)
+      (Linux [] linux)
+      (Darwin [] darwin)
+      (Wasm [] -1)
+      (BareMetal [] -1))))
+
+;;; hygiene: the platform's offsets enter this module's namespace on purpose.
+(defn gen-stat-size [] (-> Code)
+  `(const ~(primitive/syntax->datum `STAT-SIZE) ~(stat-offset 96 48 48)))
+
+(defn gen-stat-mtime [] (-> Code)
+  `(const ~(primitive/syntax->datum `STAT-MTIME) ~(stat-offset 48 88 72)))
+
+(gen-stat-size)
+(gen-stat-mtime)
+
+(extern stat :cc (cc/C) [(ptr i8) (ptr u8)] (-> i32))
+
+(defstruct StatBuf [(bytes (array u8 256))])
+
+;;; A file's size and modification time, as text: what changes when it is written. Empty where the
+;;; platform's layout is not known, and "missing" for no file.
+(defn file-stamp [(path (slice u8))] (-> (slice u8))
+  (if (< STAT-SIZE 0)
+      ""
+      (let [(mut buf) (primitive/zeroed StatBuf)
+            at (cast (ptr u8) (mut buf))]
+        (if (!= (stat (str/to-cstr (malloc-allocator) path) at) (: 0 i32))
+            "missing"
+            (let [size (load (cast (ptr i64) (primitive/index at STAT-SIZE)))
+                  sec (load (cast (ptr i64) (primitive/index at STAT-MTIME)))
+                  nsec (load (cast (ptr i64) (primitive/index at (+ STAT-MTIME 8))))]
+              (join (num-text size) (join ":" (join (num-text sec) (join ":" (num-text nsec))))))))))
+
 ;;; What an input says now, as `dep-input!` was told it.
 (defn input-print-now [(node (slice u8))] (-> (slice u8))
   (let [path (subslice node 2 (len node))
@@ -3131,19 +3209,29 @@
         (mut nodes) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut prints) (ArrayList::new [(slice u8)] (malloc-allocator))]
     (deps-lock! d)
-    (for i (range 0 (len (.texts d)))
-      (when (> (len (get (.prints d) i)) 0)
-        (push! (mut nodes) (get (.texts d) i))
-        (push! (mut prints) (get (.prints d) i))))
-    (deps-unlock! d)
-    (for i (range 0 (len nodes))
-      (let [now (input-print-now (get nodes i))]
-        (when (!= now (get prints i))
-          (push! (mut changed) (get nodes i))
-          (deps-lock! d)
-          (set! (mut (.prints d)) (dep-id! d (get nodes i)) now)
-          (deps-unlock! d)
-          (dep-changed! (get nodes i)))))
+    (let [(mut stamps) (ArrayList::new [(slice u8)] (malloc-allocator))]
+      (for i (range 0 (len (.texts d)))
+        (when (> (len (get (.prints d) i)) 0)
+          (push! (mut nodes) (get (.texts d) i))
+          (push! (mut prints) (get (.prints d) i))
+          (push! (mut stamps) (get (.stamps d) i))))
+      (deps-unlock! d)
+      (for i (range 0 (len nodes))
+        (let [node (get nodes i)
+              file? (= (cast i64 (get node 0)) 102)
+              stamp (if file? (file-stamp (subslice node 2 (len node))) "")]
+          ;; A file whose size and time stand is not read again.
+          (unless (and file? (> (len stamp) 0) (= stamp (get stamps i)))
+            (let [now (input-print-now node)]
+              (deps-lock! d)
+              (set! (mut (.stamps d)) (dep-id! d node) stamp)
+              (deps-unlock! d)
+              (when (!= now (get prints i))
+                (push! (mut changed) node)
+                (deps-lock! d)
+                (set! (mut (.prints d)) (dep-id! d node) now)
+                (deps-unlock! d)
+                (dep-changed! node)))))))
     changed))
 
 ;;; How many inputs memos have read.
