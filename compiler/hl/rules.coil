@@ -2689,7 +2689,7 @@
           (if (> (len (.fields p)) 0)
               (setting-note (mut k) base)
               (let [node (cat4 "s:" (.module p) "." (.name (.x p)))]
-                `(do (when (rt/dep-in-frame?) (rt/dep-note-path! ~node (rt/query-path ~rel ~parts))) 0))))
+                `(do (when (and (rt/dep-in-frame?) (rt/dep-wants-path? ~node)) (rt/dep-note-path! ~node (rt/query-path ~rel ~parts))) 0))))
     (None [] `0)))
 
 ;;; A read of a setting through its place, as a query of a database setting reads it: noted, as
@@ -3221,7 +3221,7 @@
                           (push! (mut call-args) (sym v))
                           (push! (mut texts) `(push! (mut parts) ~(plain-text-code (.ty p) (sym v))))))
                       (Some (te `(let [~@binds]
-                                   (when (rt/dep-in-frame?)
+                                   (when (and (rt/dep-in-frame?) (rt/dep-wants-path? ~node))
                                      (rt/dep-note-path! ~node
                                                         (rt/call-path ~(.name f)
                                                                       (let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
@@ -5117,7 +5117,7 @@
                                  (let [read (plain-expr (mut k) n want)]
                                    (set! (.quiet k) (- (.quiet k) 1))
                                    (Some (te `(let [~(sym v) ~(.code read)]
-                                                (when (rt/dep-in-frame?) (rt/dep-note-path! ~node ~path))
+                                                (when (and (rt/dep-in-frame?) (rt/dep-wants-path? ~node)) (rt/dep-note-path! ~node ~path))
                                                 ~(sym v))
                                              (.ty read)))))))
                      (None [] (None [TE]))))
@@ -5135,17 +5135,17 @@
                                       (let [i (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")]
                                         (Some (te `(let [~(sym kv) ~(.code i)]
                                                      (when (rt/dep-in-frame?)
-                                                       (rt/dep-note-path! ~node (rt/join ~path (rt/num-text ~(sym kv)))))
+                                                       (rt/dep-note-element! (primitive/alloc-static i64) ~node ~path ~(sym kv)))
                                                      (get ~(.code b) ~(sym kv)))
                                                   (elem-of t))))
                                     (and (map? t) (or (= (map-key t) "Int") (= (map-key t) "Text")))
                                       (let [i (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) (map-key t)) (map-key t))]
                                         (Some (te `(let [~(sym kv) ~(.code i)]
-                                                     (when (rt/dep-in-frame?)
-                                                       (rt/dep-note-path! ~node
-                                                                          (rt/join ~path ~(if (= (map-key t) "Int")
-                                                                                              `(rt/num-text ~(sym kv))
-                                                                                              (sym kv)))))
+                                                     ~(if (= (map-key t) "Int")
+                                                          `(when (rt/dep-in-frame?)
+                                                             (rt/dep-note-element! (primitive/alloc-static i64) ~node ~path ~(sym kv)))
+                                                          `(when (and (rt/dep-in-frame?) (rt/dep-wants-path? ~node))
+                                                             (rt/dep-note-path! ~node (rt/join ~path ~(sym kv)))))
                                                      (get ~(.code b) ~(sym kv)))
                                                   (opt-type (map-val t)))))
                                     :else (None [TE])))))
@@ -8042,6 +8042,7 @@
                (gen i64)
                (table ~(coil-type (mut k) mt))
                (args (HashMap ~(coil-type (mut k) (memo-key-type f)) ~args-ty))
+               (node-ids (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
                (busy ~(coil-type (mut k) (memo-busy-type f)))]))
     ;; An answer asked for by its key's text, as checking an answer that read it asks: with the
     ;; arguments it was computed from, which its store keeps.
@@ -8066,6 +8067,9 @@
                     (set! (.args s) ~(if (= (memo-key-type f) "Int")
                                          `(HashMap::new [i64 ~args-ty] (malloc-allocator) (i64-keyops))
                                          `(HashMap::new [(slice u8) ~args-ty] (malloc-allocator) (str/keyops))))
+                    (set! (.node-ids s) ~(if (= (memo-key-type f) "Int")
+                                             `(HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))
+                                             `(HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
                     (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
@@ -8082,9 +8086,21 @@
                     s (~store-fn)
                     word (cast (ptr i64) s)
                     tracking (rt/dep-tracking?)
-                    node (if tracking (rt/memo-node ~qname ~key-text) "")]
+                    node (if tracking
+                             (do (rt/spin-lock! word)
+                                 (let [known (get (.node-ids s) key)]
+                                   (rt/spin-unlock! word)
+                                   (match known
+                                     (Some [i] i)
+                                     (None []
+                                           (let [i (rt/dep-memo-id! ~qname ~key-text)]
+                                             (rt/spin-lock! word)
+                                             (set! (mut (.node-ids s)) key i)
+                                             (rt/spin-unlock! word)
+                                             i)))))
+                             -1)]
                 ;; A memo computing now is made from this answer.
-                (when (and tracking (rt/dep-in-frame?)) (rt/dep-note! node))
+                (when (and tracking (rt/dep-in-frame?)) (rt/dep-note-id! node))
                 (when (!= (~near-gen t) (.gen s))
                   (set! (~near t) ~(new-map (mut k) mt))
                   (set! (~near-gen t) (.gen s)))
@@ -8103,7 +8119,7 @@
                             (rt/spin-lock! word)
                             (let [found (get (.table s) key)
                                   current (match found
-                                            (Some [_] (or (not tracking) (rt/dep-current? node)))
+                                            (Some [_] (or (not tracking) (rt/dep-current-id? node)))
                                             (None [] false))]
                               (if current
                                   (do
@@ -8130,19 +8146,19 @@
                                               (let [made
                                                       (match found
                                                         (Some [old]
-                                                              (if (rt/dep-still? node)
+                                                              (if (rt/dep-still-id? node)
                                                                   old
                                                                   (do
                                                                     (rt/dep-begin!)
                                                                     (let [fresh (~(sym compute) ~@args)
                                                                           same ~(same-code (mut k) (.ret f) `old `fresh)]
-                                                                      (rt/dep-end! node same)
+                                                                      (rt/dep-end-id! node same)
                                                                       (if same old fresh)))))
                                                         (None []
                                                               (do
                                                                 (when tracking (rt/dep-begin!))
                                                                 (let [fresh (~(sym compute) ~@args)]
-                                                                  (when tracking (rt/dep-end! node false))
+                                                                  (when tracking (rt/dep-end-id! node false))
                                                                   (rt/dep-untracked!)
                                                                   fresh))))]
                                                 (rt/spin-lock! word)

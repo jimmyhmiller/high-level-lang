@@ -1300,6 +1300,12 @@
     :ids (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
     :strs (ArrayList::new [(slice u8)] (malloc-allocator))))
 
+;;; A copy that interns apart from `ns`, with the same ids.
+(defn names-copy [(ns Names)] (-> Names)
+  (let [(mut out) (names-new)]
+    (for s (.strs ns) (intern! (mut out) s))
+    out))
+
 (defn intern! [(ns (mut Names)) (s (slice u8))] (-> i64)
   (match (get (.ids ns) s)
     (Some [id] id)
@@ -2237,7 +2243,7 @@
    (job (ptr i8))
    ;; When the run was started by a memo computing, what each worker read, for it.
    (inherit bool)
-   (read (ArrayList (slice u8)))])
+   (read (ArrayList i64))])
 
 (defn pool-fail [(what (slice u8))] (-> void)
   (panic "worker pool: {}" what))
@@ -2255,7 +2261,7 @@
         (Ok [_] 0)
         (Err [_] (pool-fail "no condition")))
       (set! (.threads p) (ArrayList::new [Thread] (malloc-allocator)))
-      (set! (.read p) (ArrayList::new [(slice u8)] (malloc-allocator)))
+      (set! (.read p) (ArrayList::new [i64] (malloc-allocator)))
       (for _ (range 0 (max-workers))
         (push! (mut (.threads p)) (Thread :handle (cast (ptr i8) 0))))
       (set! (.ready p) true))
@@ -2317,7 +2323,7 @@
           (pool-unlock! p)
           (when inherit (dep-begin!))
           (body job)
-          (let [read (if inherit (dep-take-notes!) (ArrayList::new [(slice u8)] (malloc-allocator)))]
+          (let [read (if inherit (dep-take-notes!) (ArrayList::new [i64] (malloc-allocator)))]
             (pool-lock! p)
             (for x read (push! (mut (.read p)) x)))
           (atomic/store (field p left) (- (.left p) 1))
@@ -2426,7 +2432,7 @@
           (set! (.body p) body)
           (set! (.job p) job)
           (set! (.inherit p) (dep-in-frame?))
-          (set! (.read p) (ArrayList::new [(slice u8)] (malloc-allocator)))
+          (set! (.read p) (ArrayList::new [i64] (malloc-allocator)))
           (set! (.want p) count)
           (atomic/store (field p left) (- count 1))
           (atomic/store (field p round) (+ (.round p) 1))
@@ -2445,7 +2451,7 @@
           (let [read (.read p)]
             (pool-unlock! p)
             ;; What the workers read, this thread's memo read.
-            (for x read (dep-note! x)))))
+            (for x read (dep-note-id! x)))))
     0))
 
 ;;; What a program answered, carried from the thread it ran on to `main`.
@@ -2494,9 +2500,17 @@
 ;;; addresses of names given as literals, the same each time a place reads them, so a setting read
 ;;; in a loop is checked without hashing.
 (defstruct DepFrame
-  [(notes (ArrayList (slice u8)))
-   (seen (HashMap (slice u8) i64))
-   (literals (ArrayList i64))])
+  [(notes (ArrayList i64))
+   (seen (HashMap i64 i64))
+   (literals (ArrayList i64))
+   (parts (HashMap (slice u8) i64))
+   ;; Elements read by index: by site and index, each once; and how many of each setting's.
+   (elements (HashMap i64 i64))
+   (counts (HashMap i64 i64))])
+
+;;; How many parts of one setting a memo notes before it is made from the whole setting instead: one
+;;; that reads that much of it is not worth telling apart part by part.
+(const PARTS-NOTED 64)
 
 ;;; The lock word comes first. `depth-key`: a thread-specific value holding how many frames the
 ;;; thread has open.
@@ -2510,7 +2524,19 @@
    (changed (ArrayList i64))
    (verified (ArrayList i64))
    (reads (ArrayList (ArrayList i64)))
+   ;; Who read each node, and whether a node may have changed since it was last current: a
+   ;; change marks all that read it, through any number of answers, so an answer nothing marked is
+   ;; current without a look at what it read.
+   (dependents (ArrayList (ArrayList i64)))
+   (edges (HashMap i64 i64))
+   (dirty (ArrayList bool))
    (prints (ArrayList (slice u8)))
+   ;; Places that read an element of a setting by index: each one's setting and path before the
+   ;; index, by the site's number; and the node each site and index is.
+   (sites (ArrayList (slice u8)))
+   (site-settings (ArrayList i64))
+   (site-prefixes (ArrayList (slice u8)))
+   (elements (HashMap i64 i64))
    (ensurers (HashMap (slice u8) (fnptr (cc/C) [(slice u8)] i64)))
    (paths (HashMap (slice u8) (ArrayList (slice u8))))
    (stacks (ArrayList (ArrayList DepFrame)))
@@ -2528,7 +2554,14 @@
         (set! (.changed d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.verified d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.reads d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
+        (set! (.dependents d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
+        (set! (.edges d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
+        (set! (.dirty d) (ArrayList::new [bool] (malloc-allocator)))
         (set! (.prints d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.sites d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.site-settings d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.site-prefixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.elements d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
         (set! (.ensurers d) (HashMap::new [(slice u8) (fnptr (cc/C) [(slice u8)] i64)] (malloc-allocator) (str/keyops)))
         (set! (.paths d) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops)))
         (set! (.stacks d) (ArrayList::new [(ArrayList DepFrame)] (malloc-allocator)))
@@ -2558,6 +2591,8 @@
             (push! (mut (.changed d)) 0)
             (push! (mut (.verified d)) 0)
             (push! (mut (.reads d)) (ArrayList::new [i64] (malloc-allocator)))
+            (push! (mut (.dependents d)) (ArrayList::new [i64] (malloc-allocator)))
+            (push! (mut (.dirty d)) false)
             (push! (mut (.prints d)) "")
             id))))
 
@@ -2590,19 +2625,27 @@
 (defn dep-top [(d (ptr Deps)) (slot i64)] (-> i64)
   (- (len (get (.stacks d) slot)) 1))
 
-;;; `node` was read by the memo this worker is computing.
-(defn dep-note! [(node (slice u8))] (-> void)
+;;; Node `id` was read by the memo this worker is computing.
+(defn dep-note-id! [(id i64)] (-> void)
   (let [d (deps)
         slot (worker-slot)
         top (dep-top d slot)]
     (when (>= top 0)
-      (match (get (.seen (get (get (.stacks d) slot) top)) node)
+      (match (get (.seen (get (get (.stacks d) slot) top)) id)
         (Some [_] 0)
         (None []
-              (set! (mut (.seen (elem (mut (elem (mut (.stacks d)) slot)) top))) node 1)
-              (push! (mut (.notes (elem (mut (elem (mut (.stacks d)) slot)) top))) node)
+              (set! (mut (.seen (elem (mut (elem (mut (.stacks d)) slot)) top))) id 1)
+              (push! (mut (.notes (elem (mut (elem (mut (.stacks d)) slot)) top))) id)
               0))))
   0)
+
+;;; `node` was read by the memo this worker is computing.
+(defn dep-note! [(node (slice u8))] (-> void)
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [id (dep-id! d node)]
+      (deps-unlock! d)
+      (dep-note-id! id))))
 
 ;;; The same, for a name given as a literal, whose address stands for it.
 (defn dep-note-literal! [(node (slice u8))] (-> void)
@@ -2618,6 +2661,69 @@
           (dep-note! node)))))
   0)
 
+;;; A site that reads elements of `setting` by index, through `prefix` (`#`, or `.field#`): its
+;;; number, kept where `cache` points, from the first time the site reads.
+(defn dep-site! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8))] (-> i64)
+  (let [known (atomic/read cache)]
+    (if (> known 0)
+        (- known 1)
+        (let [d (deps)]
+          (deps-lock! d)
+          (let [site (len (.sites d))
+                setting-id (dep-id! d setting)]
+            (push! (mut (.sites d)) (join setting prefix))
+            (push! (mut (.site-settings d)) setting-id)
+            (push! (mut (.site-prefixes d)) prefix)
+            (deps-unlock! d)
+            (atomic/store cache (+ site 1))
+            site)))))
+
+;;; Element `index` of a setting was read, at a site (`dep-site!`), by the memo this worker is
+;;; computing. Numbers all the way: the element's node and its path's text are made only the first
+;;; time any memo reads it. Past `PARTS-NOTED` elements of one setting the memo is made from the
+;;; whole setting.
+(defn dep-note-element! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8)) (index i64)] (-> void)
+  (let [site (dep-site! cache setting prefix)
+        d (deps)
+        slot (worker-slot)
+        top (dep-top d slot)]
+    (when (and (>= top 0) (>= index 0) (< index 4294967296))
+      (let [key (+ (* site 4294967296) index)
+            setting-id (get (.site-settings d) site)
+            count (match (get (.counts (get (get (.stacks d) slot) top)) setting-id) (Some [n] n) (None [] 0))]
+        (when (and (< count PARTS-NOTED)
+                   (match (get (.elements (get (get (.stacks d) slot) top)) key) (Some [_] false) (None [] true)))
+          (set! (mut (.elements (elem (mut (elem (mut (.stacks d)) slot)) top))) key 1)
+          (set! (mut (.counts (elem (mut (elem (mut (.stacks d)) slot)) top))) setting-id (+ count 1))
+          (deps-lock! d)
+          (let [id (match (get (.elements d) key)
+                     (Some [i] i)
+                     (None []
+                           (let [path (join (get (.site-prefixes d) site) (num-text index))
+                                 i (dep-id! d (join setting path))
+                                 (mut paths) (match (get (.paths d) setting)
+                                               (Some [ps] ps)
+                                               (None [] (ArrayList::new [(slice u8)] (malloc-allocator))))]
+                             (push! (mut paths) path)
+                             (set! (mut (.paths d)) setting paths)
+                             (set! (mut (.elements d)) key i)
+                             i)))]
+            (deps-unlock! d)
+            (dep-note-id! id)
+            (when (= (+ count 1) PARTS-NOTED) (dep-note-id! setting-id)))))))
+  0)
+
+;;; Whether the memo this worker is computing still notes parts of `setting`, so that one is worth
+;;; naming: not once it noted many, and is made from the whole setting.
+(defn dep-wants-path? [(setting (slice u8))] (-> bool)
+  (let [d (deps)
+        slot (worker-slot)
+        top (dep-top d slot)]
+    (and (>= top 0)
+         (match (get (.parts (get (get (.stacks d) slot) top)) setting)
+           (Some [n] (< n PARTS-NOTED))
+           (None [] true)))))
+
 ;;; Part of a setting was read by the memo this worker is computing: `setting` at `path`. The setting
 ;;; keeps the paths read of it, so that binding it again can change just those that differ.
 (defn dep-note-path! [(setting (slice u8)) (path (slice u8))] (-> void)
@@ -2626,22 +2732,22 @@
         slot (worker-slot)
         top (dep-top d slot)]
     (when (>= top 0)
-      (match (get (.seen (get (get (.stacks d) slot) top)) node)
-        (Some [_] 0)
-        (None []
-              (dep-note! node)
-              (deps-lock! d)
-              (match (get (.ids d) node)
-                (Some [_] 0)
-                (None []
-                      (dep-id! d node)
-                      (let [(mut paths) (match (get (.paths d) setting)
-                                          (Some [ps] ps)
-                                          (None [] (ArrayList::new [(slice u8)] (malloc-allocator))))]
-                        (push! (mut paths) path)
-                        (set! (mut (.paths d)) setting paths))))
-              (deps-unlock! d)
-              0))))
+      (let [n (+ 1 (match (get (.parts (get (get (.stacks d) slot) top)) setting) (Some [n] n) (None [] 0)))]
+        (set! (mut (.parts (elem (mut (elem (mut (.stacks d)) slot)) top))) setting n)
+        (when (= n PARTS-NOTED) (dep-note! setting)))
+      (deps-lock! d)
+      (let [id (match (get (.ids d) node)
+                 (Some [i] i)
+                 (None []
+                       (let [i (dep-id! d node)
+                             (mut paths) (match (get (.paths d) setting)
+                                           (Some [ps] ps)
+                                           (None [] (ArrayList::new [(slice u8)] (malloc-allocator))))]
+                         (push! (mut paths) path)
+                         (set! (mut (.paths d)) setting paths)
+                         i)))]
+        (deps-unlock! d)
+        (dep-note-id! id))))
   0)
 
 ;;; The paths memos have read of a setting.
@@ -2737,28 +2843,46 @@
         slot (worker-slot)]
     (push! (mut (elem (mut (.stacks d)) slot))
            (DepFrame
-             :notes (ArrayList::new [(slice u8)] (malloc-allocator))
-             :seen (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
-             :literals (ArrayList::new [i64] (malloc-allocator))))
+             :notes (ArrayList::new [i64] (malloc-allocator))
+             :seen (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))
+             :literals (ArrayList::new [i64] (malloc-allocator))
+             :parts (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+             :elements (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))
+             :counts (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))))
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     0))
 
-;;; The memo this worker was computing is done, and is `node`: it read what was noted, and is
+;;; A memo answer's node id: made, with its text, the first time its store asks.
+(defn dep-memo-id! [(name (slice u8)) (key (slice u8))] (-> i64)
+  (let [d (deps)
+        node (memo-node name key)]
+    (deps-lock! d)
+    (let [id (dep-id! d node)]
+      (deps-unlock! d)
+      id)))
+
+;;; The memo this worker was computing is done, and is node `me`: it read what was noted, and is
 ;;; current in this revision; changed in it unless its answer is the one it had (`same`).
-(defn dep-end! [(node (slice u8)) (same bool)] (-> void)
+(defn dep-end-id! [(me i64) (same bool)] (-> void)
   (let [d (deps)
         slot (worker-slot)
         frame (match (pop! (mut (elem (mut (.stacks d)) slot)))
                 (Some [f] f)
-                (None [] (panic "a memo finished that never started")))
-        (mut reads) (ArrayList::new [i64] (malloc-allocator))]
+                (None [] (panic "a memo finished that never started")))]
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     (deps-lock! d)
-    (let [me (dep-id! d node)
-          now (atomic/read (field d revision))]
-      (for read (.notes frame) (push! (mut reads) (dep-id! d read)))
-      (set! (mut (.reads d)) me reads)
-      (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") node))
+    (let [now (atomic/read (field d revision))]
+      (set! (mut (.reads d)) me (.notes frame))
+      (for read (.notes frame)
+        (let [edge (+ (* read 4294967296) me)]
+          (match (get (.edges d) edge)
+            (Some [_] 0)
+            (None []
+                  (set! (mut (.edges d)) edge 1)
+                  (push! (mut (elem (mut (.dependents d)) read)) me)
+                  0))))
+      (set! (mut (.dirty d)) me false)
+      (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") (get (.texts d) me)))
       (set! (mut (.verified d)) me now)
       (unless same (set! (mut (.changed d)) me now))
       (set! (.computed d) (+ (.computed d) 1)))
@@ -2767,7 +2891,7 @@
 
 ;;; What this worker read since its frame opened, the frame closed: work a memo on another thread
 ;;; handed it, whose reads are that memo's.
-(defn dep-take-notes! [] (-> (ArrayList (slice u8)))
+(defn dep-take-notes! [] (-> (ArrayList i64))
   (let [d (deps)
         slot (worker-slot)
         frame (match (pop! (mut (elem (mut (.stacks d)) slot)))
@@ -2795,34 +2919,45 @@
     (when (.tracking d)
       (deps-lock! d)
       (let [now (+ (atomic/read (field d revision)) 1)
-            id (dep-id! d node)]
+            id (dep-id! d node)
+            (mut todo) (ArrayList::new [i64] (malloc-allocator))]
         (atomic/store (field d revision) now)
-        (set! (mut (.changed d)) id now))
+        (set! (mut (.changed d)) id now)
+        ;; Everything that read it, through any number of answers, may have changed.
+        (push! (mut todo) id)
+        (while (> (len todo) 0)
+          (let [at (match (pop! (mut todo)) (Some [x] x) (None [] -1))]
+            (for out (get (.dependents d) at)
+              (unless (get (.dirty d) out)
+                (set! (mut (.dirty d)) out true)
+                (push! (mut todo) out))))))
       (deps-unlock! d)
       (when (dep-tracing?) (println "[deps] changed {}" node)))
     0))
 
-;;; Whether a memo's answer is known current in this revision.
-(defn dep-current? [(node (slice u8))] (-> bool)
+;;; Whether a memo's answer is known current: checked in this revision, or marked by no change
+;;; since it was (and so current now).
+(defn dep-current-id? [(id i64)] (-> bool)
   (let [d (deps)]
     (deps-lock! d)
-    (let [out (match (get (.ids d) node)
-                (Some [id] (= (get (.verified d) id) (atomic/read (field d revision))))
-                (None [] false))]
+    (let [now (atomic/read (field d revision))
+          out (or (= (get (.verified d) id) now) (not (get (.dirty d) id)))]
+      (when out (set! (mut (.verified d)) id now))
       (deps-unlock! d)
       out)))
 
 ;;; Whether a memo's answer, computed in an earlier revision, is still what it would be: each node
 ;;; it read brought up to date in turn, and none changed since it was last current. If so it is
 ;;; current now. Called by the worker that has the answer's key to itself.
-(defn dep-still? [(node (slice u8))] (-> bool)
+(defn dep-still-id? [(me i64)] (-> bool)
   (let [d (deps)]
     (deps-lock! d)
-    (match (get (.ids d) node)
+    (match (Some me)
       (None [] (do (deps-unlock! d) false))
       (Some [me]
             (let [since (get (.verified d) me)
-                  reads (get (.reads d) me)]
+                  reads (get (.reads d) me)
+                  node (get (.texts d) me)]
               (deps-unlock! d)
               (block :check
                      (for read reads
@@ -2836,6 +2971,7 @@
                            (return-from :check false))))
                      (deps-lock! d)
                      (set! (mut (.verified d)) me (atomic/read (field d revision)))
+                     (set! (mut (.dirty d)) me false)
                      (deps-unlock! d)
                      true))))))
 
