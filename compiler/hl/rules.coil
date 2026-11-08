@@ -33,6 +33,7 @@
 (import "coil.cc" :as cc)
 (import "hl.rt" :as rt)
 (import "hl.dsl" :as dsl)
+(import "hl.pipeline" :as pl)
 (import "hl.syntax" :as syntax)
 (import "hl.grammars.rules" :as g)
 (import "hl.grammars.facts" :as gf)
@@ -119,8 +120,11 @@
    (sames (ArrayList (slice u8)))  ; the types `same-code` has made a comparison of, in this module
    (quiet i64)  ; inside a read of part of a setting, which notes that part and not the whole
    (attrs-from (slice u8))  ; the attribute grammar whose blocks are being read; "" for this one
-   ;; The functions the program's pipelines keep, as `module/function` (see `read-keeps!`).
-   (keeps (ArrayList (slice u8)))])
+   ;; The functions the program's pipelines keep, and those a stage makes, as `module/function`
+   ;; (see `read-keeps!`); and what reads what, to know what a setting given again changes.
+   (keeps (ArrayList (slice u8)))
+   (made (ArrayList (slice u8)))
+   (checker pl/Checker)])
 
 ;;; A name a rewrite's pattern binds to a child, or to its node, and that one's rewritten form.
 (defstruct Out [(sym (slice u8)) (code Code)])
@@ -446,7 +450,13 @@
         (push! (mut (.depends k)) path)
         (for d (.kids (get (.kids tree) 2))
           (for n (.kids (get (.kids d) 0))
-            (push! (mut (.keeps k)) (.text n)))))))
+            (push! (mut (.keeps k)) (.text n))))
+        ;; A stage's `makes`, after its functions: what the stages after it only read.
+        (for d (.kids (get (.kids tree) 3))
+          (let [makes (if (= (.kind d) (gpl/KPerStage)) (get (.kids d) 3) (get (.kids d) 2))]
+            (unless (= (.kind makes) (gpl/KNone))
+              (for n (.kids (get (.kids makes) 0))
+                (push! (mut (.made k)) (.text n)))))))))
   0)
 
 ;;; A module's tree with each function a pipeline keeps a kept one. A kept name it has no function of
@@ -1465,13 +1475,6 @@
                            (push! (mut (.memos (elem (mut (.mods k)) ix2))) (.text (kid d 0)))))
             (g/KFn [] (collect-fn! (mut k) ix2 name d))
             (_ 0)))
-        (when (any-memo? decls)
-          (push! (mut (.funcs (elem (mut (.mods k)) ix2)))
-                 (Func
-                   :name "forget-memos!"
-                   :coil "forget-memos!"
-                   :params (ArrayList::new [Param] (malloc-allocator))
-                   :ret "Void")))
         (when (= (.kind tree) (g/KAttrsFile))
           (attrs-signature! (mut k) ix2 name over decls))))
     (set! (.src k) saved-src)
@@ -3671,29 +3674,6 @@
                                        (None [~(coil-type (mut k) ty)])))
                                 (opt-type ty))))))
               (None [] (die (mut k) n "if-given takes a setting")))
-          ;; `known(f(x))`: a memo's answer that must already be up to date, which it never makes,
-          ;; so work on many threads can read it; `refresh(f(x))`: that answer brought up to date,
-          ;; read only if it has to be made again (0).
-          (and (or (= name "known") (= name "refresh")) (= count 1))
-            (let [call (if (= (.kind (get args 0)) (g/KCall))
-                           (get args 0)
-                           (die (mut k) n (cat name " takes a call of a memo function")))
-                  callee (kid call 0)
-                  module (match (.kind callee)
-                           (g/KName [] (.self k))
-                           (g/KFieldE [] (match (module-prefix (mut k) (kid callee 0))
-                                           (Some [m] m)
-                                           (None [] (die (mut k) callee (cat name " takes a call of a memo function")))))
-                           (_ (die (mut k) callee (cat name " takes a call of a memo function"))))
-                  fname (if (= (.kind callee) (g/KName)) (.text callee) (.text (kid callee 1)))
-                  f (match (find-func (mod-at (mut k) module) fname)
-                      (Some [f] f)
-                      (None [] (die (mut k) callee (cat "no function named " fname))))]
-              (unless (has-text? (.memos (mod-at (mut k) module)) fname)
-                (die (mut k) callee (cat3 name " takes a call of a memo function, and " (cat fname " is none"))))
-              (let [cs (args-code (mut k) call f (list-kids (kid call 1)))]
-                (Some (te `(~(sym (qualified (mut k) module (cat3 "memo-" name (cat "--" fname)))) ~@cs)
-                          (if (= name "known") (.ret f) "Int")))))
           ;; `parallel-map(xs, f, n)`: `f` of each element on `n` threads, results in the order of `xs`.
           ;; Each thread takes the next index it finds free, so uneven work evens out.
           (and (= name "parallel-map") (= count 3))
@@ -5336,10 +5316,8 @@
   (let [node (cat4 "s:" module "." name)
         o (fresh (mut k) "old")
         n (fresh (mut k) "new")
-        untracked
-          (match (find-func (mod-at (mut k) module) "forget-memos!")
-            (Some [_] `(~(sym (qualified (mut k) module "forget-memos!"))))
-            (None [] `0))]
+        ;; While nothing is tracked, the answers that read it start over.
+        untracked `(rt/forget-readers! ~(cat3 module "." name))]
     ;; A value nothing gave is no value to look into: going from or to one changes everything read.
     `(if (rt/dep-tracking?)
          (if ~both-given
@@ -8768,6 +8746,15 @@
 (defn dirty-field [(name (slice u8))] (-> (slice u8))
   (cat name "--dirty"))
 
+;;; A function a stage makes is made there, and read after: asked for at once by many threads, its
+;;; answer is there already, or the pipeline is wrong (see `makes`), which this says rather than make
+;;; it, there, with what making it may do.
+(defn made-check [(k (mut Comp)) (name (slice u8))] (-> Code)
+  (if (has-text? (.made k) (cat3 (.self k) "/" name))
+      `(when (rt/in-parallel?)
+         (panic "{}: a stage makes this, and many threads at once asked for it before it was made" ~(cat3 (.self k) "/" name)))
+      `0))
+
 ;;; The shared table, its lock and generation; the function; the computation under another name.
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
   (let [f (memo-check! (mut k) d)
@@ -8833,6 +8820,17 @@
                   (match found
                     (Some [a] (do (~(sym name) ~@stored) 0))
                     (None [] (panic "memo fn {} has no arguments for {}" ~name text)))))))
+    ;; Its answers forgotten, when a setting it reads is given again while nothing is tracked.
+    (emit! (mut out)
+           `(defn ~(sym (cat "memo-forget--" name)) [] (-> void)
+              (let [s (~store-fn)
+                    word (cast (ptr i64) s)]
+                (rt/spin-lock! word)
+                (set! (.table s) ~(new-map (mut k) mt))
+                (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
+                (set! (.gen s) (rt/next-pass!))
+                (rt/spin-unlock! word))
+              0))
     (emit! (mut out)
            `(defn ~store-fn [] (-> (ptr ~store))
               (let [s (primitive/alloc-static ~store)]
@@ -8853,46 +8851,13 @@
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
                   (rt/init-unlock!)
-                  (rt/dep-ensurer! ~qname (fnptr-of ~ensure)))
+                  (rt/dep-ensurer! ~qname (fnptr-of ~ensure))
+                  ~@(let [(mut regs) (primitive/code-list-new)]
+                      (for r (pl/reads-of (mut (.checker k)) (.self k) name)
+                        (push! (mut regs) `(rt/forget-when! ~r (fnptr-of ~(sym (cat "memo-forget--" name))))))
+                      regs))
                 s)))
     (emit! (mut out) (memo-persist-code (mut k) f name))
-    ;; Its answer when it must be up to date already (`known`), which it never makes.
-    (emit! (mut out)
-           `(defn ~(sym (cat "memo-known--" name)) [~@params] (-> ~rt)
-              (let [key ~(memo-key-code (mut k) f)
-                    s (~store-fn)
-                    word (cast (ptr i64) s)
-                    faulted (~(sym (cat "memo-fault--" name)) s key)
-                    tracking (rt/dep-tracking?)]
-                (rt/spin-lock! word)
-                (let [found (get (.table s) key)
-                      node (match (get (.node-ids s) key) (Some [i] i) (None [] -1))]
-                  (rt/spin-unlock! word)
-                  (match found
-                    (Some [v]
-                          (do
-                            (when tracking
-                              (when (or (< node 0) (not (rt/dep-current-id? node)))
-                                (panic "{}: an answer read where it must be up to date already is not" ~qname))
-                              (when (rt/dep-in-frame?) (rt/dep-note-id! node)))
-                            v))
-                    (None [] (panic "{}: an answer read where it must be made already never was" ~qname)))))))
-    ;; Its answer brought up to date (`refresh`): read only if it must be made again.
-    (emit! (mut out)
-           `(defn ~(sym (cat "memo-refresh--" name)) [~@params] (-> i64)
-              (let [key ~(memo-key-code (mut k) f)
-                    s (~store-fn)
-                    word (cast (ptr i64) s)
-                    prepared (~(sym (cat "memo-prepare--" name)) s)
-                    tracking (rt/dep-tracking?)]
-                (rt/spin-lock! word)
-                (let [present (or (match (get (.table s) key) (Some [_] true) (None [] false))
-                                  (match (get (.lazy s) key) (Some [_] true) (None [] false)))
-                      node (match (get (.node-ids s) key) (Some [i] i) (None [] -1))]
-                  (rt/spin-unlock! word)
-                  (if (and tracking present (>= node 0) (rt/dep-current-id? node))
-                      (do (when (rt/dep-in-frame?) (rt/dep-note-id! node)) 0)
-                      (do (~(sym name) ~@args) 0))))))
     ;; While dependencies are tracked, an answer from an earlier revision is current only once each
     ;; thing it read is shown unchanged, and an answer computed again that is the same as the one
     ;; it replaces is kept, and does not count as changed.
@@ -8969,6 +8934,7 @@
                                                               (if (rt/dep-still-id? node)
                                                                   old
                                                                   (do
+                                                                    ~(made-check (mut k) name)
                                                                     (rt/dep-begin!)
                                                                     (let [fresh (~(sym compute) ~@args)
                                                                           same ~(same-code (mut k) (.ret f) `old `fresh)]
@@ -8977,6 +8943,7 @@
                                                                       (if same old fresh)))))
                                                         (None []
                                                               (do
+                                                                ~(made-check (mut k) name)
                                                                 (when tracking (rt/dep-begin!))
                                                                 (let [fresh (~(sym compute) ~@args)]
                                                                   (when tracking (rt/dep-end-id! node false))
@@ -9001,21 +8968,6 @@
 
 ;;; Every memo of the module starts over, when dependencies are not tracked. Only while no other
 ;;; worker runs.
-(defn compile-forget! [(k (mut Comp)) (decls (ArrayList g/Node))] (-> Code)
-  (let [(mut body) (primitive/code-list-new)]
-    (for d decls
-      (when (= (.kind d) (g/KMemoFn))
-        (let [f (memo-check! (mut k) d)
-              name (.text (kid d 0))]
-          (push! (mut body)
-                 `(let [s (~(sym (cat "memo-store--" name)))]
-                    (set! (.table s) ~(new-map (mut k) (memo-map-type f)))
-                    (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
-                    (set! (.gen s) (rt/next-pass!)))))))
-    `(defn forget-memos! [] (-> void)
-       ~@body
-       0)))
-
 (defn compile-record [(k (mut Comp)) (r RecDef)] (-> Code)
   (let [(mut fields) (primitive/code-list-new)]
     (for f (.fields r)
@@ -9122,7 +9074,9 @@
             :sames (text-list)
             :quiet 0
             :attrs-from ""
-            :keeps (text-list))
+            :keeps (text-list)
+            :made (text-list)
+            :checker (pl/checker-new (dsl/manifest-entries (meta/read-context-manifest context))))
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)
     (read-keeps! (mut k))
@@ -9134,6 +9088,16 @@
       (set! (.self k) name)
       (set! (.src k) src)
       (set! (.path k) path)
+      ;; What each kept function reads is known before anything is written: the files that says it
+      ;; are what this module is compiled from too.
+      (for d decls
+        (when (= (.kind d) (g/KMemoFn))
+          (let [reads (pl/reads-of (mut (.checker k)) name (.text (kid d 0)))]
+            ;; HL_SHOW_READS set: what each kept function reads, as the compiler worked it out.
+            (unless (= (primitive/cast i64 (getenv c"HL_SHOW_READS")) 0)
+              (println "[reads] {}/{}: {}" name (.text (kid d 0)) (rt/joined reads " "))))))
+      (for f (pl/checker-depends (mut (.checker k)))
+        (unless (has-text? (.depends k) f) (push! (mut (.depends k)) f)))
       ;; Every file sees the prelude's foreign modules by their aliases.
       (emit! (mut out)
              `(do
@@ -9347,7 +9311,6 @@
           (emit! (mut out) (compile-fn (mut k) d)))
         (when (= (.kind d) (g/KMemoFn))
           (compile-memo! (mut k) d (mut out))))
-      (when (any-memo? decls) (emit! (mut out) (compile-forget! (mut k) decls)))
       (emit! (mut out) (compile-persist (mut k) decls))
       (when (= (.kind tree) (g/KAttrsFile))
         (emit! (mut out) (compile-attrs (mut k) tree decls)))

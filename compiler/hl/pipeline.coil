@@ -32,6 +32,8 @@
 (import "hl.dsl" :as dsl)
 (import "hl.grammars.pipeline" :as g)
 (import "hl.grammars.rules" :as gr)
+(import "coil.cc" :as cc)
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
 (reader-provider "hl.pipeline" read-pipeline)
 
@@ -71,7 +73,9 @@
    ;; read it.
    (typed-names (ArrayList (slice u8)))
    (typed-aliases (ArrayList (slice u8)))
-   (facts bool)])
+   (facts bool)
+   ;; Its settings: what a function reads of them is what binding one again may change.
+   (settings (ArrayList (slice u8)))])
 
 (defn info-new [(name (slice u8)) (kind Kind)] (-> Info)
   (Info
@@ -85,7 +89,8 @@
     :funs (ArrayList::new [Fun] (malloc-allocator))
     :typed-names (texts)
     :typed-aliases (texts)
-    :facts false))
+    :facts false
+    :settings (texts)))
 
 ;;; A state declared with a type `alias.Record`: remember which module it comes from.
 (defn note-typed! [(info (mut Info)) (d gr/Node)] (-> void)
@@ -173,7 +178,10 @@
                          (push! (mut (.task info)) (.text (kid d 0)))
                          (note-typed! (mut info) d)))
         ;; A setting is given by `with`, and only read: a database in one is queried.
-        (gr/KSetting [] (note-typed! (mut info) d))
+        (gr/KSetting []
+                     (do
+                       (push! (mut (.settings info)) (.text (kid d 0)))
+                       (note-typed! (mut info) d)))
         (gr/KContext [] (push! (mut (.task info)) (.text (kid d 0))))
         ;; An attribute grammar's attributes live in its task state, one copy to a worker.
         (gr/KInh [] (push! (mut (.task info)) (.text (kid d 0))))
@@ -230,13 +238,20 @@
 (defstruct Effect
   [(writes (ArrayList Write))
    (muts (ArrayList i64))  ; parameters of this function it changes
-   (hooks (ArrayList (slice u8)))])  ; function values it calls
+   (hooks (ArrayList (slice u8)))  ; function values it calls
+   ;; Settings it reads, as `module.name`, through anything it calls. A function value adds none: a
+   ;; function a build is given is a function of its arguments.
+   (reads (ArrayList (slice u8)))
+   ;; Functions a stage makes that it asks for, which it only reads (see `makes`).
+   (made (ArrayList (slice u8)))])
 
 (defn effect-new [] (-> Effect)
   (Effect
     :writes (ArrayList::new [Write] (malloc-allocator))
     :muts (ArrayList::new [i64] (malloc-allocator))
-    :hooks (texts)))
+    :hooks (texts)
+    :reads (texts)
+    :made (texts)))
 
 (defstruct Checker
   [(entries (ArrayList dsl/Entry))
@@ -244,7 +259,30 @@
    (memo-keys (ArrayList (slice u8)))
    (memo (ArrayList Effect))
    (visiting (ArrayList (slice u8)))
-   (depends (ArrayList (slice u8)))])
+   (depends (ArrayList (slice u8)))
+   ;; Functions some stage makes: asked for by another stage, each is only read.
+   (made (ArrayList (slice u8)))
+   ;; Functions the pipeline keeps.
+   (kept (ArrayList (slice u8)))])
+
+(defn checker-new [(entries (ArrayList dsl/Entry))] (-> Checker)
+  (Checker
+    :entries entries
+    :infos (ArrayList::new [Info] (malloc-allocator))
+    :memo-keys (texts)
+    :memo (ArrayList::new [Effect] (malloc-allocator))
+    :visiting (texts)
+    :depends (texts)
+    :made (texts)
+    :kept (texts)))
+
+;;; The settings `module/name` reads, through everything it calls.
+(defn reads-of [(c (mut Checker)) (module (slice u8)) (name (slice u8))] (-> (ArrayList (slice u8)))
+  (.reads (fun-effect (mut c) module name)))
+
+;;; The files read to know it.
+(defn checker-depends [(c (mut Checker))] (-> (ArrayList (slice u8)))
+  (.depends c))
 
 (defn info-index [(c (mut Checker)) (name (slice u8))] (-> i64)
   (let [(mut at) -1]
@@ -352,6 +390,8 @@
                    (where (slice u8))] (-> void)
   (for w (.writes callee) (add-write! (mut out) (.what w) (.where w)))
   (for h (.hooks callee) (add-unique! (mut (.hooks out)) h))
+  (for r (.reads callee) (add-unique! (mut (.reads out)) r))
+  (for x (.made callee) (add-unique! (mut (.made out)) x))
   (for i (.muts callee)
     (when (< i (len args))
       (write-root! (mut out)
@@ -588,20 +628,41 @@
                                             locals
                                             (kid (kid e 0) 0))
                                    where))))
-      (gr/KCall [] (unless (known-call? n) (call! (mut c) info f locals (mut out) n)))
+      (gr/KCall [] (call! (mut c) info f locals (mut out) n))
+      ;; A setting read: one of its own, or `alias.name` of another module's.
+      (gr/KName []
+                (let [name (.text n)]
+                  (when (and (not (has? locals name)) (< (param-index f name) 0) (has? (.settings info) name))
+                    (do (unless (= (primitive/cast i64 (getenv c"HL_SHOW_READS")) 0)
+                          (println "[direct] {}: {}.{}" where (.name info) name))
+                        (add-unique! (mut (.reads out)) (dsl/join3 (.name info) "." name))))))
+      (gr/KFieldE []
+                  (let [base (kid n 0)]
+                    (when (and (= (.kind base) (gr/KName))
+                               (not (has? locals (.text base)))
+                               (< (param-index f (.text base)) 0))
+                      (match (alias-of info (.text base))
+                        (Some [module]
+                              (when (has? (.settings (info-of (mut c) module)) (.text (kid n 1)))
+                                (do (unless (= (primitive/cast i64 (getenv c"HL_SHOW_READS")) 0)
+                                      (println "[direct] {}: {}.{}" where module (.text (kid n 1))))
+                                    (add-unique! (mut (.reads out)) (dsl/join3 module "." (.text (kid n 1)))))))
+                        (None [] 0)))))
       (_ 0))
-    (if (known-call? n)
-        ;; `known(f(x))` never makes f's answer: only what its arguments do counts.
-        (for a (.kids (kid (arg-expr (get (.kids (kid n 1)) 0)) 1))
-          (walk! (mut c) info f locals (mut out) a))
-        (for k (.kids n) (walk! (mut c) info f locals (mut out) k)))))
+    (for i (range 0 (len (.kids n)))
+      (unless (label? n i)
+        (walk! (mut c) info f locals (mut out) (kid n i))))))
 
-(defn known-call? [(n gr/Node)] (-> bool)
-  (and (= (.kind n) (gr/KCall))
-       (= (.kind (kid n 0)) (gr/KName))
-       (= (.text (kid n 0)) "known")
-       (= (len (.kids (kid n 1))) 1)
-       (= (.kind (arg-expr (get (.kids (kid n 1)) 0))) (gr/KCall))))
+;;; Whether a node's child names something rather than reads it: the field after `.`, a record
+;;; field's label, a named argument's name, the setting a `with` binds. A name there is no read,
+;;; whatever it is called.
+(defn label? [(n gr/Node) (i i64)] (-> bool)
+  (match (.kind n)
+    (gr/KFieldE [] (= i 1))
+    (gr/KFieldInit [] (= i 0))
+    (gr/KNamed [] (= i 0))
+    (gr/KWithBind [] (= i 0))
+    (_ false)))
 
 ;;; Names a function binds for itself: these are not the module's state, whatever they are called.
 (defn locals! [(n gr/Node) (out (mut (ArrayList (slice u8)))) (in-pattern bool)]
@@ -692,7 +753,14 @@
                                  (dsl/join2 "no function named " key)))))
               (push! (mut (.memo-keys c)) key)
               (push! (mut (.memo c)) out)
-              out))))
+              ;; What a stage makes is only read by the stages after it: of it, they see what it
+              ;; reads, and that they ask for it.
+              (if (has? (.made c) key)
+                  (let [(mut seen) (effect-new)]
+                    (for r (.reads out) (push! (mut (.reads seen)) r))
+                    (push! (mut (.made seen)) key)
+                    seen)
+                  out)))))
 
 ;; ---------------------------------------------------------------- the pipeline
 
@@ -700,6 +768,7 @@
   [(name (slice u8))
    (unit (slice u8))
    (functions (ArrayList (slice u8)))
+   (makes (ArrayList (slice u8)))
    (tok rt/Tok)])
 
 (defn tok-of [(src (slice u8)) (n g/Node)] (-> rt/Tok)
@@ -747,6 +816,13 @@
           module (subslice full 0 slash)
           name (subslice full (+ slash 1) (len full))
           e (fun-effect (mut chk) module name)]
+      ;; What a stage makes is read at once by many threads only when it is kept: otherwise a read
+      ;; would make it again, there.
+      (for x (.made e)
+        (unless (has? (.kept chk) x)
+          (dsl/die (mut c) (tok-of src at)
+                   (dsl/join3 (dsl/join3 "plan " plan-name (dsl/join3 " runs " (.name s) " in parallel, which asks for "))
+                              x ", which a stage makes and nothing keeps"))))
       (when (or (> (len (.writes e)) 0) (> (len (.hooks e)) 0))
         (let [(mut msg)
                 (dsl/join3 "plan "
@@ -778,14 +854,7 @@
                               (.line e)
                               (.col e)
                               (dsl/join2 "expected " (.want e)))))
-        (mut chk)
-          (Checker
-            :entries (dsl/manifest-entries (meta/read-context-manifest context))
-            :infos (ArrayList::new [Info] (malloc-allocator))
-            :memo-keys (texts)
-            :memo (ArrayList::new [Effect] (malloc-allocator))
-            :visiting (texts)
-            :depends (texts))
+        (mut chk) (checker-new (dsl/manifest-entries (meta/read-context-manifest context)))
         fills (split-fn (mut c) (tok-of src (kid-of tree 1)))
         record-module (get fills 0)
         record-name (get fills 1)
@@ -794,20 +863,32 @@
         (mut names) (primitive/code-list-new)]
     ;; What is kept is the rules compiler's to apply (see `keep` in the rules compiler): here each is
     ;; only a function's name.
-    (for d (.kids (kid-of tree 2))
-      (for t (.kids (kid-of d 0)) (split-fn (mut c) (tok-of src t))))
+    (let [(mut kept) (texts)]
+      (for d (.kids (kid-of tree 2))
+        (for t (.kids (kid-of d 0))
+          (split-fn (mut c) (tok-of src t))
+          (push! (mut kept) (.text t))))
+      (set! (.kept chk) kept))
     (for d (.kids (kid-of tree 3))
       (let [(mut fns) (texts)
+            (mut makes) (texts)
             per (= (.kind d) (g/KPerStage))
-            fn-list (if per (kid-of d 2) (kid-of d 1))]
+            fn-list (if per (kid-of d 2) (kid-of d 1))
+            makes-node (if per (kid-of d 3) (kid-of d 2))]
         (for t (.kids fn-list)
           (split-fn (mut c) (tok-of src t))
           (push! (mut fns) (.text t)))
+        (unless (= (.kind makes-node) (g/KNone))
+          (for t (.kids (kid-of makes-node 0))
+            (split-fn (mut c) (tok-of src t))
+            (push! (mut makes) (.text t))
+            (push! (mut (.made chk)) (.text t))))
         (push! (mut stages)
                (Stage
                  :name (.text (kid-of d 0))
                  :unit (if per (.text (kid-of d 1)) "whole")
                  :functions fns
+                 :makes makes
                  :tok (tok-of src d)))))
     (for p (.kids (kid-of tree 4))
       (let [plan-name (.text (kid-of p 0))
