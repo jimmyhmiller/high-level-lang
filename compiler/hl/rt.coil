@@ -2533,6 +2533,10 @@
    (prints (ArrayList (slice u8)))
    ;; Places that read an element of a setting by index: each one's setting and path before the
    ;; index, by the site's number; and the node each site and index is.
+   ;; Query paths of database settings, by what a row would have to hold to be seen by one: the
+   ;; setting, relation, first bound column and its value; or only the setting and relation when
+   ;; no column is bound. A changed row finds the queries it changes there.
+   (queries (HashMap (slice u8) (ArrayList i64)))
    (sites (ArrayList (slice u8)))
    (site-settings (ArrayList i64))
    (site-prefixes (ArrayList (slice u8)))
@@ -2558,6 +2562,7 @@
         (set! (.edges d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
         (set! (.dirty d) (ArrayList::new [bool] (malloc-allocator)))
         (set! (.prints d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.queries d) (HashMap::new [(slice u8) (ArrayList i64)] (malloc-allocator) (str/keyops)))
         (set! (.sites d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-settings d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.site-prefixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
@@ -2745,6 +2750,7 @@
                                            (None [] (ArrayList::new [(slice u8)] (malloc-allocator))))]
                          (push! (mut paths) path)
                          (set! (mut (.paths d)) setting paths)
+                         (query-index! d setting path i)
                          i)))]
         (deps-unlock! d)
         (dep-note-id! id))))
@@ -2788,6 +2794,87 @@
       (push-str! (mut b) (get parts i)))
     (push-str! (mut b) ")")
     (finish! (mut b))))
+
+;;; A query path (`.rel(c0,c1,…)`) filed where a changed row of its relation finds it. Under the lock.
+(defn query-index! [(d (ptr Deps)) (setting (slice u8)) (path (slice u8)) (id i64)] (-> void)
+  (when (and (> (len path) 0) (= (cast i64 (get path 0)) 46))
+    (let [open (name-end-at path 40)]
+      (when (< open (len path))
+        (let [rel (subslice path 1 open)
+              cols (split (subslice path (+ open 1) (- (len path) 1)) ",")
+              (mut first) -1]
+          (for c (range 0 (len cols)) (when (and (< first 0) (!= (get cols c) "_")) (set! first c)))
+          (let [key (if (>= first 0)
+                        (query-key setting rel first (parse-int (get cols first)))
+                        (query-key setting rel -1 0))
+                (mut ids) (match (get (.queries d) key)
+                            (Some [xs] xs)
+                            (None [] (ArrayList::new [i64] (malloc-allocator))))]
+            (push! (mut ids) id)
+            (set! (mut (.queries d)) key ids))))))
+  0)
+
+(defn query-key [(setting (slice u8)) (rel (slice u8)) (col i64) (value i64)] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) setting)
+    (push-str! (mut b) "|")
+    (push-str! (mut b) rel)
+    (push-str! (mut b) "|")
+    (push-str! (mut b) (num-text col))
+    (push-str! (mut b) "|")
+    (push-str! (mut b) (num-text value))
+    (finish! (mut b))))
+
+;;; Rows of `a` that `b` has not: each one's columns, `arity` to a row.
+(defn rel-minus [(a (mut Rel)) (b (mut Rel))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (malloc-allocator))
+        n (.arity a)]
+    (for row (range 0 (.count a))
+      (let [x0 (rel-at (mut a) row 0)
+            x1 (if (> n 1) (rel-at (mut a) row 1) 0)
+            x2 (if (> n 2) (rel-at (mut a) row 2) 0)
+            x3 (if (> n 3) (rel-at (mut a) row 3) 0)]
+        (unless (rel-has? (mut b) x0 x1 x2 x3)
+          (for c (range 0 n) (push! (mut out) (rel-at (mut a) row c))))))
+    out))
+
+;;; Whether a query path's bound columns hold a row's values.
+(defn query-sees? [(path (slice u8)) (row (ArrayList i64)) (at i64)] (-> bool)
+  (let [open (name-end-at path 40)
+        cols (split (subslice path (+ open 1) (- (len path) 1)) ",")
+        (mut sees) true]
+    (for c (range 0 (len cols))
+      (when (and sees (!= (get cols c) "_") (!= (parse-int (get cols c)) (get row (+ at c))))
+        (set! sees false)))
+    sees))
+
+;;; Relation `rel` of a database setting went from `a` to `b`: each query some memo made of it that
+;;; sees a row only one of them has is changed, and nothing else. What it costs is the relations'
+;;; size and what changed, not how much was read of them.
+(defn dep-rel-changed! [(setting (slice u8)) (rel (slice u8)) (a (mut Rel)) (b (mut Rel))] (-> void)
+  (unless (= (primitive/cast i64 (data (slice (.data a)))) (primitive/cast i64 (data (slice (.data b)))))
+    (let [d (deps)
+          gone (rel-minus (mut a) (mut b))
+          come (rel-minus (mut b) (mut a))
+          n (.arity a)
+          (mut hit) (ArrayList::new [i64] (malloc-allocator))]
+      (when (> (+ (len gone) (len come)) 0)
+        (deps-lock! d)
+        (match (get (.queries d) (query-key setting rel -1 0))
+          (Some [ids] (for id ids (push! (mut hit) id)))
+          (None [] 0))
+        (for rows [gone come]
+          (for at (range 0 (/ (len rows) n))
+            (for c (range 0 n)
+              (match (get (.queries d) (query-key setting rel c (get rows (+ (* at n) c))))
+                (Some [ids]
+                      (for id ids
+                        (when (query-sees? (subslice (get (.texts d) id) (len setting) (len (get (.texts d) id))) rows (* at n))
+                          (push! (mut hit) id))))
+                (None [] 0)))))
+        (deps-unlock! d)
+        (for id hit (dep-changed-id! id)))))
+  0)
 
 ;;; The rows of a relation a query sees, `spec` giving each column's value or `_` for any: every
 ;;; column of each, in the order the relation holds them.
@@ -2871,16 +2958,24 @@
                 (None [] (panic "a memo finished that never started")))]
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     (deps-lock! d)
-    (let [now (atomic/read (field d revision))]
+    (let [now (atomic/read (field d revision))
+          before (get (.reads d) me)
+          ;; Read just what it read last time, in the same order: its edges are there already.
+          again (and (= (len before) (len (.notes frame)))
+                     (block :again
+                            (for i (range 0 (len before))
+                              (when (!= (get before i) (get (.notes frame) i)) (return-from :again false)))
+                            true))]
       (set! (mut (.reads d)) me (.notes frame))
-      (for read (.notes frame)
-        (let [edge (+ (* read 4294967296) me)]
-          (match (get (.edges d) edge)
-            (Some [_] 0)
-            (None []
-                  (set! (mut (.edges d)) edge 1)
-                  (push! (mut (elem (mut (.dependents d)) read)) me)
-                  0))))
+      (unless again
+        (for read (.notes frame)
+          (let [edge (+ (* read 4294967296) me)]
+            (match (get (.edges d) edge)
+              (Some [_] 0)
+              (None []
+                    (set! (mut (.edges d)) edge 1)
+                    (push! (mut (elem (mut (.dependents d)) read)) me)
+                    0)))))
       (set! (mut (.dirty d)) me false)
       (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") (get (.texts d) me)))
       (set! (mut (.verified d)) me now)
@@ -2918,8 +3013,16 @@
   (let [d (deps)]
     (when (.tracking d)
       (deps-lock! d)
+      (let [id (dep-id! d node)]
+        (deps-unlock! d)
+        (dep-changed-id! id)))
+    0))
+
+(defn dep-changed-id! [(id i64)] (-> void)
+  (let [d (deps)]
+    (when (.tracking d)
+      (deps-lock! d)
       (let [now (+ (atomic/read (field d revision)) 1)
-            id (dep-id! d node)
             (mut todo) (ArrayList::new [i64] (malloc-allocator))]
         (atomic/store (field d revision) now)
         (set! (mut (.changed d)) id now)
@@ -2932,7 +3035,7 @@
                 (set! (mut (.dirty d)) out true)
                 (push! (mut todo) out))))))
       (deps-unlock! d)
-      (when (dep-tracing?) (println "[deps] changed {}" node)))
+      (when (dep-tracing?) (println "[deps] changed {}" (get (.texts d) id))))
     0))
 
 ;;; Whether a memo's answer is known current: checked in this revision, or marked by no change
