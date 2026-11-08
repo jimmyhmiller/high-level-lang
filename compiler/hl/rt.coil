@@ -1336,8 +1336,10 @@
 ;;; A whole file. A regular file is read into one buffer of its size: one seek to learn the size,
 ;;; then reads straight into the buffer. Anything that cannot seek goes the general way.
 (defn read-all [(path (slice u8))] (-> (slice u8))
-  (let [bytes (read-all-raw path)]
-    (when (dep-in-frame?) (dep-input! (join "f:" path) (print-of bytes)))
+  (let [tracked (dep-in-frame?)
+        stamp (if tracked (file-stamp path) "")
+        bytes (read-all-raw path)]
+    (when tracked (dep-input! (join "f:" path) (print-of bytes) stamp))
     bytes))
 
 (defn read-all-raw [(path (slice u8))] (-> (slice u8))
@@ -1399,7 +1401,8 @@
 ;;; A path with its links resolved, as the file system has it; the path itself when nothing is there.
 (defn real-path [(path (slice u8))] (-> (slice u8))
   (let [p (real-path-raw path)]
-    (when (dep-in-frame?) (dep-input! (join "r:" path) p))
+    ;; No stamp: a link anywhere along the path can change it.
+    (when (dep-in-frame?) (dep-input! (join "r:" path) p ""))
     p))
 
 (defn real-path-raw [(path (slice u8))] (-> (slice u8))
@@ -2005,8 +2008,10 @@
   (.col (line-col src at)))
 
 (defn file-exists? [(path (slice u8))] (-> bool)
-  (let [there (file-exists-raw? path)]
-    (when (dep-in-frame?) (dep-input! (join "e:" path) (if there "1" "0")))
+  (let [tracked (dep-in-frame?)
+        stamp (if tracked (file-stamp path) "")
+        there (file-exists-raw? path)]
+    (when tracked (dep-input! (join "e:" path) (if there "1" "0") stamp))
     there))
 
 (defn file-exists-raw? [(path (slice u8))] (-> bool)
@@ -2018,8 +2023,10 @@
 ;;; for a directory, `l` for anything else (a link, which only a look at the target can settle).
 ;;; Empty if the directory cannot be opened. One system call per directory, not per question.
 (defn dir-listing [(path (slice u8))] (-> (slice u8))
-  (let [listing (dir-listing-raw path)]
-    (when (dep-in-frame?) (dep-input! (join "d:" path) (print-of listing)))
+  (let [tracked (dep-in-frame?)
+        stamp (if tracked (file-stamp (if (= (len path) 0) "." path)) "")
+        listing (dir-listing-raw path)]
+    (when tracked (dep-input! (join "d:" path) (print-of listing) stamp))
     listing))
 
 (defn dir-listing-raw [(path (slice u8))] (-> (slice u8))
@@ -2047,8 +2054,10 @@
 
 ;;; Exists and can be read: a directory exists, but is not a file.
 (defn readable-file? [(path (slice u8))] (-> bool)
-  (let [print (file-print path)]
-    (when (dep-in-frame?) (dep-input! (join "f:" path) print))
+  (let [tracked (dep-in-frame?)
+        stamp (if tracked (file-stamp path) "")
+        print (file-print path)]
+    (when tracked (dep-input! (join "f:" path) print stamp))
     (!= print "missing")))
 
 ;;; What a file says, as an input's print: "missing" when it cannot be read.
@@ -3253,12 +3262,13 @@
     (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
     (.notes frame)))
 
-;;; An input was read: noted, with what it said, when a memo reads it.
-(defn dep-input! [(node (slice u8)) (print (slice u8))] (-> void)
+;;; An input was read: noted, with what it said, when a memo reads it. `stamp`: its size and time
+;;; (see `file-stamp`), taken before it was read, so a change while it was read changes the stamp
+;;; too; "" for an input no stamp settles.
+(defn dep-input! [(node (slice u8)) (print (slice u8)) (stamp (slice u8))] (-> void)
   (when (dep-in-frame?)
     (dep-note! node)
-    (let [d (deps)
-          stamp (if (= (cast i64 (get node 0)) 102) (file-stamp (subslice node 2 (len node))) "")]
+    (let [d (deps)]
       (deps-lock! d)
       (let [id (dep-id! d node)]
         (when (= (len (get (.prints d) id)) 0)
@@ -3442,8 +3452,9 @@
 
 (defstruct StatBuf [(bytes (array u8 256))])
 
-;;; A file's size and modification time, as text: what changes when it is written. Empty where the
-;;; platform's layout is not known, and "missing" for no file.
+;;; A file's or directory's size and modification time, eight bytes each with the nanoseconds: what
+;;; changes when a file is written, or a directory gains or loses an entry. Compared, never read.
+;;; Empty where the platform's layout is not known, and "missing" for nothing there.
 (defn file-stamp [(path (slice u8))] (-> (slice u8))
   (if (< STAT-SIZE 0)
       ""
@@ -3454,7 +3465,21 @@
             (let [size (load (cast (ptr i64) (primitive/index at STAT-SIZE)))
                   sec (load (cast (ptr i64) (primitive/index at STAT-MTIME)))
                   nsec (load (cast (ptr i64) (primitive/index at (+ STAT-MTIME 8))))]
-              (join (num-text size) (join ":" (join (num-text sec) (join ":" (num-text nsec))))))))))
+              (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+                (reserve! (mut b) 24)
+                (for v [size sec nsec]
+                  (for i (range 0 8)
+                    (push! (mut b) (cast u8 (& (>> v (* i 8)) 255)))))
+                (slice b)))))))
+
+;;; An input's stamp now, as its reader takes it; "" for one no stamp settles.
+(defn input-stamp [(node (slice u8))] (-> (slice u8))
+  (let [path (subslice node 2 (len node))
+        kind (cast i64 (get node 0))]
+    (cond (= kind 102) (file-stamp path)
+          (= kind 100) (file-stamp (if (= (len path) 0) "." path))
+          (= kind 101) (file-stamp path)
+          :else "")))
 
 ;;; What an input says now, as `dep-input!` was told it.
 (defn input-print-now [(node (slice u8))] (-> (slice u8))
@@ -3484,10 +3509,9 @@
       (deps-unlock! d)
       (for i (range 0 (len nodes))
         (let [node (get nodes i)
-              file? (= (cast i64 (get node 0)) 102)
-              stamp (if file? (file-stamp (subslice node 2 (len node))) "")]
-          ;; A file whose size and time stand is not read again.
-          (unless (and file? (> (len stamp) 0) (= stamp (get stamps i)))
+              stamp (input-stamp node)]
+          ;; An input whose size and time stand is not read again.
+          (unless (and (> (len stamp) 0) (= stamp (get stamps i)))
             (let [now (input-print-now node)]
               (deps-lock! d)
               (set! (mut (.stamps d)) (dep-id! d node) stamp)
