@@ -451,12 +451,15 @@
         (for d (.kids (get (.kids tree) 2))
           (for n (.kids (get (.kids d) 0))
             (push! (mut (.keeps k)) (.text n))))
-        ;; A stage's `makes`, after its functions: what the stages after it only read.
+        ;; A stage's `makes`, after its functions: what the stages after it only read, and so what is
+        ;; kept whatever else is.
         (for d (.kids (get (.kids tree) 3))
           (let [makes (if (= (.kind d) (gpl/KPerStage)) (get (.kids d) 3) (get (.kids d) 2))]
             (unless (= (.kind makes) (gpl/KNone))
               (for n (.kids (get (.kids makes) 0))
-                (push! (mut (.made k)) (.text n)))))))))
+                (push! (mut (.made k)) (.text n))
+                (unless (has-text? (.keeps k) (.text n))
+                  (push! (mut (.keeps k)) (.text n))))))))))
   0)
 
 ;;; A module's tree with each function a pipeline keeps a kept one. A kept name it has no function of
@@ -3218,7 +3221,7 @@
 
 ;; ---------------------------------------------------------------- calls
 
-(defn args-code [(k (mut Comp)) (n g/Node) (f Func) (args (ArrayList g/Node))]
+(defn args-code [(k (mut Comp)) (n g/Node) (module (slice u8)) (f Func) (args (ArrayList g/Node))]
   (-> Code)
   (unless (= (len args) (len (.params f)))
     (die (mut k)
@@ -3236,9 +3239,38 @@
               (unless (= (.ty x) (.ty p))
                 (die (mut k) a (cat4 "expected " (.ty p) ", found " (.ty x))))
               (push! (mut out) `(mut ~(.code x))))
-            (let [x (expect (mut k) a (expr (mut k) a (.ty p)) (.ty p))]
-              (push! (mut out) (.code x))))))
+            (match (narrowed-arg (mut k) a module f i)
+              (Some [x] (push! (mut out) x))
+              (None []
+                    (let [x (expect (mut k) a (expr (mut k) a (.ty p)) (.ty p))]
+                      (push! (mut out) (.code x))))))))
     `(~@out)))
+
+;;; A setting, or a part of one, passed to a function of the program that reads only some fields of
+;;; that parameter, through all it passes it to: while dependencies are tracked, a memo that calls it
+;;; is made from those fields only, as if it had read each itself.
+(defn narrowed-arg [(k (mut Comp)) (a g/Node) (module (slice u8)) (f Func) (i i64)] (-> (Option Code))
+  (if (or (> (.quiet k) 0) (not (= (.sort (mod-at (mut k) module)) (SRules))))
+      (None [Code])
+      (match (setting-part (mut k) a)
+        (None [] (None [Code]))
+        (Some [sp]
+              (let [read (pl/param-paths (mut (.checker k)) module (.name f) i)]
+                (if (.whole read)
+                    (None [Code])
+                    (let [node (cat4 "s:" (.module sp) "." (.name (.x sp)))
+                          base (fields-path (.fields sp))
+                          v (fresh (mut k) "narrowed")
+                          (mut notes) (primitive/code-list-new)]
+                      (for field (.fields read)
+                        (push! (mut notes)
+                               `(rt/dep-note-fixed! (primitive/alloc-static i64) ~node ~(cat base field))))
+                      (set! (.quiet k) (+ (.quiet k) 1))
+                      (let [x (expect (mut k) a (expr (mut k) a (.ty (get (.params f) i))) (.ty (get (.params f) i)))]
+                        (set! (.quiet k) (- (.quiet k) 1))
+                        (Some `(let [~(sym v) ~(.code x)]
+                                 (when (rt/dep-in-frame?) ~@notes 0)
+                                 ~(sym v)))))))))))
 
 (defn call-func [(k (mut Comp))
                  (n g/Node)
@@ -3248,7 +3280,7 @@
   (match (accessor-read (mut k) n module f args)
     (Some [t] t)
     (None []
-          (let [cs (args-code (mut k) n f args)]
+          (let [cs (args-code (mut k) n module f args)]
             (te `(~(sym (qualified (mut k) module (.coil f))) ~@cs) (.ret f))))))
 
 ;;; A foreign module's function that looks into one value, given plain values besides: what

@@ -260,10 +260,9 @@
    (memo (ArrayList Effect))
    (visiting (ArrayList (slice u8)))
    (depends (ArrayList (slice u8)))
-   ;; Functions some stage makes: asked for by another stage, each is only read.
-   (made (ArrayList (slice u8)))
-   ;; Functions the pipeline keeps.
-   (kept (ArrayList (slice u8)))])
+   ;; Functions some stage makes: asked for by another stage, each is only read. What a stage makes
+   ;; is kept, as if the pipeline said so: the stages after it read what it made.
+   (made (ArrayList (slice u8)))])
 
 (defn checker-new [(entries (ArrayList dsl/Entry))] (-> Checker)
   (Checker
@@ -273,8 +272,7 @@
     :memo (ArrayList::new [Effect] (malloc-allocator))
     :visiting (texts)
     :depends (texts)
-    :made (texts)
-    :kept (texts)))
+    :made (texts)))
 
 ;;; The settings `module/name` reads, through everything it calls.
 (defn reads-of [(c (mut Checker)) (module (slice u8)) (name (slice u8))] (-> (ArrayList (slice u8)))
@@ -762,6 +760,131 @@
                     seen)
                   out)))))
 
+;; ---------------------------------------------------------------- what a function reads of its arguments
+
+;;; What a function reads of one of its parameters: its fields, each `.name`, through everything it
+;;; passes the value to; or the whole value, where it keeps it, gives it back, or passes it where
+;;; nothing says what is read of it.
+(defstruct Paths [(whole bool) (fields (ArrayList (slice u8)))])
+
+(defn paths-new [] (-> Paths) (Paths :whole false :fields (texts)))
+
+(defn paths-whole [] (-> Paths) (Paths :whole true :fields (texts)))
+
+(defn paths-same? [(a Paths) (b Paths)] (-> bool)
+  (and (= (.whole a) (.whole b))
+       (= (len (.fields a)) (len (.fields b)))
+       (let [(mut ok) true]
+         (for x (.fields a) (unless (has? (.fields b) x) (set! ok false)))
+         ok)))
+
+(defn paths-add! [(out (mut Paths)) (more Paths)] (-> void)
+  (when (.whole more) (set! (.whole out) true))
+  (for x (.fields more) (add-unique! (mut (.fields out)) x)))
+
+;;; One question's work: what each parameter reached so far reads, as known yet, and those being
+;;; worked out now. A function calling itself, at once or round about, reads what was known of it;
+;;; the question is asked again until nothing it knows grows.
+(defstruct PathWork
+  [(keys (ArrayList (slice u8)))
+   (known (ArrayList Paths))
+   (open (ArrayList (slice u8)))
+   (grew bool)])
+
+(defn known-of [(w PathWork) (key (slice u8))] (-> Paths)
+  (let [(mut out) (paths-new)]
+    (for i (range 0 (len (.keys w)))
+      (when (= (get (.keys w) i) key) (set! out (get (.known w) i))))
+    out))
+
+(defn know! [(w (mut PathWork)) (key (slice u8)) (p Paths)] (-> void)
+  (let [(mut at) -1]
+    (for i (range 0 (len (.keys w)))
+      (when (= (get (.keys w) i) key) (set! at i)))
+    (if (< at 0)
+        (do (push! (mut (.keys w)) key) (push! (mut (.known w)) p) (set! (.grew w) true))
+        (unless (paths-same? (get (.known w) at) p)
+          (set! (mut (.known w)) at p)
+          (set! (.grew w) true)))))
+
+;;; What `module/name` reads of its parameter `index`.
+(defn param-paths [(c (mut Checker)) (module (slice u8)) (name (slice u8)) (index i64)] (-> Paths)
+  (let [(mut w) (PathWork :keys (texts) :known (ArrayList::new [Paths] (malloc-allocator)) :open (texts) :grew true)
+        (mut out) (paths-new)]
+    (while (.grew w)
+      (set! (.grew w) false)
+      (set! out (param-paths-in (mut c) (mut w) module name index)))
+    out))
+
+(defn param-paths-in [(c (mut Checker)) (w (mut PathWork)) (module (slice u8)) (name (slice u8)) (index i64)]
+  (-> Paths)
+  (let [key (dsl/join3 (dsl/join3 module "/" name) "#" (rt/num-text index))]
+    (if (has? (.open w) key)
+        (known-of w key)
+        (match (fun-of (info-of (mut c) module) name)
+          (None [] (paths-whole))
+          (Some [f]
+                (if (>= index (len (.params f)))
+                    (paths-whole)
+                    (let [p (get (.params f) index)
+                          (mut locals) (texts)]
+                      (locals! (.body f) (mut locals) false)
+                      (if (has? locals p)
+                          (paths-whole)
+                          (let [(mut out) (paths-new)]
+                            (push! (mut (.open w)) key)
+                            (uses! (mut c) (mut w) (info-of (mut c) module) f p (mut out) (.body f))
+                            (pop! (mut (.open w)))
+                            (know! (mut w) key out)
+                            out)))))))))
+
+;;; The function a call calls, when it is one of a module's: its module and name.
+(defn callee-of [(info Info) (f Fun) (callee gr/Node)] (-> (Option (slice u8)))
+  (cond (and (= (.kind callee) (gr/KName)) (< (param-index f (.text callee)) 0))
+          (match (fun-of info (.text callee))
+            (Some [_] (Some (.name info)))
+            (None [] (None [(slice u8)])))
+        (and (= (.kind callee) (gr/KFieldE)) (= (.kind (kid callee 0)) (gr/KName)))
+          (alias-of info (.text (kid callee 0)))
+        :else (None [(slice u8)])))
+
+(defn callee-name [(callee gr/Node)] (-> (slice u8))
+  (if (= (.kind callee) (gr/KName)) (.text callee) (.text (kid callee 1))))
+
+(defn uses! [(c (mut Checker)) (w (mut PathWork)) (info Info) (f Fun) (p (slice u8)) (out (mut Paths)) (n gr/Node)]
+  (-> void)
+  (match (.kind n)
+    (gr/KName [] (when (= (.text n) p) (set! (.whole out) true)))
+    (gr/KFieldE []
+                (if (and (= (.kind (kid n 0)) (gr/KName)) (= (.text (kid n 0)) p))
+                    (add-unique! (mut (.fields out)) (dsl/join2 "." (.text (kid n 1))))
+                    (uses! (mut c) (mut w) info f p (mut out) (kid n 0))))
+    (gr/KCall []
+              (let [callee (kid n 0)
+                    args (.kids (kid n 1))
+                    target (callee-of info f callee)]
+                (uses! (mut c) (mut w) info f p (mut out) callee)
+                (for j (range 0 (len args))
+                  (let [a (get args j)
+                        e (arg-expr a)]
+                    (if (and (= (.kind e) (gr/KName)) (= (.text e) p))
+                        (match target
+                          (Some [module]
+                                (let [name (callee-name callee)
+                                      at (if (= (.kind a) (gr/KNamed))
+                                             (match (fun-of (info-of (mut c) module) name)
+                                               (Some [g] (param-index g (.text (kid a 0))))
+                                               (None [] -1))
+                                             j)]
+                                  (if (< at 0)
+                                      (set! (.whole out) true)
+                                      (paths-add! (mut out) (param-paths-in (mut c) (mut w) module name at)))))
+                          (None [] (set! (.whole out) true)))
+                        (uses! (mut c) (mut w) info f p (mut out) e))))))
+    (_ (for i (range 0 (len (.kids n)))
+         (unless (label? n i)
+           (uses! (mut c) (mut w) info f p (mut out) (kid n i)))))))
+
 ;; ---------------------------------------------------------------- the pipeline
 
 (defstruct Stage
@@ -816,13 +939,7 @@
           module (subslice full 0 slash)
           name (subslice full (+ slash 1) (len full))
           e (fun-effect (mut chk) module name)]
-      ;; What a stage makes is read at once by many threads only when it is kept: otherwise a read
-      ;; would make it again, there.
-      (for x (.made e)
-        (unless (has? (.kept chk) x)
-          (dsl/die (mut c) (tok-of src at)
-                   (dsl/join3 (dsl/join3 "plan " plan-name (dsl/join3 " runs " (.name s) " in parallel, which asks for "))
-                              x ", which a stage makes and nothing keeps"))))
+
       (when (or (> (len (.writes e)) 0) (> (len (.hooks e)) 0))
         (let [(mut msg)
                 (dsl/join3 "plan "
@@ -863,12 +980,9 @@
         (mut names) (primitive/code-list-new)]
     ;; What is kept is the rules compiler's to apply (see `keep` in the rules compiler): here each is
     ;; only a function's name.
-    (let [(mut kept) (texts)]
-      (for d (.kids (kid-of tree 2))
-        (for t (.kids (kid-of d 0))
-          (split-fn (mut c) (tok-of src t))
-          (push! (mut kept) (.text t))))
-      (set! (.kept chk) kept))
+    (for d (.kids (kid-of tree 2))
+      (for t (.kids (kid-of d 0))
+        (split-fn (mut c) (tok-of src t))))
     (for d (.kids (kid-of tree 3))
       (let [(mut fns) (texts)
             (mut makes) (texts)

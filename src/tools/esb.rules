@@ -6,6 +6,7 @@ rules tools.esb
 use bundle.api as api
 use bundle.modules as m
 use bundle.jsx as jsx
+use bundle.hmr as hmr
 use app.pipelines as plans
 
 main run on big stack
@@ -29,12 +30,6 @@ fn with-flag(o: api.Options, a: Text) -> api.Options = match a {
   "--jsx-side-effects" => api.with-jsx(o, o.jsx with { side-effects: true })
   "--pretty" => o with { pretty: true }
   "--timing" => o with { timing: true }
-  "--watch" => o with { watch: true }
-  "--cache" => o with { cache: true }
-  "--no-cache" => o with { no-cache: true }
-  "--cache-dir=" ++ dir => o with { cache-dir: dir }
-  "--hmr" => o with { watch: true, hmr: true }
-  "--serve=" ++ port => o with { serve-port: parse-int(port) }
   "--sourcemap" => o with { sourcemap: true }
   "--platform=node" => api.on-node(o)
   "--platform=browser" | "--bundle" => o
@@ -79,13 +74,49 @@ fn with-flag(o: api.Options, a: Text) -> api.Options = match a {
   "--log-level=" ++ _ => o
   # For a profiler: the whole build run this many times in one process.
   "--repeat=" ++ _ => o
+  # How the builds are run: see `Run`. Hot module replacement builds in a format of its own.
+  "--hmr" => o
+  a if run-only?(a) => o
   "--" ++ _ => panic "unknown option {}", a
   entry => o with { entries: o.entries ++ [entry] }
 }
 
-# The command line's options, and how many times to build.
-fn options() -> api.Options =
-  (fold o = api.options-new(arg-at(1), "") for i in 2..arg-count(): with-flag(o, arg-at(i))) with { cache-key: cache-key() }
+# How the builds are run, which changes nothing they make.
+record Run {
+  # `--watch`: build again whenever an input changes, looking every `interval` milliseconds.
+  watch: Bool,
+  interval: Int,
+  # `--hmr`: watching, each build in the development format, and what changed sent to the page;
+  # `--serve=PORT`: the output's directory served, with the page's event stream (-1: not served).
+  hmr: Bool,
+  serve-port: Int,
+  # What builds compute, kept on disk in `cache-dir` (by default node_modules/.cache/esb), so a
+  # later run starts where this one stopped: always while watching unless `no-cache`, and for one
+  # build with `cache`. `cache-key` tells one command line's cache from another's.
+  cache: Bool,
+  no-cache: Bool,
+  cache-dir: Text,
+  cache-key: Text
+}
+
+fn with-run-flag(r: Run, a: Text) -> Run = match a {
+  "--watch" => r with { watch: true }
+  "--cache" => r with { cache: true }
+  "--no-cache" => r with { no-cache: true }
+  "--cache-dir=" ++ dir => r with { cache-dir: dir }
+  "--hmr" => r with { watch: true, hmr: true }
+  "--serve=" ++ port => r with { serve-port: parse-int(port) }
+  "--watch-interval=" ++ ms => r with { interval: parse-int(ms) }
+  _ => r
+}
+
+# The command line's options.
+fn options() -> api.Options = fold o = api.options-new(arg-at(1), "") for i in 2..arg-count(): with-flag(o, arg-at(i))
+
+fn run-options() -> Run =
+  fold r = Run(watch: false, interval: 100, hmr: false, serve-port: -1, cache: false, no-cache: false,
+               cache-dir: "node_modules/.cache/esb", cache-key: cache-key())
+  for i in 2..arg-count(): with-run-flag(r, arg-at(i))
 
 # What tells one command line's cache from another's: the directory it runs in and its arguments,
 # but not those that change only how a build is run and reported, and not `--watch`, so one build
@@ -100,8 +131,117 @@ fn run-only?(a: Text) -> Bool = match a {
 
 fn repeats() -> Int = (last i in 2..arg-count() for n in [arg-at(i)] if starts-with(n, "--repeat="): parse-int(after(n, "--repeat="))) ?? 1
 
-fn run() -> Void = for-each-time(repeats(), options())
+fn run() -> Void = for-each-time(repeats(), options(), run-options())
 
-fn for-each-time(times: Int, o: api.Options) -> Void {
-  for i in 0..times { api.build(o) }
+fn for-each-time(times: Int, o: api.Options, r: Run) -> Void {
+  for i in 0..times { build(o, r) }
+}
+
+# Builds of the options: one; or while watching, one each time an input a build read says something
+# else, until the process is stopped; with hot module replacement, each in the development format.
+fn build(o: api.Options, r: Run) -> Void {
+  started(o, r)
+  match r.hmr {
+    true => dev-rebuilding(api.dev-given(o), r)
+    false => builds(o, r)
+  }
+}
+
+fn builds(o: api.Options, r: Run) -> Void {
+  var count = 0
+  var going = true
+  while going {
+    let start = now-us()
+    let before = memo-computed()
+    timed(o.timing, "write", api.delivered(o, api.files(o)))
+    count = count + 1
+    let took = now-us() - start
+    if r.watch {
+      print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", count, took / 1000, took % 1000 / 100,
+        memo-computed() - before, inputs-watched()
+    }
+    let saving = now-us()
+    cache-kept(o, r)
+    if o.timing and cached?(r) and not r.watch {
+      print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100
+    }
+    if r.watch {
+      let changed = wait-for-changes!(r.interval)
+      print "[watch] changed: {}", join(changed, " ")
+    } else {
+      going = false
+    }
+  }
+  if r.watch { print "[watch] stopped" }
+}
+
+# Whether builds keep what they compute on disk, and start from what an earlier run kept.
+fn cached?(r: Run) -> Bool = not r.no-cache and (r.cache or r.watch)
+
+fn cache-path(r: Run) -> Text = r.cache-dir ++ "/" ++ hash-text(r.cache-key) ++ ".cache"
+
+# Builds that watch, or start from the cache, track what each answer was made from, and the first
+# starts from what an earlier run kept, loaded before anything is computed.
+fn started(o: api.Options, r: Run) -> Void {
+  if r.watch or cached?(r) {
+    one-entry(o)
+    track-dependencies!()
+  }
+  if cached?(r) {
+    # There before anything is built: made later, it would change a listing a build read.
+    make-dirs!(r.cache-dir)
+    let start = now-us()
+    if cache-load!(cache-path(r)) and o.timing {
+      print "[cache] loaded {} in {}.{} ms", cache-path(r), (now-us() - start) / 1000, (now-us() - start) % 1000 / 100
+    }
+  }
+}
+
+fn one-entry(o: api.Options) -> Bool = match o.splitting, o.outfile, len(o.entries), o.entry {
+  false, out, 1, entry if out != "" and not ends-with(entry, ".css") => true
+  _, _, _, _ => panic "--watch and --cache build one JavaScript entry to --outfile, for now"
+}
+
+# What the builds computed, kept: while watching, on a thread of its own while the watcher waits;
+# for one build, before the program ends.
+fn cache-kept(o: api.Options, r: Run) -> Void {
+  if cached?(r) {
+    if r.watch { cache-save-later!(cache-path(r), o.timing) } else { cache-save!(cache-path(r)) }
+  }
+}
+
+# Hot module replacement: each build in the development format, written, and after the first what
+# changed sent to the page as an update, or a reload when nothing that changed can take one.
+fn dev-rebuilding(o: api.Options, r: Run) -> Void {
+  let events = match r.serve-port {
+    port if port >= 0 => "http://127.0.0.1:" ++ int-text(served) ++ "/hmr"
+      where served = serve!(port, dir-of(o.outfile), "<!doctype html>\n<meta charset=\"utf-8\">\n<body>\n<script src=\"/" ++ path-base(o.outfile) ++ "\"></script>\n</body>\n")
+    _ => ""
+  }
+  if events != "" { print "[hmr] serving {} at {}", dir-of(o.outfile), text-before(events, "/hmr") }
+  var before = hmr.Dev(text: "", functions: {})
+  var builds = 0
+  while true {
+    let start = now-us()
+    let computed = memo-computed()
+    let step = api.dev-step-of(o, before, events)
+    api.written([api.Written(path: o.outfile, text: step.dev.text, said: api.said-of(step.dev.text, o.outfile))])
+    builds = builds + 1
+    let took = now-us() - start
+    print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
+      memo-computed() - computed, inputs-watched()
+    cache-kept(o, r)
+    if builds > 1 {
+      match step.sent {
+        some(sent) => {
+          broadcast!(sent.event, sent.text)
+          print "[hmr] {} to {} listening: {}", sent.event, listeners(), join(sent.changed, " ")
+        }
+        none => print "[hmr] no module changed"
+      }
+    }
+    before = step.dev
+    let changed = wait-for-changes!(r.interval)
+    print "[watch] changed: {}", join(changed, " ")
+  }
 }

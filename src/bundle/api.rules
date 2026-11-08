@@ -80,20 +80,6 @@ record Options {
   minify-syntax: Bool,
   pretty: Bool,
   timing: Bool,
-  # `--watch`: build again whenever an input changes, looking every `watch-interval` milliseconds.
-  watch: Bool,
-  watch-interval: Int,
-  # `--hmr`: watching, each build in the development format, and what changed sent to the page;
-  # `--serve=PORT`: the output's directory served, with the page's event stream (-1: not served).
-  hmr: Bool,
-  serve-port: Int,
-  # What builds compute, kept on disk in `cache-dir` (by default node_modules/.cache/esb), so a
-  # later run starts where this one stopped: always while watching unless `no-cache`, and for one
-  # build with `cache`. `cache-key` tells one command line's cache from another's.
-  cache: Bool,
-  no-cache: Bool,
-  cache-dir: Text,
-  cache-key: Text,
   sourcemap: Bool,
   defines: [DefineText],
   main-fields: [Text],
@@ -134,8 +120,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
   Options(entry: entry, entries: [entry], outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]",
           format: iife-format(), global-name: "",
-          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, watch: false, watch-interval: 100, hmr: false, serve-port: -1,
-          cache: false, no-cache: false, cache-dir: "node_modules/.cache/esb", cache-key: "", sourcemap: false,
+          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
@@ -631,84 +616,10 @@ fn base-dir(o: Options) -> Text = match o.outbase {
 record Written { path: Text, text: Text, said: Text }
 
 # One bundle, or one per entry, or one split into chunks, each name looked up as the options say:
-# the files they make, written; or, with nowhere to write it, the one bundle printed. While
-# watching, built again whenever an input a build read says something else, until the process is
-# stopped; with hot module replacement, each build in the development format.
-fn build(options: Options) -> Void {
-  started(options)
-  match options.hmr {
-    true => dev-rebuilding(dev-given(options))
-    false => builds(options)
-  }
-}
-
-# Builds one after another: one, or while watching, one each time something a build read changes.
-fn builds(o: Options) -> Void {
-  var count = 0
-  var going = true
-  while going {
-    let start = now-us()
-    let before = memo-computed()
-    timed(o.timing, "write", delivered(o, files(o)))
-    count = count + 1
-    let took = now-us() - start
-    if o.watch {
-      print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", count, took / 1000, took % 1000 / 100,
-        memo-computed() - before, inputs-watched()
-    }
-    let saving = now-us()
-    cache-kept(o)
-    if o.timing and cached?(o) and not o.watch {
-      print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100
-    }
-    if o.watch {
-      let changed = wait-for-changes!(o.watch-interval)
-      print "[watch] changed: {}", join(changed, " ")
-    } else {
-      going = false
-    }
-  }
-  if o.watch { print "[watch] stopped" }
-}
-
+# the files they make, written; or, with nowhere to write it, the one bundle printed.
 fn delivered(o: Options, ws: [Written]) -> Void = match printing?(o) {
   true => to-standard-output(ws)
   false => written(ws)
-}
-
-# Whether a build keeps what it computes on disk, and starts from what an earlier one kept.
-fn cached?(o: Options) -> Bool = not o.no-cache and (o.cache or o.watch)
-
-fn cache-path(o: Options) -> Text = o.cache-dir ++ "/" ++ hash-text(o.cache-key) ++ ".cache"
-
-# Builds that watch, or start from the cache, track what each answer was made from, and the first
-# starts from what an earlier run kept, loaded before anything is computed.
-fn started(o: Options) -> Void {
-  if o.watch or cached?(o) {
-    one-entry(o)
-    track-dependencies!()
-  }
-  if cached?(o) {
-    # There before anything is built: made later, it would change a listing a build read.
-    make-dirs!(o.cache-dir)
-    let start = now-us()
-    if cache-load!(cache-path(o)) and o.timing {
-      print "[cache] loaded {} in {}.{} ms", cache-path(o), (now-us() - start) / 1000, (now-us() - start) % 1000 / 100
-    }
-  }
-}
-
-fn one-entry(o: Options) -> Bool = match o.splitting, o.outfile, len(o.entries), o.entry {
-  false, out, 1, entry if out != "" and not ends-with(entry, ".css") => true
-  _, _, _, _ => panic "--watch and --cache build one JavaScript entry to --outfile, for now"
-}
-
-# What a build computed, kept: while watching, on a thread of its own while the watcher waits; for
-# one build, before the program ends.
-fn cache-kept(o: Options) -> Void {
-  if cached?(o) {
-    if o.watch { cache-save-later!(cache-path(o), o.timing) } else { cache-save!(cache-path(o)) }
-  }
 }
 
 # The files a build makes, not yet written.
@@ -838,42 +749,8 @@ fn given(o: Options) -> Void {
 # Everything one build writes.
 fn bundle() -> [Written] = loaded-built(building.options, building.format)
 
-# Hot module replacement: each build in the development format, written, and after the first what
-# changed sent to the page as an update, or a reload when nothing that changed can take one.
-fn dev-rebuilding(o: Options) -> [Written] {
-  let events = match o.serve-port {
-    port if port >= 0 => "http://127.0.0.1:" ++ int-text(served) ++ "/hmr"
-      where served = serve!(port, dir-of(o.outfile), "<!doctype html>\n<meta charset=\"utf-8\">\n<body>\n<script src=\"/" ++ path-base(o.outfile) ++ "\"></script>\n</body>\n")
-    _ => ""
-  }
-  if events != "" { print "[hmr] serving {} at {}", dir-of(o.outfile), text-before(events, "/hmr") }
-  var before = hmr.Dev(text: "", functions: {})
-  var builds = 0
-  while true {
-    let start = now-us()
-    let computed = memo-computed()
-    let step = with m.names = names-new() { dev-built(o, before, events) }
-    written([Written(path: o.outfile, text: step.dev.text, said: said-of(step.dev.text, o.outfile))])
-    builds = builds + 1
-    let took = now-us() - start
-    print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
-      memo-computed() - computed, inputs-watched()
-    cache-kept(o)
-    if builds > 1 {
-      match step.sent {
-        some(sent) => {
-          broadcast!(sent.event, sent.text)
-          print "[hmr] {} to {} listening: {}", sent.event, listeners(), join(sent.changed, " ")
-        }
-        none => print "[hmr] no module changed"
-      }
-    }
-    before = step.dev
-    let changed = wait-for-changes!(o.watch-interval)
-    print "[watch] changed: {}", join(changed, " ")
-  }
-  []
-}
+# One development build, as hot module replacement makes them: with names of its own.
+fn dev-step-of(o: Options, before: hmr.Dev, events: Text) -> DevStep = with m.names = names-new() { dev-built(o, before, events) }
 
 # One development build, and what to send for it after `before`.
 record DevStep { dev: hmr.Dev, sent: hmr.Sent? }
@@ -966,14 +843,7 @@ fn grouped-output(o: Options, f: Format) -> Printed =
                                ++ [group-rendered(o, entry-calls(f))]
                                ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
 
-fn group-output(g: e.Group) -> Rendered = group-rendered(output-options(), e.group-made(g))
-
-# Of the build's options, what a group's text is made by, each read by itself, so that a run with
-# other options otherwise, such as one that watches after one that did not, keeps the groups' texts.
-fn output-options() -> Options =
-  options-new("", "") with { minify-syntax: building.options.minify-syntax, drop-console: building.options.drop-console,
-                             drop-debugger: building.options.drop-debugger, charset-ascii: building.options.charset-ascii,
-                             pretty: building.options.pretty, sourcemap: building.options.sourcemap }
+fn group-output(g: e.Group) -> Rendered = group-rendered(building.options, e.group-made(g))
 
 # Statements as the output has them: minified or folded, what is dropped dropped, made ASCII, and
 # printed. A group is a module's, the finest a change to the output is followed, as Turbopack's is.
