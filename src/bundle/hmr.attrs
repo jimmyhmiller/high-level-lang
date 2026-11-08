@@ -1,0 +1,252 @@
+# The development format, for hot module replacement: no scope hoisting and no renaming, but each
+# module its own function, given to the runtime in `hmr_runtime.js` by id, which runs it once and
+# keeps its exports on one namespace object. An import becomes a variable holding the namespace it
+# imports from, and a read of what it bound a read of that namespace, so it stays live when the
+# module it reads is run again. What changed between two builds is sent as new functions for those
+# modules; `hmr.facts` says which modules run again.
+attrs bundle.hmr over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.early as early
+use bundle.hmr-plan as plan
+
+quote stmt at 1 0 ;
+quote exp at 1 0 0 ;
+
+# What an import binds: the variable holding the namespace it reads, and the name it reads there,
+# or "*" for the namespace itself.
+record Imported { space: Text, name: Text }
+
+# The module being emitted, the path each specifier it names leads to ("" for one outside the
+# bundle), what each of its imports binds by symbol, and the name its context goes by in its function.
+context module: m.Module = m.blank-module(-1, "", m.External, None(), -1)
+context leads: {Text:Text} = {}
+input imported: {Int:Imported}
+input ctx: Text
+
+# A read of an import reads its namespace.
+rewrite Ident(_) as n => import-read(n) ?? n
+rewrite Shorthand(old) as n if old.out is Ident(_) and old.out.text == old.text => n
+rewrite Shorthand(old) => Prop(PropName(old.text), old.out)
+# A call of an imported function keeps `this` undefined: `(0, ns.f)(…)`.
+rewrite CallExpr(callee, _) as n => call-read(n, callee, n.out)
+rewrite ImportMeta() => Member(Ident(ctx), PropName("meta"))
+# `import("x")` of a module the build resolved: its namespace, once it has run.
+rewrite ImportCall(Str(raw), ...) if is-some(leads[unquote(raw)]) => import-later(raw)
+
+fn call-read(n: Node, callee: Node, out: Node) -> Node = match callee {
+  Ident(_) if is-some(import-read(callee)) and not (out.callee is Ident(_)) =>
+    CallExpr(exp`(0, $f)`, out.args) with { lo: n.lo, hi: n.hi } where f = out.callee
+  _ => out
+}
+
+fn import-later(raw: Text) -> Node = exp`Promise.resolve().then(() => $c.import($spec))` where c = Ident(ctx), spec = Str(raw)
+
+fn import-read(n: Node) -> Node? = first s in module.bindings[n.lo] for i in imported[s]: space-read(i)
+
+fn space-read(i: Imported) -> Node = match i.name {
+  "*" => Ident(i.space)
+  name if plain-name?(name) => Member(Ident(i.space), PropName(name))
+  name => Index(Ident(i.space), Str(quote-text(name)))
+}
+
+fn plain-name?(s: Text) -> Bool =
+  len(s) > 0 and not digit-byte?(s[0]) and all c in s: (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or digit-byte?(c) or c == '_' or c == '$'
+
+# ---------------------------------------------------------------- one module
+
+# A module's function, as the runtime is given it: `__hmr.define(id, ` these `)`: what each
+# specifier leads to, the function, and whether it is an ES module. Made from what loading made of
+# the file, and so kept until it changes, or until the module becomes CommonJS or stops being it.
+memo fn dev-function(path: Text, cjs: Int) -> Text = with leads = leads-of(l) { define-args(dev-module(l, cjs == 1)) }
+  where l = m.loaded(path)
+
+memo fn dev-accepts(path: Text) -> Bool = accepts?(m.loaded(path).analysis.tree)
+
+fn dev-module(l: m.Loaded, cjs: Bool) -> m.Module =
+  m.blank-module(-1, l.path, match cjs { true => m.Cjs  false => m.Esm }, l.analysis.tree, l.analysis.root) with {
+    bindings: l.analysis.bindings, source: l.tree0.body.kids, text: l.parsed.src
+  }
+
+fn leads-of(l: m.Loaded) -> {Text:Text} = {l.specs[k]: match l.leads[k].key {
+  "external:" ++ _ => ""
+  path => path
+} for k in 0..len(l.specs)}
+
+fn define-args(mo: m.Module) -> Text = match mo.kind {
+  m.Cjs => deps-text(mo) ++ ", function (module, exports, require, " ++ p ++ ") {\n"
+           ++ rendered(Program(None(), List([rewritten(mo, s, no-imports(), p) for s in statements(mo.tree)]...))) ++ "}, false"
+  _ => deps-text(mo) ++ ", function (" ++ p ++ ") {\n\"use strict\";\n"
+       ++ rendered(Program(None(), List(es-body(mo, p)...))) ++ "}, true"
+} where p = context-name(mo)
+
+fn no-imports() -> {Int:Imported} = {}
+
+fn rewritten(mo: m.Module, s: Node, imported: {Int:Imported}, p: Text) -> Node = with module = mo { run(s, imported, p).tree }
+
+fn id-text(mo: m.Module) -> Text = quote-text(mo.path)
+
+fn deps-text(mo: m.Module) -> Text =
+  "{" ++ join([quote-text(spec) ++ ": " ++ dep-text(leads[spec] ?? panic "{} has no module for {}", mo.path, spec)
+               for spec in sort s in keys(leads) by s], ", ") ++ "}"
+
+fn dep-text(path: Text) -> Text = match path {
+  "" => "null"
+  _ => quote-text(path)
+}
+
+fn rendered(p: Node) -> Text = js.render-tracked(p, true, false).text
+
+fn statements(tree: Node) -> [Node] = tree.body.kids
+
+# A prefix no name in the module's text starts with: its context, and its imports' namespaces.
+fn context-name(mo: m.Module) -> Text = first i in 0.. if not contains-text?(mo.text, prefix(i)): prefix(i) ++ "$"
+
+fn prefix(i: Int) -> Text = match i {
+  0 => "__hmr_"
+  _ => "__hmr" ++ int-text(i) ++ "_"
+}
+
+# What each import statement binds, by the symbol of the name it binds, its namespace the `k`th.
+fn imports-of(mo: m.Module, p: Text) -> {Int:Imported} =
+  {s: Imported(space: space-name(p, k), name: b.name)
+   for k in 0..len(stmts) for b in bound-by(stmts[k]) if let some(s) = mo.bindings[b.at]}
+  where stmts = statements(mo.tree)
+
+fn space-name(p: Text, k: Int) -> Text = p ++ int-text(k)
+
+# A name an import statement binds: where its leaf starts, and the name it reads.
+record Bound { at: Int, name: Text, local: Text }
+
+fn bound-by(s: Node) -> [Bound] = match s {
+  Import(clause, _) => clause-bound(clause)
+  _ => []
+}
+
+fn clause-bound(c: Node) -> [Bound] = match c {
+  ImportDefault(name) => [Bound(at: name.lo, name: "default", local: name.text)]
+  ImportNamespace(name) => [Bound(at: name.lo, name: "*", local: name.text)]
+  ImportDefaultAnd(name, rest) => [Bound(at: name.lo, name: "default", local: name.text)] ++ clause-bound(rest)
+  ImportNamed(List(specs...)) => [b for x in specs for b in spec-bound(x)]
+  _ => []
+}
+
+fn spec-bound(x: Node) -> [Bound] = match x {
+  ImportName(name) => [Bound(at: name.lo, name: name.text, local: name.text)]
+  ImportAs(from, name) => [Bound(at: name.lo, name: m.module-name(from), local: name.text)]
+  _ => []
+}
+
+# An ES module's body: its exports' getters, then what it imports in order, then its statements.
+fn es-body(mo: m.Module, p: Text) -> [Node] =
+  exports-stmt(p, getters(mo, p, by-name))
+  ++ [x for k in 0..len(stmts) for x in import-stmts(stmts[k], p, space-name(p, k))]
+  ++ [rewritten(mo, out, imported, p) for s in stmts for out in own-stmt(s)]
+  where stmts = statements(mo.tree),
+        imported = imports-of(mo, p),
+        by-name = {b.local: Imported(space: space-name(p, k), name: b.name) for k in 0..len(stmts) for b in bound-by(stmts[k])}
+
+fn exports-stmt(p: Text, gs: [Getter]) -> [Node] = match gs {
+  [] => []
+  _ => [stmt`$c.export($o);`] where c = Ident(p), o = ObjectLit(List([getter(g) for g in gs]...))
+}
+
+# What a module statement that imports leaves: its namespace, read once it has run.
+fn import-stmts(s: Node, p: Text, space: Text) -> [Node] = match s {
+  Import(_, from) | ExportFrom(_, from) | ExportAllAs(_, from) => [stmt`const $v = $c.import($spec);`]
+    where v = space, c = Ident(p), spec = from
+  ImportBare(from) => [stmt`$c.import($spec);`] where c = Ident(p), spec = from
+  ExportAll(from) => [stmt`$c.star($c.import($spec));`] where c = Ident(p), spec = from
+  _ => []
+}
+
+# What a statement leaves among the module's own: an export's declaration, and nothing of what only
+# imports or exports.
+fn own-stmt(s: Node) -> [Node] = match s {
+  Import(...) | ImportBare(_) | ExportFrom(...) | ExportAllAs(...) | ExportAll(_) | ExportNamed(_) => []
+  ExportVar(list) => [VarDecl(list) with { lo: s.lo, hi: s.hi }]
+  ExportLexical(d) | ExportFunction(d) | ExportClass(d) => [d]
+  _ => [s]
+}
+
+# An export: its name, and what reading it reads.
+record Getter { name: Text, value: Node }
+
+fn getter(g: Getter) -> Node = Prop(Str(quote-text(g.name)), exp`() => $v`) where v = g.value
+
+fn getters(mo: m.Module, p: Text, by-name: {Text:Imported}) -> [Getter] =
+  [g for k in 0..len(stmts) for g in stmt-getters(stmts[k], space-name(p, k), by-name)]
+  ++ [Getter(name: "default", value: Ident(local-default(mo, name))) for s in mo.source for name in m.default-of(s)]
+  where stmts = statements(mo.tree)
+
+fn local-default(mo: m.Module, name: Text) -> Text = match name {
+  "" => mo.base ++ "_default"
+  _ => name
+}
+
+fn stmt-getters(s: Node, space: Text, by-name: {Text:Imported}) -> [Getter] = match s {
+  ExportVar(list) => [Getter(name: x, value: Ident(x)) for x in early.bound-names(list)]
+  ExportLexical(d) => [Getter(name: x, value: Ident(x)) for x in early.bound-names(d)]
+  ExportFunction(d) | ExportClass(d) => [Getter(name: d.name.text, value: Ident(d.name.text))]
+  ExportNamed(List(specs...)) => [Getter(name: exported-name(x), value: local-read(m.module-name(x.local), by-name)) for x in specs]
+  ExportFrom(List(specs...), _) =>
+    [Getter(name: exported-name(x), value: space-read(Imported(space: space, name: m.module-name(x.local)))) for x in specs]
+  ExportAllAs(name, _) => [Getter(name: m.module-name(name), value: Ident(space))]
+  _ => []
+}
+
+fn exported-name(x: Node) -> Text = match x {
+  ExportAs(_, exported) => m.module-name(exported)
+  _ => m.module-name(x.local)
+}
+
+fn local-read(name: Text, by-name: {Text:Imported}) -> Node = match by-name[name] {
+  some(i) => space-read(i)
+  none => Ident(name)
+}
+
+# Whether a module takes its own updates: `import.meta.hot.accept(…)` anywhere in it.
+fn accepts?(n: Node) -> Bool = match n {
+  CallExpr(Member(Member(ImportMeta(), hot), accept), _) if hot.text == "hot" and accept.text == "accept" => true
+  _ => any k in n.kids: accepts?(k)
+}
+
+# ---------------------------------------------------------------- builds and updates
+
+# A development build: the bundle, and what defines each module by id, to compare with the next.
+record Dev { text: Text, functions: {Text:Text} }
+
+fn files(mods: [m.Module]) -> [m.Module] = [mo for mo in mods if mo.kind == m.Esm or mo.kind == m.Cjs]
+
+# The bundle: the runtime's helpers and the development runtime, every module's function, a
+# connection to `events` when there is one, and the entry run.
+fn dev-build(entry: Int, events: Text) -> Dev =
+  Dev(text: "(() => {\n" ++ include-text("runtime.js") ++ include-text("hmr_runtime.js")
+            ++ "var __hmr_apply = (text) => eval(text);\n"
+            ++ join(["__hmr.define(" ++ id-text(mo) ++ ", " ++ (functions[mo.path] ?? "") ++ ");\n" for mo in files(m.modules)], "")
+            ++ match events { "" => ""  url => "__hmr.connect(" ++ quote-text(url) ++ ", __hmr_apply);\n" }
+            ++ "__hmr.start(" ++ id-text(m.modules[entry]) ++ ");\n})();\n",
+      functions: functions)
+  where functions = {mo.path: dev-function(mo.path, match mo.kind { m.Cjs => 1  _ => 0 }) for mo in files(m.modules)}
+
+# What the runtime is sent after a build: an update of the modules whose functions changed, with
+# the modules to run again; or a reload, when an entry that does not accept it changed. None when
+# nothing did.
+record Sent { event: Text, text: Text, changed: [Text] }
+
+fn update(before: Dev, now: Dev, entries: [Int]) -> Sent? = match changed {
+  [] => none
+  _ => match [x for db.unaccepted(?x)] {
+    [] => some(Sent(event: "update", changed: [m.modules[i].path for i in changed],
+                    text: "__hmr.update({" ++ join([quote-text(m.modules[i].path) ++ ": [" ++ (now.functions[m.modules[i].path] ?? "") ++ "]"
+                                                   for i in changed], ", ")
+                          ++ "}, " ++ id-list([x for db.dirty(?x)]) ++ ", " ++ id-list([x for db.boundary(?x)]) ++ ");"))
+    xs => some(Sent(event: "reload", changed: [m.modules[i].path for i in changed],
+                    text: join([m.modules[x].path for x in xs], ", ") ++ " changed, and does not accept updates"))
+  } where db = plan.solved([plan.fact-changed(i) for i in changed]
+                           ++ [plan.fact-imports(mo.id, d) for mo in files(m.modules) for d in mo.deps]
+                           ++ [plan.fact-accepts(mo.id) for mo in files(m.modules) if dev-accepts(mo.path)]
+                           ++ [plan.fact-entry(e) for e in entries])
+} where changed = [mo.id for mo in files(m.modules) if (before.functions[mo.path] ?? "") != (now.functions[mo.path] ?? "")]
+
+fn id-list(ids: [Int]) -> Text = "[" ++ join([quote-text(m.modules[i].path) for i in sort i in ids by i], ", ") ++ "]"

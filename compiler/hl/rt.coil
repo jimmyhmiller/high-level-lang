@@ -23,6 +23,7 @@
 (import "coil.sync" :use [Mutex Condition])
 (import "coil.atomic" :as atomic)
 (import "coil.cc" :as cc)
+(import "coil.socket" :use [TcpListener TcpConnection])
 (import "coil.args" :as args)
 
 ;;; ---------------------------------------------------------------- workers
@@ -2734,3 +2735,169 @@
       (sleep (Duration :sec (/ ms 1000) :nsec (* (% ms 1000) 1000000)))
       (set! out (dep-changed-inputs!)))
     out))
+
+;; ---------------------------------------------------------------- serving
+
+;;; A development server: the files of one directory over HTTP, and at `/hmr` a stream of events
+;;; (server-sent events, which a browser's EventSource reads) that `broadcast!` writes to every
+;;; client listening. One thread accepts and answers; a stream stays open until a write to it fails.
+(defstruct Server
+  [(lock i64)
+   (ready bool)
+   (dir (slice u8))
+   (page (slice u8))
+   (port i64)
+   (listener TcpListener)
+   (clients (ArrayList TcpConnection))
+   (thread Thread)])
+
+(defn server [] (-> (ptr Server))
+  (primitive/alloc-static Server))
+
+;;; Serve `dir` on `port` of 127.0.0.1 (0: any free port), `page` answering `/` when the directory
+;;; has no index.html. Answers the port.
+(defn serve! [(port i64) (dir (slice u8)) (page (slice u8))] (-> i64)
+  (let [s (server)]
+    (when (.ready s) (panic "already serving on port {}" (.port s)))
+    (set! (.dir s) dir)
+    (set! (.page s) page)
+    (set! (.clients s) (ArrayList::new [TcpConnection] (malloc-allocator)))
+    (match (TcpListener::listen (malloc-allocator) (field s listener) "127.0.0.1" port true 64)
+      (Err [_] (panic "cannot listen on port {}" port))
+      (Ok [_] 0))
+    (set! (.port s)
+          (match (TcpListener::port (field s listener))
+            (Ok [p] p)
+            (Err [_] (panic "cannot learn the port being served"))))
+    (set! (.ready s) true)
+    (when (!= (Thread::spawn-configured (field s thread)
+                                        (fnptr-of server-loop)
+                                        (cast (ptr i8) 0)
+                                        (ThreadConfig :stack-size 8388608 :guard-size 0))
+              (: 0 i32))
+      (panic "could not start the server thread"))
+    (.port s)))
+
+(defn server-loop [(arg (ptr i8))] (-> (ptr i8))
+  (let [s (server)]
+    (while true
+      (let [(mut c) (TcpConnection :fd (: -1 i32) :closed true)]
+        (match (TcpListener::accept (field s listener) (cast (ptr TcpConnection) (mut c)))
+          (Ok [_] (answer-request! c))
+          (Err [_] 0))))
+    (cast (ptr i8) 0)))
+
+;;; Everything, or false when the client has gone.
+(defn send-all! [(c TcpConnection) (bytes (slice u8))] (-> bool)
+  (let [(mut conn) c
+        (mut off) 0
+        (mut ok) true]
+    (while (and ok (< off (len bytes)))
+      (match (TcpConnection::write (cast (ptr TcpConnection) (mut conn))
+                                   (cast (ptr i8) (primitive/index (data bytes) off))
+                                   (- (len bytes) off))
+        (Ok [n] (if (> n 0) (set! off (+ off n)) (set! ok false)))
+        (Err [_] (set! ok false))))
+    ok))
+
+(defn close-connection! [(c TcpConnection)] (-> void)
+  (let [(mut conn) c]
+    (TcpConnection::close! (cast (ptr TcpConnection) (mut conn)))
+    0))
+
+;;; The request's head, up to the blank line, or as much as came.
+(defn request-head [(c TcpConnection)] (-> (slice u8))
+  (let [(mut conn) c
+        (mut buf) (ArrayList::new [u8] (malloc-allocator))
+        chunk (match (alloc [u8] (malloc-allocator) 4096) (Some [b] b) (None [] (panic "no memory")))
+        (mut go) true]
+    (while go
+      (match (TcpConnection::read (cast (ptr TcpConnection) (mut conn)) (cast (ptr i8) (data chunk)) 4096)
+        (Ok [n]
+            (if (<= n 0)
+                (set! go false)
+                (do (for i (range 0 n) (push! (mut buf) (get chunk i)))
+                    (when (or (contains-text? (data-slice buf) "\r\n\r\n")
+                              (> (len buf) 65536))
+                      (set! go false)))))
+        (Err [_] (set! go false))))
+    (data-slice buf)))
+
+(defn data-slice [(b (ArrayList u8))] (-> (slice u8))
+  (slice b))
+
+(defn content-type [(path (slice u8))] (-> (slice u8))
+  (cond (ends-with path ".js") "text/javascript; charset=utf-8"
+        (ends-with path ".css") "text/css; charset=utf-8"
+        (ends-with path ".html") "text/html; charset=utf-8"
+        (ends-with path ".json") "application/json"
+        (ends-with path ".map") "application/json"
+        (ends-with path ".svg") "image/svg+xml"
+        (ends-with path ".png") "image/png"
+        :else "application/octet-stream"))
+
+(defn respond! [(c TcpConnection) (status (slice u8)) (kind (slice u8)) (body (slice u8))] (-> void)
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) "HTTP/1.1 ")
+    (push-str! (mut b) status)
+    (push-str! (mut b) "\r\nContent-Type: ")
+    (push-str! (mut b) kind)
+    (push-str! (mut b) "\r\nContent-Length: ")
+    (push-str! (mut b) (num-text (len body)))
+    (push-str! (mut b) "\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
+    (push-str! (mut b) body)
+    (send-all! c (finish! (mut b)))
+    (close-connection! c)))
+
+(defn answer-request! [(c TcpConnection)] (-> void)
+  (let [s (server)
+        head (request-head c)
+        line (text-before head "\r\n")
+        target (text-before (text-after line " ") " ")
+        path (text-before target "?")]
+    (cond (not (starts-with line "GET ")) (respond! c "405 Method Not Allowed" "text/plain" "GET only\n")
+          (= path "/hmr")
+            (when (send-all! c "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n: hello\n\n")
+              (spin-lock! (cast (ptr i64) s))
+              (push! (mut (.clients s)) c)
+              (spin-unlock! (cast (ptr i64) s))
+              0)
+          (contains-text? path "..") (respond! c "404 Not Found" "text/plain" "not found\n")
+          :else
+            (let [file (join (.dir s) (if (= path "/") "/index.html" path))]
+              (cond (file-exists-raw? file) (respond! c "200 OK" (content-type file) (read-all-raw file))
+                    (= path "/") (respond! c "200 OK" "text/html; charset=utf-8" (.page s))
+                    :else (respond! c "404 Not Found" "text/plain" "not found\n"))))
+    0))
+
+;;; An event to every client listening at `/hmr`; one that has gone is dropped.
+(defn broadcast! [(event (slice u8)) (text (slice u8))] (-> void)
+  (let [s (server)
+        (mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) "event: ")
+    (push-str! (mut b) event)
+    (push-str! (mut b) "\n")
+    (for l (split text "\n")
+      (push-str! (mut b) "data: ")
+      (push-str! (mut b) l)
+      (push-str! (mut b) "\n"))
+    (push-str! (mut b) "\n")
+    (let [message (finish! (mut b))
+          (mut kept) (ArrayList::new [TcpConnection] (malloc-allocator))]
+      (when (.ready s)
+        (spin-lock! (cast (ptr i64) s))
+        (for c (.clients s)
+          (if (send-all! c message)
+              (push! (mut kept) c)
+              (close-connection! c)))
+        (set! (.clients s) kept)
+        (spin-unlock! (cast (ptr i64) s)))
+      0)))
+
+;;; How many clients listen at `/hmr`.
+(defn listeners [] (-> i64)
+  (let [s (server)]
+    (if (.ready s)
+        (do (spin-lock! (cast (ptr i64) s))
+            (let [n (len (.clients s))] (spin-unlock! (cast (ptr i64) s)) n))
+        0)))

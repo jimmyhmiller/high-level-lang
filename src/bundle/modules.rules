@@ -67,8 +67,6 @@ const bundle-scope: Int = 0
 setting db: link.Db
 setting names: rt.Names
 
-# Files parsed ahead of the walk that links them, by path.
-setting ahead: {Text:Parsed}
 
 # How the build loads, given before it does.
 record Loading {
@@ -351,9 +349,7 @@ fn configured-path(spec: Text, importer: Text) -> Text? = match spec {
 
 # Where an import leads: resolve hooks first, then the project's paths, then the search. A worker
 # that parsed the importer ahead may have found the answer already.
-fn resolve-import(spec: Text, importer: Text) -> res.Resolved =
-  (first p in ahead[importer] for t in p.targets[spec]: res.Resolved(path: t, side-effects: res.side-effects-of(t)))
-  ?? resolved-now(spec, importer)
+fn resolve-import(spec: Text, importer: Text) -> res.Resolved = resolved-now(spec, importer)
 
 fn resolved-now(spec: Text, importer: Text) -> res.Resolved = match hook-path(wanted, importer) {
   some(p) => res.Resolved(path: p, side-effects: true)
@@ -963,42 +959,25 @@ fn ahead-target(spec: Text, importer: Text) -> Text? = match spec {
     where wanted = aliased(spec)
 }
 
-# Every file the entries can reach, parsed on many threads before the graph is made. Without hooks,
-# a worker can resolve what it parsed: a walk that never waits for a wave. With them, a wave at a
-# time: each wave's files are parsed at once, and their imports are the next wave. On one thread,
-# nothing: the graph parses each file as it reaches it.
-fn parsed-ahead(paths: [Text]) -> {Text:Parsed} = match loading.load-threads > 1, len(loading.on-load) + len(loading.on-resolve) {
-  false, _ => none-ahead()
-  true, 0 => walked-ahead(roots)
-  true, _ => {d.path: d for d in parsed-waves(roots, {p: true for p in roots})}
+# Every file the entries can reach, parsed on many threads before the graph is made, into memos the
+# graph then finds them in; how many. Without hooks, a worker can resolve what it parsed: a walk
+# that never waits for a wave. With them, a wave at a time: each wave's files are parsed at once,
+# and their imports are the next wave. On one thread, nothing: the graph parses each file as it
+# reaches it.
+fn parsed-ahead(paths: [Text]) -> Int = match loading.load-threads > 1, hooked?() {
+  false, _ => 0
+  true, false => len(parallel-walk(roots, visit-file, next-files, first-files, after-files, loading.load-threads))
+  true, true => len(parsed-waves(roots, {p: true for p in roots}))
 } where roots = [p for p in paths if ahead?(p) distinct p]
 
-fn none-ahead() -> {Text:Parsed} = {}
-
-fn walked-ahead(roots: [Text]) -> {Text:Parsed} = {d.path: with-resolved(d, resolved) for d in walked if d.role is Whole}
-  where walked = parallel-walk(roots, visit-file, next-files, first-files, after-files, loading.load-threads),
-        resolved = {r.path ++ "\n" ++ s: t for r in walked if r.role is Resolved for s in keys(r.targets) if let some(t) = r.targets[s]}
-
-# A file's targets, once those of its imports resolved as items of their own (see `first-files`) join it.
-fn with-resolved(p: Parsed, resolved: {Text:Text}) -> Parsed = match p {
-  _ if len(keys(p.targets)) > 0 or len(p.specs) <= resolve-alone => p
-  _ => p with { targets: {s: t for s in p.specs if let some(t) = resolved[p.path ++ "\n" ++ s]} }
-}
-
-# With hooks, which only this thread may call: a wave's files are parsed at once, and the files
-# their imports lead to that none has led to before are the next wave.
+# With hooks, which only this thread may call: a wave's texts are asked for here, its files parsed
+# at once, and the files their imports lead to that none has led to before are the next wave.
 fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] = match wave {
   [] => []
   _ => done ++ parsed-waves(next, {p: true for ps in [keys(seen), next] for p in ps})
-    where hooked = len(loading.on-load) > 0,
-          done = parallel-map([pending(p, hooked) for p in wave], parsed-file, loading.load-threads),
+    where texts = [hooked-text(p) for p in wave],
+          done = match len(texts) { _ => parallel-map(wave, parsed-hooked, loading.load-threads) },
           next = [t for d in done for spec in d.specs if let some(t) = ahead-target(spec, d.path) if ahead?(t) and not (t in seen) distinct t]
-}
-
-# A file to parse, its text read already when a load hook may supply it.
-fn pending(path: Text, hooked: Bool) -> Pending = match hooked {
-  true => Pending(path: path, text: module-text(source-of(path), path), ready: true)
-  false => Pending(path: path, text: "", ready: false)
 }
 
 # ---------------------------------------------------------------- the graph
@@ -1022,7 +1001,7 @@ memo fn loaded(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: tree0, analysis: a.analysis, scopes: a.scopes, specs: specs, calls: calls,
          leads: [lead(spec, path) for spec in specs],
          whole: [lead(spec, path).key for spec in required ++ [x for st in tree0.body.kids for x in wholly-imported(st)]])
-  where p = ahead[path] ?? parsed-alone(path),
+  where p = parsed-for-graph(path),
         tree0 = match p.analysed {
           true => p.tree
           false => transformed(p.tree)
@@ -1043,10 +1022,36 @@ memo fn loaded(path: Text) -> Loaded =
         required = found.requires,
         specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls
 
+# What loading made of a file, before the graph joins it to the others: on many threads, what the
+# walk ahead made of it, found again in the memos it filled (a big file put together from its
+# pieces once they are done); with load hooks, the wave's parse of the text a hook gave; on one
+# thread, a parse here.
+fn parsed-for-graph(path: Text) -> Parsed = match loading.load-threads > 1 and ahead?(path), hooked?() {
+  true, false => walked-file(path)
+  true, true => parsed-hooked(path)
+  false, _ => parsed-alone(path)
+}
+
+fn hooked?() -> Bool = len(loading.on-load) + len(loading.on-resolve) > 0
+
+fn walked-file(path: Text) -> Parsed = match visit-file(path) {
+  p if p.role is Split => match visit-file(path ++ "\nprepare") {
+    q if q.role is Prepare => visit-file(path ++ "\nrest")
+    q => q
+  }
+  p => p
+}
+
 # A file nothing parsed ahead, parsed and analysed on the thread that links, once for as long as
 # its text stays the same.
 memo fn parsed-alone(path: Text) -> Parsed =
   analysed-file(parsed-file(Pending(path: path, text: as-module(source-of(path), path), ready: true)))
+
+# With load hooks, which only the thread that links may call: the text a hook gives a file, asked
+# there, and its parse, which any thread may then make.
+memo fn hooked-text(path: Text) -> Text = module-text(source-of(path), path)
+
+memo fn parsed-hooked(path: Text) -> Parsed = parsed-file(Pending(path: path, text: hooked-text(path), ready: true))
 
 fn transformed(tree: Node) -> Node = transform(tree) where transform = loading.transform
 

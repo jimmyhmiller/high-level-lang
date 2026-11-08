@@ -376,6 +376,37 @@ itself when every `f(c)` is `c`. Minifying got 11–20% faster.
 Per core this bundler still does about twice esbuild's work: most of the rest is the number of
 passes over a tree, about a dozen to esbuild's three. Attribute grammars are how they become fewer.
 
+## Watching and hot module replacement
+
+`--watch` builds, writes, and builds again whenever an input the build read changes. A `memo fn`'s
+answer records what it was made from: the files it read (by content, so a write that changes
+nothing rebuilds nothing), the settings it read, and the other memo answers it used (`hl.rt`'s
+dependency graph, which the rules compiler feeds). A change kills only what depends on it, so an
+edit to one file parses and analyses that file again and nothing else. Tracking is opt-in: a
+one-shot build pays nothing for it. Inputs are polled every 100 ms, as esbuild's watch polls.
+
+`--hmr` watches too, writing a development format: no scope hoisting or renaming, each module a
+function registered with `hmr_runtime.js` by path, its imports read through live namespace objects
+(`hmr.attrs`, 170 lines without comments). `--serve=PORT` serves the output's directory and an
+event stream at `/hmr`, from a thread in `hl.rt`. After each rebuild the modules whose functions
+changed are sent; `hmr.facts` (Datalog, 4 rules) finds which modules run again, stopping at those
+that call `import.meta.hot.accept()`, and reloads when an entry that does not accept changed.
+`import.meta.hot.dispose` and `hot.data` carry state across a replacement.
+
+| App, one edit | First build | Rebuild (`--watch`) | Fresh process | Rebuild (`--hmr`) |
+|---|---|---|---|---|
+| datefns (305 modules) | 27 ms | 7 ms | 30 ms | 4–6 ms |
+| rx (225 modules) | 26 ms | 7 ms | 29 ms | |
+| zod (96 modules) | 58 ms | 28 ms | 64 ms | 4–5 ms |
+
+A production rebuild still links, names, emits and prints the whole program: that half is not
+incremental, and it is most of zod's 28 ms. The development format has no such half.
+`tools/watch-check.py` checks every rebuild byte for byte against a fresh process, across edits to
+a module, to the entry, a new file, a `package.json`, and a write that changes nothing.
+`tools/hmr-check.py` runs a served bundle in Node and checks updates, reloads, kept state and
+dispose data, and that all 15 test apps run the same in the development format as bundled.
+A build error in `--watch` still ends the process.
+
 ## What it does
 
 Module graph, Node resolution (`exports`, `main` fields, conditions, `sideEffects: false`),
@@ -402,7 +433,7 @@ resolve, load, transform and optimize hooks.
 
 Being explicit, because "everything esbuild does" is a lot:
 
-- **Not built:** watch and serve, CSS modules, CSS nesting and other CSS lowering, JavaScript
+- **Not built:** CSS modules, CSS nesting and other CSS lowering, JavaScript
   (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
   and inlining enum values across files.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside

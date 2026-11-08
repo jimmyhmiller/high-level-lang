@@ -21,6 +21,7 @@ use bundle.legal as legal
 use bundle.tsconfig as tsc
 use bundle.ascii as ascii
 use bundle.finish as fin
+use bundle.hmr as hmr
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -82,6 +83,10 @@ record Options {
   # `--watch`: build again whenever an input changes, looking every `watch-interval` milliseconds.
   watch: Bool,
   watch-interval: Int,
+  # `--hmr`: watching, each build in the development format, and what changed sent to the page;
+  # `--serve=PORT`: the output's directory served, with the page's event stream (-1: not served).
+  hmr: Bool,
+  serve-port: Int,
   sourcemap: Bool,
   defines: [DefineText],
   main-fields: [Text],
@@ -122,7 +127,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
   Options(entry: entry, entries: [entry], outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]",
           format: iife-format(), global-name: "",
-          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, watch: false, watch-interval: 100, sourcemap: false,
+          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, watch: false, watch-interval: 100, hmr: false, serve-port: -1, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
@@ -746,7 +751,12 @@ fn one-set-up(options: Options, watching: Bool) -> [Written] = match options.ent
 # Built and written, then built again each time an input a build read says something else. What
 # the build set up stays given, so memo answers made from files nothing changed are kept: only what
 # an edit reaches is computed again.
-fn rebuilding(o: Options, f: Format) -> [Written] {
+fn rebuilding(o: Options, f: Format) -> [Written] = match o.hmr {
+  true => dev-rebuilding(o)
+  false => plain-rebuilding(o, f)
+}
+
+fn plain-rebuilding(o: Options, f: Format) -> [Written] {
   var builds = 0
   while true {
     let start = now-us()
@@ -762,11 +772,60 @@ fn rebuilding(o: Options, f: Format) -> [Written] {
   []
 }
 
+# Hot module replacement: each build in the development format, written, and after the first what
+# changed sent to the page as an update, or a reload when nothing that changed can take one.
+fn dev-rebuilding(o: Options) -> [Written] {
+  let events = match o.serve-port {
+    port if port >= 0 => "http://127.0.0.1:" ++ int-text(served) ++ "/hmr"
+      where served = serve!(port, dir-of(o.outfile), "<!doctype html>\n<meta charset=\"utf-8\">\n<script src=\"/" ++ path-base(o.outfile) ++ "\"></script>\n")
+    _ => ""
+  }
+  if events != "" { print "[hmr] serving {} at {}", dir-of(o.outfile), text-before(events, "/hmr") }
+  var before = hmr.Dev(text: "", functions: {})
+  var builds = 0
+  while true {
+    let start = now-us()
+    let computed = memo-computed()
+    let step = with m.names = names-new() { dev-built(o, before, events) }
+    written([Written(path: o.outfile, text: step.dev.text, said: said-of(step.dev.text, o.outfile))])
+    builds = builds + 1
+    let took = now-us() - start
+    print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
+      memo-computed() - computed, inputs-watched()
+    if builds > 1 {
+      match step.sent {
+        some(sent) => {
+          broadcast!(sent.event, sent.text)
+          print "[hmr] {} to {} listening: {}", sent.event, listeners(), join(sent.changed, " ")
+        }
+        none => print "[hmr] no module changed"
+      }
+    }
+    before = step.dev
+    let changed = wait-for-changes!(o.watch-interval)
+    print "[watch] changed: {}", join(changed, " ")
+  }
+  []
+}
+
+# One development build, and what to send for it after `before`.
+record DevStep { dev: hmr.Dev, sent: hmr.Sent? }
+
+fn dev-built(o: Options, before: hmr.Dev, events: Text) -> DevStep =
+  match m.parsed-ahead([o.entry]) { _ => dev-graph-built(before, events, m.graph(include-text("runtime.js"), [o.entry])) }
+
+fn dev-graph-built(before: hmr.Dev, events: Text, g: m.Graph) -> DevStep =
+  with m.modules = g.modules, m.by-path = g.by-path, m.order = g.order, m.entries = g.entries, m.entry = g.entries[0] {
+    dev-step(before, hmr.dev-build(g.entries[0], events), g.entries)
+  }
+
+fn dev-step(before: hmr.Dev, now: hmr.Dev, entries: [Int]) -> DevStep = DevStep(dev: now, sent: hmr.update(before, now, entries))
+
 fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii)
 
 # A build once it is set up: load, link, name, and the rest.
 fn loaded-built(o: Options, f: Format) -> [Written] =
-  with m.ahead = timed(o.timing, "load: parse files ahead", m.parsed-ahead([o.entry])) {
+  match timed(o.timing, "load: parse files ahead", m.parsed-ahead([o.entry])) { _ =>
     graph-built(o, f, timed(o.timing, "load: resolve, scopes, the graph", m.graph(include-text("runtime.js"), [o.entry])))
   }
 
@@ -863,7 +922,7 @@ fn split-built(options: Options) -> [Written] = match options.outdir, options.fo
   _, false => panic "code splitting needs --format=esm"
   _, true => with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, esm-format()), e.emitting = emitting-of(o, esm-format()),
                   printing = printing-of(o), m.names = names-new() {
-      with m.ahead = m.parsed-ahead(o.entries) { split-graph(o, m.graph(include-text("runtime.js"), o.entries)) }
+      match m.parsed-ahead(o.entries) { _ => split-graph(o, m.graph(include-text("runtime.js"), o.entries)) }
     } where o = with-node-env(options)
 }
 
