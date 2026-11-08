@@ -1436,6 +1436,12 @@
     (push-str! (mut sb) b)
     (finish! (mut sb))))
 
+;;; `s` in memory of its own, kept however long whatever made `s` keeps its own.
+(defn copy-text [(s (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut sb) s)
+    (finish! (mut sb))))
+
 (defn parse-int [(s (slice u8))] (-> i64)
   (match (parse-num s)
     (Some [v] v)
@@ -2571,6 +2577,9 @@
    ;; A query site's relation and column; and the sites of each setting.
    (site-rels (ArrayList (slice u8)))
    (site-cols (ArrayList i64))
+   ;; A site that reads a map by Text: the keys it has read, numbered in turn.
+   (site-keys (ArrayList (ArrayList (slice u8))))
+   (site-key-ids (ArrayList (HashMap (slice u8) i64)))
    (setting-sites (HashMap (slice u8) (ArrayList i64)))
    ;; Numbered nodes, the elements read by index: leaves that only change and are read, so each
    ;; keeps just that, its site and its index, apart from the nodes with text. Their ids carry
@@ -2611,6 +2620,8 @@
         (set! (.site-suffixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-rels d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-cols d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.site-keys d) (ArrayList::new [(ArrayList (slice u8))] (malloc-allocator)))
+        (set! (.site-key-ids d) (ArrayList::new [(HashMap (slice u8) i64)] (malloc-allocator)))
         (set! (.setting-sites d) (HashMap::new [(slice u8) (ArrayList i64)] (malloc-allocator) (str/keyops)))
         (set! (.num-changed d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.num-heads d) (ArrayList::new [i64] (malloc-allocator)))
@@ -2691,9 +2702,11 @@
 (defn dep-node-text [(d (ptr Deps)) (id i64)] (-> (slice u8))
   (if (numbered? id)
       (let [n (- id (numbered-tag))
-            site (get (.num-sites d) n)]
+            site (get (.num-sites d) n)
+            index (get (.num-indexes d) n)
+            keys (get (.site-keys d) site)]
         (join (get (.sites d) site)
-              (join (num-text (get (.num-indexes d) n)) (get (.site-suffixes d) site))))
+              (join (if (< index (len keys)) (get keys index) (num-text index)) (get (.site-suffixes d) site))))
       (get (.texts d) id)))
 
 ;;; Dependencies are tracked from here on, which only a program that builds more than once needs.
@@ -2775,6 +2788,8 @@
             (push! (mut (.site-prefixes d)) prefix)
             (push! (mut (.site-suffixes d)) suffix)
             (push! (mut (.site-pages d)) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
+            (push! (mut (.site-keys d)) (ArrayList::new [(slice u8)] (malloc-allocator)))
+            (push! (mut (.site-key-ids d)) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
             ;; `.rel(_,_,` is a query by one column: the relation and which column.
             (let [open (name-end-at prefix 40)
                   query (and (> (len prefix) 0) (= (cast i64 (get prefix 0)) 46) (< open (len prefix)))]
@@ -2798,11 +2813,46 @@
 ;;; The same for any part of a setting named by one number between a fixed `prefix` and `suffix`:
 ;;; `@symbol-at(` 12 `)`, an accessor applied to it; `.live(` 7 `)`, a query by one column.
 (defn dep-note-numbered! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8)) (suffix (slice u8)) (index i64)] (-> void)
-  (let [site (dep-site! cache setting prefix suffix)
-        d (deps)
+  (if (and (>= index 0) (< index 4294967296))
+      (dep-note-at! (dep-site! cache setting prefix suffix) index)
+      ;; A number no site numbers by: the part's path, as text.
+      (dep-note-path! setting (join prefix (join (num-text index) suffix))))
+  0)
+
+;;; The same for a map by Text read at a key, `prefix` its path up to the key: the key numbered
+;;; by the site, which keeps its text for comparing the map's old and new values there.
+(defn dep-note-keyed! [(cache (ptr i64)) (setting (slice u8)) (prefix (slice u8)) (key (slice u8))] (-> void)
+  (let [site (dep-site! cache setting prefix "")
+        d (deps)]
+    (when (>= (dep-top d (worker-slot)) 0)
+      (deps-lock! d)
+      (let [index (match (get (get (.site-key-ids d) site) key)
+                    (Some [i] i)
+                    (None []
+                          (let [i (len (get (.site-keys d) site))
+                                kept (copy-text key)]
+                            (push! (mut (elem (mut (.site-keys d)) site)) kept)
+                            (set! (mut (elem (mut (.site-key-ids d)) site)) kept i)
+                            i)))]
+        (deps-unlock! d)
+        (dep-note-at! site index))))
+  0)
+
+;;; The keys a keyed site has numbered, by number.
+(defn site-keys [(site i64)] (-> (ArrayList (slice u8)))
+  (let [d (deps)
+        (mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (deps-lock! d)
+    (for k (get (.site-keys d) site) (push! (mut out) k))
+    (deps-unlock! d)
+    out))
+
+;;; Element `index` of `site` was read by the memo this worker is computing.
+(defn dep-note-at! [(site i64) (index i64)] (-> void)
+  (let [d (deps)
         slot (worker-slot)
         top (dep-top d slot)]
-    (when (and (>= top 0) (>= index 0) (< index 4294967296))
+    (when (>= top 0)
       (let [key (+ (* site 4294967296) index)]
         (when (< (int-get (mut (.elements (elem (mut (elem (mut (.stacks d)) slot)) top))) key) 0)
           (int-put! (mut (.elements (elem (mut (elem (mut (.stacks d)) slot)) top))) key 1)

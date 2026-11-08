@@ -4,7 +4,9 @@
 # new file the entry then imports, a write that changes nothing, a package.json, and putting the
 # entry back. After each, the rebuilt output must be byte for byte what a fresh process builds from
 # the same files; a write that changes nothing must not rebuild at all. Prints each rebuild's time
-# and how many memo answers it computed, beside the fresh build's time.
+# and how many memo answers it computed, beside the fresh build's time. Then names across modules:
+# top-level names that come and go, which a nested scope in another module must step around.
+# Every write is whole when the watcher sees it: made beside the tree and moved into place.
 #   usage: watch-check.py ESB [APP...] [-- FLAG...]     (APP: datefns, rx, zod, … as in tests/apps)
 import json, os, queue, re, shutil, subprocess, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,6 +19,7 @@ ESB, = guard.in_tests(args[:1])
 APPS = args[1:] or ["datefns", "rx", "zod"]
 TESTS = os.getcwd()
 WORK = os.path.abspath(os.path.join(TESTS, "..", "out", "watch-check"))
+STAGE = WORK + "-stage"
 BUILD = re.compile(r"\[watch\] build (\d+): ([\d.]+) ms, (\d+) memo answers computed, (\d+) inputs watched")
 
 def fresh(entry, out):
@@ -40,9 +43,12 @@ def package_json(module):
         d = os.path.dirname(d)
     return os.path.join(d, "package.json")
 
-def write(rel, text):
-    with open(os.path.join(WORK, rel), "w") as f:
+def write(rel, text, root=None):
+    os.makedirs(STAGE, exist_ok=True)
+    staged = os.path.join(STAGE, "next")
+    with open(staged, "w") as f:
         f.write(text)
+    os.replace(staged, os.path.join(root or WORK, rel))
 
 def read(rel):
     return open(os.path.join(WORK, rel)).read()
@@ -115,5 +121,50 @@ for app in APPS:
               + ("identical" if same else "DIFFERENT  FAIL"))
     os.killpg(proc.pid, 9)
     proc.wait()
+# Names across modules: a nested `y` in one module, and top-level names in another that take `y`,
+# then `y2`, then go, each making the nested names step around them, or come back.
+# The sources have a directory of their own, which nothing but the edits changes: the outputs go to
+# another, there before the watcher starts.
+CLASH = os.path.join(WORK, "clash")
+if os.path.exists(WORK):
+    shutil.rmtree(WORK)
+os.makedirs(os.path.join(CLASH, "src"))
+os.makedirs(os.path.join(CLASH, "out"))
+write("src/main.js", 'import { f } from "./a.js";\nconsole.log(f());\n', CLASH)
+write("src/a.js", "export function f() { let y = 1; let y2 = 5; return y + y2; }\n", CLASH)
+clash_steps = [
+    ("a top-level name a nested one had", "src/main.js", 'import { f } from "./a.js";\nvar y = 2;\nconsole.log(f(), y);\n'),
+    ("another, the nested one's next", "src/main.js", 'import { f } from "./a.js";\nvar y = 2; var y2 = 3;\nconsole.log(f(), y, y2);\n'),
+    ("a nested name more", "src/a.js", "export function f() { let y = 1; let y2 = 5; let y3 = 7; return y + y2 + y3; }\n"),
+    ("the top-level names gone", "src/main.js", 'import { f } from "./a.js";\nconsole.log(f());\n'),
+]
+lines = queue.Queue()
+proc = subprocess.Popen([ESB, "src/main.js", "--watch", "--outfile=out/out.js"] + flags, cwd=CLASH, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, start_new_session=True)
+threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout], daemon=True).start()
+def clash_build(wait):
+    end = time.time() + wait
+    while time.time() < end:
+        try:
+            line = lines.get(timeout=max(0.01, end - time.time()))
+        except queue.Empty:
+            break
+        if BUILD.search(line):
+            return True
+    return False
+def clash_same():
+    subprocess.run([ESB, "src/main.js", "--outfile=out/fresh.js"] + flags, cwd=CLASH, capture_output=True, timeout=120)
+    return open(os.path.join(CLASH, "out/out.js")).read() == open(os.path.join(CLASH, "out/fresh.js")).read()
+print("== names across modules")
+if not clash_build(30):
+    sys.exit("the watcher never finished its first build")
+for name, rel, text in clash_steps:
+    time.sleep(0.3)
+    write(rel, text, CLASH)
+    ok = clash_build(30) and clash_same()
+    failures += not ok
+    print(f"  {name:34} " + ("identical" if ok else "DIFFERENT  FAIL"))
+os.killpg(proc.pid, 9)
+proc.wait()
 print("all identical" if failures == 0 else f"{failures} failed")
 sys.exit(1 if failures else 0)

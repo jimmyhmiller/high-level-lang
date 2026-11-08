@@ -3,11 +3,18 @@
 # first of `x`, `x2`, `x3`… that nothing has; then each nested scope's symbols, clear of the top
 # level's names and of the scopes around them. What the build chose, emitting reads: `finals` has a
 # name for each symbol.
+#
+# Each module's part is its own: the names it reserves, the claims its statements make, and its
+# nested scopes' names, which read of the top level only whether each name they try is taken. So
+# an edit to a module names again that module, and the top level only when its claims change.
 rules bundle.naming over bundle.js
 use bundle.modules as m
 use bundle.analysis as an
 
 setting finals: [Text]
+
+# The names the top level took, and which symbol took each (-1: reserved).
+setting top-taken: {Text:Int}
 
 fn final-of(s: Int) -> Text = finals[s]
 
@@ -32,7 +39,10 @@ fn import-symbol?(s: Int) -> Bool = m.db.import-of(s, _, _) or m.db.ns-import(s,
 # Names nothing may take: reserved words, and the free names of the modules in the output, the
 # runtime's being `runtime-globals`.
 fn reserved(extra: [Text]) -> {Text:Int} =
-  {w: -1 for w in keywords ++ extra ++ [f for id in m.order if id != 0 and included?(id) for f in m.modules[id].free ++ eval-kept(m.modules[id])]}
+  {w: -1 for w in keywords ++ extra ++ [f for id in m.order if id != 0 and included?(id) for f in module-reserved(id)]}
+
+# The names a module keeps from everything else.
+memo fn module-reserved(id: Int) -> [Text] = m.modules[id].free ++ eval-kept(m.modules[id])
 
 # The names of a module's nested scopes that `eval` can reach: they keep them, and nothing else may
 # take them, as esbuild has it.
@@ -51,8 +61,11 @@ record Claim { symbol: Int, name: Text }
 
 # The top level's claims in order: each live statement's own symbols, and before them its imports
 # from CommonJS, which are rewritten to property reads but whose names stay taken, as in esbuild.
-fn claims() -> [Claim] =
-  [c for id in m.order if included?(id) for p in parts-of(id) if live?(p)
+fn claims() -> [Claim] = [c for id in m.order if included?(id) for c in module-claims(id)]
+
+# A module's claims, in its statements' order.
+memo fn module-claims(id: Int) -> [Claim] =
+  [c for p in parts-of(id) if live?(p)
      for c in cjs-claims(an.linked.part-stmt[p], m.modules[id])
               ++ [Claim(symbol: s, name: sym.symbol-at(m.table, s).name) for m.db.declares(p, ?s) if not import-symbol?(s)]]
 
@@ -65,16 +78,16 @@ fn cjs-claims(s: Node, mo: m.Module) -> [Claim] = match s {
 
 # `name`, or `name2`, `name3`… the first not taken: at the top level, in a scope around, or before
 # it in its own scope.
-fn unique(name: Text, top: {Text:Int}, frames: [{Text:Int}], frame: {Text:Int}) -> Text =
-  first i in 1.. if free?(spelled(name, i), top, frames, frame): spelled(name, i)
+fn unique(name: Text, frames: [{Text:Int}], frame: {Text:Int}) -> Text =
+  first i in 1.. if free?(spelled(name, i), frames, frame): spelled(name, i)
 
 fn spelled(name: Text, i: Int) -> Text = match i {
   1 => name
   _ => name ++ int-text(i)
 }
 
-fn free?(c: Text, top: {Text:Int}, frames: [{Text:Int}], frame: {Text:Int}) -> Bool =
-  not (c in top) and not (c in frame) and not (any f in frames: c in f)
+fn free?(c: Text, frames: [{Text:Int}], frame: {Text:Int}) -> Bool =
+  not (c in top-taken) and not (c in frame) and not (any f in frames: c in f)
 
 # A symbol and the name it has.
 record Named { symbol: Int, name: Text }
@@ -91,37 +104,49 @@ fn top-level(reserved: {Text:Int}) -> TopLevel =
 record Frame { taken: {Text:Int}, named: [Named] }
 
 # A scope code can reach by name at run time keeps its names.
-fn scope-frame(now: sym.Scope, top: {Text:Int}, frames: [{Text:Int}]) -> Frame = match now.dynamic {
+fn scope-frame(now: sym.Scope, frames: [{Text:Int}]) -> Frame = match now.dynamic {
   true => Frame(taken: {sym.symbol-at(m.table, s).name: s for s in now.symbols}, named: [])
   false => fold f = Frame(taken: {}, named: []) for s in now.symbols:
     (f with { taken: f.taken ++ {name: s}, named: f.named ++ [Named(symbol: s, name: name)] }
-     where name = unique(sym.symbol-at(m.table, s).name, top, frames, f.taken))
+     where name = unique(sym.symbol-at(m.table, s).name, frames, f.taken))
 }
 
 # A scope's names and those of every scope inside it, each clear of the scopes around it. A scope
 # that declares nothing adds nothing for those inside it to stay clear of.
-fn nested(scope: Int, top: {Text:Int}, frames: [{Text:Int}]) -> [Named] = match now.symbols {
-  [] => [nested(child, top, frames)... for child in now.children]
-  _ => frame.named ++ [nested(child, top, inside)... for child in now.children]
-    where frame = scope-frame(now, top, frames),
+fn nested(scope: Int, frames: [{Text:Int}]) -> [Named] = match now.symbols {
+  [] => [nested(child, frames)... for child in now.children]
+  _ => frame.named ++ [nested(child, inside)... for child in now.children]
+    where frame = scope-frame(now, frames),
           inside = frames ++ [frame.taken]
 } where now = sym.scope-at(m.table, scope)
 
 # A module's nested scopes: CommonJS's start with its wrapper's own (exports, module) scope.
-fn module-nested(mo: m.Module, top: {Text:Int}) -> [Named] = match mo.kind {
-  m.Cjs => nested(sym.scope-at(m.table, mo.root).parent, top, [])
-  _ => [nested(child, top, [])... for child in sym.scope-at(m.table, mo.root).children]
+fn module-nested(mo: m.Module) -> [Named] = match mo.kind {
+  m.Cjs => nested(sym.scope-at(m.table, mo.root).parent, [])
+  _ => [nested(child, [])... for child in sym.scope-at(m.table, mo.root).children]
 }
 
+# A module's nested scopes' names, clear of the names the top level took.
+memo fn module-named(id: Int) -> [Named] = module-nested(m.modules[id])
+
+# The top level's names. `lowering`: whether lowering may add the runtime's helpers once the names
+# are given.
+memo fn top-level-now(lowering: Bool) -> TopLevel =
+  top-level(reserved(match lowering or included?(0) {
+    true => runtime-globals
+    false => bundle-globals
+  }))
+
 # esbuild's names for every symbol: the top level's, then the nested scopes'.
-# `lowering`: whether lowering may add the runtime's helpers once the names are given.
-fn esbuild-names(lowering: Bool) -> [Text] =
-  updated(updated(own-names(), {x.symbol: x.name for x in top.names if x.symbol >= 0}),
-          {x.symbol: x.name for id in m.order if included?(id) for x in module-nested(m.modules[id], top.taken)})
-  where top = top-level(reserved(match lowering or included?(0) {
-          true => runtime-globals
-          false => bundle-globals
-        }))
+fn esbuild-names(lowering: Bool) -> [Text] {
+  let top = top-level-now(lowering)
+  top-taken = top.taken
+  updated(updated(own-names-now(sym.symbol-count(m.table)), {x.symbol: x.name for x in top.names if x.symbol >= 0}),
+          {x.symbol: x.name for id in m.order if included?(id) for x in module-named(id)})
+}
+
+# Each of the table's `count` symbols' own names.
+memo fn own-names-now(count: Int) -> [Text] = [sym.symbol-at(m.table, s).name for s in 0..count]
 
 fn own-names() -> [Text] = [sym.symbol-at(m.table, s).name for s in 0..sym.symbol-count(m.table)]
 
