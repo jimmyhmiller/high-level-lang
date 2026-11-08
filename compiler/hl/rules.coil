@@ -118,7 +118,9 @@
    (outs (ArrayList Out))  ; in a rewrite, the names whose rewritten form `.out` reads
    (sames (ArrayList (slice u8)))  ; the types `same-code` has made a comparison of, in this module
    (quiet i64)  ; inside a read of part of a setting, which notes that part and not the whole
-   (attrs-from (slice u8))])  ; the attribute grammar whose blocks are being read; "" for this one
+   (attrs-from (slice u8))  ; the attribute grammar whose blocks are being read; "" for this one
+   ;; The functions the program's pipelines keep, as `module/function` (see `read-keeps!`).
+   (keeps (ArrayList (slice u8)))])
 
 ;;; A name a rewrite's pattern binds to a child, or to its node, and that one's rewritten form.
 (defstruct Out [(sym (slice u8)) (code Code)])
@@ -427,8 +429,51 @@
 
 (defn parse-file [(k (mut Comp)) (src (slice u8)) (path (slice u8))] (-> g/Node)
   (match (g/parse-result src path 0)
-    (Ok [t] (with-accumulators (with-everywhere src path t)))
+    (Ok [t] (with-keeps (mut k) (with-accumulators (with-everywhere src path t)) src path))
     (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
+
+;; ---------------------------------------------------------------- what is kept
+
+;;; What a build keeps is no part of the code that does the work: a pipeline says it, by function
+;;; (`keep bundle.modules/loaded …`), and every function it names is compiled as one whose answers
+;;; are kept by their arguments (see `compile-memo!`), as `memo fn` would be. Every `.pipeline` file
+;;; of the program's manifest says what it keeps, and a module is compiled again when one changes.
+(defn read-keeps! [(k (mut Comp))] (-> void)
+  (for a (.table k)
+    (when (rt/ends-with (.module a) ".pipeline")
+      (let [path (cat3 (.base k) "/" (.module a))
+            tree (pipeline-tree path)]
+        (push! (mut (.depends k)) path)
+        (for d (.kids (get (.kids tree) 2))
+          (for n (.kids (get (.kids d) 0))
+            (push! (mut (.keeps k)) (.text n)))))))
+  0)
+
+;;; A module's tree with each function a pipeline keeps a kept one. A kept name it has no function of
+;;; is an error.
+(defn with-keeps [(k (mut Comp)) (tree g/Node) (src (slice u8)) (path (slice u8))] (-> g/Node)
+  (if (or (and (!= (.kind tree) (g/KFile)) (!= (.kind tree) (g/KAttrsFile))) (= (len (.keeps k)) 0))
+      tree
+      (let [module (.text (kid tree 0))
+            prefix (cat module "/")
+            (mut found) (text-list)
+            (mut decls) (ArrayList::new [g/Node] (malloc-allocator))]
+        (for d (list-kids (kid tree 2))
+          (if (and (= (.kind d) (g/KFn)) (has-text? (.keeps k) (cat prefix (.text (kid d 0)))))
+              (let [(mut kept) d]
+                (set! (.kind kept) (g/KMemoFn))
+                (push! (mut found) (.text (kid d 0)))
+                (push! (mut decls) kept))
+              (push! (mut decls) d)))
+        (for name (.keeps k)
+          (when (and (rt/starts-with name prefix)
+                     (not (has-text? found (subslice name (len prefix) (len name)))))
+            (dsl/fail-at path 1 1 (cat3 "a pipeline keeps " name (cat ", which is no function of " module)))))
+        (let [(mut out) tree
+              (mut list) (kid tree 2)]
+          (set! (.kids list) decls)
+          (set! (mut (.kids out)) 2 list)
+          out))))
 
 ;; ---------------------------------------------------------------- everywhere functions
 
@@ -9076,9 +9121,11 @@
             :outs (ArrayList::new [Out] (malloc-allocator))
             :sames (text-list)
             :quiet 0
-            :attrs-from "")
+            :attrs-from ""
+            :keeps (text-list))
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)
+    (read-keeps! (mut k))
     (load-prelude! (mut k))
     (let [tree (load-rules-file! (mut k) path src true)
           name (.text (kid tree 0))
