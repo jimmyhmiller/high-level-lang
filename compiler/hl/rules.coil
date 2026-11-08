@@ -115,6 +115,7 @@
    (givens (ArrayList Given))
    (outs (ArrayList Out))  ; in a rewrite, the names whose rewritten form `.out` reads
    (sames (ArrayList (slice u8)))  ; the types `same-code` has made a comparison of, in this module
+   (quiet i64)  ; inside a read of part of a setting, which notes that part and not the whole
    (attrs-from (slice u8))])  ; the attribute grammar whose blocks are being read; "" for this one
 
 ;;; A name a rewrite's pattern binds to a child, or to its node, and that one's rewritten form.
@@ -1478,9 +1479,12 @@
                                                  (panic ~(cat3 "the input "
                                                                (.name x)
                                                                " was read where nothing gave it a value")))
-                                               ;; A memo computing now is made from it.
-                                               (when (rt/dep-in-frame?)
-                                                 (rt/dep-note-literal! ~(cat4 "s:" module "." (.name x))))
+                                               ;; A memo computing now is made from it, unless
+                                               ;; only part of it is read, which notes that part.
+                                               ~(if (> (.quiet k) 0)
+                                                    `0
+                                                    `(when (rt/dep-in-frame?)
+                                                       (rt/dep-note-literal! ~(cat4 "s:" module "." (.name x)))))
                                                ~(sym st)))))
 
 (defn add-global! [(k (mut Comp))
@@ -4943,6 +4947,179 @@
         (clauses-code (mut k) cs opened inner))))
 
 (defn expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
+  (match (part-read (mut k) n want)
+    (Some [read] read)
+    (None [] (plain-expr (mut k) n want))))
+
+;;; A read of part of a setting: the setting, its module, and the fields read through, from the
+;;; outside in. `an.linked.wrapped` is `linked` of `bundle.analysis` through `wrapped`.
+(defstruct SettingPart [(module (slice u8)) (x Global) (fields (ArrayList (slice u8)))])
+
+(defn setting-part [(k (mut Comp)) (e g/Node)] (-> (Option SettingPart))
+  (match (.kind e)
+    (g/KGroup [] (setting-part (mut k) (kid e 0)))
+    (g/KName []
+             (match (find-local (mut k) (.text e))
+               (Some [_] (None [SettingPart]))
+               (None []
+                     (match (find-global (self-mod (mut k)) (.text e))
+                       (Some [x]
+                             (if (= (.attr x) 5)
+                                 (Some (SettingPart :module (.self k) :x x :fields (text-list)))
+                                 (None [SettingPart])))
+                       (None [] (None [SettingPart]))))))
+    (g/KFieldE []
+               (match (module-prefix (mut k) (kid e 0))
+                 (Some [module]
+                       (match (find-global (mod-at (mut k) module) (.text (kid e 1)))
+                         (Some [x]
+                               (if (= (.attr x) 5)
+                                   (Some (SettingPart :module module :x x :fields (text-list)))
+                                   (None [SettingPart])))
+                         (None [] (None [SettingPart]))))
+                 (None []
+                       (match (setting-part (mut k) (kid e 0))
+                         (Some [p]
+                               (let [(mut fields) (.fields p)]
+                                 (push! (mut fields) (.text (kid e 1)))
+                                 (Some (SettingPart :module (.module p) :x (.x p) :fields fields))))
+                         (None [] (None [SettingPart]))))))
+    (_ (None [SettingPart]))))
+
+(defn fields-path [(fields (ArrayList (slice u8)))] (-> (slice u8))
+  (let [(mut out) ""]
+    (for f fields (set! out (cat3 out "." f)))
+    out))
+
+;;; While dependencies are tracked, a memo that reads a setting's field (`linked.wrapped`) or one
+;;; element of it (`modules[id]`, `linked.cjs-imports[s]`) is made from that part only: binding the
+;;; setting again changes only what differs (see `setting-changed-code`).
+(defn part-read [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> (Option TE))
+  (if (> (.quiet k) 0)
+      (None [TE])
+      (match (.kind n)
+        (g/KFieldE []
+                   (match (setting-part (mut k) n)
+                     (Some [p]
+                           (if (= (len (.fields p)) 0)
+                               (None [TE])
+                               (let [node (cat4 "s:" (.module p) "." (.name (.x p)))
+                                     path (fields-path (.fields p))
+                                     v (fresh (mut k) "part")]
+                                 (set! (.quiet k) (+ (.quiet k) 1))
+                                 (let [read (plain-expr (mut k) n want)]
+                                   (set! (.quiet k) (- (.quiet k) 1))
+                                   (Some (te `(let [~(sym v) ~(.code read)]
+                                                (when (rt/dep-in-frame?) (rt/dep-note-path! ~node ~path))
+                                                ~(sym v))
+                                             (.ty read)))))))
+                     (None [] (None [TE]))))
+        (g/KIndex []
+                  (match (setting-part (mut k) (kid n 0))
+                    (Some [p]
+                          (let [node (cat4 "s:" (.module p) "." (.name (.x p)))
+                                path (cat (fields-path (.fields p)) "#")
+                                kv (fresh (mut k) "key")]
+                            (set! (.quiet k) (+ (.quiet k) 1))
+                            (let [b (plain-expr (mut k) (kid n 0) "")
+                                  t (.ty b)]
+                              (set! (.quiet k) (- (.quiet k) 1))
+                              (cond (list? t)
+                                      (let [i (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")]
+                                        (Some (te `(let [~(sym kv) ~(.code i)]
+                                                     (when (rt/dep-in-frame?)
+                                                       (rt/dep-note-path! ~node (rt/join ~path (rt/num-text ~(sym kv)))))
+                                                     (get ~(.code b) ~(sym kv)))
+                                                  (elem-of t))))
+                                    (and (map? t) (or (= (map-key t) "Int") (= (map-key t) "Text")))
+                                      (let [i (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) (map-key t)) (map-key t))]
+                                        (Some (te `(let [~(sym kv) ~(.code i)]
+                                                     (when (rt/dep-in-frame?)
+                                                       (rt/dep-note-path! ~node
+                                                                          (rt/join ~path ~(if (= (map-key t) "Int")
+                                                                                              `(rt/num-text ~(sym kv))
+                                                                                              (sym kv)))))
+                                                     (get ~(.code b) ~(sym kv)))
+                                                  (opt-type (map-val t)))))
+                                    :else (None [TE])))))
+                    (None [] (None [TE]))))
+        (_ (None [TE])))))
+
+;;; What binding setting `name` of `module`, of type `ty`, from `old` to `new` changes. While
+;;; dependencies are tracked: each part of it some memo read that is not the same in both, and the
+;;; whole. Otherwise every memo answer of the module's starts over.
+(defn setting-changed-code [(k (mut Comp)) (module (slice u8)) (name (slice u8)) (ty (slice u8)) (old Code) (new Code)]
+  (-> Code)
+  (let [node (cat4 "s:" module "." name)
+        o (fresh (mut k) "old")
+        n (fresh (mut k) "new")
+        untracked
+          (match (find-func (mod-at (mut k) module) "forget-memos!")
+            (Some [_] `(~(sym (qualified (mut k) module "forget-memos!"))))
+            (None [] `0))]
+    `(if (rt/dep-tracking?)
+         (let [~(sym o) ~old
+               ~(sym n) ~new]
+           (for path (rt/dep-paths ~node)
+             (when (~(diff-helper (mut k) ty) ~(sym o) ~(sym n) path)
+               (rt/dep-changed! (rt/join ~node path))))
+           (rt/dep-changed! ~node))
+         ~untracked)))
+
+;;; The helper saying whether two values of a type differ at a path: `.field` into a record, `#key`
+;;; into a list or map, nothing for the whole. A path it cannot follow differs.
+(defn diff-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (let [name (cat "diff" (subslice (same-name t) 4 (len (same-name t))))
+        ty (coil-type (mut k) t)]
+    (unless (has-text? (.sames k) name)
+      (push! (mut (.sames k)) name)
+      (let [body
+              (cond (opt? t) `true
+                    (list? t)
+                      `(if (!= (cast i64 (get path 0)) 35)
+                           true
+                           (let [i (rt/parse-int (subslice path 1 (len path)))
+                                 in-a (< i (len a))
+                                 in-b (< i (len b))]
+                             (if (and in-a in-b)
+                                 (not ~(same-code (mut k) (elem-of t) `(get a i) `(get b i)))
+                                 (!= in-a in-b))))
+                    (and (map? t) (or (= (map-key t) "Int") (= (map-key t) "Text")))
+                      `(if (!= (cast i64 (get path 0)) 35)
+                           true
+                           (let [text (subslice path 1 (len path))
+                                 key ~(if (= (map-key t) "Int") `(rt/parse-int text) `text)]
+                             (not ~(same-code (mut k) (opt-type (map-val t)) `(get a key) `(get b key)))))
+                    (and (not (opt? t)) (not (map? t)) (not (fn? t)) (not (list? t))
+                         (> (len (type-module t)) 0)
+                         (is-some? (find-rec (mod-at (mut k) (type-module t)) (type-name t))))
+                      (let [r (match (find-rec (mod-at (mut k) (type-module t)) (type-name t))
+                                (Some [r] r)
+                                (None [] (panic "rules: no record {}" t)))
+                            (mut arms) (primitive/code-list-new)]
+                        (for f (.fields r)
+                          (push! (mut arms) `(= field ~(.name f)))
+                          (push! (mut arms)
+                                 `(~(diff-helper (mut k) (.ty f))
+                                    (~(primitive/code-symbol "." (.name f)) a)
+                                    (~(primitive/code-symbol "." (.name f)) b)
+                                    more)))
+                        `(if (!= (cast i64 (get path 0)) 46)
+                             true
+                             (let [rest (subslice path 1 (len path))
+                                   cut (rt/name-end rest)
+                                   field (subslice rest 0 cut)
+                                   more (subslice rest cut (len rest))]
+                               (cond ~@arms :else true))))
+                    :else `true)]
+        (push! (mut (.aux k))
+               `(defn ~(sym name) [(a ~ty) (b ~ty) (path (slice u8))] (-> bool)
+                  (if (= (len path) 0)
+                      (not ~(same-code (mut k) t `a `b))
+                      ~body)))))
+    (sym name)))
+
+(defn plain-expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
   (match (.kind n)
     (g/KInt [] (te `~(rt/parse-int (.text n)) "Int"))
     (g/KStr [] (te `~(str-literal n) "Text"))
@@ -5723,21 +5900,9 @@
                                                     (kid init 1)
                                                     (.ty x))
                                               (.ty x))
-                                    ;; Memo answers made from the value it had are dead, now and after:
-                                    ;; while dependencies are tracked, exactly those; otherwise every
-                                    ;; answer of the module's.
-                                    changed `(rt/dep-changed! ~(cat4 "s:" module "." name))
-                                    forget
-                                      (match (find-func owner "forget-memos!")
-                                        (Some [_]
-                                              `(if (rt/dep-tracking?)
-                                                   ~changed
-                                                   ~(if (> dot 0)
-                                                        `(~(sym (qualified (mut k)
-                                                                           module
-                                                                           "forget-memos!")))
-                                                        `(forget-memos!))))
-                                        (None [] changed))]
+                                    ;; Memo answers made from the value it had are dead, now and after.
+                                    changed-in (setting-changed-code (mut k) module name (.ty x) (sym saved) field)
+                                    changed-out (setting-changed-code (mut k) module name (.ty x) field (sym saved))]
                                 (push! (mut saves) (sym saved))
                                 (push! (mut saves) field)
                                 (if (= (.attr x) 5)
@@ -5748,12 +5913,12 @@
                                              `(set! ~field ~(.code v)))
                                       (push! (mut sets)
                                              `(set! ~bound (+ ~bound 1)))
-                                      (push! (mut sets) forget)
+                                      (push! (mut sets) changed-in)
+                                      (push! (mut restores) changed-out)
                                       (push! (mut restores)
                                              `(set! ~field ~(sym saved)))
                                       (push! (mut restores)
-                                             `(set! ~bound (- ~bound 1)))
-                                      (push! (mut restores) forget))
+                                             `(set! ~bound (- ~bound 1))))
                                     (do
                                       (push! (mut sets)
                                              `(set! ~field ~(.code v)))
@@ -6067,7 +6232,24 @@
                         (expr (mut k) (kid s 1) (.ty p))
                         (.ty p))]
           (check-assignable! (mut k) target)
-          (te `(set! ~(.code p) ~(.code v)) "Void")))))
+          (match (setting-part (mut k) target)
+            ;; A setting given a new value for good, as a cell is: what memos read of the old value
+            ;; that differs in the new is changed, and the setting has a value from here on.
+            (Some [sp]
+                  (if (> (len (.fields sp)) 0)
+                      (die (mut k) target "a setting is given a whole new value, not part of one")
+                      (let [old (fresh (mut k) "was")
+                            storage (if (= (.module sp) (.self k))
+                                        (storage-call (mut k) (.x sp))
+                                        (storage-of (mut k) (.module sp) (.x sp)))
+                            bound `(~(primitive/code-symbol "." (bound-field (.name (.x sp)))) ~storage)]
+                        (te `(let [~(sym old) ~(.code p)]
+                               (set! ~(.code p) ~(.code v))
+                               (when (= ~bound 0) (set! ~bound 1))
+                               ~(setting-changed-code (mut k) (.module sp) (.name (.x sp)) (.ty (.x sp)) (sym old) (.code p))
+                               0)
+                            "Void"))))
+            (None [] (te `(set! ~(.code p) ~(.code v)) "Void")))))))
 
 (defn plain-append [(k (mut Comp)) (s g/Node)] (-> TE)
   (let [p (place (mut k) (kid s 0))
@@ -7522,6 +7704,7 @@
                (Some [~(sym x)] (match ~b (Some [~(sym y)] ~(same-code (mut k) (opt-of t) (sym x) (sym y))) (None [] false)))
                (None [] (match ~b (Some [_] false) (None [] true)))))
         (or (list? t) (map? t)) `(~(same-helper (mut k) t) ~a ~b)
+        (< (mod-index (mut k) (type-module t)) 0) (panic "rules: cannot compare values of type {}" t)
         :else
           (let [mo (mod-at (mut k) (type-module t))]
             (cond (and (= (.sort mo) (SGrammar)) (= (type-name t) "Node"))
@@ -7540,7 +7723,8 @@
       (let [c (get t i)]
         (push-str! (mut b)
                    (cond (= c #\[) "L" (= c #\]) "E" (= c #\{) "M" (= c #\}) "N" (= c #\:) "C" (= c #\?) "O"
-                         (= c #\.) "_" (= c #\,) "S" (= c #\-) "h"
+                         (= c #\.) "_" (= c #\,) "S" (= c #\-) "h" (= c #\() "P" (= c #\)) "Q"
+                         (= c #\>) "G" (= c #\space) "_"
                          :else (subslice t i (+ i 1))))))
     (finish! (mut b))))
 
@@ -7849,6 +8033,7 @@
             :givens (ArrayList::new [Given] (malloc-allocator))
             :outs (ArrayList::new [Out] (malloc-allocator))
             :sames (text-list)
+            :quiet 0
             :attrs-from "")
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)
