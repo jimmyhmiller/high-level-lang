@@ -237,11 +237,14 @@ fn program-plus(p: Node, s: Node) -> Node = p with { body: List(p.body.kids ++ [
 
 # An entry that is itself wrapped only runs if something calls it. A format that exports the entry
 # calls CommonJS for the value it exports.
-fn run-entry(p: Node, f: Format) -> Node = match m.modules[m.entry] {
-  m.Module(kind: m.Cjs, ...) if f.exports != "" => p
-  m.Module(kind: m.Cjs, ...) as mo => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(an.require-sym(mo))
-  mo if an.wrapped?(mo) => program-plus(p, stmt`$call_me();`) where call-me = e.final-of(an.init-sym(mo))
-  _ => p
+fn run-entry(p: Node, f: Format) -> Node = fold whole = p for s in entry-calls(f): program-plus(program-plus(whole, Flag()), s)
+
+# The call that runs the entry, when it must be called: its own group, after the modules'.
+fn entry-calls(f: Format) -> [Node] = match m.modules[m.entry] {
+  m.Module(kind: m.Cjs, ...) if f.exports != "" => []
+  m.Module(kind: m.Cjs, ...) as mo => [stmt`$call_me();`] where call-me = e.final-of(an.require-sym(mo))
+  mo if an.wrapped?(mo) => [stmt`$call_me();`] where call-me = e.final-of(an.init-sym(mo))
+  _ => []
 }
 
 # The entry as a format exports it: an ES module's namespace made CommonJS, or what running a
@@ -285,6 +288,8 @@ fn printed(o: Options, p: Node, prefix: Text, suffix: Text) -> Printed =
 # its neighbour only when it is an expression, a `var`, `let` or `const`, or an `if`.
 fn closed?(s: Node) -> Bool = match s {
   FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | ClassDecl(...) => true
+  # Where one group of the output ends: nothing joins across it (see `e.groups`).
+  Flag() => true
   _ => false
 }
 
@@ -565,7 +570,10 @@ fn body-text(bodies: [Rendered], k: Int) -> Text = match k {
 
 # Rendered pieces one after another, a `;` between two where the first left a statement open, and
 # each piece's marks moved by where it starts.
-fn pieces-joined(o: Options, pieces: [Rendered]) -> Rendered =
+# A piece with no text is no piece: it leaves open what the one before it left open.
+fn pieces-joined(o: Options, all: [Rendered]) -> Rendered = some-pieces-joined(o, [p for p in all if len(p.text) > 0])
+
+fn some-pieces-joined(o: Options, pieces: [Rendered]) -> Rendered =
   Rendered(text: join([gaps[i] ++ pieces[i].text for i in 0..len(pieces)], ""),
            marks: [Mark(out: mk.out + ends[i] - len(pieces[i].text), src: mk.src) for i in 0..len(pieces) for mk in pieces[i].marks],
            open: len(pieces) > 0 and last(pieces).open)
@@ -929,6 +937,7 @@ fn loaded-built(o: Options, f: Format) -> [Written] =
 # value for good, so the next build compares its own with it part by part, and what reads a part
 # that stayed the same stays as it was.
 fn graph-built(o: Options, f: Format, g: m.Graph) -> [Written] {
+  if not tracking?() { m.bodies = m.bodies-made(g) }
   m.modules = g.modules
   m.by-path = g.by-path
   m.order = g.order
@@ -967,17 +976,9 @@ fn named-built(o: Options, f: Format) -> [Written] =
   beside(o.outfile ++ ".LEGAL.txt", notes.file) ++ with-map(o, o.outfile, full, full, len(head) + out0.base, out0.marks)
   ++ [sheet-written(css-out, b)... for b in css]
   ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
-  where emission = e.program(),
-        emitted = timed(o.timing, "emit: rewrite identifiers", run-entry(emission.tree, f)),
-        fused = fusable?(o) and not incremental?(o),
-        p = timed(o.timing, "minify rules", match fused, o.minify-syntax {
-          true, _ => emitted
-          false, true => for-target(o, optimized(o, emitted))
-          false, false => for-target(o, folded(o, emitted))
-        }),
-        out0 = match fused {
-          true => finished-output(o, f, p)
-          false => wrap-format(o, f, p)
+  where out0 = match grouped?(o) {
+          true => grouped-output(o, f)
+          false => flat-output(o, f)
         },
         # The banner comes first, ahead of everything the map describes.
         head = match o.banner { "" => ""  b => b ++ "\n" },
@@ -988,6 +989,59 @@ fn named-built(o: Options, f: Format) -> [Written] =
         css-out = with-extension(o.outfile, ".css"),
         css = [cssb.bundle(sheets, css-out, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
                for s in [sheets] if len(s) > 0]
+
+# The output made from the whole program at once.
+fn flat-output(o: Options, f: Format) -> Printed = match fused {
+  true => finished-output(o, f, p)
+  false => wrap-format(o, f, p)
+} where emission = e.program(),
+        emitted = timed(o.timing, "emit: rewrite identifiers", run-entry(emission.tree, f)),
+        fused = fusable?(o) and not incremental?(o),
+        p = timed(o.timing, "minify rules", match fused, o.minify-syntax {
+          true, _ => emitted
+          false, true => for-target(o, optimized(o, emitted))
+          false, false => for-target(o, folded(o, emitted))
+        })
+
+# While building again, with the bundler's own optimiser and nothing to lower, the output is made
+# group by group (see `e.groups`), each group's text an answer kept by its units: an edit to one
+# module makes its groups again, and the others' texts are read back, not their statements.
+fn grouped?(o: Options) -> Bool = incremental?(o) and not o.has-optimize and o.target >= lower.no-lowering
+
+fn grouped-output(o: Options, f: Format) -> Printed =
+  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
+  where exports = export-statements(f),
+        # Bodies up to date before any group made again reads them.
+        all = pieces-joined(o, [group-output(g.units, g.namespace) for g in match [m.refresh-body(id) for id in m.order] { _ => e.groups() }]
+                               ++ [group-rendered(o, entry-calls(f))]
+                               ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
+
+memo fn group-output(units: [e.Unit], namespace: Bool) -> Rendered =
+  group-rendered(output-options(), e.group-made(e.Group(units: units, namespace: namespace)))
+
+# Of the build's options, what a group's text is made by, each read by itself, so that a run with
+# other options otherwise, such as one that watches after one that did not, keeps the groups' texts.
+fn output-options() -> Options =
+  options-new("", "") with { minify-syntax: building.options.minify-syntax, drop-console: building.options.drop-console,
+                             drop-debugger: building.options.drop-debugger, charset-ascii: building.options.charset-ascii,
+                             pretty: building.options.pretty, sourcemap: building.options.sourcemap }
+
+# Statements as the output has them: minified or folded, what is dropped dropped, made ASCII, and
+# printed. A group is a module's, the finest a change to the output is followed, as Turbopack's is.
+fn group-rendered(o: Options, stmts: [Node]) -> Rendered = js.render-tracked(made, o.pretty, o.sourcemap)
+  where p = program-of(None(), stmts),
+        steps = match o.minify-syntax {
+          true => default-optimize(p)
+          false => fold.run(p)
+        },
+        dropped = match o.drop-console or o.drop-debugger {
+          true => without-dropped(o, steps)
+          false => steps
+        },
+        made = match o.charset-ascii {
+          true => fin.ascii-only(dropped)
+          false => dropped
+        }
 
 # ---------------------------------------------------------------- code splitting
 
@@ -1040,7 +1094,7 @@ fn split-built(options: Options) -> [Written] = match options.outdir, options.fo
 
 # A split build once its modules are known.
 fn split-graph(o: Options, g: m.Graph) -> [Written] =
-  with m.modules = g.modules, m.by-path = g.by-path, m.order = g.order, m.entries = g.entries, m.entry = g.entries[0] {
+  with m.bodies = m.bodies-made(g), m.modules = g.modules, m.by-path = g.by-path, m.order = g.order, m.entries = g.entries, m.entry = g.entries[0] {
     linked-split(o, g)
   }
 

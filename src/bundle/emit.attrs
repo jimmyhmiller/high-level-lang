@@ -25,7 +25,9 @@ setting chunk-paths: {Int:Text}
 fn chunk-path(root: Int) -> Text =
   chunk-paths[root] ?? panic "{} starts no chunk in this build", m.modules[root].path
 
-context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
+context here: m.Module = m.blank-module(-1, "", m.External, -1)
+# The body of the module `here` is: what it is made of.
+context body: m.Body = m.empty-body()
 
 fn import-symbol?(s: Int) -> Bool = nm.import-symbol?(s)
 
@@ -54,7 +56,7 @@ fn helper-name(name: Text) -> Text = final-of(an.helper(name))
 fn void-zero() -> Node = exp`void 0`
 
 # The CommonJS property this name reads, whether imported here or re-exported to here.
-fn cjs-import-of(leaf: Node) -> an.CjsImport? = match m.symbol-of(here, leaf.lo) {
+fn cjs-import-of(leaf: Node) -> an.CjsImport? = match m.symbol-in(body, here, leaf.lo) {
   some(s) => match an.linked.cjs-imports[s] {
     none if an.linked.any-reexport => an.linked.cjs-imports[target-of(s)]
     found => found
@@ -81,7 +83,7 @@ fn symbol-read(s: Int) -> Node = match an.linked.cjs-imports[t] {
 fn namespace-property(target: Int, name: Text) -> Node = Member(Ident(final-of(an.ns-sym(m.modules[target]))), PropName(name))
 
 # `ns.name` when `ns` is `import * as` of an ES module: the export itself.
-fn namespace-read(n: Node) -> Node? = match an.namespace-of(here, n.object) {
+fn namespace-read(n: Node) -> Node? = match an.namespace-of(body, here, n.object) {
   none => none
   some(target) => match exported(target, n.property.text) {
     some(s) => some(symbol-read(s))
@@ -147,7 +149,7 @@ on FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncE
   | AsyncGenMethod(...) | Getter(...) | Setter(...) | StaticBlock(...) | ClassBody(...) { kids.depth = depth + 1 }
 
 rewrite Ident(x) as n => final-ident(n, x)
-rewrite BindName(_) as n => match m.symbol-of(here, n.lo) {
+rewrite BindName(_) as n => match m.symbol-in(body, here, n.lo) {
   some(s) => BindName(final-of(s)) with { lo: n.lo, hi: n.hi }
   none => n
 }
@@ -159,7 +161,7 @@ rewrite Shorthand(old) => Prop(PropName(old.text), old.out)
 rewrite PatShort(old, init) => short-pattern(old, old.out, init.out)
 rewrite CallExpr(callee, _) as n => final-call(n, callee, n.out)
 # `require` of a wrapped ES module whose value goes unused only runs it, as esbuild writes it.
-rewrite ExprStmt(CallExpr(...) as call) as n => match an.known-require-target(here, call) {
+rewrite ExprStmt(CallExpr(...) as call) as n => match an.known-require-target(body, here, call) {
   some(t) if m.modules[t].kind == Esm and an.wrapped?(m.modules[t]) => stmt`$init();` where init = final-of(an.init-sym(m.modules[t]))
   _ => n.out
 }
@@ -182,7 +184,7 @@ fn rewritten(s: Node) -> Node = run(s).tree
 
 fn final-ident(n: Node, x: Text) -> Node = match cjs-import-of(n) {
   some(ci) => cjs-read(ci)
-  none => match m.symbol-of(here, n.lo) {
+  none => match m.symbol-in(body, here, n.lo) {
     some(s) => dynamic-read(s) ?? script-read(s) ?? Ident(final-of(target-of(s))) with { lo: n.lo, hi: n.hi }
     none if x in here.helpers => Ident(helper-name(x)) with { lo: n.lo, hi: n.hi }
     # A free `undefined` is the shorter `void 0` under --minify-syntax.
@@ -198,7 +200,7 @@ fn short-pattern(old: Node, new: Node, init: Node) -> Node = match new.text {
 
 # `require("x")` becomes `require_x()`; a call of a CommonJS import keeps `this` undefined by
 # reading the function first: `(0, import_x.f)(…)`. `out` is the call with its parts rewritten.
-fn final-call(n: Node, callee: Node, out: Node) -> Node = match an.known-require-target(here, n) {
+fn final-call(n: Node, callee: Node, out: Node) -> Node = match an.known-require-target(body, here, n) {
   some(target) => required(m.modules[target], out)
   none => CallExpr(wrapped, out.args) with { lo: wrapped.lo, hi: out.args.hi }
     where wrapped = callee-read(callee, out.callee)
@@ -335,7 +337,7 @@ fn import-spec(imported: Node, local: Text) -> Node = match imported {
 
 fn wanted?(b: Node) -> Bool = not emitting.drop-unused-imports or (any m.db.mentions(?p, binding-sym(b)): live?(p))
 
-fn binding-sym(b: Node) -> Int = m.symbol-of(here, b.lo) ?? panic "{}: no symbol for import {}", here.path, b.text
+fn binding-sym(b: Node) -> Int = m.symbol-in(body, here, b.lo) ?? panic "{}: no symbol for import {}", here.path, b.text
 
 fn local-of(b: Node) -> Node = BindName(final-of(binding-sym(b)))
 
@@ -365,13 +367,13 @@ fn param-of(s: Int) -> Node = Param(BindName(final-of(s)), None())
 # `var require_x = __commonJS({ "path"(exports, module) { … } });`, leaving out parameters nothing
 # uses, as esbuild does.
 fn cjs-part() -> Node = match an.linking.compact {
-  true => stmt`var $name = $wrap(($$params) => { $$body });`
-  false => stmt`var $name = $wrap({ $path($$params) { $$body } });`
+  true => stmt`var $name = $wrap(($$params) => { $$kept });`
+  false => stmt`var $name = $wrap({ $path($$params) { $$kept } });`
 } where e = wrapper-param("exports"),
         mo = wrapper-param("module"),
         # Its statements that stay, after the wrapper's own part.
-        body = [stamped(rewritten(stmts[i])) for i in 0..len(stmts) if live?(ps[i + 1]) and in-this-chunk?(ps[i + 1])],
-        stmts = here.tree.body.kids,
+        kept = [stamped(rewritten(stmts[i])) for i in 0..len(stmts) if live?(ps[i + 1]) and in-this-chunk?(ps[i + 1])],
+        stmts = body.tree.body.kids,
         ps = parts-of(here.id),
         name = final-of(an.require-sym(here)),
         wrap = helper-name(an.wrapper-helper("__commonJS")),
@@ -564,10 +566,18 @@ fn own-parts(mo: m.Module) -> [Int] = match split?(mo) {
   false => parts-of(mo.id)
 }
 
-fn imports-of(mo: m.Module) -> [Int] = [p for p in parts-of(mo.id) if is-some(import-from(an.linked.part-stmt[p]))]
+fn imports-of(mo: m.Module) -> [Int] = [x.part for x in import-parts(mo.id)]
 
 fn imported-module(mo: m.Module, p: Int) -> Int =
-  an.known-dep(mo, import-from(an.linked.part-stmt[p]) ?? panic "{}: part {} imports nothing", mo.path, p)
+  (first x in import-parts(mo.id) if x.part == p: x.target) ?? panic "{}: part {} imports nothing", mo.path, p
+
+# A module's parts that import, and the module each imports: what ordering the output needs of a
+# module, kept by itself, so ordering never reads every module's body.
+record ImportPart { part: Int, target: Int }
+
+memo fn import-parts(id: Int) -> [ImportPart] = with here = m.modules[id], body = m.body-of(id) {
+  [ImportPart(part: p, target: an.known-dep(here, from)) for p in parts-of(id) for from in import-from(an.stmt-in(body, here, p))]
+}
 
 fn import-from(s: Node) -> Node? = match s {
   Import(_, from) | ImportBare(from) | ExportFrom(_, from) | ExportAllAs(_, from) | ExportAll(from) => some(from)
@@ -587,7 +597,7 @@ fn piece-units(pc: Piece, first: Bool) -> [Unit] = match m.modules[pc.module] {
 
 fn unit-emitted(u: Unit) -> Emitted = match included?(u.module) and any-part-here?(u.module) {
   false => Emitted(body: [], namespace: [])
-  true => with here = m.modules[u.module] { module-emitted(u) }
+  true => with here = m.modules[u.module], body = m.known-body(u.module) { module-emitted(u) }
 }
 
 fn module-emitted(u: Unit) -> Emitted = match here.kind {
@@ -610,7 +620,7 @@ fn statements-of(o: Node) -> [Node] = match o {
 
 fn import-statement?(s: Node) -> Bool = s is Import(...) or s is ImportBare(...)
 
-fn part-emitted(p: Int) -> Emitted = match an.linked.part-stmt[p] {
+fn part-emitted(p: Int) -> Emitted = match an.stmt-in(body, here, p) {
   None() => Emitted(body: [], namespace: namespace-stmts())
   Flag() => Emitted(body: [], namespace: [])
   # A part may stand for several statements, as a list of them.
@@ -628,9 +638,40 @@ memo fn units-now(entry: Text) -> [Unit] = units-of-order()
 # to the next, so a unit stays what it was wherever the others move.
 memo fn unit-emitted-of(u: Unit) -> Emitted = unit-emitted(u)
 
+# The output's statements in groups: the runtime's, then each piece's namespace objects, then each
+# piece's statements, where a piece is a run of units of one module. Between groups the program has
+# a `Flag()`, which prints as nothing and which nothing the optimiser does crosses: as esbuild, which
+# never merges one file's statements with another's. While building again, each group is made
+# apart, by its units, so one module's edit makes only its own groups again.
+record Group { units: [Unit], namespace: Bool }
+
+# Where each group's units are among the build's: from, up to, and which of the two it holds.
+record Range { from: Int, to: Int, namespace: Bool }
+
+fn ranges() -> [Range] =
+  [Range(from: 0, to: runtime-units, namespace: false)]
+  ++ [Range(from: ns[i], to: ns[i + 1], namespace: true) for i in 0..len(ns) - 1]
+  ++ [Range(from: bodies[i], to: bodies[i + 1], namespace: false) for i in 0..len(bodies) - 1]
+  where runtime-units = (last i in 0..len(units) if units[i].module == 0: i + 1) ?? 0,
+        ns = piece-ends(0, len(units)),
+        bodies = piece-ends(runtime-units, len(units))
+
+# Where runs of units of one module start and end, from `from` up to `to`.
+fn piece-ends(from: Int, to: Int) -> [Int] =
+  [from] ++ [k for k in from + 1..to if units[k].module != units[k - 1].module] ++ [to]
+
+fn groups() -> [Group] = [Group(units: units[r.from..r.to], namespace: r.namespace) for r in ranges()]
+
+fn group-stmts(namespace: Bool, emitted: [Emitted]) -> [Node] = match namespace {
+  true => [s for em in emitted for s in em.namespace]
+  false => [s for em in emitted for s in em.body]
+}
+
+# A group's statements, made from its units' answers.
+fn group-made(g: Group) -> [Node] = group-stmts(g.namespace, [unit-emitted-of(u) for u in g.units])
+
 fn program() -> Emission =
-  Emission(tree: Program(None(), List((runtime ++ [s for em in emitted for s in em.namespace] ++ rest)...)))
-  where emitted = parallel-map(units, unit-emitted-of, emitting.emit-threads),
-        runtime-units = (last i in 0..len(units) if units[i].module == 0: i + 1) ?? 0,
-        runtime = [s for em in emitted[0..runtime-units] for s in em.body],
-        rest = [s for em in emitted[runtime-units..len(emitted)] for s in em.body]
+  Emission(tree: Program(None(), List([s for k in 0..len(made) if len(made[k]) > 0
+                                       for s in [Flag() for x in [k] if any j in 0..k: len(made[j]) > 0] ++ made[k]]...)))
+  where emitted = match [m.refresh-body(id) for id in m.order] { _ => parallel-map(units, unit-emitted-of, emitting.emit-threads) },
+        made = [group-stmts(r.namespace, emitted[r.from..r.to]) for r in ranges()]

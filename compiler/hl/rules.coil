@@ -88,7 +88,9 @@
    (rels (ArrayList RelDef))
    (quotes (ArrayList QuoteDef))
    (aliases (ArrayList Alias))
-   (over (slice u8))])
+   (over (slice u8))
+   ;; Its memo functions' names.
+   (memos (ArrayList (slice u8)))])
 
 (defstruct Local
   [(name (slice u8)) (ty (slice u8)) (sym (slice u8)) (mutable bool)])
@@ -405,7 +407,8 @@
     :rels (ArrayList::new [RelDef] (malloc-allocator))
     :quotes (ArrayList::new [QuoteDef] (malloc-allocator))
     :aliases (ArrayList::new [Alias] (malloc-allocator))
-    :over over))
+    :over over
+    :memos (text-list)))
 
 (defn func-of [(name (slice u8)) (ret (slice u8))] (-> Func)
   (Func
@@ -1412,7 +1415,9 @@
             (g/KRewrite [] (attrs-only! (mut k) tree d))
             (g/KInclude [] (attrs-only! (mut k) tree d))
             (g/KConst [] (add-global! (mut k) ix2 name d false))
-            (g/KMemoFn [] (collect-fn! (mut k) ix2 name d))
+            (g/KMemoFn []
+                       (do (collect-fn! (mut k) ix2 name d)
+                           (push! (mut (.memos (elem (mut (.mods k)) ix2))) (.text (kid d 0)))))
             (g/KFn [] (collect-fn! (mut k) ix2 name d))
             (_ 0)))
         (when (any-memo? decls)
@@ -3621,6 +3626,29 @@
                                        (None [~(coil-type (mut k) ty)])))
                                 (opt-type ty))))))
               (None [] (die (mut k) n "if-given takes a setting")))
+          ;; `known(f(x))`: a memo's answer that must already be up to date, which it never makes,
+          ;; so work on many threads can read it; `refresh(f(x))`: that answer brought up to date,
+          ;; read only if it has to be made again (0).
+          (and (or (= name "known") (= name "refresh")) (= count 1))
+            (let [call (if (= (.kind (get args 0)) (g/KCall))
+                           (get args 0)
+                           (die (mut k) n (cat name " takes a call of a memo function")))
+                  callee (kid call 0)
+                  module (match (.kind callee)
+                           (g/KName [] (.self k))
+                           (g/KFieldE [] (match (module-prefix (mut k) (kid callee 0))
+                                           (Some [m] m)
+                                           (None [] (die (mut k) callee (cat name " takes a call of a memo function")))))
+                           (_ (die (mut k) callee (cat name " takes a call of a memo function"))))
+                  fname (if (= (.kind callee) (g/KName)) (.text callee) (.text (kid callee 1)))
+                  f (match (find-func (mod-at (mut k) module) fname)
+                      (Some [f] f)
+                      (None [] (die (mut k) callee (cat "no function named " fname))))]
+              (unless (has-text? (.memos (mod-at (mut k) module)) fname)
+                (die (mut k) callee (cat3 name " takes a call of a memo function, and " (cat fname " is none"))))
+              (let [cs (args-code (mut k) call f (list-kids (kid call 1)))]
+                (Some (te `(~(sym (qualified (mut k) module (cat3 "memo-" name (cat "--" fname)))) ~@cs)
+                          (if (= name "known") (.ret f) "Int")))))
           ;; `parallel-map(xs, f, n)`: `f` of each element on `n` threads, results in the order of `xs`.
           ;; Each thread takes the next index it finds free, so uneven work evens out.
           (and (= name "parallel-map") (= count 3))
@@ -8783,6 +8811,43 @@
                   (rt/dep-ensurer! ~qname (fnptr-of ~ensure)))
                 s)))
     (emit! (mut out) (memo-persist-code (mut k) f name))
+    ;; Its answer when it must be up to date already (`known`), which it never makes.
+    (emit! (mut out)
+           `(defn ~(sym (cat "memo-known--" name)) [~@params] (-> ~rt)
+              (let [key ~(memo-key-code (mut k) f)
+                    s (~store-fn)
+                    word (cast (ptr i64) s)
+                    faulted (~(sym (cat "memo-fault--" name)) s key)
+                    tracking (rt/dep-tracking?)]
+                (rt/spin-lock! word)
+                (let [found (get (.table s) key)
+                      node (match (get (.node-ids s) key) (Some [i] i) (None [] -1))]
+                  (rt/spin-unlock! word)
+                  (match found
+                    (Some [v]
+                          (do
+                            (when tracking
+                              (when (or (< node 0) (not (rt/dep-current-id? node)))
+                                (panic "{}: an answer read where it must be up to date already is not" ~qname))
+                              (when (rt/dep-in-frame?) (rt/dep-note-id! node)))
+                            v))
+                    (None [] (panic "{}: an answer read where it must be made already never was" ~qname)))))))
+    ;; Its answer brought up to date (`refresh`): read only if it must be made again.
+    (emit! (mut out)
+           `(defn ~(sym (cat "memo-refresh--" name)) [~@params] (-> i64)
+              (let [key ~(memo-key-code (mut k) f)
+                    s (~store-fn)
+                    word (cast (ptr i64) s)
+                    prepared (~(sym (cat "memo-prepare--" name)) s)
+                    tracking (rt/dep-tracking?)]
+                (rt/spin-lock! word)
+                (let [present (or (match (get (.table s) key) (Some [_] true) (None [] false))
+                                  (match (get (.lazy s) key) (Some [_] true) (None [] false)))
+                      node (match (get (.node-ids s) key) (Some [i] i) (None [] -1))]
+                  (rt/spin-unlock! word)
+                  (if (and tracking present (>= node 0) (rt/dep-current-id? node))
+                      (do (when (rt/dep-in-frame?) (rt/dep-note-id! node)) 0)
+                      (do (~(sym name) ~@args) 0))))))
     ;; While dependencies are tracked, an answer from an earlier revision is current only once each
     ;; thing it read is shown unchanged, and an answer computed again that is the same as the one
     ;; it replaces is kept, and does not count as changed.

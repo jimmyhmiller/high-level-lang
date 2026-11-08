@@ -19,7 +19,9 @@ record Imported { space: Text, name: Text }
 
 # The module being emitted, the path each specifier it names leads to ("" for one outside the
 # bundle), what each of its imports binds by symbol, and the name its context goes by in its function.
-context module: m.Module = m.blank-module(-1, "", m.External, None(), -1)
+context module: m.Module = m.blank-module(-1, "", m.External, -1)
+# What that module is made of.
+context body: m.Body = m.empty-body()
 context leads: {Text:Text} = {}
 input imported: {Int:Imported}
 input ctx: Text
@@ -42,7 +44,7 @@ fn call-read(n: Node, callee: Node, out: Node) -> Node = match callee {
 
 fn import-later(raw: Text) -> Node = exp`Promise.resolve().then(() => $c.import($spec))` where c = Ident(ctx), spec = Str(raw)
 
-fn import-read(n: Node) -> Node? = first s in module.bindings[n.lo] for i in imported[s]: space-read(i)
+fn import-read(n: Node) -> Node? = first s in body.bindings[n.lo] for i in imported[s]: space-read(i)
 
 fn space-read(i: Imported) -> Node = match i.name {
   "*" => Ident(i.space)
@@ -58,15 +60,13 @@ fn plain-name?(s: Text) -> Bool =
 # A module's function, as the runtime is given it: `__hmr.define(id, ` these `)`: what each
 # specifier leads to, the function, and whether it is an ES module. Made from what loading made of
 # the file, and so kept until it changes, or until the module becomes CommonJS or stops being it.
-memo fn dev-function(path: Text, cjs: Int) -> Text = with leads = leads-of(l) { define-args(dev-module(l, cjs == 1)) }
+memo fn dev-function(path: Text, cjs: Int) -> Text = with leads = leads-of(l), body = m.file-body(l) { define-args(dev-module(l, cjs == 1)) }
   where l = m.loaded(path)
 
 memo fn dev-accepts(path: Text) -> Bool = accepts?(m.loaded(path).analysis.tree)
 
 fn dev-module(l: m.Loaded, cjs: Bool) -> m.Module =
-  m.blank-module(-1, l.path, match cjs { true => m.Cjs  false => m.Esm }, l.analysis.tree, l.analysis.root) with {
-    bindings: l.analysis.bindings, source: l.tree0.body.kids, text: l.parsed.src
-  }
+  m.blank-module(-1, l.path, match cjs { true => m.Cjs  false => m.Esm }, l.analysis.root)
 
 fn leads-of(l: m.Loaded) -> {Text:Text} = {l.specs[k]: match l.leads[k].key {
   "external:" ++ _ => ""
@@ -75,7 +75,7 @@ fn leads-of(l: m.Loaded) -> {Text:Text} = {l.specs[k]: match l.leads[k].key {
 
 fn define-args(mo: m.Module) -> Text = match mo.kind {
   m.Cjs => deps-text(mo) ++ ", function (module, exports, require, " ++ p ++ ") {\n"
-           ++ rendered(Program(None(), List([rewritten(mo, s, no-imports(), p) for s in statements(mo.tree)]...))) ++ "}, false"
+           ++ rendered(Program(None(), List([rewritten(mo, s, no-imports(), p) for s in statements(body.tree)]...))) ++ "}, false"
   _ => deps-text(mo) ++ ", function (" ++ p ++ ") {\n\"use strict\";\n"
        ++ rendered(Program(None(), List(es-body(mo, p)...))) ++ "}, true"
 } where p = context-name(mo)
@@ -100,7 +100,7 @@ fn rendered(p: Node) -> Text = js.render-tracked(p, true, false).text
 fn statements(tree: Node) -> [Node] = tree.body.kids
 
 # A prefix no name in the module's text starts with: its context, and its imports' namespaces.
-fn context-name(mo: m.Module) -> Text = first i in 0.. if not contains-text?(mo.text, prefix(i)): prefix(i) ++ "$"
+fn context-name(mo: m.Module) -> Text = first i in 0.. if not contains-text?(body.text, prefix(i)): prefix(i) ++ "$"
 
 fn prefix(i: Int) -> Text = match i {
   0 => "__hmr_"
@@ -110,8 +110,8 @@ fn prefix(i: Int) -> Text = match i {
 # What each import statement binds, by the symbol of the name it binds, its namespace the `k`th.
 fn imports-of(mo: m.Module, p: Text) -> {Int:Imported} =
   {s: Imported(space: space-name(p, k), name: b.name)
-   for k in 0..len(stmts) for b in bound-by(stmts[k]) if let some(s) = mo.bindings[b.at]}
-  where stmts = statements(mo.tree)
+   for k in 0..len(stmts) for b in bound-by(stmts[k]) if let some(s) = body.bindings[b.at]}
+  where stmts = statements(body.tree)
 
 fn space-name(p: Text, k: Int) -> Text = p ++ int-text(k)
 
@@ -142,7 +142,7 @@ fn es-body(mo: m.Module, p: Text) -> [Node] =
   exports-stmt(p, getters(mo, p, by-name))
   ++ [x for k in 0..len(stmts) for x in import-stmts(stmts[k], p, space-name(p, k))]
   ++ [rewritten(mo, out, imported, p) for s in stmts for out in own-stmt(s)]
-  where stmts = statements(mo.tree),
+  where stmts = statements(body.tree),
         imported = imports-of(mo, p),
         by-name = {b.local: Imported(space: space-name(p, k), name: b.name) for k in 0..len(stmts) for b in bound-by(stmts[k])}
 
@@ -176,8 +176,8 @@ fn getter(g: Getter) -> Node = Prop(Str(quote-text(g.name)), exp`() => $v`) wher
 
 fn getters(mo: m.Module, p: Text, by-name: {Text:Imported}) -> [Getter] =
   [g for k in 0..len(stmts) for g in stmt-getters(stmts[k], space-name(p, k), by-name)]
-  ++ [Getter(name: "default", value: Ident(local-default(mo, name))) for s in mo.source for name in m.default-of(s)]
-  where stmts = statements(mo.tree)
+  ++ [Getter(name: "default", value: Ident(local-default(mo, name))) for s in body.source for name in m.default-of(s)]
+  where stmts = statements(body.tree)
 
 fn local-default(mo: m.Module, name: Text) -> Text = match name {
   "" => mo.base ++ "_default"

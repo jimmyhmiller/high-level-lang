@@ -41,8 +41,8 @@ record Made { purpose: Purpose, owner: Int, exported: Text, scope: Int, name: Te
 # What linking works out, for the facts and for naming and emitting after them: the modules that are
 # `__esm` wrapped; those `import()` makes the roots of chunks; the symbols it makes, numbered from
 # `first-made`, by what each is for and whose it is; the imports that become property reads, and
-# those of ES namespaces; each part's statement; and whether any module re-exports names only known
-# at run time, or re-exports from CommonJS.
+# those of ES namespaces; and whether any module re-exports names only known at run time, or
+# re-exports from CommonJS. A part's statement is its module's (`stmt-of`).
 record Linked {
   wrapped: {Int:Bool},
   dynamic-roots: [Int],
@@ -57,7 +57,6 @@ record Linked {
   reexports: {Text:Int},
   cjs-imports: {Int:CjsImport},
   ns-imports: {Int:Int},
-  part-stmt: [Node],
   any-dynamic: Bool,
   any-reexport: Bool
 }
@@ -65,7 +64,9 @@ record Linked {
 setting linked: Linked
 
 # The module the current analysis is looking at.
-context here: m.Module = m.blank-module(-1, "", m.External, None(), -1)
+context here: m.Module = m.blank-module(-1, "", m.External, -1)
+# The body of the module `here` is: what it is made of.
+context body: m.Body = m.empty-body()
 
 fn root-sym(mo: m.Module, name: Text) -> Int? = sym.scope-at(m.table, mo.root).names[name]
 
@@ -92,7 +93,7 @@ fn kept?(t: m.Module) -> Bool = linking.esm-output and t.kind == External
 # Held in an import variable, made an ES module with `__toESM`: an opaque module not kept.
 fn held?(t: m.Module) -> Bool = opaque?(t) and not kept?(t)
 
-fn bound?(n: Node) -> Bool = n.lo in here.bindings
+fn bound?(n: Node) -> Bool = n.lo in body.bindings
 
 # The symbols linking made: a module's `require_x`, `x_exports` and `init_x`, its import variable
 # for a module it imports opaquely, and a name it re-exports from one.
@@ -139,12 +140,12 @@ on FuncDecl(name, ...) | GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGe
   kids.top = false
   name.top = top
 }
-on BindName(x) as n if declaring and top and (m.symbol-of(here, n.lo) ?? panic "{}: no symbol for binding {}", here.path, x) is s
+on BindName(x) as n if declaring and top and (m.symbol-in(body, here, n.lo) ?? panic "{}: no symbol for binding {}", here.path, x) is s
                        and sym.symbol-at(m.table, s).scope == here.root {
   declares += s
 }
 on Ident(x) as n if counting and name-mention(n, x) is some(found) { mentions += found }
-on Member(object, property) if counting and namespace-of(here, object) is some(target) {
+on Member(object, property) if counting and namespace-of(body, here, object) is some(target) {
   mentions += Mention(reach: Member, id: target, name: property.text)
   object.counting = false
 }
@@ -156,7 +157,7 @@ on ImportCall(...) as n if counting and imported-str(n) is some(from) and m.modu
                         }, known-dep(here, from))
   kids.counting = false
 }
-on CallExpr(...) as n if counting and required-str(here, n) is some(from) {
+on CallExpr(...) as n if counting and required-str(body, n) is some(from) {
   mentions += mentioned(Required, known-dep(here, from))
   kids.counting = false
 }
@@ -167,7 +168,7 @@ on _ as n if sc.opens?(n.kind) { kids.top = false }
 fn mentioned(reach: Reach, id: Int) -> Mention = Mention(reach: reach, id: id, name: "")
 
 # What a name mentions: its symbol, or a runtime helper it names freely.
-fn name-mention(n: Node, x: Text) -> Mention? = match m.symbol-of(here, n.lo) {
+fn name-mention(n: Node, x: Text) -> Mention? = match m.symbol-in(body, here, n.lo) {
   some(s) => some(mentioned(Symbol, s))
   none if x in here.helpers => some(mentioned(Symbol, helper(x)))
   none => none
@@ -184,10 +185,11 @@ fn once-each-symbol(ms: [Mention]) -> [Mention] =
 
 # A module's summaries: one for each top-level statement, empty for an ES module's that get their
 # facts from what they import and export.
-memo fn summaries-of(id: Int) -> [Summary] = with here = m.modules[id] {
+# Bodies are brought up to date before work on many threads reads them (`link`).
+memo fn summaries-of(id: Int) -> [Summary] = with here = m.modules[id], body = m.known-body(id) {
   match here.kind {
-    Cjs => [summary-of(s, true) for s in here.tree.body.kids]
-    _ => [statement-summary(s) for s in here.tree.body.kids]
+    Cjs => [summary-of(s, true) for s in body.tree.body.kids]
+    _ => [statement-summary(s) for s in body.tree.body.kids]
   }
 }
 
@@ -202,8 +204,8 @@ fn walked?(s: Node) -> Bool = match s {
 }
 
 # The module an identifier names when it is `import * as` of an ES module.
-fn namespace-of(mo: m.Module, n: Node) -> Int? = match n {
-  Ident(_) => match m.symbol-of(mo, n.lo) {
+fn namespace-of(b: m.Body, mo: m.Module, n: Node) -> Int? = match n {
+  Ident(_) => match m.symbol-in(b, mo, n.lo) {
     some(s) => linked.ns-imports[s]
     none => none
   }
@@ -217,15 +219,15 @@ fn imported-str(n: Node) -> Node? = match n {
 }
 
 # `require("x")` with a literal path and a free `require`: the path.
-fn required-str(mo: m.Module, n: Node) -> Node? = match n {
-  CallExpr(Ident("require") as callee, Args(List(Str(_) as from))) if not (callee.lo in mo.bindings) => some(from)
+fn required-str(b: m.Body, n: Node) -> Node? = match n {
+  CallExpr(Ident("require") as callee, Args(List(Str(_) as from))) if not (callee.lo in b.bindings) => some(from)
   _ => none
 }
 
 # The modules those name, once everything is resolved: these only look up, so many threads may ask.
 fn known-import-call-target(mo: m.Module, n: Node) -> Int? = first from in imported-str(n): known-dep(mo, from)
 
-fn known-require-target(mo: m.Module, n: Node) -> Int? = first from in required-str(mo, n): known-dep(mo, from)
+fn known-require-target(b: m.Body, mo: m.Module, n: Node) -> Int? = first from in required-str(b, n): known-dep(mo, from)
 
 # ---------------------------------------------------------------- what can be removed
 
@@ -277,13 +279,13 @@ const known-global-properties: [Text] = [
   "Object.prototype.unwatch", "Object.prototype.valueOf", "Object.prototype.watch"]
 const known-collections: [Text] = ["Map", "Set", "WeakMap", "WeakSet"]
 
-fn annotated?(n: Node) -> Bool = n.lo in here.pure-at or (any hi in here.pure-calls[n.lo]: hi == n.hi)
+fn annotated?(n: Node) -> Bool = n.lo in body.pure-at or (any hi in body.pure-calls[n.lo]: hi == n.hi)
 fn free-ident?(n: Node) -> Bool = n is Ident(_) and not bound?(n)
 fn known-collection?(callee: Node) -> Bool = free-ident?(callee) and callee.text in known-collections
 fn all-pure?(xs: [Node]) -> Bool = all x in xs: pure?(x)
 
 fn listed-pure?(callee: Node) -> Bool =
-  len(linking.pure-names) > 0 and (match m.dotted-name(callee, here.bindings) {
+  len(linking.pure-names) > 0 and (match m.dotted-name(callee, body.bindings) {
     some(name) => name in linking.pure-names
     none => false
   })
@@ -316,7 +318,7 @@ fn pure?(n: Node) -> Bool = match n {
   CallExpr(...) => pure-call?(n)
   NewExpr(...) => pure-call?(n) or pure-new?(n)
   NewNoArgs(callee) => annotated?(n) or known-collection?(callee)
-  Member(...) => match m.dotted-name(n, here.bindings) {
+  Member(...) => match m.dotted-name(n, body.bindings) {
     some(name) => name in known-global-properties
     none => false
   }
@@ -403,7 +405,7 @@ record Load { target: Int, by-import: Bool }
 
 fn loads-of(mo: m.Module, n: Node) -> [Load] = match n {
   ImportCall(...) => [Load(target: known-dep(mo, from), by-import: true) for from in imported-str(n)]
-  CallExpr(...) => [Load(target: known-dep(mo, from), by-import: false) for from in required-str(mo, n)]
+  CallExpr(...) => [Load(target: known-dep(mo, from), by-import: false) for from in required-str(body, n)]
   _ => []
 }
 
@@ -411,14 +413,14 @@ fn loads-of(mo: m.Module, n: Node) -> [Load] = match n {
 # them is a walk of every tree, so modules are searched at once.
 memo fn on-demand-calls(id: Int) -> [Node] = match m.modules[id] {
   # What a module's tree calls was found when it was loaded: one with none has nothing to walk.
-  mo if mo.kind != Runtime and mo.calls => on-demand-calls-under(mo.tree, mo)
+  mo if mo.kind != Runtime and mo.calls => on-demand-calls-under(b.tree, b) where b = m.known-body(id)
   _ => []
 }
 
 # Calls inside these calls count too, after them.
-everywhere fn on-demand-calls-under(n: Node, mo: m.Module) -> [Node] = match n {
-  ImportCall(...) if imported-str(n) is some(_) => [n] ++ [on-demand-calls-under(k, mo)... for k in n.kids]
-  CallExpr(...) if required-str(mo, n) is some(_) => [n] ++ [on-demand-calls-under(k, mo)... for k in n.kids]
+everywhere fn on-demand-calls-under(n: Node, b: m.Body) -> [Node] = match n {
+  ImportCall(...) if imported-str(n) is some(_) => [n] ++ [on-demand-calls-under(k, b)... for k in n.kids]
+  CallExpr(...) if required-str(b, n) is some(_) => [n] ++ [on-demand-calls-under(k, b)... for k in n.kids]
 }
 
 # Which ES modules are `__esm` wrapped: anything loaded on demand runs when it is, and so must
@@ -433,8 +435,9 @@ fn none-wrapped() -> {Int:Bool} = {}
 # A name an import statement binds: its symbol, the module it is from, and its name there.
 record Bound { symbol: Int, target: Int, name: Text, namespace: Bool }
 
+# Of the module `here` and its `body`.
 fn import-bindings(mo: m.Module) -> [Bound] = match mo.kind {
-  Esm => [b for s in mo.tree.body.kids for b in statement-bindings(mo, s)]
+  Esm => [b for s in body.tree.body.kids for b in statement-bindings(mo, s)]
   _ => []
 }
 
@@ -454,7 +457,7 @@ fn clause-bindings(mo: m.Module, t: Int, spec: Node) -> [Bound] = match spec {
 }
 
 fn bound(mo: m.Module, t: Int, name: Text, b: Node, namespace: Bool) -> Bound =
-  Bound(symbol: m.symbol-of(mo, b.lo) ?? (panic "{}: no symbol for import {}", mo.path, b.text), target: t, name: name, namespace: namespace)
+  Bound(symbol: m.symbol-in(body, mo, b.lo) ?? (panic "{}: no symbol for import {}", mo.path, b.text), target: t, name: name, namespace: namespace)
 
 # A name a module re-exports from CommonJS: a property of its import variable.
 record Reexport { target: Int, name: Text, namespace: Bool, exported: Text }
@@ -473,10 +476,11 @@ fn export-spec-names(spec: Node) -> Text = match spec {
   _ => m.module-name(spec.local)
 }
 
-# The statements of a module that are not CommonJS, whose import statements stand for themselves.
+# The statements of a module that are not CommonJS, whose import statements stand for themselves: of
+# the module `here` and its `body`.
 fn linked-statements(mo: m.Module) -> [Node] = match mo.kind {
   Cjs => []
-  _ => mo.tree.body.kids
+  _ => body.tree.body.kids
 }
 
 # The symbols a module needs made for it: CommonJS's `require_x`, an ES module's `x_exports`, and a
@@ -535,16 +539,25 @@ fn reexport-name(r: Reexport) -> Text = match kept?(m.modules[r.target]), r.name
 
 # A module's parts, each standing for a statement. CommonJS's first is `Flag`, its wrapper's
 # `require_x`; an ES module's are `None`, its namespace object, and `Flag`, the `__esm` wrapper's
-# `init_x`, which brings the whole module with it.
-fn module-parts(mo: m.Module, wrapped: {Int:Bool}) -> [Node] = match mo.kind {
-  Cjs => [Flag()] ++ mo.tree.body.kids
-  _ => synthetic(mo, wrapped) ++ mo.tree.body.kids
+# `init_x`, which brings the whole module with it. How many, for `statements` statements.
+fn part-count(mo: m.Module, wrapped: {Int:Bool}, statements: Int) -> Int = match mo.kind {
+  Cjs => 1 + statements
+  _ => len(synthetic(mo, wrapped)) + statements
 }
 
-fn part-count(mo: m.Module, wrapped: {Int:Bool}) -> Int = match mo.kind {
-  Cjs => 1 + len(mo.tree.body.kids)
-  _ => len(synthetic(mo, wrapped)) + len(mo.tree.body.kids)
-}
+# Part `p`'s statement, of module `id`; with its body in hand, `stmt-in`.
+fn stmt-of(id: Int, p: Int) -> Node = stmt-in(m.body-of(id), m.modules[id], p)
+
+fn stmt-in(b: m.Body, mo: m.Module, p: Int) -> Node = match mo.kind {
+  Cjs => match local {
+    0 => Flag()
+    _ => b.tree.body.kids[local - 1]
+  }
+  _ => match local < len(synth) {
+    true => synth[local]
+    false => b.tree.body.kids[local - len(synth)]
+  } where synth = synthetic(mo, linked.wrapped)
+} where local = p - (linked.part-starts[mo.id] ?? panic "{} has no parts", mo.path)
 
 fn synthetic(mo: m.Module, wrapped: {Int:Bool}) -> [Node] = match mo.kind, mo.id in wrapped {
   Esm, true => [None(), Flag()]
@@ -566,7 +579,20 @@ fn kept-star?(mo: m.Module, t: m.Module) -> Bool = kept?(t) and mo.id in m.entri
 # module loads on demand is wrapped, or with splitting, the root of a chunk of its own. The symbols
 # linking makes are numbered from `first`: the modules' own, then the import statements' variables,
 # then what the other statements need, each import variable made once.
-fn linked-of(calls: [[Node]], first: Int) -> Linked =
+# What linking needs of one module, kept while what it is made of stays the same: what it loads on
+# demand, the names its imports bind, what it re-exports from CommonJS, the symbols its statements
+# need made, whether it re-exports names only known at run time, and how many statements it has.
+record ModuleLink { loads: [Load], bindings: [Bound], reexports: [Reexport], made: [Made], dynamic: Bool, statements: Int }
+
+memo fn module-link(id: Int) -> ModuleLink = with here = m.modules[id], body = m.known-body(id) {
+  ModuleLink(loads: [loads-of(here, n)... for n in on-demand-calls(id)], bindings: import-bindings(here),
+             reexports: [r for s in linked-statements(here) for r in statement-reexports(here, s)],
+             made: [x for s in linked-statements(here) for x in statement-made(here, s)],
+             dynamic: any s in linked-statements(here): dynamic-star?(here, s),
+             statements: len(body.tree.body.kids))
+}
+
+fn linked-of(links: [ModuleLink], first: Int) -> Linked =
   Linked(wrapped: wrapped, dynamic-roots: roots, made: made, first-made: first, made-ids: ids, requires: made-for(made, ids, Require),
          namespaces: made-for(made, ids, Exports), inits: made-for(made, ids, Init), import-vars: import-vars,
          reexports: reexports,
@@ -576,29 +602,27 @@ fn linked-of(calls: [[Node]], first: Int) -> Linked =
                       ++ {reexport-in(reexports, mo, r.exported):
                             CjsImport(importer: mo.id, import-var: symbol-in(import-vars, import-key(mo, r.target)), name: r.name,
                                       namespace: r.namespace)
-                          for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for r in statement-reexports(mo, s)
+                          for i in 0..len(m.order) for mo in [m.modules[m.order[i]]] for r in links[i].reexports
                           if held?(m.modules[r.target])},
          ns-imports: {b.symbol: b.target for bs in bindings for b in bs if b.namespace and not opaque?(m.modules[b.target])},
          part-starts: {m.order[k]: starts[k] for k in 0..len(m.order)},
-         part-stmt: updated([None() for _ in 0..m.part-places-used()],
-                            {starts[k] + j: parts[k][j] for k in 0..len(m.order) for j in 0..len(parts[k])}),
-         any-dynamic: any id in m.order for mo in [m.modules[id]] for s in linked-statements(mo): dynamic-star?(mo, s),
+         any-dynamic: any l in links: l.dynamic,
          any-reexport: any x in made: x.purpose == ReexportName)
-  where loads = [loads-of(m.modules[m.order[i]], n)... for i in 0..len(m.order) for n in calls[i]],
+  where loads = [x for l in links for x in l.loads],
         roots = [l.target for l in loads if linking.splitting and l.by-import and m.modules[l.target].kind != External distinct l.target],
         seeds = [l.target for l in loads if not (linking.splitting and l.by-import)],
         wrapped = fold w = none-wrapped() for t in seeds: wrapping(t, w),
-        bindings = [import-bindings(m.modules[id]) for id in m.order],
+        bindings = [l.bindings for l in links],
         made = [x for x in [x for id in m.order for x in module-made(m.modules[id], wrapped)]
                            ++ [import-made(m.modules[m.order[i]], b.target) for i in 0..len(m.order) for b in bindings[i]
                                if held?(m.modules[b.target])]
-                           ++ [x for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for x in statement-made(mo, s)]
+                           ++ [x for l in links for x in l.made]
                 distinct made-once(x)],
         ids = m.made-ids!([made-key(x) for x in made]),
         import-vars = made-for(made, ids, ImportVar),
         reexports = {reexport-key(made[i].owner, made[i].exported): ids[i] for i in 0..len(made) if made[i].purpose == ReexportName},
-        parts = [module-parts(m.modules[id], wrapped) for id in m.order],
-        starts = m.part-starts!([m.modules[id].path for id in m.order], [len(ps) for ps in parts])
+        starts = m.part-starts!([m.modules[id].path for id in m.order],
+                                [part-count(m.modules[m.order[k]], wrapped, links[k].statements) for k in 0..len(m.order)])
 
 # ---------------------------------------------------------------- the facts
 
@@ -614,10 +638,11 @@ fn facts() -> [link.Fact] =
 # A module's facts, and the facts its import bindings state, each kept while what it is made of
 # stays the same. The names they intern keep their ids from one build to the next (see
 # `m.interning`), so facts kept from an earlier build still say what they said.
-memo fn module-facts-at(id: Int) -> [link.Fact] =
+memo fn module-facts-at(id: Int) -> [link.Fact] = with here = m.modules[id], body = m.body-of(id) {
   facts-of(id, summaries-of(id), linked.part-starts[id] ?? panic "{} has no parts", m.modules[id].path)
+}
 
-memo fn binding-facts-at(id: Int) -> [link.Fact] = [binding-facts(b)... for b in import-bindings(m.modules[id])]
+memo fn binding-facts-at(id: Int) -> [link.Fact] = [binding-facts(b)... for b in module-link(id).bindings]
 
 fn entry-facts() -> [link.Fact] = match linking.splitting {
   true => [chunk-root(r)... for r in m.entries ++ linked.dynamic-roots]
@@ -645,10 +670,10 @@ fn parts-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] = 
   Cjs => [link.fact-part-of(start, mo.id), link.fact-effect(start), link.fact-declares(start, require-sym(mo)),
           link.fact-mentions(start, helper(wrapper-helper("__commonJS")))]
          ++ [cjs-statement-facts(mo, summaries[i], start + 1 + i, i < directives)... for i in 0..len(summaries)]
-    where directives = len([s for s in mo.tree.body.kids while s is ExprStmt(Str(_))])
+    where directives = len([s for s in body.tree.body.kids while s is ExprStmt(Str(_))])
   _ => synthetic-facts(mo, start) ++ [part-facts(mo, stmts[i], summaries[i], first + i)... for i in 0..len(stmts)]
-       ++ [export-local(mo, "default", default-name(mo, name)) for s in mo.source if let some(name) = m.default-of(s)]
-    where stmts = mo.tree.body.kids,
+       ++ [export-local(mo, "default", default-name(mo, name)) for s in body.source if let some(name) = m.default-of(s)]
+    where stmts = body.tree.body.kids,
           first = start + len(synthetic(mo, linked.wrapped))
 }
 
@@ -677,7 +702,7 @@ fn synthetic-facts(mo: m.Module, start: Int) -> [link.Fact] = match mo.kind, wra
 fn namespace-part(mo: m.Module, part: Int) -> [link.Fact] =
   [link.fact-part-of(part, mo.id), link.fact-ns-part(part, mo.id), link.fact-ns-symbol(mo.id, ns-sym(mo)),
    link.fact-declares(part, ns-sym(mo))]
-  ++ [link.fact-mentions(part, helper("__export")) for s in [mo] if any x in mo.tree.body.kids: exporting?(x)]
+  ++ [link.fact-mentions(part, helper("__export")) for s in [mo] if any x in body.tree.body.kids: exporting?(x)]
   ++ entry-namespace(mo, part)
 
 # A statement that exports: a module with none has an empty namespace object, and no `__export`.
@@ -822,7 +847,11 @@ fn export-from-facts(mo: m.Module, part: Int, t: Int, specs: [Node]) -> [link.Fa
 # ---------------------------------------------------------------- linking
 
 # What linking works out, the symbols it makes numbered after the `symbols` the modules have.
-fn link(symbols: Int) -> Linked = linked-of(parallel-map(m.order, on-demand-calls, linking.facts-threads), symbols)
+# Each module's body up to date first, on this thread: what loads a file may call what a build was
+# given, whose effects nothing here can know, so work on many threads only reads what is known.
+fn link(symbols: Int) -> Linked = match [m.refresh-body(id) for id in m.order] {
+  _ => linked-of(parallel-map(m.order, module-link, linking.facts-threads), symbols)
+}
 
 # A build's linking, table and solved facts, each kept while what it is made of stays the same.
 memo fn linked-now(entry: Text) -> Linked = link(0)

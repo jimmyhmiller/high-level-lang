@@ -19,23 +19,20 @@ use bundle.tsconfig as tsc
 # `External` is an import left for the runtime: it has no source and no statements.
 enum ModuleKind { Esm, Cjs, Runtime, External }
 
+# A module as the program's graph has it: what the whole program's steps need of it. What it is made
+# of, its tree and the rest, is its `Body`, which only what works on this module reads, so a step
+# over every module never holds every tree.
 record Module {
   id: Int,
   path: Text,
   kind: ModuleKind,
-  tree: Node,
   root: Int,
-  bindings: {Int:Int},  # the symbol each name leaf is, by where it starts, as its own table numbers them
   side-effects: Bool,
   deps: [Int],
   dep-ids: {Text:Int},  # the module each specifier it imports or requires led to
   symbol-shift: Int,    # how far those symbols moved when its table joined the shared one
   base: Text,
-  source: [Node],
   free: [Text],
-  text: Text,
-  pure-at: {Int:Bool},
-  pure-calls: {Int:Int},
   legal: [Text],
   helpers: [Text],      # runtime helpers lowered code names, which are no global names
   # Whether its tree may `require` or `import()` anything: false when loading found no such call.
@@ -312,10 +309,54 @@ fn or-else(given: Text, otherwise: Text) -> Text = match given {
 # Is this file in node compatibility mode: `.mjs`, or under "type": "module"?
 fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-module?(path)
 
-fn blank-module(id: Int, path: Text, kind: ModuleKind, tree: Node, root: Int) -> Module =
-  Module(id: id, path: path, kind: kind, tree: tree, root: root, bindings: {}, side-effects: true,
-         deps: [], dep-ids: {}, symbol-shift: 0, base: base-name(path), source: [], free: [], text: "",
-         pure-at: {}, pure-calls: {}, legal: [], helpers: [], calls: true, script: false)
+fn blank-module(id: Int, path: Text, kind: ModuleKind, root: Int) -> Module =
+  Module(id: id, path: path, kind: kind, root: root, side-effects: true,
+         deps: [], dep-ids: {}, symbol-shift: 0, base: base-name(path), free: [],
+         legal: [], helpers: [], calls: true, script: false)
+
+# What a module is made of: its tree; the symbol each name leaf is, by where it starts, as its own
+# table numbers them; its statements as written; its source; and where it marks calls pure.
+record Body { tree: Node, bindings: {Int:Int}, source: [Node], text: Text, pure-at: {Int:Bool}, pure-calls: {Int:Int} }
+
+fn empty-body() -> Body = Body(tree: None(), bindings: {}, source: [], text: "", pure-at: {}, pure-calls: {})
+
+# Module `id`'s body. While dependencies are tracked, each is a memo answer of its own, kept while
+# what it is made of stays the same, and read from the cache only when something asks for it. A
+# build that tracks nothing makes them all once, after the graph, as the setting `bodies`.
+fn body-of(id: Int) -> Body = match tracking?() {
+  true => body-memo(id)
+  false => bodies[id]
+}
+
+# The same where many threads read it, which must not make it: brought up to date before.
+fn known-body(id: Int) -> Body = match tracking?() {
+  true => known(body-memo(id))
+  false => bodies[id]
+}
+
+fn refresh-body(id: Int) -> Int = match tracking?() {
+  true => refresh(body-memo(id))
+  false => 0
+}
+
+memo fn body-memo(id: Int) -> Body = body-made(modules[id])
+
+setting bodies: [Body]
+
+# Every module's body, for a build that tracks nothing: made while what loading made is at hand.
+fn bodies-made(g: Graph) -> [Body] = [body-made(mo) for mo in g.modules]
+
+fn body-made(mo: Module) -> Body = match mo.kind {
+  Runtime => Body(tree: rt.tree, bindings: rt.analysis.bindings, source: [], text: text, pure-at: {}, pure-calls: {})
+    where text = include-text("runtime.js"),
+          rt = runtime-parsed(text)
+  External => empty-body()
+  _ => file-body(loaded(mo.path))
+}
+
+fn file-body(l: Loaded) -> Body =
+  Body(tree: l.analysis.tree, bindings: l.analysis.bindings, source: l.tree0.body.kids, text: l.parsed.src,
+       pure-at: l.parsed.pure-at, pure-calls: l.parsed.pure-calls)
 
 # An alias replaces a package name, and carries any subpath along.
 fn aliased(spec: Text) -> Text = (first a in loading.aliases: alias-of(a, spec)) ?? spec
@@ -502,7 +543,10 @@ fn wrapper-names-module?(w: sym.Analysis) -> Bool =
 fn wrapper-of(s: sym.Analysis) -> Int = sym.scope-at(s.table, s.root).parent
 
 # The symbol the name leaf starting at `lo` is, in the shared table's numbering.
-fn symbol-of(mo: Module, lo: Int) -> Int? = first s in mo.bindings[lo]: s + mo.symbol-shift
+fn symbol-of(mo: Module, lo: Int) -> Int? = symbol-in(body-of(mo.id), mo, lo)
+
+# The same, with the module's body in hand: what reads every name of a module asks this.
+fn symbol-in(b: Body, mo: Module, lo: Int) -> Int? = first s in b.bindings[lo]: s + mo.symbol-shift
 
 # The text a module of this loader stands for. Not the file loader's: that writes an asset, so it
 # is made by `as-module`, on the thread that links.
@@ -1163,7 +1207,7 @@ fn lead(spec: Text, importer: Text) -> Lead = match stays-external?(spec, import
 # What a node of the graph leads to: an outside import, nothing.
 fn led-to(key: Text) -> [Text] = match key {
   "external:" ++ _ => []
-  path => [l.key for l in loaded(path).leads]
+  path => [l.key for l in leads-of(path)]
 }
 
 fn external?(key: Text) -> Bool = key is "external:" ++ _
@@ -1173,7 +1217,7 @@ fn external?(key: Text) -> Bool = key is "external:" ++ _
 # each module after what it imports, as it runs in esbuild's output. Every module's symbols will join
 # one table in the order of their ids, and each module knows how far its own move.
 fn graph(runtime: Text, paths: [Text]) -> Graph =
-  Graph(modules: updated([runtime-module(rt-tree, rt, runtime, lay)] ++ [blank-module(id, "", External, None(), bundle-scope) for id in 1..top],
+  Graph(modules: updated([runtime-module(rt, lay)] ++ [blank-module(id, "", External, bundle-scope) for id in 1..top],
                          {numbers[i]: module-at(w, i, ids, lay, parts, wholes) for i in 0..len(w.pre)}),
         by-path: ids, order: [0] ++ [numbers[i] for i in w.post if not external?(w.pre[i])],
         entries: [ids[p] ?? (panic "{} was not loaded", p) for p in paths], parts: tables, symbols: lay.symbols,
@@ -1184,12 +1228,11 @@ fn graph(runtime: Text, paths: [Text]) -> Graph =
         top = (fold t = 1 for n in numbers: max(t, n + 1)),
         files = [key for key in w.pre if not external?(key)],
         # The files something requires, or imports the default or namespace of.
-        wholes = {key: true for f in files for key in loaded(f).whole},
+        wholes = {key: true for f in files for key in whole-of(f)},
         # Where each file's scopes are among the parts the table is made of: after the runtime's.
         parts = {files[k]: k + 1 for k in 0..len(files)},
-        rt-tree = runtime-parsed(runtime).tree,
         rt = runtime-parsed(runtime).analysis,
-        tables = [rt.table] ++ [loaded(f).scopes for f in files],
+        tables = [rt.table] ++ [scopes-of(f) for f in files],
         lay = placement!(["<runtime>"] ++ files, tables)
 
 # The runtime parsed and analysed, once for as long as its text is the same.
@@ -1198,21 +1241,28 @@ record RuntimeParsed { tree: Node, analysis: sym.Analysis }
 memo fn runtime-parsed(text: Text) -> RuntimeParsed = RuntimeParsed(tree: t, analysis: sc.analysis(t, [])) where t = js.parse(text, "<runtime>")
 
 # The runtime is an ordinary module that nothing makes live unless a part mentions one of its helpers.
-fn runtime-module(tree: Node, rt: sym.Analysis, text: Text, lay: Placement) -> Module =
-  blank-module(0, "<runtime>", Runtime, tree, rt.root + lay.scope-shifts[0]) with {
-    bindings: rt.bindings, symbol-shift: lay.symbol-shifts[0], side-effects: false, base: "runtime", free: rt.free, text: text
+fn runtime-module(rt: sym.Analysis, lay: Placement) -> Module =
+  blank-module(0, "<runtime>", Runtime, rt.root + lay.scope-shifts[0]) with {
+    symbol-shift: lay.symbol-shifts[0], side-effects: false, base: "runtime", free: rt.free
   }
+
+# What the graph reads of a loaded file, each kept by itself: what it leads to, what it imports whole
+# or requires, and its scopes. While one file is edited the others' are read from what was kept,
+# not made again from all that loading them made.
+memo fn leads-of(path: Text) -> [Lead] = loaded(path).leads
+memo fn whole-of(path: Text) -> [Text] = loaded(path).whole
+memo fn scopes-of(path: Text) -> sym.Table = loaded(path).scopes
 
 # The module the walk reached `i`th: an outside import, or a file, with side effects as the import
 # that first reached it says, or as an entry has them.
 fn module-at(w: Walk, i: Int, ids: {Text:Int}, lay: Placement, parts: {Text:Int}, wholes: {Text:Bool}) -> Module = match w.pre[i] {
-  "external:" ++ spec => blank-module(ids[w.pre[i]] ?? i + 1, spec, External, None(), bundle-scope)
+  "external:" ++ spec => blank-module(ids[w.pre[i]] ?? i + 1, spec, External, bundle-scope)
   path => module-of(path, ids[path] ?? i + 1, effects, lay.scope-shifts[part], lay.symbol-shifts[part], path in wholes,
-                    [led(ids, x.key) for x in loaded(path).leads])
+                    [led(ids, x.key) for x in leads-of(path)])
     where part = parts[path] ?? (panic "{} has no scopes", path),
           effects = match w.parent[i] {
             p if p < 0 => true
-            p => loaded(w.pre[p]).leads[w.slot[i]].effects
+            p => leads-of(w.pre[p])[w.slot[i]].effects
           }
 }
 
@@ -1222,9 +1272,9 @@ memo fn module-of(path: Text, id: Int, effects: Bool, scope-shift: Int, symbol-s
 
 # `deps`: the id each of its leads leads to, in order.
 fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift: Int, deps: [Int], whole: Bool) -> Module =
-  blank-module(id, l.path, kind, l.analysis.tree, l.analysis.root + scope-shift) with {
-    bindings: l.analysis.bindings, symbol-shift: symbol-shift, side-effects: effects, source: l.tree0.body.kids,
-    free: l.analysis.free, text: l.parsed.src, pure-at: l.parsed.pure-at, pure-calls: l.parsed.pure-calls,
+  blank-module(id, l.path, kind, l.analysis.root + scope-shift) with {
+    symbol-shift: symbol-shift, side-effects: effects,
+    free: l.analysis.free,
     legal: l.parsed.legal, helpers: l.parsed.helpers, deps: deps,
     dep-ids: {l.specs[k]: deps[k] for k in 0..len(l.specs)}, calls: len(l.calls) > 0,
     script: l.analysis.script and kind == Esm
