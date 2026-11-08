@@ -1518,7 +1518,8 @@
 ;;; Where a global lives: once per program, or once per worker slot for `task state` and contexts.
 ;;; A function runs on one thread from start to end, so inside one the slot is looked up once.
 (defn storage-call [(k (mut Comp)) (x Global)] (-> Code)
-  (cond (not (.task x)) `(rules-state)
+  (cond (= (.attr x) 5) `(~(sym (cat "setting-state--" (.name x))))
+        (not (.task x)) `(rules-state)
         (.in-fn k) (do (set! (.task-used k) true) `rules-task-here)
         :else `(rules-task)))
 
@@ -1538,7 +1539,9 @@
           :else field)))
 
 (defn storage-of [(k (mut Comp)) (module (slice u8)) (x Global)] (-> Code)
-  `(~(sym (qualified (mut k) module (if (.task x) "rules-task" "rules-state")))))
+  (if (= (.attr x) 5)
+      `(~(sym (qualified (mut k) module (cat "setting-state--" (.name x)))))
+      `(~(sym (qualified (mut k) module (if (.task x) "rules-task" "rules-state"))))))
 
 ;; ---------------------------------------------------------------- locals
 
@@ -6267,11 +6270,15 @@
                                       (push! (mut sets)
                                              `(set! ~field ~(.code v)))
                                       (push! (mut sets)
+                                             `(set! (~(primitive/code-symbol "." (dirty-field name)) ~storage) 1))
+                                      (push! (mut sets)
                                              `(set! ~bound (+ ~bound 1)))
                                       (push! (mut sets) changed-in)
                                       (push! (mut restores) changed-out)
                                       (push! (mut restores)
                                              `(set! ~field ~(sym saved)))
+                                      (push! (mut restores)
+                                             `(set! (~(primitive/code-symbol "." (dirty-field name)) ~storage) 1))
                                       (push! (mut restores)
                                              `(set! ~bound (- ~bound 1))))
                                     (do
@@ -6601,6 +6608,7 @@
                         (te `(let [~(sym old) ~(.code p)
                                    given (> ~bound 0)]
                                (set! ~(.code p) ~(.code v))
+                               (set! (~(primitive/code-symbol "." (dirty-field (.name (.x sp)))) ~storage) 1)
                                (when (= ~bound 0) (set! ~bound 1))
                                ~(setting-changed-code (mut k) (.module sp) (.name (.x sp)) (.ty (.x sp)) (sym old) (.code p) `given)
                                0)
@@ -8252,23 +8260,50 @@
           (= (.sort mo) (SForeign)) "foreign"
           :else (panic "rules: a value of type {} cannot be kept in the cache" t))))
 
-;;; A value compared only by its bytes (an opaque one, or a database) is written once and shared
-;;; when read back, so a value two settings or answers held, in any modules, is still one value,
-;;; and the same as itself. The runtime keeps those read so far by the type's name.
+;;; A value compared only by its bytes (an opaque one, or a database) is an object of the cache's:
+;;; written once and shared when read back, so a value two settings or answers held, in any modules,
+;;; is still one value, and the same as itself.
 (defn shared-enc [(k (mut Comp)) (t (slice u8)) (inner Code)] (-> Code)
   `(let [(mut vv) v]
-     (when (rt/put-shared-value! w ~t (cast (ptr u8) (mut vv)) (sizeof ~(coil-type (mut k) t)))
-       ~inner)))
+     (when (rt/put-object-bytes! w ~t (cast (ptr u8) (mut vv)) (sizeof ~(coil-type (mut k) t)))
+       ~inner
+       (rt/put-object-end! w))))
 
 (defn shared-dec [(k (mut Comp)) (t (slice u8)) (inner Code)] (-> Code)
   (let [ty (coil-type (mut k) t)]
-    `(let [id (rt/take-shared r)]
-       (if (>= id 0)
-           (load (cast (ptr ~ty) (rt/shared-value-at r ~t id)))
-           (let [at (rt/shared-value-reserve! r ~t)
-                 (mut v) ~inner]
-             (rt/shared-value-set! r ~t at (cast (ptr u8) (mut v)) (sizeof ~ty))
-             v)))))
+    `(let [id (rt/take-object r)]
+       (if (rt/object-ready? r id)
+           (do (rt/object-skip! r)
+               (load (cast (ptr ~ty) (rt/object-value r id))))
+           (do (rt/object-enter! r)
+               (let [(mut v) ~inner]
+                 (rt/object-leave! r (cast (ptr u8) (mut v)) (sizeof ~ty))
+                 (rt/writer-know-bytes! ~t (cast (ptr u8) (mut v)) (sizeof ~ty) id)
+                 v))))))
+
+;;; Whether a value of the type holds a tree, whose identity is where its parts are: a memo whose
+;;; key does makes its keys again when the cache is read.
+(defn tree-type? [(k (mut Comp)) (t (slice u8))] (-> bool)
+  (cond (or (= t "Int") (= t "Bool") (= t "Text")) false
+        (list? t) (tree-type? (mut k) (elem-of t))
+        (opt? t) (tree-type? (mut k) (opt-of t))
+        (map? t) (or (tree-type? (mut k) (map-key t)) (tree-type? (mut k) (map-val t)))
+        (fn? t) false
+        :else
+          (let [mo (mod-at (mut k) (type-module t))]
+            (cond (and (= (.sort mo) (SGrammar)) (= (type-name t) "Node")) true
+                  :else
+                    (match (find-rec mo (type-name t))
+                      (Some [r]
+                            (let [(mut any) false]
+                              (for f (.fields r) (when (tree-type? (mut k) (.ty f)) (set! any true)))
+                              any))
+                      (None [] false))))))
+
+(defn tree-keyed? [(k (mut Comp)) (f Func)] (-> bool)
+  (let [(mut any) false]
+    (for p (.params f) (when (tree-type? (mut k) (.ty p)) (set! any true)))
+    any))
 
 (defn enc-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
   (let [name (persist-name "enc--" t)
@@ -8379,14 +8414,26 @@
                   ~body))))
     (sym name)))
 
-;;; A memo's answers, for the cache: each with the arguments it was computed from and its node.
-;;; Read back, each is found by its key as this run makes it from the arguments, and its node's
-;;; text made again to match.
+;;; A memo's answers, for the cache. A save writes each answer new since the last (or every one,
+;;; when the log is written whole): its arguments and answer as data, and in the index its key, node
+;;; and where the data is. Reading the index notes where each is; an answer is read when its key is
+;;; first asked for. A memo whose keys hold where trees are writes no key: its arguments are read when
+;;; it is first used, and its keys made again from them, and its nodes' texts to match.
 (defn memo-persist-code [(k (mut Comp)) (f Func) (name (slice u8))] (-> Code)
-  (let [store-fn (sym (cat "memo-store--" name))
+  (let [store (sym (cat "MemoStore--" name))
+        store-fn (sym (cat "memo-store--" name))
         args-ty (sym (cat "MemoArgs--" name))
+        save (sym (cat "memo-save--" name))
+        load-index (sym (cat "memo-load--" name))
+        prepare (sym (cat "memo-prepare--" name))
+        fault (sym (cat "memo-fault--" name))
+        fault-slow (sym (cat "memo-fault-slow--" name))
+        force (sym (cat "memo-force--" name))
         qname (cat3 (.self k) "." name)
-        key-text (if (= (memo-key-type f) "Int") `(rt/num-text key) `key)
+        keyty (coil-type (mut k) (memo-key-type f))
+        int-key (= (memo-key-type f) "Int")
+        tree (tree-keyed? (mut k) f)
+        key-text (if int-key `(rt/num-text key) `key)
         (mut puts) (primitive/code-list-new)
         (mut binds) (primitive/code-list-new)
         (mut inits) (primitive/code-list-new)]
@@ -8399,48 +8446,157 @@
         (push! (mut inits) (primitive/code-symbol ":" field))
         (push! (mut inits) (memo-arg i))))
     `(do
-       (defn ~(sym (cat "memo-save--" name)) [(w (ptr rt/Writer))] (-> void)
-         (let [s (~store-fn)]
-           (rt/put-varint! w (len (.args s)))
-           (for key (.args s)
+       (defn ~save [(w (ptr rt/Writer)) (x (ptr rt/Writer)) (full bool)] (-> void)
+         (let [s (~store-fn)
+               (mut keys) (ArrayList::new [~keyty] (malloc-allocator))]
+           (when (and full (or (> (len (.lazy s)) 0) (> (len (.pending s)) 0)))
+             (panic "memo fn {} is written whole with answers still unread" ~name))
+           (if full
+               (for key (.table s) (push! (mut keys) key))
+               (for key (.dirty s)
+                 (match (get (.table s) key) (Some [_] (push! (mut keys) key)) (None [] 0))))
+           (rt/put-varint! x (len keys))
+           (for key keys
              (match (get (.args s) key)
                (Some [a]
-                     (do ~@puts
+                     (do ~(if tree `0 (if int-key `(rt/put-int! x key) `(rt/put-text! x key)))
+                         (match (get (.node-ids s) key)
+                           (Some [id] (rt/put-int! x id))
+                           (None [] (panic "memo fn {} kept arguments with no node" ~name)))
+                         (rt/put-varint! x (rt/writer-at w))
+                         ~@puts
                          (match (get (.table s) key)
                            (Some [answer] ~(enc-code (mut k) (.ret f) `answer))
-                           (None [] (panic "memo fn {} kept arguments with no answer" ~name)))
-                         (match (get (.node-ids s) key)
-                           (Some [id] (rt/put-int! w id))
-                           (None [] (panic "memo fn {} kept arguments with no node" ~name)))))
-               (None [] (panic "a map lost a key while it was written")))))
+                           (None [] (panic "memo fn {} kept arguments with no answer" ~name)))))
+               (None [] (panic "memo fn {} kept an answer with no arguments" ~name))))
+           (HashMap::clear! (mut (.dirty s))))
          0)
-       (defn ~(sym (cat "memo-load--" name)) [(r (ptr rt/Reader))] (-> void)
+       (defn ~load-index [(r (ptr rt/Reader))] (-> void)
          (let [s (~store-fn)
                n (rt/take-varint r)]
-           (for _ (range 0 n)
-             (let [~@binds
-                   answer ~(dec-code (mut k) (.ret f))
-                   id (rt/take-int r)
-                   key ~(memo-key-code (mut k) f)]
-               (set! (mut (.args s)) key (~args-ty ~@inits))
-               (set! (mut (.table s)) key answer)
-               (set! (mut (.node-ids s)) key id)
-               (rt/dep-retext! id (rt/memo-node ~qname ~key-text)))))
+           ~(if tree
+                `(do
+                   (when (> n 0) (rt/memo-pending-name! ~qname))
+                   (for _ (range 0 n)
+                     (let [id (rt/take-int r)
+                           at (rt/take-varint r)]
+                       (push! (mut (.pending s)) id)
+                       (push! (mut (.pending s)) at))))
+                `(for _ (range 0 n)
+                   (let [key ~(if int-key `(rt/take-int r) `(rt/take-text r))
+                         id (rt/take-int r)
+                         at (rt/take-varint r)]
+                     (set! (mut (.lazy s)) key at)
+                     (set! (mut (.node-ids s)) key id)
+                     (rt/dep-claim! id)))))
+         0)
+       ;; A memo whose keys hold trees: each answer's arguments read, its key made, its node's text
+       ;; made to match. Once, when first used.
+       (defn ~prepare [(s (ptr ~store))] (-> i64)
+         ~(if tree
+              `(let [word (cast (ptr i64) s)]
+                 (rt/spin-lock! word)
+                 (let [pending (len (.pending s))]
+                   (rt/spin-unlock! word)
+                   (when (> pending 0)
+                     (rt/cache-lock!)
+                     (rt/spin-lock! word)
+                     (let [todo (.pending s)]
+                       (rt/spin-unlock! word)
+                       (when (> (len todo) 0)
+                         (let [r (rt/the-reader)]
+                           (for i (range 0 (/ (len todo) 2))
+                             (let [id (get todo (* 2 i))
+                                   at (get todo (+ (* 2 i) 1))]
+                               (rt/reader-seek! r at)
+                               (let [~@binds
+                                     key ~(memo-key-code (mut k) f)
+                                     answer-at (.at r)]
+                                 (rt/reader-return! r)
+                                 (rt/spin-lock! word)
+                                 (set! (mut (.lazy s)) key answer-at)
+                                 (set! (mut (.args s)) key (~args-ty ~@inits))
+                                 (set! (mut (.node-ids s)) key id)
+                                 (rt/spin-unlock! word)
+                                 (rt/dep-retext! id (rt/memo-node ~qname ~key-text))))))
+                         (rt/spin-lock! word)
+                         (set! (.pending s) (ArrayList::new [i64] (malloc-allocator)))
+                         (rt/spin-unlock! word)
+                         (rt/dep-unclaimed-of! ~qname)))
+                     (rt/cache-unlock!))))
+              `0)
+         0)
+       ;; An answer the cache holds and this run has not read, read now that it is asked for.
+       (defn ~fault [(s (ptr ~store)) (key ~keyty)] (-> i64)
+         (~prepare s)
+         (let [word (cast (ptr i64) s)]
+           (rt/spin-lock! word)
+           (let [lazy (match (get (.lazy s) key) (Some [_] true) (None [] false))]
+             (rt/spin-unlock! word)
+             (when lazy (~fault-slow s key))))
+         0)
+       (defn ~fault-slow [(s (ptr ~store)) (key ~keyty)] (-> void)
+         (rt/cache-lock!)
+         (let [word (cast (ptr i64) s)
+               r (rt/the-reader)]
+           (rt/spin-lock! word)
+           (let [found (get (.lazy s) key)]
+             (rt/spin-unlock! word)
+             (match found
+               (Some [at]
+                     (do
+                       (rt/reader-seek! r at)
+                       ~(if tree
+                            `(let [answer ~(dec-code (mut k) (.ret f))]
+                               (rt/reader-return! r)
+                               (rt/spin-lock! word)
+                               (set! (mut (.table s)) key answer)
+                               (HashMap::remove! (mut (.lazy s)) key)
+                               (rt/spin-unlock! word))
+                            `(let [~@binds
+                                   answer ~(dec-code (mut k) (.ret f))]
+                               (rt/reader-return! r)
+                               (rt/spin-lock! word)
+                               (set! (mut (.args s)) key (~args-ty ~@inits))
+                               (set! (mut (.table s)) key answer)
+                               (HashMap::remove! (mut (.lazy s)) key)
+                               (rt/spin-unlock! word)))
+                       0))
+               (None [] 0))))
+         (rt/cache-unlock!)
+         0)
+       ;; Every answer the cache holds read, before the log is written whole.
+       (defn ~force [] (-> void)
+         (let [s (~store-fn)
+               word (cast (ptr i64) s)]
+           (~prepare s)
+           (rt/spin-lock! word)
+           (let [(mut keys) (ArrayList::new [~keyty] (malloc-allocator))]
+             (for key (.lazy s) (push! (mut keys) key))
+             (rt/spin-unlock! word)
+             (for key keys (~fault-slow s key))))
          0))))
 
-;;; A module's part of the cache: first the parts of the modules it uses, each once, then its own
-;;; settings (whether given, and the value), states and memo answers.
+;;; A module's part of the cache: first the parts of the modules it uses, each once, then its own.
+;;; A save writes each setting given a value since the last (whether it has one, and the value),
+;;; every state, and its memos' new answers; reading the index notes where each setting is, reads
+;;; the states, and notes where its memos' answers are. A setting is read when first used: each is
+;;; reached through its own function, which reads it first if it must (`setting-state--NAME`).
 (defn compile-persist [(k (mut Comp)) (decls (ArrayList g/Node))] (-> Code)
   (let [self (self-mod (mut k))
         name (.self k)
         (mut others-save) (primitive/code-list-new)
         (mut others-load) (primitive/code-list-new)
+        (mut others-force) (primitive/code-list-new)
         (mut puts) (primitive/code-list-new)
-        (mut gets) (primitive/code-list-new)]
+        (mut gets) (primitive/code-list-new)
+        (mut forces) (primitive/code-list-new)
+        (mut accessors) (primitive/code-list-new)]
     (for m (.mods k)
       (when (and (= (.sort m) (SRules)) (!= (.name m) name) (!= (.name m) "hl.prelude"))
-        (push! (mut others-save) `(~(sym (qualified (mut k) (.name m) "persist-save!")) w))
-        (push! (mut others-load) `(~(sym (qualified (mut k) (.name m) "persist-load!")) r))))
+        (push! (mut others-save) `(~(sym (qualified (mut k) (.name m) "persist-save!")) w x full))
+        (push! (mut others-load) `(~(sym (qualified (mut k) (.name m) "persist-load!")) r))
+        (push! (mut others-force) `(~(sym (qualified (mut k) (.name m) "persist-force!"))))))
     (for d decls
       (when (or (= (.kind d) (g/KSetting)) (= (.kind d) (g/KState)))
         (let [g-name (.text (kid d 0))
@@ -8450,29 +8606,70 @@
               field (primitive/code-symbol "." g-name)]
           (when (not (.task x))
             (if (= (.kind d) (g/KSetting))
-                (let [bound (primitive/code-symbol "." (bound-field g-name))]
+                (let [bound (primitive/code-symbol "." (bound-field g-name))
+                      lazy (primitive/code-symbol "." (lazy-field g-name))
+                      lazy-name (sym (lazy-field g-name))
+                      dirty (primitive/code-symbol "." (dirty-field g-name))
+                      accessor (sym (cat "setting-state--" g-name))
+                      forcer (sym (cat "setting-force--" g-name))]
+                  (push! (mut accessors)
+                         `(defn ~accessor [] (-> (ptr RulesState))
+                            (let [st (rules-state)]
+                              (when (> (atomic/read (field st ~lazy-name)) 0) (~forcer st))
+                              st)))
+                  (push! (mut accessors)
+                         `(defn ~forcer [(st (ptr RulesState))] (-> void)
+                            (rt/cache-lock!)
+                            (let [at (atomic/read (field st ~lazy-name))]
+                              (when (> at 0)
+                                (let [r (rt/the-reader)]
+                                  (rt/reader-seek! r (- at 1))
+                                  (set! (~field st) ~(dec-code (mut k) (.ty x)))
+                                  (rt/reader-return! r)
+                                  (atomic/store (field st ~lazy-name) 0))))
+                            (rt/cache-unlock!)
+                            0))
                   (push! (mut puts)
-                         `(let [given (> (~bound st) 0)]
-                            (rt/put-bool! w given)
-                            (when given ~(enc-code (mut k) (.ty x) `(~field st)))))
+                         `(if (or full (> (~dirty st) 0))
+                              (let [given (> (~bound st) 0)]
+                                (when (> (atomic/read (field st ~lazy-name)) 0)
+                                  (panic "setting {} is written while still unread" ~g-name))
+                                (rt/put-bool! x true)
+                                (rt/put-bool! x given)
+                                (rt/put-varint! x (rt/writer-at w))
+                                (when given ~(enc-code (mut k) (.ty x) `(~field st)))
+                                (set! (~dirty st) 0))
+                              (rt/put-bool! x false)))
                   (push! (mut gets)
                          `(when (rt/take-bool r)
-                            (set! (~field st) ~(dec-code (mut k) (.ty x)))
-                            (set! (~bound st) 1))))
+                            (let [given (rt/take-bool r)
+                                  at (rt/take-varint r)]
+                              (set! (~bound st) (if given 1 0))
+                              (set! (~dirty st) 0)
+                              (atomic/store (field st ~lazy-name) (if given (+ at 1) 0)))))
+                  (push! (mut forces) `(~accessor)))
                 (do
-                  (push! (mut puts) (enc-code (mut k) (.ty x) `(~field st)))
-                  (push! (mut gets) `(set! (~field st) ~(dec-code (mut k) (.ty x))))))))))
+                  (push! (mut puts)
+                         `(do (rt/put-varint! x (rt/writer-at w))
+                              ~(enc-code (mut k) (.ty x) `(~field st))))
+                  (push! (mut gets)
+                         `(let [at (rt/take-varint r)]
+                            (rt/reader-seek! r at)
+                            (set! (~field st) ~(dec-code (mut k) (.ty x)))
+                            (rt/reader-return! r)))))))))
     (for d decls
       (when (= (.kind d) (g/KMemoFn))
         (push! (mut puts) `(rt/put-part! w ~(cat3 name "." (.text (kid d 0)))))
-        (push! (mut puts) `(~(sym (cat "memo-save--" (.text (kid d 0)))) w))
-        (push! (mut gets) `(~(sym (cat "memo-load--" (.text (kid d 0)))) r))))
+        (push! (mut puts) `(~(sym (cat "memo-save--" (.text (kid d 0)))) w x full))
+        (push! (mut gets) `(~(sym (cat "memo-load--" (.text (kid d 0)))) r))
+        (push! (mut forces) `(~(sym (cat "memo-force--" (.text (kid d 0))))))))
     `(do
-       (defn persist-save! [(w (ptr rt/Writer))] (-> void)
-         (when (rt/put-module! w ~name)
+       ~@accessors
+       (defn persist-save! [(w (ptr rt/Writer)) (x (ptr rt/Writer)) (full bool)] (-> void)
+         (when (rt/put-module! x ~name)
            ~@others-save
            (rt/put-part! w ~(cat name " settings and states"))
-           (rt/put-mark! w ~name)
+           (rt/put-mark! x ~name)
            (let [st (rules-state)]
              ~@puts
              0))
@@ -8484,7 +8681,19 @@
            (let [st (rules-state)]
              ~@gets
              0))
+         0)
+       (defn persist-force! [] (-> void)
+         (when (rt/force-module! ~name)
+           ~@others-force
+           ~@forces
+           0)
          0))))
+
+(defn lazy-field [(name (slice u8))] (-> (slice u8))
+  (cat name "--lazy"))
+
+(defn dirty-field [(name (slice u8))] (-> (slice u8))
+  (cat name "--dirty"))
 
 ;;; The shared table, its lock and generation; the function; the computation under another name.
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
@@ -8527,14 +8736,24 @@
                (table ~(coil-type (mut k) mt))
                (args (HashMap ~(coil-type (mut k) (memo-key-type f)) ~args-ty))
                (node-ids (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
-               (busy ~(coil-type (mut k) (memo-busy-type f)))]))
-    ;; An answer asked for by its key's text, as checking an answer that read it asks: with the
-    ;; arguments it was computed from, which its store keeps.
+               (busy ~(coil-type (mut k) (memo-busy-type f)))
+               ;; Answers the cache holds that this run has not read, by where their data is;
+               ;; answers new since the last save; and, for a memo whose keys hold trees, the nodes
+               ;; and data of answers whose keys are not made yet.
+               (lazy (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
+               (dirty (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
+               (pending (ArrayList i64))]))
+    ;; An answer asked for by its node, as checking an answer that read it asks: its key from the
+    ;; node's text, once the store has made its keys, and the arguments it was computed from, which
+    ;; its store keeps.
     (emit! (mut out)
-           `(defn ~ensure [(text (slice u8))] (-> i64)
+           `(defn ~ensure [(id i64)] (-> i64)
               (let [s (~store-fn)
                     word (cast (ptr i64) s)
+                    prepared (~(sym (cat "memo-prepare--" name)) s)
+                    text (rt/dep-memo-key id)
                     key ~(if (= (memo-key-type f) "Int") `(rt/parse-int text) `text)]
+                (~(sym (cat "memo-fault--" name)) s key)
                 (rt/spin-lock! word)
                 (let [found (get (.args s) key)]
                   (rt/spin-unlock! word)
@@ -8555,6 +8774,9 @@
                                              `(HashMap::new [i64 i64] (malloc-allocator) (i64-keyops))
                                              `(HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
                     (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
+                    (set! (.lazy s) ~(new-map (mut k) (cat3 "{" (memo-key-type f) ":Int}")))
+                    (set! (.dirty s) ~(new-map (mut k) (cat3 "{" (memo-key-type f) ":Int}")))
+                    (set! (.pending s) (ArrayList::new [i64] (malloc-allocator)))
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
                   (rt/init-unlock!)
@@ -8570,6 +8792,8 @@
                     t (rules-task)
                     s (~store-fn)
                     word (cast (ptr i64) s)
+                    ;; An answer the cache holds is read before anything looks for it.
+                    faulted (~(sym (cat "memo-fault--" name)) s key)
                     tracking (rt/dep-tracking?)
                     node (if tracking
                              (do (rt/spin-lock! word)
@@ -8599,6 +8823,7 @@
                   (None []
                         (let [me (+ (rt/worker-slot) 1)
                               (mut answer) (None [~rt])
+                              (mut new-answer) false
                               (mut go) true]
                           (while go
                             (rt/spin-lock! word)
@@ -8638,6 +8863,7 @@
                                                                     (let [fresh (~(sym compute) ~@args)
                                                                           same ~(same-code (mut k) (.ret f) `old `fresh)]
                                                                       (rt/dep-end-id! node same)
+                                                                      (unless same (set! new-answer true))
                                                                       (if same old fresh)))))
                                                         (None []
                                                               (do
@@ -8645,10 +8871,13 @@
                                                                 (let [fresh (~(sym compute) ~@args)]
                                                                   (when tracking (rt/dep-end-id! node false))
                                                                   (rt/dep-untracked!)
+                                                                  (set! new-answer true)
                                                                   fresh))))]
                                                 (rt/spin-lock! word)
                                                 (when tracking
-                                                  (set! (mut (.args s)) key (~args-ty ~@arg-inits)))
+                                                  (set! (mut (.args s)) key (~args-ty ~@arg-inits))
+                                                  ;; What the cache does not hold yet.
+                                                  (when new-answer (set! (mut (.dirty s)) key 1)))
                                                 (set! (mut (.table s))
                                                       key
                                                       made)
@@ -8856,7 +9085,13 @@
                         (push! (mut state-inits)
                                `(set! (~(primitive/code-symbol "."
                                                                (bound-field g-name)) s)
-                                      0)))))))
+                                      0))
+                        ;; Where the cache holds its value, plus one, until it is read; and
+                        ;; whether it was given one since the cache was last written.
+                        (push! (mut state-fields) `(~(sym (lazy-field g-name)) i64))
+                        (push! (mut state-inits) `(set! (~(primitive/code-symbol "." (lazy-field g-name)) s) 0))
+                        (push! (mut state-fields) `(~(sym (dirty-field g-name)) i64))
+                        (push! (mut state-inits) `(set! (~(primitive/code-symbol "." (dirty-field g-name)) s) 0)))))))
             (when (= (.kind d) (g/KInclude))
               (let [m (mod-at (mut k) (.text (kid d 0)))
                     rt-ty
@@ -8972,13 +9207,23 @@
                         `(~(primitive/code-symbol "." (.name x)) (rules-state))
                       tb (fresh (mut k) "kept")
                       bound
-                        `(~(primitive/code-symbol "." (bound-field (.name x))) (rules-state))]
+                        `(~(primitive/code-symbol "." (bound-field (.name x))) (rules-state))
+                      tl (fresh (mut k) "kept")
+                      lazy `(~(primitive/code-symbol "." (lazy-field (.name x))) (rules-state))
+                      td (fresh (mut k) "kept")
+                      dirty `(~(primitive/code-symbol "." (dirty-field (.name x))) (rules-state))]
                   (push! (mut keeps) (sym t))
                   (push! (mut keeps) field)
                   (push! (mut keeps) (sym tb))
                   (push! (mut keeps) bound)
+                  (push! (mut keeps) (sym tl))
+                  (push! (mut keeps) lazy)
+                  (push! (mut keeps) (sym td))
+                  (push! (mut keeps) dirty)
                   (push! (mut puts) `(set! ~field ~(sym t)))
-                  (push! (mut puts) `(set! ~bound ~(sym tb))))))
+                  (push! (mut puts) `(set! ~bound ~(sym tb)))
+                  (push! (mut puts) `(set! ~lazy ~(sym tl)))
+                  (push! (mut puts) `(set! ~dirty ~(sym td))))))
             (emit! (mut out)
                    `(defn reset-state! [] (-> void)
                       (let [~@keeps]
@@ -9014,7 +9259,7 @@
     (if (none? (kid d 1))
         `(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
            (rt/args-init! argc argv)
-           (rt/persist-root! (fnptr-of persist-save!) (fnptr-of persist-load!))
+           (rt/persist-root! (fnptr-of persist-save!) (fnptr-of persist-load!) (fnptr-of persist-force!))
            ~(if answers `(~(sym name)) `(do (~(sym name)) 0)))
         `(do
            (defn rules-worker [(arg (ptr i8))] (-> (ptr i8))
@@ -9022,7 +9267,7 @@
              arg)
            (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
              (rt/args-init! argc argv)
-             (rt/persist-root! (fnptr-of persist-save!) (fnptr-of persist-load!))
+             (rt/persist-root! (fnptr-of persist-save!) (fnptr-of persist-load!) (fnptr-of persist-force!))
              (rt/run-on-big-stack (fnptr-of rules-worker))
              (rt/answer))))))
 

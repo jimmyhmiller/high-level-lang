@@ -40,11 +40,11 @@ def fresh(entry, root):
         sys.exit("fresh build failed: " + p.stderr[-2000:])
     return read("out/fresh.js", root)
 
-def watched_run(entry, root, esb=ESB):
+def watched_run(entry, root, esb=ESB, env=None):
     """A watcher's first build: what it said, and how many memo answers it computed."""
     # With --timing the watcher says when its save, on a thread of its own, is done.
     p = subprocess.Popen([esb, entry, "--watch", "--timing", "--outfile=out/out.js"], cwd=root, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                         stderr=subprocess.STDOUT, text=True, start_new_session=True, env=env)
     said, computed = [], None
     deadline = time.time() + 60
     for line in p.stdout:
@@ -68,13 +68,42 @@ def once_run(entry, root):
         sys.exit("a build with --cache failed: " + (p.stdout + p.stderr)[-2000:])
     return p.stdout.splitlines()
 
-def check(name, root, entry, run, most=None, says=None):
+def editing_run(entry, root, edit):
+    """A watcher started from the cache, an edit while it runs, and its second build: what it said,
+    and how many memo answers that build computed."""
+    p = subprocess.Popen([ESB, entry, "--watch", "--timing", "--outfile=out/out.js"], cwd=root, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    said, computed, builds, saved = [], None, 0, 0
+    deadline = time.time() + 60
+    for line in p.stdout:
+        said.append(line.rstrip())
+        m = re.search(r"\[watch\] build (\d+): [\d.]+ ms, (\d+) memo answers computed", line)
+        if m:
+            builds = int(m.group(1))
+            computed = int(m.group(2))
+        if "[cache] saved in" in line or "[cache] nothing new to save" in line:
+            saved += 1
+            if builds == 1:
+                edit()
+            elif builds == 2:
+                break
+        if time.time() > deadline:
+            break
+    os.killpg(p.pid, 9)
+    p.wait()
+    if builds != 2:
+        sys.exit("the watcher never made its second build:\n" + "\n".join(said))
+    return said, computed
+
+def check(name, root, entry, run, most=None, says=None, env=None, edit=None):
     """A run, against a fresh build: the same bytes; at most `most` answers computed; a line saying `says`."""
     global failures
     if run == "once":
         said, computed = once_run(entry, root), None
+    elif run == "editing":
+        said, computed = editing_run(entry, root, edit)
     else:
-        said, computed = watched_run(entry, root, run if run != "watch" else ESB)
+        said, computed = watched_run(entry, root, run if run != "watch" else ESB, env)
     same = read("out/out.js", root) == fresh(entry, root)
     ok = same and (most is None or computed <= most) and (says is None or any(says in l for l in said))
     failures += not ok
@@ -133,6 +162,24 @@ for app in APPS:
         check("a cache another build wrote", WORK, entry, other, says="another build")
         check("this build again, from what it set aside", WORK, entry, "watch", says="another build")
         check("again: nothing computed", WORK, entry, "watch", most=0)
+        # A run stopped while it wrote a segment leaves part of one at the log's end.
+        with open(cache_files(WORK)[0], "ab") as f:
+            f.write(os.urandom(1000))
+        check("a segment cut short at the end", WORK, entry, "watch", most=0)
+        write(module, 'console.log("after the cut");\n' + read(module, WORK), WORK)
+        check("an edit written after it", WORK, entry, "watch", most=60)
+        check("again: nothing computed", WORK, entry, "watch", most=0)
+    # Edits while a watcher that started from the cache runs: answers read from the cache as the
+    # rebuild asks for them, and what is new added to the log.
+    check("an edit while watching, from the cache", WORK, entry, "editing", most=60,
+          edit=lambda: write(module, 'console.log("while watching");\n' + read(module, WORK), WORK))
+    check("again: nothing computed", WORK, entry, "watch", most=0)
+    # The log written whole by a run that read only some of it: the rest read first.
+    write(entry, original + 'console.log("whole");\n', WORK)
+    check("an edit, then the log written whole", WORK, entry, "watch", most=60, env=dict(os.environ, HL_CACHE_WHOLE="1"))
+    check("again: nothing computed", WORK, entry, "watch", most=0)
+    write(entry, original, WORK)
+    check("the entry back", WORK, entry, "watch", most=60)
 
 # Names across modules, across runs: top-level names that come and go in one module, which nested
 # names in another step around.

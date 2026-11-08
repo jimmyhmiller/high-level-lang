@@ -2323,19 +2323,20 @@
               (= (primitive/cast i64 (data (.text a)))
                  (primitive/cast i64 (data (.text b))))))
 ;;; A node for the cache (see the cache in hl.rt): its kind, text, children, place and stamp.
-       ;;; A list of children is written once and after that by number, so a tree that shares
-       ;;; children with another shares them after a load too, and `node-key` stays its identity.
-       (defstruct NodeTables [(load i64) (lists (ArrayList (ArrayList Node)))])
-       ;; Its one cell, whose address also tells this grammar's lists from others' as they are written.
+       ;;; A list of children is an object of the cache's, so a tree that shares children with
+       ;;; another shares them after a load too, and `node-key` stays its identity.
+       (defstruct NodeTables [(load i64)])
+       ;; Its one cell, whose address tells this grammar's lists from others' as they are written.
        (defn node-tables [] (-> (ptr NodeTables))
          (primitive/alloc-static NodeTables))
        (defn node-encode! [(w (ptr rt/Writer)) (n Node)] (-> void)
          (rt/put-varint! w (kind-tag (.kind n)))
          (rt/put-text! w (.text n))
-         (when (rt/put-shared! w (primitive/cast i64 (node-tables))
-                             (primitive/cast i64 (data (slice (.kids n)))) (len (.kids n)))
+         (when (rt/put-object! w (primitive/cast i64 (node-tables))
+                               (primitive/cast i64 (data (slice (.kids n)))) (len (.kids n)))
            (rt/put-varint! w (len (.kids n)))
-           (for c (.kids n) (node-encode! w c)))
+           (for c (.kids n) (node-encode! w c))
+           (rt/put-object-end! w))
          (rt/put-int! w (.lo n))
          (rt/put-int! w (.hi n))
          (rt/put-int! w (.gen n))
@@ -2349,20 +2350,19 @@
                g (rt/take-int r)]
            (Node :kind kind :text text :kids kids :lo lo :hi hi :gen g)))
        (defn node-kids-decode [(r (ptr rt/Reader))] (-> (ArrayList Node))
-         (let [t (node-tables)]
-           (when (!= (.load t) (rt/reader-load r))
-             (set! (.lists t) (ArrayList::new [(ArrayList Node)] (malloc-allocator)))
-             (set! (.load t) (rt/reader-load r)))
-           (let [id (rt/take-shared r)]
-             (if (>= id 0)
-                 (get (.lists t) id)
-                 (let [at (len (.lists t))
-                       n (do (push! (mut (.lists t)) (new-kids)) (rt/take-varint r))
-                       (mut kids) (new-kids)]
-                   (reserve! (mut kids) n)
-                   (for _ (range 0 n) (push! (mut kids) (node-decode r)))
-                   (set! (mut (.lists t)) at kids)
-                   kids)))))
+         (let [id (rt/take-object r)]
+           (if (rt/object-ready? r id)
+               (do (rt/object-skip! r)
+                   (load (cast (ptr (ArrayList Node)) (rt/object-value r id))))
+               (do (rt/object-enter! r)
+                   (let [n (rt/take-varint r)
+                         (mut kids) (new-kids)]
+                     (reserve! (mut kids) n)
+                     (for _ (range 0 n) (push! (mut kids) (node-decode r)))
+                     (rt/object-leave! r (cast (ptr u8) (mut kids)) (sizeof (ArrayList Node)))
+                     (rt/writer-know! (primitive/cast i64 (node-tables))
+                                      (primitive/cast i64 (data (slice kids))) (len kids) id)
+                     kids)))))
        ;;; A copy of a node with another stamp; the node itself is untouched.
        (defn with-gen [(n Node) (g i64)] (-> Node)
          (let [(mut c) n] (set! (.gen c) g) c))

@@ -2613,7 +2613,9 @@
    (num-indexes (ArrayList i64))
    ;; Each site's nodes by index, in pages of 1024 made as an index in one is first read (-1: none).
    (site-pages (ArrayList (ArrayList (ArrayList i64))))
-   (ensurers (HashMap (slice u8) (fnptr (cc/C) [(slice u8)] i64)))
+   ;; Each memo's function that brings one of its answers up to date, by the answer's node: its
+   ;; store, read from the cache first if it must be, makes its key from the node's text.
+   (ensurers (HashMap (slice u8) (fnptr (cc/C) [i64] i64)))
    (paths (HashMap (slice u8) (ArrayList (slice u8))))
    (stacks (ArrayList (ArrayList DepFrame)))
    (computed i64)
@@ -2652,7 +2654,7 @@
         (set! (.num-sites d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.num-indexes d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.site-pages d) (ArrayList::new [(ArrayList (ArrayList i64))] (malloc-allocator)))
-        (set! (.ensurers d) (HashMap::new [(slice u8) (fnptr (cc/C) [(slice u8)] i64)] (malloc-allocator) (str/keyops)))
+        (set! (.ensurers d) (HashMap::new [(slice u8) (fnptr (cc/C) [i64] i64)] (malloc-allocator) (str/keyops)))
         (set! (.paths d) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops)))
         (set! (.stacks d) (ArrayList::new [(ArrayList DepFrame)] (malloc-allocator)))
         (for _ (range 0 (max-workers))
@@ -3202,7 +3204,7 @@
   (dep-note! (memo-node name key)))
 
 ;;; A memo can be asked for an answer by its key's text: what checking an answer that read it calls.
-(defn dep-ensurer! [(name (slice u8)) (f (fnptr (cc/C) [(slice u8)] i64))] (-> void)
+(defn dep-ensurer! [(name (slice u8)) (f (fnptr (cc/C) [i64] i64))] (-> void)
   (let [d (deps)]
     (deps-lock! d)
     (set! (mut (.ensurers d)) name f)
@@ -3402,7 +3404,7 @@
                   (Some [f] f)
                   (None [] (panic "no memo named {} to ask for {}" name text)))]
           (deps-unlock! d)
-          (f (subslice text (+ cut 1) (len text)))
+          (f id)
           (deps-lock! d)
           (let [c (get (.changed d) id)] (deps-unlock! d) c)))))
 
@@ -3730,42 +3732,100 @@
 
 ;; ---------------------------------------------------------------- the cache on disk
 
-;;; What a program computed, kept on disk so that a later run starts where an earlier one stopped:
-;;; the dependency graph above, and every memo answer, setting and state of the program's modules,
-;;; which their generated code writes through a Writer and reads through a Reader. Values go in
-;;; order, with no names or types, so only the build of the program that wrote them reads them
-;;; back, which the header checks. A text, or a tree's children, is written once and after that
-;;; referred to by number: what was one object is one object after a load, and a tree's identity
-;;; (`node-identity`, where its parts are) means after a load what it meant before the save.
+;;; What a program computed, kept on disk so that a later run starts where an earlier one stopped,
+;;; and reads back only what it uses. Two files: the dependency graph above, written whole each
+;;; time (`.deps`), and a log (`.cache`) of every memo answer, setting and state of the program's
+;;; modules, which their generated code writes through a Writer and reads through a Reader.
+;;;
+;;; The log is segments, each written once and never changed: what changed since the last save,
+;;; then an index of it. A run reads the indexes, and an answer or a setting only when it is first
+;;; asked for. An object several values hold (a tree's list of children, a long text, an opaque
+;;; value) has a number for as long as the log does: written whole the first time, with its length,
+;;; so a reader that does not want it yet skips it, and after that by number; read once, by
+;;; whichever value is read first, and then shared, so one object is one object after a load, and a
+;;; tree's identity (`node-identity`) means what it meant. When the log has grown to twice what it
+;;; holds, the next save writes it again whole. Values go with no names or types: only the build of
+;;; the program that wrote them reads them, which the headers check.
 
 (defstruct Writer
-  [;; What is written so far: `pos` bytes of `mem`.
+  [;; What is written so far: `pos` bytes of `mem`, which start at `base` in the file.
    (mem (slice u8))
    (pos i64)
-   ;; Objects written, by (tag, where, how long): open addressing over three columns, each slot's
-   ;; number kept plus one so a slot of zeros is empty.
+   (base i64)
+   ;; Whether objects are shared (the log's writer) or each written where it is (the graph's).
+   (objects bool)
+   ;; Objects in the log, by (tag, where, how long): open addressing over three columns, each
+   ;; slot's number kept plus one so a slot of zeros is empty; and by their bytes.
    (keys (ArrayList i64))
    (ids (ArrayList i64))
    (mask i64)
    (filled i64)
-   ;; Values known by their bytes (`put-shared-value!`).
    (shared (HashMap (slice u8) i64))
-   (counts (HashMap i64 i64))
+   (next-id i64)
+   ;; Objects this buffer defines, as (number, where its content starts) pairs; and the places of
+   ;; the lengths of those still being written.
+   (defined (ArrayList i64))
+   (open (ArrayList i64))
    (modules (HashMap (slice u8) i64))])
 
 (defstruct Reader
   [(bytes (slice u8))
    (at i64)
-   ;; Long texts, by number, as read so far.
-   (texts (ArrayList (slice u8)))
-   (modules (HashMap (slice u8) i64))
-   ;; Values shared by their bytes (`put-shared-value!`), by their type's name, as read so far.
-   (values (HashMap (slice u8) (ArrayList (slice u8))))
-   ;; Which load this is: tables of shared objects kept elsewhere start over with each.
-   (load i64)])
+   (objects bool)
+   ;; Where to come back to after reading something elsewhere.
+   (returns (ArrayList i64))
+   ;; Each object's content by number (-1: not in the log), and its value once read: where its
+   ;; bytes are in `arena`, plus one.
+   (offsets (ArrayList i64))
+   (values (ArrayList i64))
+   (arena (ArrayList u8))
+   ;; Objects being read: number, whether it is written here (1) or elsewhere (0), where it ends.
+   (frames (ArrayList i64))
+   (modules (HashMap (slice u8) i64))])
+
+(defn writer-new [(objects bool)] (-> Writer)
+  (Writer
+    :mem (match (alloc [u8] (malloc-allocator) 1048576) (Some [m] m) (None [] (panic "no memory to write the cache")))
+    :pos 0
+    :base 0
+    :objects objects
+    :keys (ArrayList::new [i64] (malloc-allocator))
+    :ids (ArrayList::new [i64] (malloc-allocator))
+    :mask -1
+    :filled 0
+    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :next-id 0
+    :defined (ArrayList::new [i64] (malloc-allocator))
+    :open (ArrayList::new [i64] (malloc-allocator))
+    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+
+;;; A buffer to write the next part in, at `base`, keeping what objects are known.
+(defn writer-restart! [(w (ptr Writer)) (base i64)] (-> void)
+  (set! (.pos w) 0)
+  (set! (.base w) base)
+  (clear! (mut (.defined w)))
+  (clear! (mut (.open w)))
+  (HashMap::clear! (mut (.modules w)))
+  0)
+
+(defn reader-new [(bytes (slice u8)) (objects bool)] (-> Reader)
+  (Reader
+    :bytes bytes
+    :at 0
+    :objects objects
+    :returns (ArrayList::new [i64] (malloc-allocator))
+    :offsets (ArrayList::new [i64] (malloc-allocator))
+    :values (ArrayList::new [i64] (malloc-allocator))
+    :arena (ArrayList::new [u8] (malloc-allocator))
+    :frames (ArrayList::new [i64] (malloc-allocator))
+    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
 
 (defn written-bytes [(w (ptr Writer))] (-> (slice u8))
   (subslice (.mem w) 0 (.pos w)))
+
+;;; Where the next byte goes, in the file.
+(defn writer-at [(w (ptr Writer))] (-> i64)
+  (+ (.base w) (.pos w)))
 
 ;;; Room for `n` more bytes.
 (defn put-room! [(w (ptr Writer)) (n i64)] (-> void)
@@ -3811,6 +3871,18 @@
     (set! (.pos w) (+ (.pos w) (len s))))
   0)
 
+;;; Eight bytes, low first, at `at` in what is written: a length known only once what it measures is.
+(defn put-word-at! [(w (ptr Writer)) (at i64) (v i64)] (-> void)
+  (for i (range 0 8)
+    (store! (primitive/index (data (.mem w)) (+ at i)) (cast u8 (& (>> v (* i 8)) 255))))
+  0)
+
+(defn put-word! [(w (ptr Writer)) (v i64)] (-> void)
+  (put-room! w 8)
+  (put-word-at! w (.pos w) v)
+  (set! (.pos w) (+ (.pos w) 8))
+  0)
+
 (defn take-byte [(r (ptr Reader))] (-> i64)
   (when (>= (.at r) (len (.bytes r))) (panic "the cache ends before what it holds does"))
   (let [b (cast i64 (get (.bytes r) (.at r)))]
@@ -3848,34 +3920,37 @@
     (set! (.at r) (+ at n))
     (subslice (.bytes r) at (+ at n))))
 
-;;; An object kept by where it is and how long, under `tag` (0 for texts; for others an address
-;;; that is theirs alone): the first time, true, and the caller writes it next; after that its number
-;;; is written, and false.
-(defn put-shared! [(w (ptr Writer)) (tag i64) (at i64) (n i64)] (-> bool)
-  (when (> (* (+ (.filled w) 1) 2) (+ (.mask w) 1)) (shared-grow! w))
-  (let [(mut i) (& (memo-hash (^ (memo-hash (^ (memo-hash tag) at)) n)) (.mask w))
-        (mut out) -1]
-    (while (< out 0)
-      (let [v (get (.ids w) i)]
-        (cond (= v 0)
-                (let [id (match (get (.counts w) tag) (Some [c] c) (None [] 0))]
-                  (set! (mut (.counts w)) tag (+ id 1))
-                  (set! (mut (.keys w)) (* i 3) tag)
-                  (set! (mut (.keys w)) (+ (* i 3) 1) at)
-                  (set! (mut (.keys w)) (+ (* i 3) 2) n)
-                  (set! (mut (.ids w)) i (+ id 1))
-                  (set! (.filled w) (+ (.filled w) 1))
-                  (set! out 0))
-              (and (= (get (.keys w) (* i 3)) tag)
-                   (= (get (.keys w) (+ (* i 3) 1)) at)
-                   (= (get (.keys w) (+ (* i 3) 2)) n))
-                (set! out v)
-              :else (set! i (& (+ i 1) (.mask w))))))
-    (put-varint! w out)
-    (= out 0)))
+(defn word-at [(bytes (slice u8)) (at i64)] (-> i64)
+  (let [(mut v) 0]
+    (for i (range 0 8)
+      (set! v (| v (<< (cast i64 (get bytes (+ at i))) (* i 8)))))
+    v))
 
-;;; The table of objects written, twice as big, each where it falls now.
-(defn shared-grow! [(w (ptr Writer))] (-> void)
+(defn take-word [(r (ptr Reader))] (-> i64)
+  (let [at (.at r)]
+    (when (> (+ at 8) (len (.bytes r))) (panic "the cache ends before what it holds does"))
+    (set! (.at r) (+ at 8))
+    (word-at (.bytes r) at)))
+
+;;; Reading something elsewhere in the bytes, and back.
+(defn reader-seek! [(r (ptr Reader)) (at i64)] (-> void)
+  (push! (mut (.returns r)) (.at r))
+  (set! (.at r) at)
+  0)
+
+(defn reader-return! [(r (ptr Reader))] (-> void)
+  (match (pop! (mut (.returns r)))
+    (Some [at] (set! (.at r) at))
+    (None [] (panic "the cache's reader came back from nowhere")))
+  0)
+
+;; ---- objects
+
+(defn object-slot [(tag i64) (at i64) (n i64) (mask i64)] (-> i64)
+  (& (memo-hash (^ (memo-hash (^ (memo-hash tag) at)) n)) mask))
+
+;;; The table of objects known, twice as big, each where it falls now.
+(defn objects-grow! [(w (ptr Writer))] (-> void)
   (let [old-keys (.keys w)
         old-ids (.ids w)
         cap (if (< (.mask w) 1023) 1024 (* (+ (.mask w) 1) 2))
@@ -3889,7 +3964,7 @@
           (let [tag (get old-keys (* j 3))
                 at (get old-keys (+ (* j 3) 1))
                 n (get old-keys (+ (* j 3) 2))
-                (mut i) (& (memo-hash (^ (memo-hash (^ (memo-hash tag) at)) n)) (- cap 1))]
+                (mut i) (object-slot tag at n (- cap 1))]
             (while (!= (get ids i) 0) (set! i (& (+ i 1) (- cap 1))))
             (set! (mut keys) (* i 3) tag)
             (set! (mut keys) (+ (* i 3) 1) at)
@@ -3901,87 +3976,184 @@
     (set! (.mask w) (- cap 1)))
   0)
 
-;;; The same for a value of type `ty` (its name) known by its bytes, `n` of them at `at`, such as an
-;;; opaque one whose parts are where its bytes point: one value, written once wherever it was, is
-;;; one value when read back (see `take-shared-value`).
-(defn put-shared-value! [(w (ptr Writer)) (ty (slice u8)) (at (ptr u8)) (n i64)] (-> bool)
-  (let [tag (bytes-hash ty)
-        (mut key) (ArrayList::new [u8] (malloc-allocator))]
-    (for i (range 0 8) (push! (mut key) (cast u8 (& (>> tag (* i 8)) 255))))
+;;; The object at (tag, at, n)'s number, or -1; with `new`, one made for it when it has none.
+(defn object-id! [(w (ptr Writer)) (tag i64) (at i64) (n i64) (new i64)] (-> i64)
+  (when (> (* (+ (.filled w) 1) 2) (+ (.mask w) 1)) (objects-grow! w))
+  (let [(mut i) (object-slot tag at n (.mask w))
+        (mut out) -2]
+    (while (= out -2)
+      (let [v (get (.ids w) i)]
+        (cond (= v 0)
+                (if (< new 0)
+                    (set! out -1)
+                    (do
+                      (set! (mut (.keys w)) (* i 3) tag)
+                      (set! (mut (.keys w)) (+ (* i 3) 1) at)
+                      (set! (mut (.keys w)) (+ (* i 3) 2) n)
+                      (set! (mut (.ids w)) i (+ new 1))
+                      (set! (.filled w) (+ (.filled w) 1))
+                      (set! out -1)))
+              (and (= (get (.keys w) (* i 3)) tag)
+                   (= (get (.keys w) (+ (* i 3) 1)) at)
+                   (= (get (.keys w) (+ (* i 3) 2)) n))
+                (set! out (- v 1))
+              :else (set! i (& (+ i 1) (.mask w))))))
+    out))
+
+;;; An object known by (tag, where it is, how long), such as a list of children (tag: an address
+;;; that is its grammar's alone; 0 for texts): written the first time, true, and the caller writes
+;;; its content next and then `put-object-end!`; after that by number, and false.
+(defn put-object! [(w (ptr Writer)) (tag i64) (at i64) (n i64)] (-> bool)
+  (let [known (object-id! w tag at n -1)]
+    (if (>= known 0)
+        (do (put-varint! w (+ (* known 2) 2)) false)
+        (let [id (.next-id w)]
+          (object-id! w tag at n id)
+          (set! (.next-id w) (+ id 1))
+          (object-open! w id)
+          true))))
+
+;;; The same for a value of type `ty` (its name) known by its bytes, `n` of them at `at`: an opaque
+;;; one, whose parts are where its bytes point.
+(defn put-object-bytes! [(w (ptr Writer)) (ty (slice u8)) (at (ptr u8)) (n i64)] (-> bool)
+  (let [key (object-bytes-key ty at n)]
+    (match (get (.shared w) key)
+      (Some [known] (put-varint! w (+ (* known 2) 2)) false)
+      (None []
+            (let [id (.next-id w)]
+              (set! (mut (.shared w)) key id)
+              (set! (.next-id w) (+ id 1))
+              (object-open! w id)
+              true)))))
+
+(defn object-bytes-key [(ty (slice u8)) (at (ptr u8)) (n i64)] (-> (slice u8))
+  (let [(mut key) (ArrayList::new [u8] (malloc-allocator))]
+    (for c ty (push! (mut key) c))
+    (push! (mut key) (cast u8 0))
     (for i (range 0 n) (push! (mut key) (load (primitive/index at i))))
-    (let [found (get (.shared w) (slice key))]
-      (match found
-        (Some [id]
-              (free! (mut key))
-              (put-varint! w (+ id 1))
-              false)
-        (None []
-              (let [id (match (get (.counts w) tag) (Some [c] c) (None [] 0))]
-                (set! (mut (.counts w)) tag (+ id 1))
-                (set! (mut (.shared w)) (slice key) id)
-                (free! (mut key))
-                (put-varint! w 0)
-                true))))))
+    (slice key)))
 
-;;; The values of type `ty` read so far, made when this is the first.
-(defn shared-values [(r (ptr Reader)) (ty (slice u8))] (-> (ArrayList (slice u8)))
-  (match (get (.values r) ty)
-    (Some [xs] xs)
-    (None []
-          (let [xs (ArrayList::new [(slice u8)] (malloc-allocator))]
-            (set! (mut (.values r)) ty xs)
-            xs))))
-
-;;; Value `id` of type `ty`, read before: where its bytes are.
-(defn shared-value-at [(r (ptr Reader)) (ty (slice u8)) (id i64)] (-> (ptr u8))
-  (data (get (shared-values r ty) id)))
-
-;;; A place for the next value of type `ty`, kept before it is read, since what it holds is
-;;; numbered after it; and its bytes, once read.
-(defn shared-value-reserve! [(r (ptr Reader)) (ty (slice u8))] (-> i64)
-  (let [(mut xs) (shared-values r ty)
-        at (len xs)]
-    (push! (mut xs) "")
-    (set! (mut (.values r)) ty xs)
-    at))
-
-(defn shared-value-set! [(r (ptr Reader)) (ty (slice u8)) (at i64) (bytes (ptr u8)) (n i64)] (-> void)
-  (let [(mut copy) (ArrayList::new [u8] (malloc-allocator))
-        (mut xs) (shared-values r ty)]
-    (ArrayList::extend! (mut copy) bytes n)
-    (set! (mut xs) at (slice copy))
-    (set! (mut (.values r)) ty xs))
+;;; An object's number, then the place its length will go; its content starts after.
+(defn object-open! [(w (ptr Writer)) (id i64)] (-> void)
+  (put-varint! w (+ (* id 2) 1))
+  (put-room! w 8)
+  (push! (mut (.open w)) (.pos w))
+  (set! (.pos w) (+ (.pos w) 8))
+  (push! (mut (.defined w)) id)
+  (push! (mut (.defined w)) (writer-at w))
   0)
 
-;;; What `put-shared!` wrote: the number of an object read before, or -1 for one that follows. Its
-;;; reader numbers the objects of a tag in the order it reads them, as the writer did.
-(defn take-shared [(r (ptr Reader))] (-> i64)
-  (- (take-varint r) 1))
+(defn put-object-end! [(w (ptr Writer))] (-> void)
+  (match (pop! (mut (.open w)))
+    (Some [at] (put-word-at! w at (- (.pos w) (+ at 8))))
+    (None [] (panic "an object ended that never started")))
+  0)
 
-;;; A text: a short one by its length (twice it) and bytes; a long one, such as a file's source,
-;;; once (1, then as `put-shared!`) and after that by number. Read back it is part of the cache's
-;;; bytes, which are kept for as long as the program runs, as texts are. A tree's identity is its
-;;; text's words, not where they are (see `node-identity`), so sharing only saves room.
+;;; What a reader read: known from now on as object `id`, so a later save refers to it.
+(defn writer-know! [(tag i64) (at i64) (n i64) (id i64)] (-> void)
+  (object-id! (the-writer) tag at n id)
+  0)
+
+(defn writer-know-bytes! [(ty (slice u8)) (at (ptr u8)) (n i64) (id i64)] (-> void)
+  (set! (mut (.shared (the-writer))) (object-bytes-key ty at n) id)
+  0)
+
+;;; An object read where a value refers to it: its number. With `object-ready?` it has been read
+;;; and `object-skip!` passes it by; otherwise `object-enter!` goes where it is, the caller reads
+;;; it, and `object-leave!` keeps its value and comes back.
+(defn take-object [(r (ptr Reader))] (-> i64)
+  (let [v (take-varint r)]
+    (if (= (& v 1) 1)
+        (let [id (/ (- v 1) 2)
+              n (take-word r)]
+          (push! (mut (.frames r)) id)
+          (push! (mut (.frames r)) 1)
+          (push! (mut (.frames r)) (+ (.at r) n))
+          id)
+        (let [id (- (/ v 2) 1)]
+          (when (< id 0) (panic "the cache refers to no object"))
+          (push! (mut (.frames r)) id)
+          (push! (mut (.frames r)) 0)
+          (push! (mut (.frames r)) 0)
+          id))))
+
+(defn object-ready? [(r (ptr Reader)) (id i64)] (-> bool)
+  (and (< id (len (.values r))) (> (get (.values r) id) 0)))
+
+;;; Where object `id`'s value is: valid until the next is kept, so read it at once.
+(defn object-value [(r (ptr Reader)) (id i64)] (-> (ptr u8))
+  (primitive/index (data (slice (.arena r))) (- (get (.values r) id) 1)))
+
+(defn frame-pop! [(r (ptr Reader))] (-> i64)
+  (let [n (len (.frames r))
+        id (get (.frames r) (- n 3))
+        inline (get (.frames r) (- n 2))
+        end (get (.frames r) (- n 1))]
+    (pop! (mut (.frames r)))
+    (pop! (mut (.frames r)))
+    (pop! (mut (.frames r)))
+    (if (= inline 1) end -1)))
+
+(defn object-skip! [(r (ptr Reader))] (-> void)
+  (let [end (frame-pop! r)]
+    (when (>= end 0) (set! (.at r) end)))
+  0)
+
+(defn object-enter! [(r (ptr Reader))] (-> void)
+  (let [n (len (.frames r))
+        id (get (.frames r) (- n 3))
+        inline (get (.frames r) (- n 2))]
+    (when (= inline 0)
+      (let [at (if (< id (len (.offsets r))) (get (.offsets r) id) -1)]
+        (when (< at 0) (panic "the cache refers to object {}, which it does not hold" id))
+        (reader-seek! r at))))
+  0)
+
+;;; The object just read: its value kept, `n` bytes at `at`, and the reader back where it was.
+(defn object-leave! [(r (ptr Reader)) (at (ptr u8)) (n i64)] (-> i64)
+  (let [k (len (.frames r))
+        id (get (.frames r) (- k 3))
+        inline (get (.frames r) (- k 2))
+        end (frame-pop! r)
+        off (len (.arena r))]
+    (for i (range 0 n) (push! (mut (.arena r)) (load (primitive/index at i))))
+    (while (<= (len (.values r)) id) (push! (mut (.values r)) 0))
+    (set! (mut (.values r)) id (+ off 1))
+    (if (= inline 1)
+        (set! (.at r) end)
+        (reader-return! r))
+    id))
+
+;; ---- texts and functions
+
+;;; A text: a short one by its length (twice it) and bytes; a long one, such as a file's source, as
+;;; an object (1, then as `put-object!`). Read back it is part of the cache's bytes, which are kept
+;;; for as long as the program runs, as texts are. A tree's identity is its text's words, not where
+;;; they are (see `node-identity`), so sharing only saves room.
 (defn put-text! [(w (ptr Writer)) (s (slice u8))] (-> void)
-  (if (< (len s) 64)
+  (if (or (< (len s) 64) (not (.objects w)))
       (do (put-varint! w (* (len s) 2))
           (put-raw! w s))
       (do (put-varint! w 1)
-          (when (put-shared! w 0 (primitive/cast i64 (data s)) (len s))
+          (when (put-object! w 0 (primitive/cast i64 (data s)) (len s))
             (put-varint! w (len s))
-            (put-raw! w s))
+            (put-raw! w s)
+            (put-object-end! w))
           0)))
 
 (defn take-text [(r (ptr Reader))] (-> (slice u8))
   (let [h (take-varint r)]
     (if (= (& h 1) 0)
         (take-raw r (/ h 2))
-        (let [id (take-shared r)]
-          (if (>= id 0)
-              (get (.texts r) id)
-              (let [t (take-raw r (take-varint r))]
-                (push! (mut (.texts r)) t)
-                t))))))
+        (let [id (take-object r)]
+          (if (object-ready? r id)
+              (do (object-skip! r)
+                  (load (cast (ptr (slice u8)) (object-value r id))))
+              (do (object-enter! r)
+                  (let [(mut t) (take-raw r (take-varint r))]
+                    (object-leave! r (cast (ptr u8) (mut t)) (sizeof (slice u8)))
+                    (writer-know! 0 (primitive/cast i64 (data t)) (len t) id)
+                    t)))))))
 
 ;;; A function value: where it is from a function of this module, which is the same in each run of
 ;;; the same build. 0 for none.
@@ -4003,7 +4175,7 @@
     (load (cast (ptr i64) (mut f)))))
 
 ;;; With HL_CACHE_SIZES set, how many bytes each part written takes, said once it is written: a
-;;; part starts at `put-part!`, and ends where the next starts.
+;;; part starts at `put-part!`, and ends where the next starts; and how long reading takes.
 (defstruct SizeNotes [(known i64) (on i64) (label (slice u8)) (from i64)])
 
 (defn size-notes [] (-> (ptr SizeNotes))
@@ -4022,7 +4194,7 @@
       (set! (.from t) (.pos w))))
   0)
 
-;;; A module's part, once: true the first time, when its name is written as a mark.
+;;; A module's part, once in a save or a read of an index: true the first time.
 (defn put-module! [(w (ptr Writer)) (name (slice u8))] (-> bool)
   (match (get (.modules w) name)
     (Some [_] false)
@@ -4101,6 +4273,7 @@
         (set! (mut out) key (take-ints r))))
     out))
 
+;;; Interned names: each in the order of its id.
 ;;; Interned names: each in the order of its id.
 (defn persist-encode-Names [(w (ptr Writer)) (ns Names)] (-> void)
   (put-texts! w (.strs ns)))
@@ -4244,29 +4417,126 @@
     (set! (.site-ids d) sites))
   0)
 
-;;; A memo answer's node, loaded: its text made again from its key as this run makes it, since a
-;;; key may hold where a tree is. Under no lock; only while loading.
+;; ---- reading lazily
+
+;;; One lock for everything read from the log: a reader has one place it is at.
+(defstruct CacheLock [(word i64)])
+
+(defn cache-lock! [] (-> void)
+  (spin-lock! (cast (ptr i64) (cache-lock-cell))))
+
+(defn cache-unlock! [] (-> void)
+  (spin-unlock! (cast (ptr i64) (cache-lock-cell))))
+
+(defn cache-lock-cell [] (-> (ptr CacheLock))
+  (primitive/alloc-static CacheLock))
+
+;;; The log's reader and the writer that appends to it: one of each, for the program.
+(defstruct Cells [(reader Reader) (writer Writer) (ready bool)])
+
+(defn cells [] (-> (ptr Cells))
+  (let [c (primitive/alloc-static Cells)]
+    (unless (.ready c)
+      (set! (.reader c) (reader-new "" true))
+      (set! (.writer c) (writer-new true))
+      (set! (.ready c) true))
+    c))
+
+(defn the-reader [] (-> (ptr Reader))
+  (field (cells) reader))
+
+(defn the-writer [] (-> (ptr Writer))
+  (field (cells) writer))
+
+;;; A memo answer's node, read: claimed by its store, with its text made again from its key as this
+;;; run makes it, since a key may hold where a tree is.
 (defn dep-retext! [(id i64) (text (slice u8))] (-> void)
-  (let [d (deps)
-        loading (loading-state)
-        old (get (.texts d) id)]
-    (when (!= old text)
-      (match (get (.ids d) old)
-        (Some [x] (when (= x id) (HashMap::remove! (mut (.ids d)) old)))
-        (None [] 0))
-      (set! (mut (.texts d)) id text)
-      (set! (mut (.ids d)) text id))
-    (set! (mut (.confirmed loading)) id true))
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [old (get (.texts d) id)]
+      (when (!= old text)
+        (match (get (.ids d) old)
+          (Some [x] (when (= x id) (HashMap::remove! (mut (.ids d)) old)))
+          (None [] 0))
+        (set! (mut (.texts d)) id text)
+        (set! (mut (.ids d)) text id)))
+    (dep-claim-locked! d id)
+    (deps-unlock! d))
   0)
 
-;;; While a cache is loaded: which memo answers' nodes their stores have claimed. And what the cache
-;;; on disk holds, by the revision and how many answers had been computed: while both stay, a
-;;; save would write what is there (-1: nothing known to be there).
-(defstruct Loading [(confirmed (ArrayList bool)) (loads i64) (kept-revision i64) (kept-computed i64) (kept bool)])
+(defn dep-claim! [(id i64)] (-> void)
+  (let [d (deps)]
+    (deps-lock! d)
+    (dep-claim-locked! d id)
+    (deps-unlock! d))
+  0)
 
-;;; The one cell of it (`alloc-static` makes one per place it is written).
+(defn dep-claim-locked! [(d (ptr Deps)) (id i64)] (-> void)
+  (let [l (loading-state)]
+    (when (< id (len (.claimed l))) (set! (mut (.claimed l)) id true)))
+  0)
+
+;;; A memo answer's key, as its node's text has it now.
+(defn dep-memo-key [(id i64)] (-> (slice u8))
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [t (get (.texts d) id)]
+      (deps-unlock! d)
+      (match (index-of t "\0")
+        (Some [i] (subslice t (+ i 1) (len t)))
+        (None [] (panic "node {} is no memo answer's" id))))))
+
+;;; A memo whose answers are found by keys holding where trees are: its keys are made when it is
+;;; first used, so its nodes are claimed then, not when the log is read.
+(defn memo-pending-name! [(name (slice u8))] (-> void)
+  (set! (mut (.pending (loading-state))) name 1)
+  0)
+
+;;; Memo answers' nodes of `name` (or, with "", of every memo not pending) no store claimed: their
+;;; key cannot be made again, so nothing finds them by text, and they count as changed to whatever
+;;; checks what read them, which nothing does unless something else it read changed.
+(defn dep-unclaimed-of! [(name (slice u8))] (-> void)
+  (let [d (deps)
+        l (loading-state)]
+    (deps-lock! d)
+    (for i (range 0 (len (.texts d)))
+      (let [t (get (.texts d) i)]
+        (match (index-of t "\0")
+          (Some [cut]
+                (let [owner (subslice t 0 cut)]
+                  (when (and (< i (len (.claimed l)))
+                             (not (get (.claimed l) i))
+                             (if (= (len name) 0)
+                                 (match (get (.pending l) owner) (Some [_] false) (None [] true))
+                                 (= owner name)))
+                    (HashMap::remove! (mut (.ids d)) t)
+                    (set! (mut (.texts d)) i "")
+                    (set! (mut (.changed d)) i 4611686018427387903))))
+          (None [] 0))))
+    (deps-unlock! d))
+  0)
+
+;;; While the log is read and after: which memo answers' nodes their stores have claimed, which
+;;; memos claim theirs when first used, and what the files on disk hold: the log's length and the
+;;; length it had when last written whole, and the revision and how many answers had been computed
+;;; when they were last written or read (while both stay, a save would write nothing new).
+(defstruct Loading
+  [(claimed (ArrayList bool))
+   (pending (HashMap (slice u8) i64))
+   (log-end i64)
+   (compacted i64)
+   (kept-revision i64)
+   (kept-computed i64)
+   (kept bool)
+   (ready bool)])
+
 (defn loading-state [] (-> (ptr Loading))
-  (primitive/alloc-static Loading))
+  (let [l (primitive/alloc-static Loading)]
+    (unless (.ready l)
+      (set! (.claimed l) (ArrayList::new [bool] (malloc-allocator)))
+      (set! (.pending l) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+      (set! (.ready l) true))
+    l))
 
 ;;; What wrote the cache and what reads it must be the same build of the program: the executable,
 ;;; by where it is and its size and time.
@@ -4302,21 +4572,25 @@
       (set! h (primitive/imul (^ h (cast i64 (get bytes i))) 1099511628211)))
     h))
 
-;;; What a program keeps: its main's functions that write and read every module's part, set as it
-;;; starts.
+;;; What a program keeps: its main's functions that write and read every module's part, and that
+;;; read whatever is still unread, set as it starts.
 (defstruct PersistRoot
-  [(save (fnptr (cc/C) [(ptr Writer)] void))
+  [(save (fnptr (cc/C) [(ptr Writer) (ptr Writer) bool] void))
    (load (fnptr (cc/C) [(ptr Reader)] void))
+   (force (fnptr (cc/C) [] void))
    (set bool)])
 
-;;; The one cell of it.
+;;; The one cell of it (`alloc-static` makes one per place it is written).
 (defn persist-root-cell [] (-> (ptr PersistRoot))
   (primitive/alloc-static PersistRoot))
 
-(defn persist-root! [(save (fnptr (cc/C) [(ptr Writer)] void)) (load (fnptr (cc/C) [(ptr Reader)] void))] (-> void)
+(defn persist-root! [(save (fnptr (cc/C) [(ptr Writer) (ptr Writer) bool] void))
+                     (load (fnptr (cc/C) [(ptr Reader)] void))
+                     (force (fnptr (cc/C) [] void))] (-> void)
   (let [root (persist-root-cell)]
     (set! (.save root) save)
     (set! (.load root) load)
+    (set! (.force root) force)
     (set! (.set root) true))
   0)
 
@@ -4325,10 +4599,30 @@
     (unless (.set root) (panic "nothing says what to keep: a program's main sets that, as it starts"))
     root))
 
-(defn cache-magic [] (-> (slice u8)) "hl.rt cache 1\n")
+;;; Each module's part, once in a pass that reads all that is unread.
+(defstruct ForceVisits [(seen (HashMap (slice u8) i64)) (ready bool)])
 
-;;; Everything kept, written to `path` whole: to a file beside it first, then moved into place, so
-;;; a reader finds the old cache or the new one, never part of one. Only while no memo computes.
+(defn force-module! [(name (slice u8))] (-> bool)
+  (let [f (primitive/alloc-static ForceVisits)]
+    (unless (.ready f)
+      (set! (.seen f) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+      (set! (.ready f) true))
+    (match (get (.seen f) name)
+      (Some [_] false)
+      (None []
+            (set! (mut (.seen f)) name 1)
+            true))))
+
+(defn force-pass-start! [] (-> void)
+  (let [f (primitive/alloc-static ForceVisits)]
+    (when (.ready f) (HashMap::clear! (mut (.seen f)))))
+  (force-module! "")
+  0)
+
+(defn log-magic [] (-> (slice u8)) "hl.rt cache 2\n")
+(defn deps-magic [] (-> (slice u8)) "hl.rt deps 2\n")
+
+;;; Everything new since the files were last written, kept: only while no memo computes.
 (defn cache-save! [(path (slice u8))] (-> void)
   (cache-saved!)
   (cache-save-now! path)
@@ -4336,12 +4630,140 @@
 
 (defn cache-save-now! [(path (slice u8))] (-> void)
   (let [d (deps)
-        root (persist-root)
-        w (primitive/alloc-static Writer)]
+        l (loading-state)]
     (unless (.tracking d) (panic "the cache keeps what tracked builds compute, and nothing is tracked"))
     (unless (cache-current? d)
-      (cache-write! path d root w))
+      ;; HL_CACHE_WHOLE set: always whole, so what that does is seen without waiting for the log to grow.
+      (if (or (= (.log-end l) 0)
+              (> (.log-end l) (+ (* 2 (.compacted l)) 8388608))
+              (not (file-exists-raw? path))
+              (!= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) "HL_CACHE_WHOLE"))) 0))
+          (cache-write-whole! path d)
+          (cache-append! path d)))
     0))
+
+;;; The log written again, whole: everything read first, then numbered afresh.
+(defn cache-write-whole! [(path (slice u8)) (d (ptr Deps))] (-> void)
+  (let [root (persist-root)
+        force (.force root)]
+    (force-pass-start!)
+    (force)
+    (let [c (cells)]
+      (set! (.writer c) (writer-new true)))
+    (let [w (the-writer)
+          magic (log-magic)
+          id (exe-identity)
+          (mut head) (ArrayList::new [u8] (malloc-allocator))]
+      (for b magic (push! (mut head) b))
+      (let [hw (primitive/alloc-static HeadWriter)]
+        (set! (.w hw) (writer-new false))
+        (put-varint! (field hw w) (len id))
+        (put-raw! (field hw w) id)
+        (for b (written-bytes (field hw w)) (push! (mut head) b)))
+      (let [segment (segment-bytes (len head) true)
+            (mut all) head]
+        (ArrayList::extend! (mut all) (data segment) (len segment))
+        (let [tmp (join path ".new")]
+          (write-output tmp (slice all))
+          (match (fs/rename-file (malloc-allocator) tmp path)
+            (Ok [_] 0)
+            (Err [_] (panic "cannot move {} to {}" tmp path))))
+        (let [l (loading-state)]
+          (set! (.log-end l) (len all))
+          (set! (.compacted l) (len all)))
+        (deps-write! path d))))
+  0)
+
+(defstruct HeadWriter [(w Writer)])
+
+;;; What changed since the last save, as a segment at the log's end.
+(defn cache-append! [(path (slice u8)) (d (ptr Deps))] (-> void)
+  (let [l (loading-state)
+        start (.log-end l)
+        segment (segment-bytes start false)]
+    (append-at! path start segment)
+    (set! (.log-end l) (+ start (len segment)))
+    (deps-write! path d))
+  0)
+
+;;; A segment starting at `start` in the log: its length, what is new (everything, when `whole`),
+;;; its index (the objects it defines, then each module's part), where the index starts, and a hash.
+(defn segment-bytes [(start i64) (whole bool)] (-> (slice u8))
+  (let [w (the-writer)
+        x (primitive/alloc-static IndexWriter)
+        root (persist-root)
+        save (.save root)]
+    (writer-restart! w (+ start 8))
+    (set! (.w x) (writer-new false))
+    (save w (field x w) whole)
+    (put-part! w "")
+    (let [index-at (writer-at w)
+          defined (.defined w)]
+      (put-varint! w (/ (len defined) 2))
+      (for v defined (put-varint! w v))
+      (put-raw! w (written-bytes (field x w)))
+      (put-word! w index-at)
+      (free [u8] (malloc-allocator) (.mem (field x w)))
+      (let [body (written-bytes w)
+            f (primitive/alloc-static FrameWriter)]
+        (set! (.w f) (writer-new false))
+        (put-word! (field f w) (len body))
+        (put-raw! (field f w) body)
+        (put-word! (field f w) (bytes-hash body))
+        (written-bytes (field f w))))))
+
+(defstruct IndexWriter [(w Writer)])
+(defstruct FrameWriter [(w Writer)])
+
+(extern ftruncate :cc (cc/C) [i32 i64] (-> i32))
+(extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
+
+;;; `bytes` written at `at` in the file at `path`, which ends there: whatever was after it, part of
+;;; a segment a run stopped in the middle of, gone.
+(defn append-at! [(path (slice u8)) (at i64) (bytes (slice u8))] (-> void)
+  (let [fd (os/open (str/to-cstr (malloc-allocator) path)
+                    (primitive/cast i32 (| fs/O_WRONLY fs/O_CLOEXEC))
+                    0)]
+    (when (< fd (: 0 i32)) (panic "cannot write {}" path))
+    (when (< (ftruncate fd at) (: 0 i32)) (panic "cannot cut {} to where it was whole" path))
+    (lseek fd at 0)
+    (let [(mut off) 0]
+      (while (< off (len bytes))
+        (let [n (write fd (primitive/cast (ptr i8) (primitive/index (data bytes) off))
+                       (primitive/cast isize (- (len bytes) off)))]
+          (when (<= (primitive/cast i64 n) 0) (panic "cannot write {}" path))
+          (set! off (+ off (primitive/cast i64 n))))))
+    (os/close fd))
+  0)
+
+;;; The dependency graph, beside the log: whole, with how long the log is that goes with it, moved
+;;; into place once written.
+(defn deps-write! [(path (slice u8)) (d (ptr Deps))] (-> void)
+  (let [hw (primitive/alloc-static DepsWriter)
+        l (loading-state)]
+    (set! (.w hw) (writer-new false))
+    (let [w (field hw w)
+          id (exe-identity)]
+      (put-raw! w (deps-magic))
+      (put-varint! w (len id))
+      (put-raw! w id)
+      (put-int! w (.log-end l))
+      (put-int! w (.compacted l))
+      (put-part! w "dependencies")
+      (deps-encode! w d)
+      (put-part! w "")
+      (put-word! w (bytes-hash (written-bytes w)))
+      (let [tmp (join path ".deps.new")
+            to (join path ".deps")]
+        (write-output tmp (written-bytes w))
+        (match (fs/rename-file (malloc-allocator) tmp to)
+          (Ok [_] 0)
+          (Err [_] (panic "cannot move {} to {}" tmp to))))
+      (free [u8] (malloc-allocator) (.mem w))))
+  (cache-kept! d)
+  0)
+
+(defstruct DepsWriter [(w Writer)])
 
 ;;; A save on a thread of its own (`cache-save-later!`).
 (defstruct Saving [(running bool) (thread Thread) (path (slice u8)) (timing bool)])
@@ -4388,8 +4810,8 @@
       (set! (.running s) false)))
   0)
 
-;;; Whether the cache on disk holds what is here: nothing changed, and nothing was computed, since
-;;; it was loaded or saved.
+;;; Whether the files on disk hold what is here: nothing changed, and nothing was computed, since
+;;; they were read or written.
 (defn cache-current? [(d (ptr Deps))] (-> bool)
   (let [l (loading-state)]
     (and (.kept l)
@@ -4403,108 +4825,128 @@
     (set! (.kept-computed l) (.computed d)))
   0)
 
-(defn cache-write! [(path (slice u8)) (d (ptr Deps)) (root (ptr PersistRoot)) (w (ptr Writer))] (-> void)
-  (do
-    (set! (.mem w) (match (alloc [u8] (malloc-allocator) 1048576)
-                     (Some [m] m)
-                     (None [] (panic "no memory to write the cache"))))
-    (set! (.pos w) 0)
-    (set! (.keys w) (ArrayList::new [i64] (malloc-allocator)))
-    (set! (.ids w) (ArrayList::new [i64] (malloc-allocator)))
-    (set! (.mask w) -1)
-    (set! (.filled w) 0)
-    (set! (.shared w) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
-    (set! (.counts w) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
-    (set! (.modules w) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
-    (put-raw! w (cache-magic))
-    (let [id (exe-identity)]
-      (put-varint! w (len id))
-      (put-raw! w id))
-    (put-part! w "dependencies")
-    (deps-encode! w d)
-    (let [save (.save root)] (save w))
-    (put-part! w "")
-    (put-mark! w "end")
-    (let [h (bytes-hash (written-bytes w))]
-      (for i (range 0 8) (put-byte! w (>> h (* i 8)))))
-    (let [tmp (join path ".new")]
-      (write-output tmp (written-bytes w))
-      (match (fs/rename-file (malloc-allocator) tmp path)
-        (Ok [_] 0)
-        (Err [_] (panic "cannot move {} to {}" tmp path))))
-    (free [u8] (malloc-allocator) (.mem w))
-    (free! (mut (.keys w)))
-    (free! (mut (.ids w)))
-    (HashMap::free! (mut (.shared w)))
-    (HashMap::free! (mut (.counts w)))
-    (HashMap::free! (mut (.modules w)))
-    (cache-kept! d))
-  0)
+;;; A file's bytes when its header is `magic` and this program's identity and its last eight bytes
+;;; hash the rest: the rest, after the header. Otherwise none, and why.
+(defn checked-file [(path (slice u8)) (magic (slice u8)) (hashed bool)] (-> (Option (slice u8)))
+  (let [bytes (read-all-raw path)
+        n (len bytes)
+        id (exe-identity)]
+    (cond (or (< n (+ (len magic) 8)) (!= (subslice bytes 0 (len magic)) magic))
+            (do (println "[cache] {} is not a cache this program wrote; building from the start" path)
+                (None [(slice u8)]))
+          (and hashed (!= (bytes-hash (subslice bytes 0 (- n 8))) (word-at bytes (- n 8))))
+            (do (println "[cache] {} is damaged; building from the start" path) (None [(slice u8)]))
+          :else
+            (let [r (primitive/alloc-static HeadReader)]
+              (set! (.r r) (reader-new bytes false))
+              (set! (.at (field r r)) (len magic))
+              (let [found (take-raw (field r r) (take-varint (field r r)))]
+                (if (!= found id)
+                    (do (println "[cache] {} was written by another build of this program; building from the start" path)
+                        (None [(slice u8)]))
+                    (Some (subslice bytes 0 (if hashed (- n 8) n)))))))))
 
-;;; The cache at `path`, loaded, when there is one this build wrote: true, with every input checked
-;;; since, so what changed while nothing ran is changed now. False, saying why when there is a
-;;; cache it will not use, when there is none. Only before any memo computes.
+(defstruct HeadReader [(r Reader)])
+
+;;; The cache at `path` (the log, and the graph beside it), read when there is one this build wrote:
+;;; the graph whole, the log's indexes, and the states; answers and settings when first asked for.
+;;; True, with every input checked since, so what changed while nothing ran is changed now. False,
+;;; saying why when there is a cache it will not use, when there is none. Only before any memo
+;;; computes.
 (defn cache-load! [(path (slice u8))] (-> bool)
-  (let [d (deps)]
+  (let [d (deps)
+        deps-path (join path ".deps")]
     (unless (.tracking d) (panic "a cache is loaded into tracked builds, and nothing is tracked"))
     (when (> (len (.texts d)) 0) (panic "a cache is loaded before anything is computed"))
-    (if (not (file-exists-raw? path))
+    (if (or (not (file-exists-raw? path)) (not (file-exists-raw? deps-path)))
         false
-        (let [bytes (read-all-raw path)
-              magic (cache-magic)
-              id (exe-identity)
-              n (len bytes)]
-          (cond (or (< n (+ (len magic) 8)) (!= (subslice bytes 0 (len magic)) magic))
-                  (do (println "[cache] {} is not a cache this program wrote; building from the start" path) false)
-                (!= (bytes-hash (subslice bytes 0 (- n 8)))
-                    (let [(mut h) 0]
-                      (for i (range 0 8)
-                        (set! h (| h (<< (cast i64 (get bytes (+ (- n 8) i))) (* i 8)))))
-                      h))
-                  (do (println "[cache] {} is damaged; building from the start" path) false)
-                :else
-                  (let [r (primitive/alloc-static Reader)
-                        loading (loading-state)]
-                    (set! (.bytes r) (subslice bytes 0 (- n 8)))
-                    (set! (.at r) (len magic))
-                    (set! (.modules r) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
-                    (set! (.texts r) (ArrayList::new [(slice u8)] (malloc-allocator)))
-                    (set! (.values r) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops)))
-                    (set! (.loads loading) (+ (.loads loading) 1))
-                    (set! (.load r) (.loads loading))
-                    (if (!= (take-raw r (take-varint r)) id)
-                        (do (println "[cache] {} was written by another build of this program; building from the start" path)
-                            false)
-                        (do
-                          (deps-decode! r d)
-                          (cache-kept! d)
-                          (let [(mut confirmed) (ArrayList::new [bool] (malloc-allocator))]
-                            (for _ (range 0 (len (.texts d))) (push! (mut confirmed) false))
-                            (set! (.confirmed loading) confirmed))
-                          (let [load-all (.load (persist-root))] (load-all r))
-                          (take-mark! r "end")
-                          (unless (= (.at r) (len (.bytes r)))
-                            (panic "the cache holds more than its reader read"))
-                          (dep-unclaimed-changed!)
-                          (dep-changed-inputs!)
-                          true))))))))
+        (match (checked-file deps-path (deps-magic) true)
+          (None [] false)
+          (Some [graph]
+                (match (checked-file path (log-magic) false)
+                  (None [] false)
+                  (Some [log]
+                        (let [hr (primitive/alloc-static GraphReader)]
+                          (set! (.r hr) (reader-new graph false))
+                          (let [g (field hr r)]
+                            (set! (.at g) (len (deps-magic)))
+                            (take-raw g (take-varint g))
+                            (let [log-end (take-int g)
+                                  compacted (take-int g)]
+                              (match (segments-of log log-end)
+                                (None []
+                                      ;; A segment whose hash is wrong, or one too few for the graph beside it.
+                                      (println "[cache] {} is damaged; building from the start" path)
+                                      false)
+                                (Some [starts]
+                                      (let [t0 (now-us)]
+                                        (deps-decode! g d)
+                                        (when (= (.on (size-notes)) 1)
+                                          (println "[cache] dependencies read in {} us" (- (now-us) t0))))
+                                      (log-read! log starts d)
+                                      (let [l (loading-state)]
+                                        (set! (.log-end l) log-end)
+                                        (set! (.compacted l) compacted))
+                                      (cache-kept! d)
+                                      (dep-unclaimed-of! "")
+                                      (dep-changed-inputs!)
+                                      true))))))))))))
 
-;;; Memo answers' nodes no store claimed while loading: their key cannot be made again, so nothing
-;;; finds them by text, and what read them counts them changed.
-(defn dep-unclaimed-changed! [] (-> void)
-  (let [d (deps)
-        loading (loading-state)
-        (mut dead) (ArrayList::new [i64] (malloc-allocator))]
-    (for i (range 0 (len (.texts d)))
-      (let [t (get (.texts d) i)]
-        (when (and (not (get (.confirmed loading) i)) (is-some-index? (index-of t "\0")))
-          (push! (mut dead) i))))
-    (for i dead
-      (HashMap::remove! (mut (.ids d)) (get (.texts d) i))
-      (set! (mut (.texts d)) i ""))
-    (for i dead (dep-changed-id! i)))
+(defstruct GraphReader [(r Reader)])
+
+;;; Where each whole segment of the log starts, up to `end`: none when one before it is not whole.
+(defn segments-of [(log (slice u8)) (end i64)] (-> (Option (ArrayList i64)))
+  (let [(mut at) (+ (len (log-magic)) 0)
+        (mut starts) (ArrayList::new [i64] (malloc-allocator))
+        (mut ok) true]
+    ;; Past the header: the identity, a length and its bytes.
+    (let [hr (primitive/alloc-static HeadReader)]
+      (set! (.r hr) (reader-new log false))
+      (set! (.at (field hr r)) at)
+      (take-raw (field hr r) (take-varint (field hr r)))
+      (set! at (.at (field hr r))))
+    (while (and ok (< at end))
+      (if (> (+ at 16) (len log))
+          (set! ok false)
+          (let [n (word-at log at)
+                body-at (+ at 8)]
+            (if (or (< n 0) (> (+ body-at n 8) (len log))
+                    (!= (bytes-hash (subslice log body-at (+ body-at n))) (word-at log (+ body-at n))))
+                (set! ok false)
+                (do (push! (mut starts) body-at)
+                    (push! (mut starts) n)
+                    (set! at (+ body-at n 8)))))))
+    (if (and ok (= at end)) (Some starts) (None [(ArrayList i64)]))))
+
+;;; The log's indexes, in order, each module reading its part of each: what is in which segment,
+;;; later ones over earlier ones.
+(defn log-read! [(log (slice u8)) (starts (ArrayList i64)) (d (ptr Deps))] (-> void)
+  (let [c (cells)
+        l (loading-state)
+        t0 (now-us)]
+    (set! (.reader c) (reader-new log true))
+    (set! (.writer c) (writer-new true))
+    (let [(mut claimed) (ArrayList::new [bool] (malloc-allocator))]
+      (for _ (range 0 (len (.texts d))) (push! (mut claimed) false))
+      (set! (.claimed l) claimed))
+    (let [r (the-reader)
+          w (the-writer)
+          root (persist-root)
+          load-all (.load root)]
+      (for k (range 0 (/ (len starts) 2))
+        (let [body-at (get starts (* k 2))
+              n (get starts (+ (* k 2) 1))
+              index-at (word-at log (- (+ body-at n) 8))]
+          (set! (.at r) index-at)
+          (let [count (take-varint r)]
+            (for _ (range 0 count)
+              (let [id (take-varint r)
+                    at (take-varint r)]
+                (while (<= (len (.offsets r)) id) (push! (mut (.offsets r)) -1))
+                (set! (mut (.offsets r)) id at)
+                (when (>= id (.next-id w)) (set! (.next-id w) (+ id 1))))))
+          (HashMap::clear! (mut (.modules r)))
+          (load-all r))))
+    (when (= (.on (size-notes)) 1)
+      (println "[cache] indexes and states read in {} us" (- (now-us) t0))))
   0)
-
-;;; Which load a reader is, for tables of shared objects kept outside it.
-(defn reader-load [(r (ptr Reader))] (-> i64)
-  (.load r))
