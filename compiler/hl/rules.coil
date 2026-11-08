@@ -3654,26 +3654,6 @@
                              (push! (mut ~(sym o)) ~(sym t)))
                            ~(sym o))
                         (cat3 "[" (map-key (.ty e)) "]"))))
-          ;; `if-given(m.names)`: a setting's value when it has one, from a `with` or an assignment, or
-          ;; from the cache a run started from; none when it has none.
-          (and (= name "if-given") (= count 1))
-            (match (setting-part (mut k) (get args 0))
-              (Some [p]
-                    (if (> (len (.fields p)) 0)
-                      (die (mut k) n "if-given takes a setting, not a part of one")
-                    (let [storage (if (= (.module p) (.self k))
-                                      (storage-call (mut k) (.x p))
-                                      (storage-of (mut k) (.module p) (.x p)))
-                          st (fresh (mut k) "storage")
-                          ty (.ty (.x p))
-                          node (cat4 "s:" (.module p) "." (.name (.x p)))]
-                      (Some (te `(let [~(sym st) ~storage]
-                                   (when (rt/dep-in-frame?) (rt/dep-note-literal! ~node))
-                                   (if (> (~(primitive/code-symbol "." (bound-field (.name (.x p)))) ~(sym st)) 0)
-                                       (Some (~(primitive/code-symbol "." (.name (.x p))) ~(sym st)))
-                                       (None [~(coil-type (mut k) ty)])))
-                                (opt-type ty))))))
-              (None [] (die (mut k) n "if-given takes a setting")))
           ;; `parallel-map(xs, f, n)`: `f` of each element on `n` threads, results in the order of `xs`.
           ;; Each thread takes the next index it finds free, so uneven work evens out.
           (and (= name "parallel-map") (= count 3))
@@ -7001,10 +6981,13 @@
         :else (die (mut k) at (cat "no empty value of " ty))))
 
 ;;; A global's first value: its own expression, or the empty one for an input or a collection. A
-;;; setting is never read before a `with` gives it one, so a type with no empty value of its own,
-;;; such as a foreign one, is held as zeroes until then.
+;;; setting has the value its root gives (`setting names: Names = names-new()`), as a dynamic var's
+;;; root binding; one with none is never read before a `with` or an assignment gives it one, so a
+;;; type with no empty value of its own, such as a foreign one, is held as zeroes until then.
 (defn global-init [(k (mut Comp)) (d g/Node) (x Global)] (-> Code)
-  (cond (and (= (.kind d) (g/KSetting)) (not (has-default? (mut k) (.ty x))))
+  (cond (setting-root? d)
+          (.code (expect (mut k) (kid d 2) (expr (mut k) (kid d 2) (.ty x)) (.ty x)))
+        (and (= (.kind d) (g/KSetting)) (not (has-default? (mut k) (.ty x))))
           `(primitive/zeroed ~(coil-type (mut k) (.ty x)))
         (or (= (.kind d) (g/KInput))
             (= (.kind d) (g/KCollect))
@@ -7015,6 +6998,10 @@
                          (kid d 2)
                          (expr (mut k) (kid d 2) (.ty x))
                          (.ty x)))))
+
+;;; Whether a setting has a root value: one it has wherever nothing has given it another.
+(defn setting-root? [(d g/Node)] (-> bool)
+  (and (= (.kind d) (g/KSetting)) (> (len (.kids d)) 2) (not (none? (kid d 2)))))
 
 ;;; Whether `default-of` has an empty value for the type.
 (defn has-default? [(k (mut Comp)) (ty (slice u8))] (-> bool)
@@ -8029,10 +8016,6 @@
           (match (find-func (self-mod (mut k)) (.text (kid d 0)))
             (Some [x] x)
             (None [] (die (mut k) d "this function was not collected")))]
-    (when (= (len (.params f)) 0)
-      (die (mut k)
-           d
-           "a memo function takes what it remembers by: at least one argument"))
     (for p (.params f)
       (when (.by-ref p)
         (die (mut k) d "a memo function's argument cannot be mut"))
@@ -8566,7 +8549,7 @@
                                  (rt/reader-return! r)
                                  (rt/spin-lock! word)
                                  (set! (mut (.lazy s)) key answer-at)
-                                 (set! (mut (.args s)) key (~args-ty ~@inits))
+                                 (set! (mut (.args s)) key ~(if (= (len (.params f)) 0) `(zeroed ~args-ty) `(~args-ty ~@inits)))
                                  (set! (mut (.node-ids s)) key id)
                                  (rt/spin-unlock! word)
                                  (rt/dep-retext! id (rt/memo-node ~qname ~key-text))))))
@@ -8608,7 +8591,7 @@
                                    answer ~(dec-code (mut k) (.ret f))]
                                (rt/reader-return! r)
                                (rt/spin-lock! word)
-                               (set! (mut (.args s)) key (~args-ty ~@inits))
+                               (set! (mut (.args s)) key ~(if (= (len (.params f)) 0) `(zeroed ~args-ty) `(~args-ty ~@inits)))
                                (set! (mut (.table s)) key answer)
                                (HashMap::remove! (mut (.lazy s)) key)
                                (rt/spin-unlock! word)))
@@ -8952,7 +8935,7 @@
                                                                   fresh))))]
                                                 (rt/spin-lock! word)
                                                 (when tracking
-                                                  (set! (mut (.args s)) key (~args-ty ~@arg-inits))
+                                                  (set! (mut (.args s)) key ~(if (= (len (.params f)) 0) `(zeroed ~args-ty) `(~args-ty ~@arg-inits)))
                                                   ;; What the cache does not hold yet.
                                                   (when new-answer (set! (mut (.dirty s)) key 1)))
                                                 (set! (mut (.table s))
@@ -9161,7 +9144,7 @@
                         (push! (mut state-inits)
                                `(set! (~(primitive/code-symbol "."
                                                                (bound-field g-name)) s)
-                                      0))
+                                      ~(if (setting-root? d) `1 `0)))
                         ;; Where the cache holds its value, plus one, until it is read; and
                         ;; whether it was given one since the cache was last written.
                         (push! (mut state-fields) `(~(sym (lazy-field g-name)) i64))

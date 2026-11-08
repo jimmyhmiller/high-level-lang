@@ -192,8 +192,7 @@ fn names-in-use() -> [Text] =
   nm.finals ++ [f for mo in m.modules for f in mo.free] ++ nm.keywords
 
 fn for-target(o: Options, p: Node) -> Node = match o.charset-ascii {
-  true if incremental?(o) => watched-runs(lowered, 2)
-  true => in-parts(o, lowered, fin.ascii-only)
+  true => in-parts(o, lowered, fin.ascii-only, ascii-run)
   false => lowered
 } where dropped = match o.drop-console or o.drop-debugger {
           true => without-dropped(o, p)
@@ -205,8 +204,8 @@ fn for-target(o: Options, p: Node) -> Node = match o.charset-ascii {
         }
 
 # `f` on each part of the program at once.
-fn in-parts(o: Options, p: Node, f: Fn(Node)->Node) -> Node = match o.plan.optimize-parts {
-  n if n <= 1 => f(p)
+fn in-parts(o: Options, p: Node, f: Fn(Node)->Node, run: Fn([Node])->[Node]) -> Node = match o.plan.optimize-parts {
+  n if n <= 1 => in-runs(p, run)
   n => in-pieces(p, n, o.plan.optimize-threads, f, false)
 }
 
@@ -318,18 +317,16 @@ fn runs-of(stmts: [Node], n: Int) -> [[Node]] = match stmts {
 
 # A program's statements in runs that stay put from one build to the next: each ends after a
 # statement that closes, where cutting changes nothing the optimiser does (see `closed?`), so an
-# edit changes only the runs it touches. While watching, each run is minified, folded, made ASCII
-# and printed apart, and each kept while its statements are the same ones.
+# edit changes only the runs it touches. Done in one part, each run is minified, folded, made ASCII
+# and printed apart.
 fn stable-runs(stmts: [Node]) -> [[Node]] = [stmts[ends[i]..ends[i + 1]] for i in 0..len(ends) - 1]
   where ends = [0] ++ [k + 1 for k in 0..len(stmts) if closed?(stmts[k]) and k + 1 < len(stmts)] ++ [len(stmts)]
 
-fn watched-runs(p: Node, step: Int) -> Node = p with { body: List([s for r in stable-runs(p.body.kids) for s in run-step(step, r)]...) }
+fn in-runs(p: Node, f: Fn([Node])->[Node]) -> Node = p with { body: List([s for r in stable-runs(p.body.kids) for s in f(r)]...) }
 
-fn run-step(step: Int, stmts: [Node]) -> [Node] = match step {
-  0 => default-optimize(program-of(None(), stmts)).body.kids
-  1 => fold.run(program-of(None(), stmts)).body.kids
-  _ => fin.ascii-only(program-of(None(), stmts)).body.kids
-}
+fn optimized-run(stmts: [Node]) -> [Node] = default-optimize(program-of(None(), stmts)).body.kids
+fn folded-run(stmts: [Node]) -> [Node] = fold.run(program-of(None(), stmts)).body.kids
+fn ascii-run(stmts: [Node]) -> [Node] = fin.ascii-only(program-of(None(), stmts)).body.kids
 
 fn rendered-run(hashbang: Node, stmts: [Node], pretty: Bool, maps: Bool) -> Rendered =
   js.render-tracked(program-of(hashbang, stmts), pretty, maps)
@@ -447,36 +444,12 @@ fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) 
 # what follows, so this is the program the optimiser would make of the whole. A spec's own
 # optimiser is given top-level parts only: what it does to a body with a hole is its own.
 fn optimized(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
-  _ if incremental?(o) and not o.has-optimize => watched-runs(p, 0)
-  n if n <= 1 => o.optimize(p)
+  n if n <= 1 and o.has-optimize => o.optimize(p)
+  n if n <= 1 => in-runs(p, optimized-run)
   n if o.has-optimize => joined(p, heaviest-first(parts-of(p, n), o.optimize, o.plan.optimize-threads))
   n => in-pieces(p, n, o.plan.optimize-threads, o.optimize, true)
 }
 
-# ---------------------------------------------------------------- the back half at once
-
-# When nothing between minifying and printing needs the whole program, each part is minified,
-# made ASCII and printed in one go: no barrier between them, and no program put back together
-# only to be cut again. The parts print as the whole would, since printing cuts anywhere.
-fn fusable?(o: Options) -> Bool =
-  o.minify-syntax and not o.has-optimize and o.plan.optimize-parts > 1 and o.plan.print-parts > 1
-  and o.target >= lower.no-lowering and not o.drop-console and not o.drop-debugger
-
-
-# A part minified, made ASCII and printed, and how its statements end.
-record Piece { rendered: Rendered, ends: Ends }
-
-fn finished-piece(p: Node) -> Piece = Piece(rendered: render-part(t), ends: ends-of(t.body.kids))
-  where t = fin.finished(minify.run(p), printing.ascii)
-
-fn printed-piece(p: Node) -> Piece = Piece(rendered: render-part(p), ends: ends-of([]))
-
-fn finished-output(o: Options, f: Format, p: Node) -> Printed =
-  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
-  where r = rendered-pieces(o, p, o.plan.optimize-parts, o.plan.optimize-threads, finished-piece, true),
-        # What the format adds goes after, as it is: it was never minified.
-        exports = export-statements(f),
-        all = pieces-joined(o, [r] ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
 
 # `f` of each part at once, the heaviest started first, so the last to finish is a light one; the
 # results in the parts' order.
@@ -486,10 +459,10 @@ fn heaviest-first(parts: [Node], f: Fn(Node)->Node, threads: Int) -> [Node] =
         done = parallel-map([parts[i] for i in order], f, threads),
         place = {order[k]: k for k in 0..len(order)}
 
-fn heaviest-pieces(parts: [Node], f: Fn(Node)->Piece, threads: Int) -> [Piece] =
+fn heaviest-rendered(parts: [Node], threads: Int) -> [Rendered] =
   [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
   where order = heaviest-order(parts),
-        done = parallel-map([parts[i] for i in order], f, threads),
+        done = parallel-map([parts[i] for i in order], render-part, threads),
         place = {order[k]: k for k in 0..len(order)}
 
 fn heaviest-order(parts: [Node]) -> [Int] = sort i in [i for i in 0..len(parts)] by part-weight(parts[i]) desc
@@ -497,8 +470,7 @@ fn heaviest-order(parts: [Node]) -> [Int] = sort i in [i for i in 0..len(parts)]
 fn part-weight(p: Node) -> Int = sum s in p.body.kids: weight(s)
 
 fn folded(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
-  _ if incremental?(o) => watched-runs(p, 1)
-  n if n <= 1 => fold.run(p)
+  n if n <= 1 => in-runs(p, folded-run)
   n => in-pieces(p, n, o.plan.optimize-threads, fold.run, false)
 }
 
@@ -512,34 +484,28 @@ fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, prin
 # where its part landed. A part that ends where the printer dropped a `;` gets it back, as the
 # printer would have written it had the next part followed.
 fn rendered-in-parts(o: Options, p: Node) -> Rendered = match o.plan.print-parts {
-  _ if incremental?(o) => pieces-joined(o, [rendered-run(match i { 0 => p.hashbang  _ => None() }, runs[i], o.pretty, o.sourcemap)
-                                    for i in 0..len(runs)])
+  n if n <= 1 => pieces-joined(o, [rendered-run(match i { 0 => p.hashbang  _ => None() }, runs[i], o.pretty, o.sourcemap)
+                                   for i in 0..len(runs)])
     where runs = stable-runs(p.body.kids)
-  n if n <= 1 => js.render-tracked(p, o.pretty, o.sourcemap)
-  n => rendered-pieces(o, p, n, o.plan.print-threads, printed-piece, false)
+  n => rendered-pieces(o, p, n, o.plan.print-threads)
 }
 
-# `f` of each part at once, printing it, and the texts put together: each body's parts joined, and
-# spliced into the shell's text where its hole printed, the marks after it moved along. When `f`
-# minifies and a body's end would have changed, all of it is done in top-level parts instead.
-fn rendered-pieces(o: Options, p: Node, n: Int, threads: Int, f: Fn(Node)->Piece, minifying: Bool) -> Rendered = match hollowed(p, n) {
-  h if len(h.holes) == 0 => whole-pieces(o, p, n, threads, f)
-  h => match changed {
-    true => none
-    false => spliced(shell, [hole-name(hole.at) for hole in h.holes], texts)
-  } ?? whole-pieces(o, p, n, threads, f)
+# Each part printed at once, and the texts put together: each body's parts joined, and spliced into
+# the shell's text where its hole printed, the marks after it moved along.
+fn rendered-pieces(o: Options, p: Node, n: Int, threads: Int) -> Rendered = match hollowed(p, n) {
+  h if len(h.holes) == 0 => whole-pieces(o, p, n, threads)
+  h => spliced(shell, [hole-name(hole.at) for hole in h.holes], texts) ?? whole-pieces(o, p, n, threads)
     where shell-parts = parts-of(h.shell, n),
           bodies = [body-parts(hole, h.total, n) for hole in h.holes],
-          done = heaviest-pieces(shell-parts ++ [x for b in bodies for x in b], f, threads),
+          done = heaviest-rendered(shell-parts ++ [x for b in bodies for x in b], threads),
           starts = body-starts(len(shell-parts), bodies),
-          changed = minifying and (any k in 0..len(bodies): end-changed?([d.ends for d in done[starts[k]..starts[k + 1]]])),
-          shell = pieces-joined(o, [d.rendered for d in done[0..len(shell-parts)]]),
-          texts = [pieces-joined(o, [d.rendered for d in done[starts[k]..starts[k + 1]]]) for k in 0..len(bodies)]
+          shell = pieces-joined(o, done[0..len(shell-parts)]),
+          texts = [pieces-joined(o, done[starts[k]..starts[k + 1]]) for k in 0..len(bodies)]
 }
 
 # Only top-level parts, each printed, joined.
-fn whole-pieces(o: Options, p: Node, n: Int, threads: Int, f: Fn(Node)->Piece) -> Rendered =
-  pieces-joined(o, [d.rendered for d in heaviest-pieces(parts-of(p, n), f, threads)])
+fn whole-pieces(o: Options, p: Node, n: Int, threads: Int) -> Rendered =
+  pieces-joined(o, heaviest-rendered(parts-of(p, n), threads))
 
 # Each body where its hole printed, in one pass: the shell's text between holes and the bodies'
 # texts written out in turn, and each mark moved by what the holes before it grew by. Nothing when
@@ -665,28 +631,63 @@ fn base-dir(o: Options) -> Text = match o.outbase {
 record Written { path: Text, text: Text, said: Text }
 
 # One bundle, or one per entry, or one split into chunks, each name looked up as the options say:
-# the files they make, written; or, with nowhere to write it, the one bundle printed.
-fn build(options: Options) -> Void = match options.watch, cached?(options) {
-  true, _ => watched(options)
-  false, true => cached-once(options)
-  false, false => timed(options.timing, "write", match printing?(options) {
-    true => to-standard-output(files(options))
-    false => written(files(options))
-  })
+# the files they make, written; or, with nowhere to write it, the one bundle printed. While
+# watching, built again whenever an input a build read says something else, until the process is
+# stopped; with hot module replacement, each build in the development format.
+fn build(options: Options) -> Void {
+  started(options)
+  match options.hmr {
+    true => dev-rebuilding(dev-given(options))
+    false => builds(options)
+  }
+}
+
+# Builds one after another: one, or while watching, one each time something a build read changes.
+fn builds(o: Options) -> Void {
+  var count = 0
+  var going = true
+  while going {
+    let start = now-us()
+    let before = memo-computed()
+    timed(o.timing, "write", delivered(o, files(o)))
+    count = count + 1
+    let took = now-us() - start
+    if o.watch {
+      print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", count, took / 1000, took % 1000 / 100,
+        memo-computed() - before, inputs-watched()
+    }
+    let saving = now-us()
+    cache-kept(o)
+    if o.timing and cached?(o) and not o.watch {
+      print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100
+    }
+    if o.watch {
+      let changed = wait-for-changes!(o.watch-interval)
+      print "[watch] changed: {}", join(changed, " ")
+    } else {
+      going = false
+    }
+  }
+  if o.watch { print "[watch] stopped" }
+}
+
+fn delivered(o: Options, ws: [Written]) -> Void = match printing?(o) {
+  true => to-standard-output(ws)
+  false => written(ws)
 }
 
 # Whether a build keeps what it computes on disk, and starts from what an earlier one kept.
 fn cached?(o: Options) -> Bool = not o.no-cache and (o.cache or o.watch)
 
-# Whether a build is made of memo answers kept for the next: one that watches, or starts from the
-# cache. It runs its steps in runs of statements, each a memo, where another fuses them.
-fn incremental?(o: Options) -> Bool = o.watch or cached?(o)
-
 fn cache-path(o: Options) -> Text = o.cache-dir ++ "/" ++ hash-text(o.cache-key) ++ ".cache"
 
-# Dependencies tracked, and what an earlier run kept loaded, before anything is computed.
-fn tracked-start(o: Options) -> Void {
-  track-dependencies!()
+# Builds that watch, or start from the cache, track what each answer was made from, and the first
+# starts from what an earlier run kept, loaded before anything is computed.
+fn started(o: Options) -> Void {
+  if o.watch or cached?(o) {
+    one-entry(o)
+    track-dependencies!()
+  }
   if cached?(o) {
     # There before anything is built: made later, it would change a listing a build read.
     make-dirs!(o.cache-dir)
@@ -697,6 +698,11 @@ fn tracked-start(o: Options) -> Void {
   }
 }
 
+fn one-entry(o: Options) -> Bool = match o.splitting, o.outfile, len(o.entries), o.entry {
+  false, out, 1, entry if out != "" and not ends-with(entry, ".css") => true
+  _, _, _, _ => panic "--watch and --cache build one JavaScript entry to --outfile, for now"
+}
+
 # What a build computed, kept: while watching, on a thread of its own while the watcher waits; for
 # one build, before the program ends.
 fn cache-kept(o: Options) -> Void {
@@ -705,34 +711,20 @@ fn cache-kept(o: Options) -> Void {
   }
 }
 
-# `--cache` without `--watch`: one build, as a watched build makes it, from what the cache kept.
-fn cached-once(options: Options) -> Void {
-  tracked-start(options)
-  set-up(options, true)
-}
-
 # The files a build makes, not yet written.
-fn files(options: Options) -> [Written] = set-up(options, false)
-
-# `--watch`: one bundle built and written, then built again whenever something a build read
-# changes, until the process is stopped.
-fn watched(options: Options) -> Void {
-  tracked-start(options)
-  set-up(options, true)
-  print "[watch] stopped"
+fn files(options: Options) -> [Written] {
+  set-up(options)
+  built(printable(options))
 }
 
-fn set-up(options: Options, watching: Bool) -> [Written] =
-  with res.options = resolve-options(options), tsc.forced = options.tsconfig, ascii.braces = options.target >= 2015,
-       cssb.loaders = loader-map(options) {
-    match watching {
-      false => built(printable(options))
-      true => match options.splitting, options.outfile, len(options.entries), options.entry {
-        false, out, 1, entry if out != "" and not ends-with(entry, ".css") => one-set-up(options, true)
-        _, _, _, _ => panic "--watch and --cache build one JavaScript entry to --outfile, for now"
-      }
-    }
-  }
+# What every build of these options reads, given it: each build gives its own, and what reads a
+# part of one is made again only when that part is something else.
+fn set-up(options: Options) -> Void {
+  res.options = resolve-options(options)
+  tsc.forced = options.tsconfig
+  ascii.braces = options.target >= 2015
+  cssb.loaders = loader-map(options)
+}
 
 fn written(ws: [Written]) -> Void = write-files!([w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
 
@@ -805,75 +797,46 @@ fn module-assets(out-dir: Text) -> [cssb.Asset] =
   [cssb.asset-of(mo.path, out-dir) for mo in m.modules if mo.kind != m.External and m.loader-of(mo.path) == "file"]
 
 # One bundle, as the build's settings say how to load, link, emit and print it.
-fn one-built(options: Options) -> [Written] = one-set-up(options, false)
-
-fn one-set-up(options: Options, watching: Bool) -> [Written] = match options.entry {
+fn one-built(options: Options) -> [Written] = match options.entry {
   _ ++ ".css" => css-built(options)
   _ if options.pretty and options.jsx.runtime == jsx.Preserve =>
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
-  _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, false, f),
-            e.emitting = emitting-of(o, f), e.chunk-parts = none, printing = printing-of(o),
-            # A build started from the cache keeps the names it interned, so a name keeps its id.
-            m.names = if-given(m.names) ?? names-new() {
-         match watching {
-           false => loaded-built(timed(o.timing, "startup", o), f)
-           true => rebuilding(o, f)
-         }
-       }
-    where o = with-node-env(options),
-          f = match o.format.export-names or len(o.format.exports) > 0 {
-            true => o.format
-            false => named(o.format, o.global-name)
-          }
+  _ => bundled(with-node-env(options))
 }
 
-# Built and written, then built again each time an input a build read says something else. What
-# the build set up stays given, so memo answers made from files nothing changed are kept: only what
-# an edit reaches is computed again.
-fn rebuilding(o: Options, f: Format) -> [Written] = match o.hmr {
-  true => dev-rebuilding(o)
-  false => plain-rebuilding(o, f)
+fn bundled(o: Options) -> [Written] {
+  given(o)
+  bundle()
 }
 
-# How one build is made, given while builds are: what `built-files` makes them from.
+# Hot module replacement's builds, once what they read is given.
+fn dev-given(options: Options) -> Options {
+  set-up(options)
+  given(with-node-env(options))
+  with-node-env(options)
+}
+
+# How one build is made: its options, and the format its output takes.
 record Building { options: Options, format: Format }
 
 setting building: Building
 
-# Everything one build writes, for its entry: an answer of its own, made from everything a build
-# reads, so a run that changed nothing has it with no look at anything else, and reads nothing else
-# from the cache.
-fn built-files(entry: Text) -> [Written] = loaded-built(building.options, building.format)
-
-fn plain-rebuilding(o: Options, f: Format) -> [Written] = with building = Building(options: o, format: f) { built-again(o) }
-
-fn built-again(o: Options) -> [Written] {
-  var builds = 0
-  var going = true
-  while going {
-    let start = now-us()
-    let before = memo-computed()
-    written(built-files(o.entry))
-    builds = builds + 1
-    let took = now-us() - start
-    if o.watch {
-      print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
-        memo-computed() - before, inputs-watched()
-    }
-    let saving = now-us()
-    cache-kept(o)
-    if o.timing and cached?(o) and not o.watch {
-      print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100
-    }
-    if o.watch {
-      let changed = wait-for-changes!(o.watch-interval)
-      print "[watch] changed: {}", join(changed, " ")
-    } else {
-      going = false
-    }
+# What one bundle's build reads, given it.
+fn given(o: Options) -> Void {
+  let f = match o.format.export-names or len(o.format.exports) > 0 {
+    true => o.format
+    false => named(o.format, o.global-name)
   }
-  []
+  m.loading = loading-of(o, dir-of(o.outfile))
+  an.linking = linking-of(o, len(f.exports) > 0, false, f)
+  e.emitting = emitting-of(o, f)
+  e.chunk-parts = none
+  printing = printing-of(o)
+  building = Building(options: o, format: f)
 }
+
+# Everything one build writes.
+fn bundle() -> [Written] = loaded-built(building.options, building.format)
 
 # Hot module replacement: each build in the development format, written, and after the first what
 # changed sent to the page as an update, or a reload when nothing that changed can take one.
@@ -930,7 +893,7 @@ fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: o.sour
 # A build once it is set up: load, link, name, and the rest.
 fn loaded-built(o: Options, f: Format) -> [Written] =
   match timed(o.timing, "load: parse files ahead", m.parsed-ahead([o.entry])) { _ =>
-    graph-built(o, f, timed(o.timing, "load: resolve, scopes, the graph", m.graph-of(o.entry)))
+    graph-built(o, f, timed(o.timing, "load: resolve, scopes, the graph", m.graph(include-text("runtime.js"), [o.entry])))
   }
 
 # A build once its modules are known. Each stage's result is given to what follows as a setting's
@@ -942,25 +905,18 @@ fn graph-built(o: Options, f: Format, g: m.Graph) -> [Written] {
   m.order = g.order
   m.entries = g.entries
   m.entry = g.entries[0]
-  m.built-graph = g
-  linked-built(o, f)
+  linked-built(o, f, g)
 }
 
-fn linked-built(o: Options, f: Format) -> [Written] {
+fn linked-built(o: Options, f: Format, g: m.Graph) -> [Written] {
   m.interning = names-copy(m.names)
-  an.linked = an.linked-now(o.entry)
-  m.table = an.table-now(o.entry)
-  m.db = timed(o.timing, "link: facts and Datalog", an.db-now(o.entry))
+  an.linked = an.link(0)
+  m.table = an.linked-table(g)
+  m.db = timed(o.timing, "link: facts and Datalog", an.solved-facts())
   m.names = names-copy(m.interning)
-  e.units = e.units-now(o.entry)
-  nm.finals = timed(o.timing, "naming", names-now(o.minify-identifiers, o.plan.emit-threads, o.target < lower.no-lowering))
+  e.units = e.units-of-order()
+  nm.finals = timed(o.timing, "naming", final-names(o))
   named-built(o, f)
-}
-
-# Each symbol's name, kept while what they are made of stays the same.
-fn names-now(minify: Bool, threads: Int, lowering: Bool) -> [Text] = match minify {
-  true => mangle.minified-names(threads)
-  false => nm.esbuild-names(lowering)
 }
 
 # Each symbol's name: minified, or as esbuild's number renamer gives them.
@@ -990,32 +946,27 @@ fn named-built(o: Options, f: Format) -> [Written] =
                for s in [sheets] if len(s) > 0]
 
 # The output made from the whole program at once.
-fn flat-output(o: Options, f: Format) -> Printed = match fused {
-  true => finished-output(o, f, p)
-  false => wrap-format(o, f, p)
-} where emission = e.program(),
+fn flat-output(o: Options, f: Format) -> Printed = wrap-format(o, f, p)
+  where emission = e.program(),
         emitted = timed(o.timing, "emit: rewrite identifiers", run-entry(emission.tree, f)),
-        fused = fusable?(o) and not incremental?(o),
-        p = timed(o.timing, "minify rules", match fused, o.minify-syntax {
-          true, _ => emitted
-          false, true => for-target(o, optimized(o, emitted))
-          false, false => for-target(o, folded(o, emitted))
+        p = timed(o.timing, "minify rules", match o.minify-syntax {
+          true => for-target(o, optimized(o, emitted))
+          false => for-target(o, folded(o, emitted))
         })
 
-# While building again, with the bundler's own optimiser and nothing to lower, the output is made
-# group by group (see `e.groups`), each group's text an answer kept by its units: an edit to one
-# module makes its groups again, and the others' texts are read back, not their statements.
-fn grouped?(o: Options) -> Bool = incremental?(o) and not o.has-optimize and o.target >= lower.no-lowering
+# With the bundler's own optimiser and nothing to lower, the output is made group by group (see
+# `e.groups`), each group's text from its own units alone, on many threads at once, and the texts
+# joined. Nothing the optimiser does crosses from one group to the next.
+fn grouped?(o: Options) -> Bool = not o.has-optimize and o.target >= lower.no-lowering
 
 fn grouped-output(o: Options, f: Format) -> Printed =
   Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
   where exports = export-statements(f),
-        all = pieces-joined(o, [group-output(g.units, g.namespace) for g in e.groups()]
+        all = pieces-joined(o, parallel-map(e.groups(), group-output, o.plan.print-threads)
                                ++ [group-rendered(o, entry-calls(f))]
                                ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
 
-fn group-output(units: [e.Unit], namespace: Bool) -> Rendered =
-  group-rendered(output-options(), e.group-made(e.Group(units: units, namespace: namespace)))
+fn group-output(g: e.Group) -> Rendered = group-rendered(output-options(), e.group-made(g))
 
 # Of the build's options, what a group's text is made by, each read by itself, so that a run with
 # other options otherwise, such as one that watches after one that did not, keeps the groups' texts.
