@@ -184,6 +184,7 @@ fn names-in-use() -> [Text] =
   nm.finals ++ [f for mo in m.modules for f in mo.free] ++ nm.keywords
 
 fn for-target(o: Options, p: Node) -> Node = match o.charset-ascii {
+  true if o.watch => watched-runs(lowered, 2)
   true => in-parts(o, lowered, fin.ascii-only)
   false => lowered
 } where dropped = match o.drop-console or o.drop-debugger {
@@ -302,6 +303,24 @@ fn runs-of(stmts: [Node], n: Int) -> [[Node]] = match stmts {
           ends = cuts ++ [len(stmts)]
 }
 
+# A program's statements in runs that stay put from one build to the next: each ends after a
+# statement that closes, where cutting changes nothing the optimiser does (see `closed?`), so an
+# edit changes only the runs it touches. While watching, each run is minified, folded, made ASCII
+# and printed apart, and each kept while its statements are the same ones.
+fn stable-runs(stmts: [Node]) -> [[Node]] = [stmts[ends[i]..ends[i + 1]] for i in 0..len(ends) - 1]
+  where ends = [0] ++ [k + 1 for k in 0..len(stmts) if closed?(stmts[k]) and k + 1 < len(stmts)] ++ [len(stmts)]
+
+fn watched-runs(p: Node, step: Int) -> Node = p with { body: List([s for r in stable-runs(p.body.kids) for s in run-step(step, r)]...) }
+
+memo fn run-step(step: Int, stmts: [Node]) -> [Node] = match step {
+  0 => default-optimize(program-of(None(), stmts)).body.kids
+  1 => fold.run(program-of(None(), stmts)).body.kids
+  _ => fin.ascii-only(program-of(None(), stmts)).body.kids
+}
+
+memo fn rendered-run(hashbang: Node, stmts: [Node], pretty: Bool, maps: Bool) -> Rendered =
+  js.render-tracked(program-of(hashbang, stmts), pretty, maps)
+
 # A program cut into runs of its statements, each a program of its own.
 fn parts-of(p: Node, n: Int) -> [Node] = match runs-of(p.body.kids, n) {
   [_] => [p]
@@ -415,6 +434,7 @@ fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) 
 # what follows, so this is the program the optimiser would make of the whole. A spec's own
 # optimiser is given top-level parts only: what it does to a body with a hole is its own.
 fn optimized(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
+  _ if o.watch and not o.has-optimize => watched-runs(p, 0)
   n if n <= 1 => o.optimize(p)
   n if o.has-optimize => joined(p, heaviest-first(parts-of(p, n), o.optimize, o.plan.optimize-threads))
   n => in-pieces(p, n, o.plan.optimize-threads, o.optimize, true)
@@ -464,6 +484,7 @@ fn heaviest-order(parts: [Node]) -> [Int] = sort i in [i for i in 0..len(parts)]
 fn part-weight(p: Node) -> Int = sum s in p.body.kids: weight(s)
 
 fn folded(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
+  _ if o.watch => watched-runs(p, 1)
   n if n <= 1 => fold.run(p)
   n => in-pieces(p, n, o.plan.optimize-threads, fold.run, false)
 }
@@ -478,6 +499,9 @@ fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, prin
 # where its part landed. A part that ends where the printer dropped a `;` gets it back, as the
 # printer would have written it had the next part followed.
 fn rendered-in-parts(o: Options, p: Node) -> Rendered = match o.plan.print-parts {
+  _ if o.watch => pieces-joined(o, [rendered-run(match i { 0 => p.hashbang  _ => None() }, runs[i], o.pretty, o.sourcemap)
+                                    for i in 0..len(runs)])
+    where runs = stable-runs(p.body.kids)
   n if n <= 1 => js.render-tracked(p, o.pretty, o.sourcemap)
   n => rendered-pieces(o, p, n, o.plan.print-threads, printed-piece, false)
 }
@@ -826,22 +850,36 @@ fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: o.sour
 # A build once it is set up: load, link, name, and the rest.
 fn loaded-built(o: Options, f: Format) -> [Written] =
   match timed(o.timing, "load: parse files ahead", m.parsed-ahead([o.entry])) { _ =>
-    graph-built(o, f, timed(o.timing, "load: resolve, scopes, the graph", m.graph(include-text("runtime.js"), [o.entry])))
+    graph-built(o, f, timed(o.timing, "load: resolve, scopes, the graph", m.graph-of(o.entry)))
   }
 
-# A build once its modules are known.
-fn graph-built(o: Options, f: Format, g: m.Graph) -> [Written] =
-  with m.modules = g.modules, m.by-path = g.by-path, m.order = g.order, m.entries = g.entries, m.entry = g.entries[0] {
-    linked-built(o, f, g)
-  }
+# A build once its modules are known. Each stage's result is given to what follows as a setting's
+# value for good, so the next build compares its own with it part by part, and what reads a part
+# that stayed the same stays as it was.
+fn graph-built(o: Options, f: Format, g: m.Graph) -> [Written] {
+  m.modules = g.modules
+  m.by-path = g.by-path
+  m.order = g.order
+  m.entries = g.entries
+  m.entry = g.entries[0]
+  m.built-graph = g
+  linked-built(o, f)
+}
 
-fn linked-built(o: Options, f: Format, g: m.Graph) -> [Written] =
-  with an.linked = an.link(g.symbols), m.table = an.linked-table(g),
-       m.db = timed(o.timing, "link: facts and Datalog", an.solved-facts()) {
-    with e.units = e.units-of-order() {
-      with nm.finals = timed(o.timing, "naming", final-names(o)) { named-built(o, f) }
-    }
-  }
+fn linked-built(o: Options, f: Format) -> [Written] {
+  an.linked = an.linked-now(o.entry)
+  m.table = an.table-now(o.entry)
+  m.db = timed(o.timing, "link: facts and Datalog", an.db-now(o.entry))
+  e.units = e.units-now(o.entry)
+  nm.finals = timed(o.timing, "naming", names-now(o.minify-identifiers, o.plan.emit-threads, o.target < lower.no-lowering))
+  named-built(o, f)
+}
+
+# Each symbol's name, kept while what they are made of stays the same.
+memo fn names-now(minify: Bool, threads: Int, lowering: Bool) -> [Text] = match minify {
+  true => mangle.minified-names(threads)
+  false => nm.esbuild-names(lowering)
+}
 
 # Each symbol's name: minified, or as esbuild's number renamer gives them.
 fn final-names(o: Options) -> [Text] = match o.minify-identifiers {
@@ -857,7 +895,7 @@ fn named-built(o: Options, f: Format) -> [Written] =
   ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
   where emission = e.program(),
         emitted = timed(o.timing, "emit: rewrite identifiers", run-entry(emission.tree, f)),
-        fused = fusable?(o),
+        fused = fusable?(o) and not o.watch,
         p = timed(o.timing, "minify rules", match fused, o.minify-syntax {
           true, _ => emitted
           false, true => for-target(o, optimized(o, emitted))

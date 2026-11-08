@@ -1309,8 +1309,10 @@
             (push! (mut (.strs ns)) s)
             id))))
 
+;;; An id's string, and nothing for an id it never gave: so asking a table of another build, which
+;;; may hold fewer, is safe.
 (defn name-of [(ns Names) (id i64)] (-> (slice u8))
-  (get (.strs ns) id))
+  (if (and (>= id 0) (< id (len (.strs ns)))) (get (.strs ns) id) ""))
 
 (defn name-count [(ns Names)] (-> i64)
   (len (.strs ns)))
@@ -1482,6 +1484,33 @@
     out))
 
 ;;; One text for a memo's several arguments, each told apart by its length, whatever it holds.
+;;; Whether `n` bytes at two places are the same.
+(defn same-bytes? [(a (ptr u8)) (b (ptr u8)) (n i64)] (-> bool)
+  (let [(mut same) true
+        (mut i) 0]
+    (while (and same (< i n))
+      (when (!= (load (primitive/index a i)) (load (primitive/index b i))) (set! same false))
+      (set! i (+ i 1)))
+    same))
+
+;;; A tree's identity: see `node-key` in the grammars.
+(defn node-identity [(kind i64) (lo i64) (hi i64) (text (slice u8)) (kids i64) (count i64)] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) (num-text kind))
+    (push-str! (mut b) ":")
+    (push-str! (mut b) (num-text lo))
+    (push-str! (mut b) ":")
+    (push-str! (mut b) (num-text hi))
+    (push-str! (mut b) ":")
+    (push-str! (mut b) (num-text (primitive/cast i64 (data text))))
+    (push-str! (mut b) ":")
+    (push-str! (mut b) (num-text (len text)))
+    (push-str! (mut b) ":")
+    (push-str! (mut b) (num-text kids))
+    (push-str! (mut b) ":")
+    (push-str! (mut b) (num-text count))
+    (finish! (mut b))))
+
 ;;; A key `memo-key-of` made, back into its parts.
 (defn memo-key-parts [(key (slice u8))] (-> (ArrayList (slice u8)))
   (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))
@@ -2205,7 +2234,10 @@
    (left i64)  ; workers of this run still at it
    (running bool)
    (body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
-   (job (ptr i8))])
+   (job (ptr i8))
+   ;; When the run was started by a memo computing, what each worker read, for it.
+   (inherit bool)
+   (read (ArrayList (slice u8)))])
 
 (defn pool-fail [(what (slice u8))] (-> void)
   (panic "worker pool: {}" what))
@@ -2223,6 +2255,7 @@
         (Ok [_] 0)
         (Err [_] (pool-fail "no condition")))
       (set! (.threads p) (ArrayList::new [Thread] (malloc-allocator)))
+      (set! (.read p) (ArrayList::new [(slice u8)] (malloc-allocator)))
       (for _ (range 0 (max-workers))
         (push! (mut (.threads p)) (Thread :handle (cast (ptr i8) 0))))
       (set! (.ready p) true))
@@ -2279,10 +2312,14 @@
       (set! seen (.round p))
       (when (< slot (.want p))
         (let [body (.body p)
-              job (.job p)]
+              job (.job p)
+              inherit (.inherit p)]
           (pool-unlock! p)
+          (when inherit (dep-begin!))
           (body job)
-          (pool-lock! p)
+          (let [read (if inherit (dep-take-notes!) (ArrayList::new [(slice u8)] (malloc-allocator)))]
+            (pool-lock! p)
+            (for x read (push! (mut (.read p)) x)))
           (atomic/store (field p left) (- (.left p) 1))
           (when (= (.left p) 0)
             (match (Condition::notify-all! (field p done))
@@ -2388,6 +2425,8 @@
           (set! (.running p) true)
           (set! (.body p) body)
           (set! (.job p) job)
+          (set! (.inherit p) (dep-in-frame?))
+          (set! (.read p) (ArrayList::new [(slice u8)] (malloc-allocator)))
           (set! (.want p) count)
           (atomic/store (field p left) (- count 1))
           (atomic/store (field p round) (+ (.round p) 1))
@@ -2403,7 +2442,10 @@
           (pool-lock! p)
           (while (> (.left p) 0) (pool-wait! p (field p done)))
           (set! (.running p) false)
-          (pool-unlock! p)))
+          (let [read (.read p)]
+            (pool-unlock! p)
+            ;; What the workers read, this thread's memo read.
+            (for x read (dep-note! x)))))
     0))
 
 ;;; What a program answered, carried from the thread it ran on to `main`.
@@ -2613,6 +2655,64 @@
     (deps-unlock! d)
     out))
 
+;;; Where byte `c` first is in a path, or its end.
+(defn name-end-at [(path (slice u8)) (c i64)] (-> i64)
+  (let [(mut i) 0]
+    (while (and (< i (len path)) (!= (cast i64 (get path i)) c)) (set! i (+ i 1)))
+    i))
+
+;;; An accessor call's path: `@name(args)`, its arguments as `memo-key-of` joins them.
+(defn call-path [(name (slice u8)) (parts (ArrayList (slice u8)))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) "@")
+    (push-str! (mut b) name)
+    (push-str! (mut b) "(")
+    (push-str! (mut b) (memo-key-of parts))
+    (push-str! (mut b) ")")
+    (finish! (mut b))))
+
+;;; A query's path: `.rel(c0,c1,…)`, each column a value or `_`.
+(defn query-path [(rel (slice u8)) (parts (ArrayList (slice u8)))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) ".")
+    (push-str! (mut b) rel)
+    (push-str! (mut b) "(")
+    (for i (range 0 (len parts))
+      (when (> i 0) (push-str! (mut b) ","))
+      (push-str! (mut b) (get parts i)))
+    (push-str! (mut b) ")")
+    (finish! (mut b))))
+
+;;; The rows of a relation a query sees, `spec` giving each column's value or `_` for any: every
+;;; column of each, in the order the relation holds them.
+(defn rel-matching [(r (mut Rel)) (spec (slice u8))] (-> (ArrayList i64))
+  (let [cols (split spec ",")
+        (mut out) (ArrayList::new [i64] (malloc-allocator))
+        (mut first) -1]
+    (for i (range 0 (len cols)) (when (and (< first 0) (!= (get cols i) "_")) (set! first i)))
+    (let [rows (if (>= first 0)
+                   (rel-bucket (mut r) first (parse-int (get cols first)))
+                   (let [(mut all) (ArrayList::new [i64] (malloc-allocator))]
+                     (for row (range 0 (.count r)) (push! (mut all) row))
+                     all))]
+      (for row rows
+        (let [(mut fits) true]
+          (for c (range 0 (len cols))
+            (when (and fits (!= (get cols c) "_") (!= (rel-at (mut r) row c) (parse-int (get cols c))))
+              (set! fits false)))
+          (when fits
+            (for c (range 0 (.arity r)) (push! (mut out) (rel-at (mut r) row c)))))))
+    out))
+
+;;; Whether a query sees the same rows of two relations.
+(defn rel-rows-same? [(a (mut Rel)) (b (mut Rel)) (spec (slice u8))] (-> bool)
+  (let [x (rel-matching (mut a) spec)
+        y (rel-matching (mut b) spec)]
+    (and (= (len x) (len y))
+         (block :same
+                (for i (range 0 (len x)) (when (!= (get x i) (get y i)) (return-from :same false)))
+                true))))
+
 ;;; Where a field's name ends in a path: at the next `.` or `#`, or the end.
 (defn name-end [(path (slice u8))] (-> i64)
   (let [(mut i) 0]
@@ -2658,11 +2758,23 @@
           now (atomic/read (field d revision))]
       (for read (.notes frame) (push! (mut reads) (dep-id! d read)))
       (set! (mut (.reads d)) me reads)
+      (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") node))
       (set! (mut (.verified d)) me now)
       (unless same (set! (mut (.changed d)) me now))
       (set! (.computed d) (+ (.computed d) 1)))
     (deps-unlock! d)
     0))
+
+;;; What this worker read since its frame opened, the frame closed: work a memo on another thread
+;;; handed it, whose reads are that memo's.
+(defn dep-take-notes! [] (-> (ArrayList (slice u8)))
+  (let [d (deps)
+        slot (worker-slot)
+        frame (match (pop! (mut (elem (mut (.stacks d)) slot)))
+                (Some [f] f)
+                (None [] (panic "work for a memo finished that never started")))]
+    (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
+    (.notes frame)))
 
 ;;; An input was read: noted, with what it said, when a memo reads it.
 (defn dep-input! [(node (slice u8)) (print (slice u8))] (-> void)
@@ -2686,7 +2798,8 @@
             id (dep-id! d node)]
         (atomic/store (field d revision) now)
         (set! (mut (.changed d)) id now))
-      (deps-unlock! d))
+      (deps-unlock! d)
+      (when (dep-tracing?) (println "[deps] changed {}" node)))
     0))
 
 ;;; Whether a memo's answer is known current in this revision.
@@ -2714,7 +2827,13 @@
               (block :check
                      (for read reads
                        (let [changed (dep-bring-up! d read)]
-                         (when (> changed since) (return-from :check false))))
+                         (when (> changed since)
+                           (when (dep-tracing?)
+                             (deps-lock! d)
+                             (let [what (get (.texts d) read)]
+                               (deps-unlock! d)
+                               (println "[deps] {} because {}" node what)))
+                           (return-from :check false))))
                      (deps-lock! d)
                      (set! (mut (.verified d)) me (atomic/read (field d revision)))
                      (deps-unlock! d)
@@ -2744,6 +2863,16 @@
     (push-str! (mut b) "\0")
     (push-str! (mut b) key)
     (finish! (mut b))))
+
+;;; Whether HL_TRACE_DEPS is set: each memo answer computed is printed, and whether it changed.
+(defn dep-tracing? [] (-> bool)
+  (let [t (primitive/alloc-static DepTrace)]
+    (when (= (.known t) 0)
+      (set! (.on t) (if (= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) "HL_TRACE_DEPS"))) 0) 0 1))
+      (set! (.known t) 1))
+    (= (.on t) 1)))
+
+(defstruct DepTrace [(known i64) (on i64)])
 
 ;;; How many memo answers have been computed, ever.
 (defn dep-computed [] (-> i64)

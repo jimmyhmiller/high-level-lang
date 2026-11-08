@@ -2681,6 +2681,30 @@
     (_ (die (mut k) h "expected a loop head"))))
 
 ;;; `db.rel(a, ?x, _)`: rows matching the known columns, binding the `?` ones.
+;;; A query of a database setting: noted as the rows of `rel` it can see, by the columns it gives
+;;; (`parts`, each a value or `_`).
+(defn query-note [(k (mut Comp)) (base g/Node) (rel (slice u8)) (parts Code)] (-> Code)
+  (match (setting-part (mut k) base)
+    (Some [p]
+          (if (> (len (.fields p)) 0)
+              (setting-note (mut k) base)
+              (let [node (cat4 "s:" (.module p) "." (.name (.x p)))]
+                `(do (when (rt/dep-in-frame?) (rt/dep-note-path! ~node (rt/query-path ~rel ~parts))) 0))))
+    (None [] `0)))
+
+;;; A read of a setting through its place, as a query of a database setting reads it: noted, as
+;;; any read of a setting is, for the memo computing now. Nothing for a base that is no setting.
+(defn setting-note [(k (mut Comp)) (base g/Node)] (-> Code)
+  (match (setting-part (mut k) base)
+    (Some [p]
+          (let [node (cat4 "s:" (.module p) "." (.name (.x p)))]
+            `(do (when (rt/dep-in-frame?)
+                   ~(if (= (len (.fields p)) 0)
+                        `(rt/dep-note-literal! ~node)
+                        `(rt/dep-note-path! ~node ~(fields-path (.fields p)))))
+                 0)))
+    (None [] `0)))
+
 (defn query-open! [(k (mut Comp)) (call g/Node)] (-> HeadInfo)
   (unless (and (= (.kind call) (g/KCall)) (= (.kind (kid call 0)) (g/KFieldE)))
     (die (mut k) call "a query is db.relation(columns)"))
@@ -2698,7 +2722,8 @@
         row (fresh (mut k) "row")
         rowsym (sym row)
         (mut key-col) -1
-        (mut key-sym) ""]
+        (mut key-sym) ""
+        (mut specs) (primitive/code-list-new)]
     (rel-check (mut k) call (.ty db) rel-name (len args))
     ;; A query only reads, though it may build an index as it goes. A relation's indexes live in
     ;; storage its copies share, so one held by `let` (or made by a call) is read through a copy.
@@ -2707,11 +2732,12 @@
       (push! (mut lets) rel-of))
     (for i (range 0 (len args))
       (let [a (get args i)]
-        (cond (= (.kind a) (g/KQvar)) 0
-              (and (= (.kind a) (g/KName)) (= (.text a) "_")) 0
+        (cond (= (.kind a) (g/KQvar)) (do (push! (mut specs) `(push! (mut parts) "_")) 0)
+              (and (= (.kind a) (g/KName)) (= (.text a) "_")) (do (push! (mut specs) `(push! (mut parts) "_")) 0)
               :else
                 (let [v (expect (mut k) a (expr (mut k) a "Int") "Int")
                       t (fresh (mut k) "key")]
+                  (push! (mut specs) `(push! (mut parts) (rt/num-text ~(sym t))))
                   (push! (mut lets) (sym t))
                   (push! (mut lets) (.code v))
                   (if (< key-col 0)
@@ -2728,6 +2754,11 @@
                                false)]
             (push! (mut binds) (sym v))
             (push! (mut binds) `(rt/rel-at ~rel-code ~rowsym ~i))))))
+    ;; The rows it can see are what it reads: its relation, by the columns it gives.
+    (push! (mut lets) (sym (fresh (mut k) "noted")))
+    (push! (mut lets) (query-note (mut k) base rel-name `(let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                                                          ~@specs
+                                                          parts)))
     (HeadInfo
       :wrap-kind 4
       :alts (no-alts)
@@ -3134,8 +3165,71 @@
                  (module (slice u8))
                  (f Func)
                  (args (ArrayList g/Node))] (-> TE)
-  (let [cs (args-code (mut k) n f args)]
-    (te `(~(sym (qualified (mut k) module (.coil f))) ~@cs) (.ret f))))
+  (match (accessor-read (mut k) n module f args)
+    (Some [t] t)
+    (None []
+          (let [cs (args-code (mut k) n f args)]
+            (te `(~(sym (qualified (mut k) module (.coil f))) ~@cs) (.ret f))))))
+
+;;; A foreign module's function that looks into one value, given plain values besides: what
+;;; `sym.symbol-at(table, s)` is. Applied to a setting, it reads just what it answers.
+(defn accessor? [(k (mut Comp)) (module (slice u8)) (f Func)] (-> bool)
+  (and (= (.sort (mod-at (mut k) module)) (SForeign))
+       (> (len (.params f)) 0)
+       (not (.by-ref (get (.params f) 0)))
+       (not (= (.ret f) "Void"))
+       (let [(mut ok) true]
+         (for i (range 1 (len (.params f)))
+           (let [p (get (.params f) i)]
+             (unless (and (not (.by-ref p)) (or (= (.ty p) "Int") (= (.ty p) "Text") (= (.ty p) "Bool")))
+               (set! ok false))))
+         ok)))
+
+(defn plain-text-code [(t (slice u8)) (v Code)] (-> Code)
+  (cond (= t "Int") `(rt/num-text ~v)
+        (= t "Bool") `(if ~v "1" "0")
+        :else v))
+
+;;; While dependencies are tracked, a memo that calls an accessor on a setting is made from what the
+;;; call answers: binding the setting again changes it only if the call answers otherwise.
+(defn accessor-read [(k (mut Comp)) (n g/Node) (module (slice u8)) (f Func) (args (ArrayList g/Node))]
+  (-> (Option TE))
+  (if (or (> (.quiet k) 0) (= (len args) 0) (!= (len args) (len (.params f))) (not (accessor? (mut k) module f)))
+      (None [TE])
+      (match (setting-part (mut k) (get args 0))
+        (Some [sp]
+              (if (> (len (.fields sp)) 0)
+                  (None [TE])
+                  (let [node (cat4 "s:" (.module sp) "." (.name (.x sp)))
+                        (mut binds) (primitive/code-list-new)
+                        (mut call-args) (primitive/code-list-new)
+                        (mut texts) (primitive/code-list-new)]
+                    (set! (.quiet k) (+ (.quiet k) 1))
+                    (let [first (expect (mut k) (get args 0) (expr (mut k) (get args 0) (.ty (get (.params f) 0)))
+                                        (.ty (get (.params f) 0)))
+                          v0 (fresh (mut k) "of")]
+                      (set! (.quiet k) (- (.quiet k) 1))
+                      (push! (mut binds) (sym v0))
+                      (push! (mut binds) (.code first))
+                      (push! (mut call-args) (sym v0))
+                      (for i (range 1 (len args))
+                        (let [p (get (.params f) i)
+                              a (expect (mut k) (get args i) (expr (mut k) (get args i) (.ty p)) (.ty p))
+                              v (fresh (mut k) "arg")]
+                          (push! (mut binds) (sym v))
+                          (push! (mut binds) (.code a))
+                          (push! (mut call-args) (sym v))
+                          (push! (mut texts) `(push! (mut parts) ~(plain-text-code (.ty p) (sym v))))))
+                      (Some (te `(let [~@binds]
+                                   (when (rt/dep-in-frame?)
+                                     (rt/dep-note-path! ~node
+                                                        (rt/call-path ~(.name f)
+                                                                      (let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                                                                        ~@texts
+                                                                        parts))))
+                                   (~(sym (qualified (mut k) module (.coil f))) ~@call-args))
+                                (.ret f)))))))
+        (None [] (None [TE])))))
 
 ;;; Calls the language itself understands, for any element type.
 (defn builtin-call [(k (mut Comp))
@@ -4038,13 +4132,26 @@
               code (head-wrap (mut k) h `(return-from ~label true))]
           (locals-reset! (mut k) mark)
           (te `(block ~label ~code false) "Bool"))
-        (do
+        (let [(mut vs) (primitive/code-list-new)
+              (mut binds) (primitive/code-list-new)
+              (mut specs) (primitive/code-list-new)]
           (for a args
-            (let [x (expect (mut k) a (expr (mut k) a "Int") "Int")]
-              (push! (mut cs) (.code x))))
+            (let [x (expect (mut k) a (expr (mut k) a "Int") "Int")
+                  v (fresh (mut k) "col")]
+              (push! (mut cs) (.code x))
+              (push! (mut binds) (sym v))
+              (push! (mut binds) (.code x))
+              (push! (mut vs) (sym v))
+              (push! (mut specs) `(push! (mut parts) (rt/num-text ~(sym v))))))
           (let [has (sym (qualified (mut k) module (cat3 "has-" rel "?")))]
             (if (writable? (mut k) (kid (kid n 0) 0))
-                (te `(~has (mut ~(.code db)) ~@cs) "Bool")
+                (te `(let [~@binds
+                           noted ~(query-note (mut k) (kid (kid n 0) 0) rel
+                                              `(let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                                                 ~@specs
+                                                 parts))]
+                       (~has (mut ~(.code db)) ~@vs))
+                    "Bool")
                 ;; Read through a copy, as a query does: the copies share their indexes.
                 (let [copy (sym (fresh (mut k) "db"))]
                   (te `(let [(mut ~copy) ~(.code db)] (~has (mut ~copy) ~@cs)) "Bool"))))))))
@@ -5048,7 +5155,8 @@
 ;;; What binding setting `name` of `module`, of type `ty`, from `old` to `new` changes. While
 ;;; dependencies are tracked: each part of it some memo read that is not the same in both, and the
 ;;; whole. Otherwise every memo answer of the module's starts over.
-(defn setting-changed-code [(k (mut Comp)) (module (slice u8)) (name (slice u8)) (ty (slice u8)) (old Code) (new Code)]
+(defn setting-changed-code [(k (mut Comp)) (module (slice u8)) (name (slice u8)) (ty (slice u8)) (old Code) (new Code)
+                            (both-given Code)]
   (-> Code)
   (let [node (cat4 "s:" module "." name)
         o (fresh (mut k) "old")
@@ -5057,13 +5165,19 @@
           (match (find-func (mod-at (mut k) module) "forget-memos!")
             (Some [_] `(~(sym (qualified (mut k) module "forget-memos!"))))
             (None [] `0))]
+    ;; A value nothing gave is no value to look into: going from or to one changes everything read.
     `(if (rt/dep-tracking?)
-         (let [~(sym o) ~old
-               ~(sym n) ~new]
-           (for path (rt/dep-paths ~node)
-             (when (~(diff-helper (mut k) ty) ~(sym o) ~(sym n) path)
-               (rt/dep-changed! (rt/join ~node path))))
-           (rt/dep-changed! ~node))
+         (if ~both-given
+             (let [~(sym o) ~old
+                   ~(sym n) ~new]
+               (unless ~(same-code (mut k) ty (sym o) (sym n))
+                 (for path (rt/dep-paths ~node)
+                   (when (~(diff-helper (mut k) ty) ~(sym o) ~(sym n) path)
+                     (rt/dep-changed! (rt/join ~node path))))
+                 (rt/dep-changed! ~node)))
+             (do
+               (for path (rt/dep-paths ~node) (rt/dep-changed! (rt/join ~node path)))
+               (rt/dep-changed! ~node)))
          ~untracked)))
 
 ;;; The helper saying whether two values of a type differ at a path: `.field` into a record, `#key`
@@ -5110,6 +5224,51 @@
                                    cut (rt/name-end rest)
                                    field (subslice rest 0 cut)
                                    more (subslice rest cut (len rest))]
+                               (cond ~@arms :else true))))
+                    (and (> (mod-index (mut k) (type-module t)) -1)
+                         (= (.sort (mod-at (mut k) (type-module t))) (SFacts)))
+                      (let [mo (mod-at (mut k) (type-module t))
+                            (mut arms) (primitive/code-list-new)]
+                        (for r (.rels mo)
+                          (push! (mut arms) `(= rel ~(.name r)))
+                          (push! (mut arms)
+                                 `(let [(mut x) (~(primitive/code-symbol "." (.name r)) a)
+                                        (mut y) (~(primitive/code-symbol "." (.name r)) b)]
+                                    (not (rt/rel-rows-same? (mut x) (mut y) spec)))))
+                        `(if (!= (cast i64 (get path 0)) 46)
+                             true
+                             (let [open (rt/name-end-at path 40)
+                                   rel (subslice path 1 open)
+                                   spec (subslice path (+ open 1) (- (len path) 1))]
+                               (cond ~@arms :else true))))
+                    (and (> (mod-index (mut k) (type-module t)) -1)
+                         (= (.sort (mod-at (mut k) (type-module t))) (SForeign)))
+                      (let [module (type-module t)
+                            (mut arms) (primitive/code-list-new)]
+                        (for f (.funcs (mod-at (mut k) module))
+                          (when (and (accessor? (mut k) module f) (= (.ty (get (.params f) 0)) t))
+                            (let [(mut call-a) (primitive/code-list-new)
+                                  (mut call-b) (primitive/code-list-new)]
+                              (push! (mut call-a) `a)
+                              (push! (mut call-b) `b)
+                              (for i (range 1 (len (.params f)))
+                                (let [pt (.ty (get (.params f) i))
+                                      raw `(get parts ~(- i 1))
+                                      v (cond (= pt "Int") `(rt/parse-int ~raw)
+                                              (= pt "Bool") `(= ~raw "1")
+                                              :else raw)]
+                                  (push! (mut call-a) v)
+                                  (push! (mut call-b) v)))
+                              (push! (mut arms) `(= name ~(.name f)))
+                              (push! (mut arms)
+                                     `(not ~(same-code (mut k) (.ret f)
+                                                       `(~(sym (qualified (mut k) module (.coil f))) ~@call-a)
+                                                       `(~(sym (qualified (mut k) module (.coil f))) ~@call-b)))))))
+                        `(if (!= (cast i64 (get path 0)) 64)
+                             true
+                             (let [open (rt/name-end-at path 40)
+                                   name (subslice path 1 open)
+                                   parts (rt/memo-key-parts (subslice path (+ open 1) (- (len path) 1)))]
                                (cond ~@arms :else true))))
                     :else `true)]
         (push! (mut (.aux k))
@@ -5901,8 +6060,11 @@
                                                     (.ty x))
                                               (.ty x))
                                     ;; Memo answers made from the value it had are dead, now and after.
-                                    changed-in (setting-changed-code (mut k) module name (.ty x) (sym saved) field)
-                                    changed-out (setting-changed-code (mut k) module name (.ty x) field (sym saved))]
+                                    bound-now `(~(primitive/code-symbol "." (bound-field name)) ~storage)
+                                    ;; After the binding counts itself, it had one before if more than one.
+                                    changed-in (setting-changed-code (mut k) module name (.ty x) (sym saved) field `(> ~bound-now 1))
+                                    ;; Before it uncounts itself, the value it goes back to was given if more than one.
+                                    changed-out (setting-changed-code (mut k) module name (.ty x) field (sym saved) `(> ~bound-now 1))]
                                 (push! (mut saves) (sym saved))
                                 (push! (mut saves) field)
                                 (if (= (.attr x) 5)
@@ -6243,10 +6405,11 @@
                                         (storage-call (mut k) (.x sp))
                                         (storage-of (mut k) (.module sp) (.x sp)))
                             bound `(~(primitive/code-symbol "." (bound-field (.name (.x sp)))) ~storage)]
-                        (te `(let [~(sym old) ~(.code p)]
+                        (te `(let [~(sym old) ~(.code p)
+                                   given (> ~bound 0)]
                                (set! ~(.code p) ~(.code v))
                                (when (= ~bound 0) (set! ~bound 1))
-                               ~(setting-changed-code (mut k) (.module sp) (.name (.x sp)) (.ty (.x sp)) (sym old) (.code p))
+                               ~(setting-changed-code (mut k) (.module sp) (.name (.x sp)) (.ty (.x sp)) (sym old) (.code p) `given)
                                0)
                             "Void"))))
             (None [] (te `(set! ~(.code p) ~(.code v)) "Void")))))))
@@ -7621,33 +7784,82 @@
     (for p (.params f)
       (when (.by-ref p)
         (die (mut k) d "a memo function's argument cannot be mut"))
-      (unless (or (= (.ty p) "Text") (= (.ty p) "Int"))
-        (die (mut k) d "a memo function's arguments are Text or Int, for now")))
+      (unless (keyable? (mut k) (.ty p))
+        (die (mut k) d (cat3 "a memo function cannot remember by a " (.ty p)
+                             ": its arguments are Int, Text, Bool, trees, and lists and records of those"))))
     (when (= (.ret f) "Void")
       (die (mut k) d "a memo function must answer something"))
     f))
 
-;;; What a memo is looked up by: its one argument, or its arguments' text joined.
+;;; What a memo can remember by: values whose text says which they are. A tree is remembered by
+;;; its identity, not its contents: trees are never changed, so the same tree is the same value, and
+;;; one an earlier answer kept is found again.
+(defn keyable? [(k (mut Comp)) (t (slice u8))] (-> bool)
+  (cond (or (= t "Int") (= t "Text") (= t "Bool")) true
+        (list? t) (keyable? (mut k) (elem-of t))
+        (or (opt? t) (map? t) (fn? t)) false
+        (< (mod-index (mut k) (type-module t)) 0) false
+        :else
+          (let [mo (mod-at (mut k) (type-module t))]
+            (cond (and (= (.sort mo) (SGrammar)) (= (type-name t) "Node")) true
+                  :else
+                    (match (find-rec mo (type-name t))
+                      (Some [r]
+                            (let [(mut ok) true]
+                              (for fd (.fields r) (unless (keyable? (mut k) (.ty fd)) (set! ok false)))
+                              ok))
+                      (None [] false))))))
+
+;;; A value's text, as a key: see `keyable?`.
+(defn key-part-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
+  (cond (= t "Int") `(rt/num-text ~v)
+        (= t "Text") v
+        (= t "Bool") `(if ~v "1" "0")
+        (list? t)
+          (let [e (fresh (mut k) "e")
+                ps (fresh (mut k) "parts")]
+            `(let [(mut ~(sym ps)) (ArrayList::new [(slice u8)] (malloc-allocator))]
+               (for ~(sym e) ~v (push! (mut ~(sym ps)) ~(key-part-code (mut k) (elem-of t) (sym e))))
+               (rt/memo-key-of ~(sym ps))))
+        :else
+          (let [mo (mod-at (mut k) (type-module t))]
+            (if (= (.sort mo) (SGrammar))
+                `(~(sym (qualified (mut k) (type-module t) "node-key")) ~v)
+                (let [r (match (find-rec mo (type-name t)) (Some [r] r) (None [] (panic "rules: no record {}" t)))
+                      ps (fresh (mut k) "parts")
+                      (mut pushes) (primitive/code-list-new)]
+                  (for fd (.fields r)
+                    (push! (mut pushes)
+                           `(push! (mut ~(sym ps))
+                                   ~(key-part-code (mut k) (.ty fd) `(~(primitive/code-symbol "." (.name fd)) ~v)))))
+                  `(let [(mut ~(sym ps)) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                     ~@pushes
+                     (rt/memo-key-of ~(sym ps))))))))
+
+;;; What a memo is looked up by: its one argument when that is an Int or Text, or else its
+;;; arguments' text joined.
 (defn memo-key-type [(f Func)] (-> (slice u8))
-  (if (= (len (.params f)) 1) (.ty (get (.params f) 0)) "Text"))
+  (if (and (= (len (.params f)) 1)
+           (or (= (.ty (get (.params f) 0)) "Int") (= (.ty (get (.params f) 0)) "Text")))
+      (.ty (get (.params f) 0))
+      "Text"))
 
 ;;; The memo's own name for its argument `i`.
 (defn memo-arg [(i i64)] (-> Code)
   (sym (cat "memo-arg-" (rt/num-text i))))
 
-(defn memo-key-code [(f Func)] (-> Code)
-  (if (= (len (.params f)) 1)
+(defn memo-key-code [(k (mut Comp)) (f Func)] (-> Code)
+  (if (!= (memo-key-type f) "Text")
       (memo-arg 0)
-      (let [(mut pushes) (primitive/code-list-new)]
-        (for i (range 0 (len (.params f)))
-          (push! (mut pushes)
-                 `(push! (mut memo-parts)
-                         ~(if (= (.ty (get (.params f) i)) "Int")
-                              `(rt/num-text ~(memo-arg i))
-                              (memo-arg i)))))
-        `(let [(mut memo-parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
-           ~@pushes
-           (rt/memo-key-of memo-parts)))))
+      (if (and (= (len (.params f)) 1) (= (.ty (get (.params f) 0)) "Text"))
+          (memo-arg 0)
+          (let [(mut pushes) (primitive/code-list-new)]
+            (for i (range 0 (len (.params f)))
+              (push! (mut pushes)
+                     `(push! (mut memo-parts) ~(key-part-code (mut k) (.ty (get (.params f) i)) (memo-arg i)))))
+            `(let [(mut memo-parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
+               ~@pushes
+               (rt/memo-key-of memo-parts))))))
 
 (defn memo-map-type [(f Func)] (-> (slice u8))
   (cat4 "{" (memo-key-type f) ":" (cat (.ret f) "}")))
@@ -7696,7 +7908,7 @@
 ;;; module's opaque types, cannot be looked into: two of them are never the same.
 (defn same-code [(k (mut Comp)) (t (slice u8)) (a Code) (b Code)] (-> Code)
   (cond (or (= t "Int") (= t "Bool") (= t "Text")) `(= ~a ~b)
-        (fn? t) `false
+        (fn? t) `(~(identity-helper (mut k) t) ~a ~b)
         (opt? t)
           (let [x (fresh (mut k) "x")
                 y (fresh (mut k) "y")]
@@ -7711,7 +7923,22 @@
                     `(~(sym (qualified (mut k) (type-module t) "node-same?")) ~a ~b)
                   (is-some? (find-enum-named mo (type-name t))) `(= ~a ~b)
                   (is-some? (find-rec mo (type-name t))) `(~(same-helper (mut k) t) ~a ~b)
-                  :else `false))))
+                  ;; What cannot be looked into is the same only as itself: the same bytes.
+                  :else `(~(identity-helper (mut k) t) ~a ~b)))))
+
+;;; Whether two values are the very same one: the same bytes, which for a value holding its parts
+;;; by pointer means the same parts.
+(defn identity-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (let [name (cat "ident" (subslice (same-name t) 4 (len (same-name t))))
+        ty (coil-type (mut k) t)]
+    (unless (has-text? (.sames k) name)
+      (push! (mut (.sames k)) name)
+      (push! (mut (.aux k))
+             `(defn ~(sym name) [(a ~ty) (b ~ty)] (-> bool)
+                (let [(mut x) a
+                      (mut y) b]
+                  (rt/same-bytes? (cast (ptr u8) (mut x)) (cast (ptr u8) (mut y)) (sizeof ~ty))))))
+    (sym name)))
 
 (defn is-some? [T] [(o (Option T))] (-> bool)
   (match o (Some [_] true) (None [] false)))
@@ -7791,29 +8018,44 @@
         key-text (if (= (memo-key-type f) "Int") `(rt/num-text key) `key)
         (mut params) (primitive/code-list-new)
         (mut args) (primitive/code-list-new)
-        (mut parsed) (primitive/code-list-new)
+        (mut arg-fields) (primitive/code-list-new)
+        (mut arg-inits) (primitive/code-list-new)
+        (mut stored) (primitive/code-list-new)
+        args-ty (sym (cat "MemoArgs--" name))
         rt (coil-type (mut k) (.ret f))]
     (for i (range 0 (len (.params f)))
       (push! (mut params)
              `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
       (push! (mut args) (memo-arg i))
-      (let [part (if (= (len (.params f)) 1) `text `(get parts ~i))]
-        (push! (mut parsed) (if (= (.ty (get (.params f) i)) "Int") `(rt/parse-int ~part) part))))
+      (push! (mut arg-fields) `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
+      (push! (mut arg-inits) (primitive/code-symbol ":" (cat "memo-arg-" (rt/num-text i))))
+      (push! (mut arg-inits) (memo-arg i))
+      (push! (mut stored) `(~(primitive/code-symbol "." (cat "memo-arg-" (rt/num-text i))) a)))
     (emit! (mut out) (compile-fn-as (mut k) d compute))
     ;; The lock word comes first, so the store's address is the word's.
+    (emit! (mut out)
+           `(defstruct ~args-ty [~@arg-fields]))
     (emit! (mut out)
            `(defstruct ~store
               [(lock i64)
                (ready bool)
                (gen i64)
                (table ~(coil-type (mut k) mt))
+               (args (HashMap ~(coil-type (mut k) (memo-key-type f)) ~args-ty))
                (busy ~(coil-type (mut k) (memo-busy-type f)))]))
-    ;; An answer asked for by its key's text, as checking an answer that read it asks.
+    ;; An answer asked for by its key's text, as checking an answer that read it asks: with the
+    ;; arguments it was computed from, which its store keeps.
     (emit! (mut out)
            `(defn ~ensure [(text (slice u8))] (-> i64)
-              (let [parts ~(if (> (len (.params f)) 1) `(rt/memo-key-parts text) `(rt/memo-key-parts ""))]
-                (~(sym name) ~@parsed)
-                0)))
+              (let [s (~store-fn)
+                    word (cast (ptr i64) s)
+                    key ~(if (= (memo-key-type f) "Int") `(rt/parse-int text) `text)]
+                (rt/spin-lock! word)
+                (let [found (get (.args s) key)]
+                  (rt/spin-unlock! word)
+                  (match found
+                    (Some [a] (do (~(sym name) ~@stored) 0))
+                    (None [] (panic "memo fn {} has no arguments for {}" ~name text)))))))
     (emit! (mut out)
            `(defn ~store-fn [] (-> (ptr ~store))
               (let [s (primitive/alloc-static ~store)]
@@ -7821,6 +8063,9 @@
                   (rt/init-lock!)
                   (unless (.ready s)
                     (set! (.table s) ~(new-map (mut k) mt))
+                    (set! (.args s) ~(if (= (memo-key-type f) "Int")
+                                         `(HashMap::new [i64 ~args-ty] (malloc-allocator) (i64-keyops))
+                                         `(HashMap::new [(slice u8) ~args-ty] (malloc-allocator) (str/keyops))))
                     (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
@@ -7832,7 +8077,7 @@
     ;; it replaces is kept, and does not count as changed.
     (emit! (mut out)
            `(defn ~(sym name) [~@params] (-> ~rt)
-              (let [key ~(memo-key-code f)
+              (let [key ~(memo-key-code (mut k) f)
                     t (rules-task)
                     s (~store-fn)
                     word (cast (ptr i64) s)
@@ -7901,6 +8146,8 @@
                                                                   (rt/dep-untracked!)
                                                                   fresh))))]
                                                 (rt/spin-lock! word)
+                                                (when tracking
+                                                  (set! (mut (.args s)) key (~args-ty ~@arg-inits)))
                                                 (set! (mut (.table s))
                                                       key
                                                       made)
