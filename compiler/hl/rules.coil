@@ -2692,6 +2692,22 @@
                 `(do (when (and (rt/dep-in-frame?) (rt/dep-wants-path? ~node)) (rt/dep-note-path! ~node (rt/query-path ~rel ~parts))) 0))))
     (None [] `0)))
 
+;;; A query giving one column, `at` of `arity`, the value `v`: noted by number, as an element is.
+(defn query-note-one [(k (mut Comp)) (base g/Node) (rel (slice u8)) (arity i64) (at i64) (v Code)] (-> Code)
+  (match (setting-part (mut k) base)
+    (Some [p]
+          (if (> (len (.fields p)) 0)
+              (setting-note (mut k) base)
+              (let [node (cat4 "s:" (.module p) "." (.name (.x p)))
+                    (mut prefix) (cat3 "." rel "(")
+                    (mut suffix) ")"]
+                (for _ (range 0 at) (set! prefix (cat prefix "_,")))
+                (for _ (range (+ at 1) arity) (set! suffix (cat ",_" suffix)))
+                `(do (when (rt/dep-in-frame?)
+                       (rt/dep-note-numbered! (primitive/alloc-static i64) ~node ~prefix ~suffix ~v))
+                     0))))
+    (None [] `0)))
+
 ;;; A read of a setting through its place, as a query of a database setting reads it: noted, as
 ;;; any read of a setting is, for the memo computing now. Nothing for a base that is no setting.
 (defn setting-note [(k (mut Comp)) (base g/Node)] (-> Code)
@@ -2723,7 +2739,10 @@
         rowsym (sym row)
         (mut key-col) -1
         (mut key-sym) ""
-        (mut specs) (primitive/code-list-new)]
+        (mut specs) (primitive/code-list-new)
+        (mut bound-count) 0
+        (mut bound-at) -1
+        (mut bound-sym) `0]
     (rel-check (mut k) call (.ty db) rel-name (len args))
     ;; A query only reads, though it may build an index as it goes. A relation's indexes live in
     ;; storage its copies share, so one held by `let` (or made by a call) is read through a copy.
@@ -2738,6 +2757,9 @@
                 (let [v (expect (mut k) a (expr (mut k) a "Int") "Int")
                       t (fresh (mut k) "key")]
                   (push! (mut specs) `(push! (mut parts) (rt/num-text ~(sym t))))
+                  (set! bound-count (+ bound-count 1))
+                  (set! bound-at i)
+                  (set! bound-sym (sym t))
                   (push! (mut lets) (sym t))
                   (push! (mut lets) (.code v))
                   (if (< key-col 0)
@@ -2756,9 +2778,11 @@
             (push! (mut binds) `(rt/rel-at ~rel-code ~rowsym ~i))))))
     ;; The rows it can see are what it reads: its relation, by the columns it gives.
     (push! (mut lets) (sym (fresh (mut k) "noted")))
-    (push! (mut lets) (query-note (mut k) base rel-name `(let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
-                                                          ~@specs
-                                                          parts)))
+    (push! (mut lets) (if (= bound-count 1)
+                          (query-note-one (mut k) base rel-name (len args) bound-at bound-sym)
+                          (query-note (mut k) base rel-name `(let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                                                              ~@specs
+                                                              parts))))
     (HeadInfo
       :wrap-kind 4
       :alts (no-alts)
@@ -4146,10 +4170,13 @@
           (te `(block ~label ~code false) "Bool"))
         (let [(mut vs) (primitive/code-list-new)
               (mut binds) (primitive/code-list-new)
-              (mut specs) (primitive/code-list-new)]
+              (mut specs) (primitive/code-list-new)
+              (mut first-v) `0
+              (mut seen-first) false]
           (for a args
             (let [x (expect (mut k) a (expr (mut k) a "Int") "Int")
                   v (fresh (mut k) "col")]
+              (unless seen-first (set! first-v (sym v)) (set! seen-first true))
               (push! (mut cs) (.code x))
               (push! (mut binds) (sym v))
               (push! (mut binds) (.code x))
@@ -4158,10 +4185,12 @@
           (let [has (sym (qualified (mut k) module (cat3 "has-" rel "?")))]
             (if (writable? (mut k) (kid (kid n 0) 0))
                 (te `(let [~@binds
-                           noted ~(query-note (mut k) (kid (kid n 0) 0) rel
-                                              `(let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
-                                                 ~@specs
-                                                 parts))]
+                           noted ~(if (= (len args) 1)
+                                      (query-note-one (mut k) (kid (kid n 0) 0) rel 1 0 first-v)
+                                      (query-note (mut k) (kid (kid n 0) 0) rel
+                                                  `(let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                                                     ~@specs
+                                                     parts)))]
                        (~has (mut ~(.code db)) ~@vs))
                     "Bool")
                 ;; Read through a copy, as a query does: the copies share their indexes.
@@ -5198,14 +5227,90 @@
                                         (mut y) (~(primitive/code-symbol "." (.name r)) ~(sym n))]
                                     (rt/dep-rel-changed! ~node ~(.name r) (mut x) (mut y)))))
                         `(do ~@calls 0))
-                      `(for path (rt/dep-paths ~node)
-                         (when (~(diff-helper (mut k) ty) ~(sym o) ~(sym n) path)
-                           (rt/dep-changed! (rt/join ~node path)))))
+                      `(do
+                         (for path (rt/dep-paths ~node)
+                           (when (~(diff-helper (mut k) ty) ~(sym o) ~(sym n) path)
+                             (rt/dep-changed! (rt/join ~node path))))
+                         ;; Parts read by number: compared by number, no text made.
+                         (for site (rt/dep-sites ~node)
+                           (let [prefix (rt/site-prefix site)
+                                 suffix (rt/site-suffix site)
+                                 pairs (rt/site-nodes site)]
+                             (for i (range 0 (/ (len pairs) 2))
+                               (when (~(diffn-helper (mut k) ty) ~(sym o) ~(sym n) prefix (get pairs (* 2 i)) suffix)
+                                 (rt/dep-changed-id! (get pairs (+ (* 2 i) 1)))))))
+                         0))
                  (rt/dep-changed! ~node)))
              (do
                (for path (rt/dep-paths ~node) (rt/dep-changed! (rt/join ~node path)))
+               (for site (rt/dep-sites ~node)
+                 (let [pairs (rt/site-nodes site)]
+                   (for i (range 0 (/ (len pairs) 2)) (rt/dep-changed-id! (get pairs (+ (* 2 i) 1))))))
                (rt/dep-changed! ~node)))
          ~untracked)))
+
+;;; The helper saying whether two values of a type differ at a part read by number: the path
+;;; `prefix` `index` `suffix` (`#` 3, `.field#` 3, `@symbol-at(` 3 `)`), without the text made.
+(defn diffn-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (let [name (cat "diffn" (subslice (same-name t) 4 (len (same-name t))))
+        ty (coil-type (mut k) t)]
+    (unless (has-text? (.sames k) name)
+      (push! (mut (.sames k)) name)
+      (let [body
+              (cond (opt? t) `true
+                    (list? t)
+                      `(if (or (!= prefix "#") (!= suffix ""))
+                           true
+                           (let [in-a (< index (len a))
+                                 in-b (< index (len b))]
+                             (if (and in-a in-b)
+                                 (not ~(same-code (mut k) (elem-of t) `(get a index) `(get b index)))
+                                 (!= in-a in-b))))
+                    (and (map? t) (= (map-key t) "Int"))
+                      `(if (or (!= prefix "#") (!= suffix ""))
+                           true
+                           (not ~(same-code (mut k) (opt-type (map-val t)) `(get a index) `(get b index))))
+                    (and (not (map? t)) (not (fn? t)) (not (list? t))
+                         (> (len (type-module t)) 0)
+                         (> (mod-index (mut k) (type-module t)) -1)
+                         (is-some? (find-rec (mod-at (mut k) (type-module t)) (type-name t))))
+                      (let [r (match (find-rec (mod-at (mut k) (type-module t)) (type-name t))
+                                (Some [r] r)
+                                (None [] (panic "rules: no record {}" t)))
+                            (mut arms) (primitive/code-list-new)]
+                        (for f (.fields r)
+                          (push! (mut arms) `(= field ~(.name f)))
+                          (push! (mut arms)
+                                 `(~(diffn-helper (mut k) (.ty f))
+                                    (~(primitive/code-symbol "." (.name f)) a)
+                                    (~(primitive/code-symbol "." (.name f)) b)
+                                    more index suffix)))
+                        `(if (or (= (len prefix) 0) (!= (cast i64 (get prefix 0)) 46))
+                             true
+                             (let [rest (subslice prefix 1 (len prefix))
+                                   cut (rt/name-end rest)
+                                   field (subslice rest 0 cut)
+                                   more (subslice rest cut (len rest))]
+                               (cond ~@arms :else true))))
+                    (and (> (len (type-module t)) 0)
+                         (> (mod-index (mut k) (type-module t)) -1)
+                         (= (.sort (mod-at (mut k) (type-module t))) (SForeign)))
+                      (let [module (type-module t)
+                            (mut arms) (primitive/code-list-new)]
+                        (for f (.funcs (mod-at (mut k) module))
+                          (when (and (accessor? (mut k) module f) (= (.ty (get (.params f) 0)) t)
+                                     (= (len (.params f)) 2) (= (.ty (get (.params f) 1)) "Int"))
+                            (push! (mut arms) `(= prefix ~(cat3 "@" (.name f) "(")))
+                            (push! (mut arms)
+                                   `(not ~(same-code (mut k) (.ret f)
+                                                     `(~(sym (qualified (mut k) module (.coil f))) a index)
+                                                     `(~(sym (qualified (mut k) module (.coil f))) b index))))))
+                        `(cond ~@arms :else true))
+                    :else `true)]
+        (push! (mut (.aux k))
+               `(defn ~(sym name) [(a ~ty) (b ~ty) (prefix (slice u8)) (index i64) (suffix (slice u8))] (-> bool)
+                  ~body))))
+    (sym name)))
 
 ;;; The helper saying whether two values of a type differ at a path: `.field` into a record, `#key`
 ;;; into a list or map, nothing for the whole. A path it cannot follow differs.

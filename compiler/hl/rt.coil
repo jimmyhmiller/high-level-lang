@@ -2537,6 +2537,14 @@
    (site-settings (ArrayList i64))
    (site-prefixes (ArrayList (slice u8)))
    (site-suffixes (ArrayList (slice u8)))
+   ;; Each site's elements read, as (index, node) pairs; a query site's relation and column; the
+   ;; sites of each setting; and for a numbered node its site and index (-1 for a node with text).
+   (site-nodes (ArrayList (ArrayList i64)))
+   (site-rels (ArrayList (slice u8)))
+   (site-cols (ArrayList i64))
+   (setting-sites (HashMap (slice u8) (ArrayList i64)))
+   (node-sites (ArrayList i64))
+   (node-indexes (ArrayList i64))
    (elements (HashMap i64 i64))
    (ensurers (HashMap (slice u8) (fnptr (cc/C) [(slice u8)] i64)))
    (paths (HashMap (slice u8) (ArrayList (slice u8))))
@@ -2564,6 +2572,12 @@
         (set! (.site-settings d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.site-prefixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-suffixes d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.site-nodes d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
+        (set! (.site-rels d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.site-cols d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.setting-sites d) (HashMap::new [(slice u8) (ArrayList i64)] (malloc-allocator) (str/keyops)))
+        (set! (.node-sites d) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.node-indexes d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.elements d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
         (set! (.ensurers d) (HashMap::new [(slice u8) (fnptr (cc/C) [(slice u8)] i64)] (malloc-allocator) (str/keyops)))
         (set! (.paths d) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops)))
@@ -2598,7 +2612,34 @@
             (push! (mut (.dirty d)) false)
             (push! (mut (.prints d)) "")
             (push! (mut (.stamps d)) "")
+            (push! (mut (.node-sites d)) -1)
+            (push! (mut (.node-indexes d)) 0)
             id))))
+
+;;; A numbered node, element `index` of `site`: no text, which only tracing makes. Under the lock.
+(defn dep-new-numbered! [(d (ptr Deps)) (site i64) (index i64)] (-> i64)
+  (let [id (len (.texts d))]
+    (push! (mut (.texts d)) "")
+    (push! (mut (.changed d)) 0)
+    (push! (mut (.verified d)) 0)
+    (push! (mut (.reads d)) (ArrayList::new [i64] (malloc-allocator)))
+    (push! (mut (.dependents d)) (ArrayList::new [i64] (malloc-allocator)))
+    (push! (mut (.dirty d)) false)
+    (push! (mut (.prints d)) "")
+    (push! (mut (.stamps d)) "")
+    (push! (mut (.node-sites d)) site)
+    (push! (mut (.node-indexes d)) index)
+    (push! (mut (elem (mut (.site-nodes d)) site)) index)
+    (push! (mut (elem (mut (.site-nodes d)) site)) id)
+    id))
+
+;;; A node's text: its own, or a numbered one's made from its site. Under the lock.
+(defn dep-node-text [(d (ptr Deps)) (id i64)] (-> (slice u8))
+  (let [site (get (.node-sites d) id)]
+    (if (< site 0)
+        (get (.texts d) id)
+        (join (get (.sites d) site)
+              (join (num-text (get (.node-indexes d) id)) (get (.site-suffixes d) site))))))
 
 ;;; Dependencies are tracked from here on, which only a program that builds more than once needs.
 ;;; Before any memo has computed anything, since what it computed untracked could never be checked.
@@ -2679,6 +2720,17 @@
             (push! (mut (.site-settings d)) setting-id)
             (push! (mut (.site-prefixes d)) prefix)
             (push! (mut (.site-suffixes d)) suffix)
+            (push! (mut (.site-nodes d)) (ArrayList::new [i64] (malloc-allocator)))
+            ;; `.rel(_,_,` is a query by one column: the relation and which column.
+            (let [open (name-end-at prefix 40)
+                  query (and (> (len prefix) 0) (= (cast i64 (get prefix 0)) 46) (< open (len prefix)))]
+              (push! (mut (.site-rels d)) (if query (subslice prefix 1 open) ""))
+              (push! (mut (.site-cols d)) (if query (count-byte prefix open (len prefix) 44) -1)))
+            (let [(mut sites) (match (get (.setting-sites d) setting)
+                                (Some [xs] xs)
+                                (None [] (ArrayList::new [i64] (malloc-allocator))))]
+              (push! (mut sites) site)
+              (set! (mut (.setting-sites d)) setting sites))
             (deps-unlock! d)
             (atomic/store cache (+ site 1))
             site)))))
@@ -2704,15 +2756,8 @@
           (let [id (match (get (.elements d) key)
                      (Some [i] i)
                      (None []
-                           (let [path (join (get (.site-prefixes d) site) (join (num-text index) (get (.site-suffixes d) site)))
-                                 i (dep-id! d (join setting path))
-                                 (mut paths) (match (get (.paths d) setting)
-                                               (Some [ps] ps)
-                                               (None [] (ArrayList::new [(slice u8)] (malloc-allocator))))]
-                             (push! (mut paths) path)
-                             (set! (mut (.paths d)) setting paths)
+                           (let [i (dep-new-numbered! d site index)]
                              (set! (mut (.elements d)) key i)
-                             (query-index! d setting path i)
                              i)))]
             (deps-unlock! d)
             (dep-note-id! id))))))
@@ -2746,6 +2791,35 @@
         (deps-unlock! d)
         (dep-note-id! id))))
   0)
+
+;;; The numbered sites memos have read a setting at, and each one's fixed text and (index, node) pairs.
+(defn dep-sites [(setting (slice u8))] (-> (ArrayList i64))
+  (let [d (deps)
+        (mut out) (ArrayList::new [i64] (malloc-allocator))]
+    (deps-lock! d)
+    (match (get (.setting-sites d) setting)
+      (Some [xs] (for x xs (push! (mut out) x)))
+      (None [] 0))
+    (deps-unlock! d)
+    out))
+
+(defn site-prefix [(site i64)] (-> (slice u8))
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [p (get (.site-prefixes d) site)] (deps-unlock! d) p)))
+
+(defn site-suffix [(site i64)] (-> (slice u8))
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [p (get (.site-suffixes d) site)] (deps-unlock! d) p)))
+
+(defn site-nodes [(site i64)] (-> (ArrayList i64))
+  (let [d (deps)
+        (mut out) (ArrayList::new [i64] (malloc-allocator))]
+    (deps-lock! d)
+    (for x (get (.site-nodes d) site) (push! (mut out) x))
+    (deps-unlock! d)
+    out))
 
 ;;; The paths memos have read of a setting.
 (defn dep-paths [(setting (slice u8))] (-> (ArrayList (slice u8)))
@@ -2866,6 +2940,20 @@
         (match (get (.queries d) (query-key setting rel -1 0))
           (Some [ids] (for id ids (push! (mut hit) id)))
           (None [] 0))
+        ;; Queries by one column, numbered: the site and the row's value there name the node.
+        (match (get (.setting-sites d) setting)
+          (Some [sites]
+                (for site sites
+                  (when (= (get (.site-rels d) site) rel)
+                    (let [col (get (.site-cols d) site)]
+                      (for rows [gone come]
+                        (for at (range 0 (/ (len rows) n))
+                          (let [v (get rows (+ (* at n) col))]
+                            (when (and (>= v 0) (< v 4294967296))
+                              (match (get (.elements d) (+ (* site 4294967296) v))
+                                (Some [id] (push! (mut hit) id))
+                                (None [] 0))))))))))
+          (None [] 0))
         (for rows [gone come]
           (for at (range 0 (/ (len rows) n))
             (for c (range 0 n)
@@ -2980,7 +3068,7 @@
                   (Some [_] 0)
                   (None [] (push! (mut (elem (mut (.dependents d)) read)) me) 0))))))
       (set! (mut (.dirty d)) me false)
-      (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") (get (.texts d) me)))
+      (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") (dep-node-text d me)))
       (set! (mut (.verified d)) me now)
       (unless same (set! (mut (.changed d)) me now))
       (set! (.computed d) (+ (.computed d) 1)))
@@ -3040,7 +3128,7 @@
                 (set! (mut (.dirty d)) out true)
                 (push! (mut todo) out))))))
       (deps-unlock! d)
-      (when (dep-tracing?) (println "[deps] changed {}" (get (.texts d) id))))
+      (when (dep-tracing?) (println "[deps] changed {}" (dep-node-text d id))))
     0))
 
 ;;; Whether a memo's answer is known current: checked in this revision, or marked by no change
@@ -3065,7 +3153,7 @@
       (Some [me]
             (let [since (get (.verified d) me)
                   reads (get (.reads d) me)
-                  node (get (.texts d) me)]
+                  node (dep-node-text d me)]
               (deps-unlock! d)
               (block :check
                      (for read reads
@@ -3073,7 +3161,7 @@
                          (when (> changed since)
                            (when (dep-tracing?)
                              (deps-lock! d)
-                             (let [what (get (.texts d) read)]
+                             (let [what (dep-node-text d read)]
                                (deps-unlock! d)
                                (println "[deps] {} because {}" node what)))
                            (return-from :check false))))
