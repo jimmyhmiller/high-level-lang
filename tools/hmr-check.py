@@ -51,7 +51,7 @@ def edit(rel, old, new):
 
 def fresh_matches():
     """The bundle the watcher wrote, against a fresh process's first development build."""
-    p = subprocess.Popen([ESB, "apps/hmr/main.js", "--hmr", "--outfile=out/fresh.js"], cwd=WORK,
+    p = subprocess.Popen([ESB, "apps/hmr/main.js", "--hmr", "--no-cache", "--outfile=out/fresh.js"], cwd=WORK,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     ok = wait_for(lines_of(p), r"\[watch\] build 1:", 30)
     os.killpg(p.pid, 9)
@@ -136,7 +136,7 @@ def run_node(path):
 for app, flags in APPS.items():
     entry = next(os.path.join("apps", f) for f in sorted(os.listdir(os.path.join(TESTS, "apps"))) if f.split(".")[0] == app)
     subprocess.run([ESB, entry, f"--outfile={OUT}/{app}.cjs"] + flags, capture_output=True, timeout=120)
-    p = subprocess.Popen([ESB, entry, "--hmr", f"--outfile={OUT}/{app}.dev.cjs"] + flags, stdout=subprocess.PIPE,
+    p = subprocess.Popen([ESB, entry, "--hmr", "--no-cache", f"--outfile={OUT}/{app}.dev.cjs"] + flags, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
     m = wait_for(lines_of(p), r"\[watch\] build 1: ([\d.]+) ms", 60)
     os.killpg(p.pid, 9)

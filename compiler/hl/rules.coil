@@ -3598,6 +3598,26 @@
                              (push! (mut ~(sym o)) ~(sym t)))
                            ~(sym o))
                         (cat3 "[" (map-key (.ty e)) "]"))))
+          ;; `if-given(m.names)`: a setting's value when it has one, from a `with` or an assignment, or
+          ;; from the cache a run started from; none when it has none.
+          (and (= name "if-given") (= count 1))
+            (match (setting-part (mut k) (get args 0))
+              (Some [p]
+                    (if (> (len (.fields p)) 0)
+                      (die (mut k) n "if-given takes a setting, not a part of one")
+                    (let [storage (if (= (.module p) (.self k))
+                                      (storage-call (mut k) (.x p))
+                                      (storage-of (mut k) (.module p) (.x p)))
+                          st (fresh (mut k) "storage")
+                          ty (.ty (.x p))
+                          node (cat4 "s:" (.module p) "." (.name (.x p)))]
+                      (Some (te `(let [~(sym st) ~storage]
+                                   (when (rt/dep-in-frame?) (rt/dep-note-literal! ~node))
+                                   (if (> (~(primitive/code-symbol "." (bound-field (.name (.x p)))) ~(sym st)) 0)
+                                       (Some (~(primitive/code-symbol "." (.name (.x p))) ~(sym st)))
+                                       (None [~(coil-type (mut k) ty)])))
+                                (opt-type ty))))))
+              (None [] (die (mut k) n "if-given takes a setting")))
           ;; `parallel-map(xs, f, n)`: `f` of each element on `n` threads, results in the order of `xs`.
           ;; Each thread takes the next index it finds free, so uneven work evens out.
           (and (= name "parallel-map") (= count 3))
@@ -8096,6 +8116,11 @@
                     `(~(sym (qualified (mut k) (type-module t) "node-same?")) ~a ~b)
                   (is-some? (find-enum-named mo (type-name t))) `(= ~a ~b)
                   (is-some? (find-rec mo (type-name t))) `(~(same-helper (mut k) t) ~a ~b)
+                  ;; An opaque type its module says how to compare: `same-T?(a, b)`.
+                  (is-some? (find-func mo (cat3 "same-" (type-name t) "?")))
+                    (let [f (match (find-func mo (cat3 "same-" (type-name t) "?")) (Some [f] f) (None [] (panic "rules: lost {}" t)))]
+                      `(or (~(identity-helper (mut k) t) ~a ~b)
+                           (~(sym (qualified (mut k) (type-module t) (.coil f))) ~a ~b)))
                   ;; What cannot be looked into is the same only as itself: the same bytes.
                   :else `(~(identity-helper (mut k) t) ~a ~b)))))
 
@@ -8176,6 +8201,291 @@
     (for y xs (when (= y x) (set! hit true)))
     hit))
 
+;; ---------------------------------------------------------------- the cache on disk
+
+;;; What a module keeps (see the cache in hl.rt) is written and read by helpers made from its
+;;; types, one for each type the first time it is asked for: `w` is the Writer and `r` the Reader
+;;; in all of them.
+(defn persist-name [(prefix (slice u8)) (t (slice u8))] (-> (slice u8))
+  (let [n (same-name t)]
+    (cat prefix (subslice n 6 (len n)))))
+
+;;; Code writing `v`, of type `t`.
+(defn enc-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
+  (cond (= t "Int") `(rt/put-int! w ~v)
+        (= t "Bool") `(rt/put-bool! w ~v)
+        (= t "Text") `(rt/put-text! w ~v)
+        ;; A function value's bits, read as an integer.
+        (fn? t) (let [f (fresh (mut k) "f")]
+                  `(rt/put-fn! w (let [(mut ~(sym f)) ~v] (load (cast (ptr i64) (mut ~(sym f)))))))
+        (opt? t)
+          (let [x (fresh (mut k) "x")]
+            `(match ~v
+               (Some [~(sym x)] (do (rt/put-bool! w true) ~(enc-code (mut k) (opt-of t) (sym x))))
+               (None [] (rt/put-bool! w false))))
+        :else `(~(enc-helper (mut k) t) w ~v)))
+
+;;; Code reading a value of type `t`.
+(defn dec-code [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (cond (= t "Int") `(rt/take-int r)
+        (= t "Bool") `(rt/take-bool r)
+        (= t "Text") `(rt/take-text r)
+        (fn? t) (let [f (fresh (mut k) "f")]
+                  `(let [(mut ~(sym f)) (rt/take-fn r)] (load (cast (ptr ~(coil-type (mut k) t)) (mut ~(sym f))))))
+        (opt? t)
+          `(if (rt/take-bool r)
+               (Some ~(dec-code (mut k) (opt-of t)))
+               (None [~(coil-type (mut k) (opt-of t))]))
+        :else `(~(dec-helper (mut k) t) r)))
+
+;;; How a value of a module's own kind of type is kept: "node", "db", "fact", "enum", "record", or
+;;; "foreign" for an opaque type its foreign module writes and reads itself.
+(defn persist-kind [(k (mut Comp)) (t (slice u8))] (-> (slice u8))
+  (when (< (mod-index (mut k) (type-module t)) 0)
+    (panic "rules: a value of type {} cannot be kept in the cache: its module is not known" t))
+  (let [mo (mod-at (mut k) (type-module t))]
+    (cond (and (= (.sort mo) (SGrammar)) (= (type-name t) "Node")) "node"
+          (and (= (.sort mo) (SFacts)) (= (type-name t) "Db")) "db"
+          (and (= (.sort mo) (SFacts)) (= (type-name t) "Fact")) "fact"
+          (is-some? (find-enum-named mo (type-name t))) "enum"
+          (is-some? (find-rec mo (type-name t))) "record"
+          (= (.sort mo) (SForeign)) "foreign"
+          :else (panic "rules: a value of type {} cannot be kept in the cache" t))))
+
+;;; A value compared only by its bytes (an opaque one, or a database) is written once and shared
+;;; when read back, so a value two settings or answers held, in any modules, is still one value,
+;;; and the same as itself. The runtime keeps those read so far by the type's name.
+(defn shared-enc [(k (mut Comp)) (t (slice u8)) (inner Code)] (-> Code)
+  `(let [(mut vv) v]
+     (when (rt/put-shared-value! w ~t (cast (ptr u8) (mut vv)) (sizeof ~(coil-type (mut k) t)))
+       ~inner)))
+
+(defn shared-dec [(k (mut Comp)) (t (slice u8)) (inner Code)] (-> Code)
+  (let [ty (coil-type (mut k) t)]
+    `(let [id (rt/take-shared r)]
+       (if (>= id 0)
+           (load (cast (ptr ~ty) (rt/shared-value-at r ~t id)))
+           (let [at (rt/shared-value-reserve! r ~t)
+                 (mut v) ~inner]
+             (rt/shared-value-set! r ~t at (cast (ptr u8) (mut v)) (sizeof ~ty))
+             v)))))
+
+(defn enc-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (let [name (persist-name "enc--" t)
+        ty (coil-type (mut k) t)]
+    (unless (has-text? (.sames k) name)
+      (push! (mut (.sames k)) name)
+      (let [body
+              (cond (list? t)
+                      `(do (rt/put-varint! w (len v))
+                           (for e v ~(enc-code (mut k) (elem-of t) `e)))
+                    (map? t)
+                      `(do (rt/put-varint! w (len v))
+                           (for key v
+                             ~(enc-code (mut k) (map-key t) `key)
+                             (match (get v key)
+                               (Some [x] ~(enc-code (mut k) (map-val t) `x))
+                               (None [] (panic "a map lost a key while it was written")))))
+                    :else
+                      (let [kind (persist-kind (mut k) t)
+                            module (type-module t)
+                            mo (mod-at (mut k) module)]
+                        (cond (= kind "node") `(~(sym (qualified (mut k) module "node-encode!")) w v)
+                              (= kind "db")
+                                (let [(mut puts) (primitive/code-list-new)]
+                                  (for r (.rels mo)
+                                    (push! (mut puts) `(rt/rel-encode! w (~(primitive/code-symbol "." (.name r)) v))))
+                                  (shared-enc (mut k) t `(do ~@puts)))
+                              (= kind "fact")
+                                `(do (rt/put-int! w (cast i64 (.rel v)))
+                                     (rt/put-int! w (cast i64 (.a v)))
+                                     (rt/put-int! w (cast i64 (.b v)))
+                                     (rt/put-int! w (cast i64 (.c v)))
+                                     (rt/put-int! w (cast i64 (.d v))))
+                              (= kind "enum")
+                                `(rt/put-varint! w (~(sym (qualified (mut k) module (cat "enum-tag-" (type-name t)))) v))
+                              (= kind "record")
+                                (let [r (match (find-rec mo (type-name t)) (Some [r] r) (None [] (panic "rules: no record {}" t)))
+                                      (mut puts) (primitive/code-list-new)]
+                                  (for f (.fields r)
+                                    (push! (mut puts) (enc-code (mut k) (.ty f) `(~(primitive/code-symbol "." (.name f)) v))))
+                                  `(do ~@puts))
+                              :else (shared-enc (mut k) t `(~(sym (qualified (mut k) module (cat "persist-encode-" (type-name t)))) w v)))))]
+        (push! (mut (.aux k))
+               `(defn ~(sym name) [(w (ptr rt/Writer)) (v ~ty)] (-> void)
+                  ~body
+                  0))))
+    (sym name)))
+
+(defn dec-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (let [name (persist-name "dec--" t)
+        ty (coil-type (mut k) t)]
+    (unless (has-text? (.sames k) name)
+      (push! (mut (.sames k)) name)
+      (let [body
+              (cond (list? t)
+                      `(let [n (rt/take-varint r)
+                             (mut out) ~(new-list (mut k) (elem-of t))]
+                         (reserve! (mut out) n)
+                         (for _ (range 0 n) (push! (mut out) ~(dec-code (mut k) (elem-of t))))
+                         out)
+                    (map? t)
+                      `(let [n (rt/take-varint r)
+                             (mut out) ~(new-map (mut k) t)]
+                         (for _ (range 0 n)
+                           (let [key ~(dec-code (mut k) (map-key t))
+                                 x ~(dec-code (mut k) (map-val t))]
+                             (set! (mut out) key x)))
+                         out)
+                    :else
+                      (let [kind (persist-kind (mut k) t)
+                            module (type-module t)
+                            mo (mod-at (mut k) module)]
+                        (cond (= kind "node") `(~(sym (qualified (mut k) module "node-decode")) r)
+                              (= kind "db")
+                                (let [(mut sets) (primitive/code-list-new)]
+                                  (for rd (.rels mo)
+                                    (push! (mut sets) `(set! (~(primitive/code-symbol "." (.name rd)) db) (rt/rel-decode r))))
+                                  (shared-dec (mut k) t
+                                              `(let [(mut db) (~(sym (qualified (mut k) module "new-db")))]
+                                                 ~@sets
+                                                 db)))
+                              (= kind "fact")
+                                `(let [rel (rt/take-int r) a (rt/take-int r) b (rt/take-int r) c (rt/take-int r) d (rt/take-int r)]
+                                   (~(sym (qualified (mut k) module "Fact"))
+                                     :rel (cast i32 rel) :a (cast i32 a) :b (cast i32 b) :c (cast i32 c) :d (cast i32 d)))
+                              (= kind "enum")
+                                (let [e (match (find-enum-named mo (type-name t)) (Some [e] e) (None [] (panic "rules: no enum {}" t)))
+                                      (mut arms) (primitive/code-list-new)]
+                                  (for i (range 0 (len (.variants e)))
+                                    (push! (mut arms) `(= i ~i))
+                                    (push! (mut arms) `(~(sym (qualified (mut k) module (get (.variants e) i))))))
+                                  `(let [i (rt/take-varint r)]
+                                     (cond ~@arms :else (panic "the cache has variant {} of an enum with fewer" i))))
+                              (= kind "record")
+                                (let [r (match (find-rec mo (type-name t)) (Some [r] r) (None [] (panic "rules: no record {}" t)))
+                                      (mut binds) (primitive/code-list-new)
+                                      (mut inits) (primitive/code-list-new)]
+                                  (for f (.fields r)
+                                    (let [v (fresh (mut k) "f")]
+                                      (push! (mut binds) (sym v))
+                                      (push! (mut binds) (dec-code (mut k) (.ty f)))
+                                      (push! (mut inits) (primitive/code-symbol ":" (.name f)))
+                                      (push! (mut inits) (sym v))))
+                                  `(let [~@binds] (~(sym (qualified (mut k) module (type-name t))) ~@inits)))
+                              :else (shared-dec (mut k) t `(~(sym (qualified (mut k) module (cat "persist-decode-" (type-name t)))) r)))))]
+        (push! (mut (.aux k))
+               `(defn ~(sym name) [(r (ptr rt/Reader))] (-> ~ty)
+                  ~body))))
+    (sym name)))
+
+;;; A memo's answers, for the cache: each with the arguments it was computed from and its node.
+;;; Read back, each is found by its key as this run makes it from the arguments, and its node's
+;;; text made again to match.
+(defn memo-persist-code [(k (mut Comp)) (f Func) (name (slice u8))] (-> Code)
+  (let [store-fn (sym (cat "memo-store--" name))
+        args-ty (sym (cat "MemoArgs--" name))
+        qname (cat3 (.self k) "." name)
+        key-text (if (= (memo-key-type f) "Int") `(rt/num-text key) `key)
+        (mut puts) (primitive/code-list-new)
+        (mut binds) (primitive/code-list-new)
+        (mut inits) (primitive/code-list-new)]
+    (for i (range 0 (len (.params f)))
+      (let [ty (.ty (get (.params f) i))
+            field (cat "memo-arg-" (rt/num-text i))]
+        (push! (mut puts) (enc-code (mut k) ty `(~(primitive/code-symbol "." field) a)))
+        (push! (mut binds) (memo-arg i))
+        (push! (mut binds) (dec-code (mut k) ty))
+        (push! (mut inits) (primitive/code-symbol ":" field))
+        (push! (mut inits) (memo-arg i))))
+    `(do
+       (defn ~(sym (cat "memo-save--" name)) [(w (ptr rt/Writer))] (-> void)
+         (let [s (~store-fn)]
+           (rt/put-varint! w (len (.args s)))
+           (for key (.args s)
+             (match (get (.args s) key)
+               (Some [a]
+                     (do ~@puts
+                         (match (get (.table s) key)
+                           (Some [answer] ~(enc-code (mut k) (.ret f) `answer))
+                           (None [] (panic "memo fn {} kept arguments with no answer" ~name)))
+                         (match (get (.node-ids s) key)
+                           (Some [id] (rt/put-int! w id))
+                           (None [] (panic "memo fn {} kept arguments with no node" ~name)))))
+               (None [] (panic "a map lost a key while it was written")))))
+         0)
+       (defn ~(sym (cat "memo-load--" name)) [(r (ptr rt/Reader))] (-> void)
+         (let [s (~store-fn)
+               n (rt/take-varint r)]
+           (for _ (range 0 n)
+             (let [~@binds
+                   answer ~(dec-code (mut k) (.ret f))
+                   id (rt/take-int r)
+                   key ~(memo-key-code (mut k) f)]
+               (set! (mut (.args s)) key (~args-ty ~@inits))
+               (set! (mut (.table s)) key answer)
+               (set! (mut (.node-ids s)) key id)
+               (rt/dep-retext! id (rt/memo-node ~qname ~key-text)))))
+         0))))
+
+;;; A module's part of the cache: first the parts of the modules it uses, each once, then its own
+;;; settings (whether given, and the value), states and memo answers.
+(defn compile-persist [(k (mut Comp)) (decls (ArrayList g/Node))] (-> Code)
+  (let [self (self-mod (mut k))
+        name (.self k)
+        (mut others-save) (primitive/code-list-new)
+        (mut others-load) (primitive/code-list-new)
+        (mut puts) (primitive/code-list-new)
+        (mut gets) (primitive/code-list-new)]
+    (for m (.mods k)
+      (when (and (= (.sort m) (SRules)) (!= (.name m) name) (!= (.name m) "hl.prelude"))
+        (push! (mut others-save) `(~(sym (qualified (mut k) (.name m) "persist-save!")) w))
+        (push! (mut others-load) `(~(sym (qualified (mut k) (.name m) "persist-load!")) r))))
+    (for d decls
+      (when (or (= (.kind d) (g/KSetting)) (= (.kind d) (g/KState)))
+        (let [g-name (.text (kid d 0))
+              x (match (find-global self g-name)
+                  (Some [v] v)
+                  (None [] (die (mut k) d "this was not collected")))
+              field (primitive/code-symbol "." g-name)]
+          (when (not (.task x))
+            (if (= (.kind d) (g/KSetting))
+                (let [bound (primitive/code-symbol "." (bound-field g-name))]
+                  (push! (mut puts)
+                         `(let [given (> (~bound st) 0)]
+                            (rt/put-bool! w given)
+                            (when given ~(enc-code (mut k) (.ty x) `(~field st)))))
+                  (push! (mut gets)
+                         `(when (rt/take-bool r)
+                            (set! (~field st) ~(dec-code (mut k) (.ty x)))
+                            (set! (~bound st) 1))))
+                (do
+                  (push! (mut puts) (enc-code (mut k) (.ty x) `(~field st)))
+                  (push! (mut gets) `(set! (~field st) ~(dec-code (mut k) (.ty x))))))))))
+    (for d decls
+      (when (= (.kind d) (g/KMemoFn))
+        (push! (mut puts) `(rt/put-part! w ~(cat3 name "." (.text (kid d 0)))))
+        (push! (mut puts) `(~(sym (cat "memo-save--" (.text (kid d 0)))) w))
+        (push! (mut gets) `(~(sym (cat "memo-load--" (.text (kid d 0)))) r))))
+    `(do
+       (defn persist-save! [(w (ptr rt/Writer))] (-> void)
+         (when (rt/put-module! w ~name)
+           ~@others-save
+           (rt/put-part! w ~(cat name " settings and states"))
+           (rt/put-mark! w ~name)
+           (let [st (rules-state)]
+             ~@puts
+             0))
+         0)
+       (defn persist-load! [(r (ptr rt/Reader))] (-> void)
+         (when (rt/take-module! r ~name)
+           ~@others-load
+           (rt/take-mark! r ~name)
+           (let [st (rules-state)]
+             ~@gets
+             0))
+         0))))
+
 ;;; The shared table, its lock and generation; the function; the computation under another name.
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
   (let [f (memo-check! (mut k) d)
@@ -8250,6 +8560,7 @@
                   (rt/init-unlock!)
                   (rt/dep-ensurer! ~qname (fnptr-of ~ensure)))
                 s)))
+    (emit! (mut out) (memo-persist-code (mut k) f name))
     ;; While dependencies are tracked, an answer from an earlier revision is current only once each
     ;; thing it read is shown unchanged, and an answer computed again that is the same as the one
     ;; it replaces is kept, and does not count as changed.
@@ -8680,6 +8991,7 @@
         (when (= (.kind d) (g/KMemoFn))
           (compile-memo! (mut k) d (mut out))))
       (when (any-memo? decls) (emit! (mut out) (compile-forget! (mut k) decls)))
+      (emit! (mut out) (compile-persist (mut k) decls))
       (when (= (.kind tree) (g/KAttrsFile))
         (emit! (mut out) (compile-attrs (mut k) tree decls)))
       (for a (.aux k) (emit! (mut out) a))
@@ -8702,6 +9014,7 @@
     (if (none? (kid d 1))
         `(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
            (rt/args-init! argc argv)
+           (rt/persist-root! (fnptr-of persist-save!) (fnptr-of persist-load!))
            ~(if answers `(~(sym name)) `(do (~(sym name)) 0)))
         `(do
            (defn rules-worker [(arg (ptr i8))] (-> (ptr i8))
@@ -8709,6 +9022,7 @@
              arg)
            (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
              (rt/args-init! argc argv)
+             (rt/persist-root! (fnptr-of persist-save!) (fnptr-of persist-load!))
              (rt/run-on-big-stack (fnptr-of rules-worker))
              (rt/answer))))))
 

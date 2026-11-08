@@ -5,6 +5,7 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap for-entries])
 (import "coil.str" :as str)
+(import "hl.rt" :as rt)
 
 ;;; A map from names. Names are the program's own text, which is never changed or freed, so the
 ;;; map need not copy them.
@@ -385,3 +386,74 @@
 
 (defn has-free? [(t Table) (name (slice u8))] (-> bool)
   (match (get (.free t) name) (Some [_] true) (None [] false)))
+
+;; ---------------------------------------------------------------- the cache on disk
+
+;;; A table, for the cache (see the cache in hl.rt): its scopes, symbols, free names and outer uses.
+(defn persist-encode-Table [(w (ptr rt/Writer)) (t Table)] (-> void)
+  (rt/put-varint! w (len (.scopes t)))
+  (for sc (.scopes t)
+    (rt/put-int! w (.parent sc))
+    (encode-names! w (.names sc))
+    (rt/put-ints! w (.symbols sc))
+    (rt/put-ints! w (.children sc))
+    (rt/put-bool! w (.dynamic sc)))
+  (rt/put-varint! w (len (.symbols t)))
+  (for s (.symbols t)
+    (rt/put-text! w (.name s))
+    (rt/put-int! w (.scope s))
+    (rt/put-int! w (.uses s))
+    (rt/put-text! w (.final s))
+    (rt/put-bool! w (.pinned s)))
+  (encode-names! w (.free t))
+  (rt/put-varint! w (len (.outer t)))
+  (for key (.outer t)
+    (rt/put-int! w key)
+    (match (get (.outer t) key)
+      (Some [v] (rt/put-int! w v))
+      (None [] (panic "a map lost a key while it was written"))))
+  0)
+
+(defn encode-names! [(w (ptr rt/Writer)) (m (HashMap (slice u8) i64))] (-> void)
+  (rt/put-varint! w (len m))
+  (for key m
+    (rt/put-text! w key)
+    (match (get m key)
+      (Some [v] (rt/put-int! w v))
+      (None [] (panic "a map lost a key while it was written"))))
+  0)
+
+(defn decode-names [(r (ptr rt/Reader))] (-> (HashMap (slice u8) i64))
+  (let [n (rt/take-varint r)
+        (mut m) (names-map)]
+    (for _ (range 0 n)
+      (let [key (rt/take-text r)]
+        (set! (mut m) key (rt/take-int r))))
+    m))
+
+(defn persist-decode-Table [(r (ptr rt/Reader))] (-> Table)
+  (let [(mut scopes) (ArrayList::new [Scope] (malloc-allocator))
+        (mut symbols) (ArrayList::new [Symbol] (malloc-allocator))
+        (mut outer) (HashMap::new-scalar [i64 i64] (malloc-allocator))
+        nscopes (rt/take-varint r)]
+    (for _ (range 0 nscopes)
+      (let [parent (rt/take-int r)
+            names (decode-names r)
+            syms (rt/take-ints r)
+            children (rt/take-ints r)
+            dynamic (rt/take-bool r)]
+        (push! (mut scopes) (Scope :parent parent :names names :symbols syms :children children :dynamic dynamic))))
+    (let [nsymbols (rt/take-varint r)]
+      (for _ (range 0 nsymbols)
+        (let [name (rt/take-text r)
+              scope (rt/take-int r)
+              uses (rt/take-int r)
+              final (rt/take-text r)
+              pinned (rt/take-bool r)]
+          (push! (mut symbols) (Symbol :name name :scope scope :uses uses :final final :pinned pinned)))))
+    (let [free (decode-names r)
+          nouter (rt/take-varint r)]
+      (for _ (range 0 nouter)
+        (let [key (rt/take-int r)]
+          (set! (mut outer) key (rt/take-int r))))
+      (Table :scopes scopes :symbols symbols :free free :outer outer))))

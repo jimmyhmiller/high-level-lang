@@ -87,6 +87,13 @@ record Options {
   # `--serve=PORT`: the output's directory served, with the page's event stream (-1: not served).
   hmr: Bool,
   serve-port: Int,
+  # What builds compute, kept on disk in `cache-dir` (by default node_modules/.cache/esb), so a
+  # later run starts where this one stopped: always while watching unless `no-cache`, and for one
+  # build with `cache`. `cache-key` tells one command line's cache from another's.
+  cache: Bool,
+  no-cache: Bool,
+  cache-dir: Text,
+  cache-key: Text,
   sourcemap: Bool,
   defines: [DefineText],
   main-fields: [Text],
@@ -127,7 +134,8 @@ fn options-new(entry: Text, outfile: Text) -> Options =
   Options(entry: entry, entries: [entry], outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]",
           format: iife-format(), global-name: "",
-          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, watch: false, watch-interval: 100, hmr: false, serve-port: -1, sourcemap: false,
+          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, watch: false, watch-interval: 100, hmr: false, serve-port: -1,
+          cache: false, no-cache: false, cache-dir: "node_modules/.cache/esb", cache-key: "", sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
@@ -184,7 +192,7 @@ fn names-in-use() -> [Text] =
   nm.finals ++ [f for mo in m.modules for f in mo.free] ++ nm.keywords
 
 fn for-target(o: Options, p: Node) -> Node = match o.charset-ascii {
-  true if o.watch => watched-runs(lowered, 2)
+  true if incremental?(o) => watched-runs(lowered, 2)
   true => in-parts(o, lowered, fin.ascii-only)
   false => lowered
 } where dropped = match o.drop-console or o.drop-debugger {
@@ -434,7 +442,7 @@ fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) 
 # what follows, so this is the program the optimiser would make of the whole. A spec's own
 # optimiser is given top-level parts only: what it does to a body with a hole is its own.
 fn optimized(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
-  _ if o.watch and not o.has-optimize => watched-runs(p, 0)
+  _ if incremental?(o) and not o.has-optimize => watched-runs(p, 0)
   n if n <= 1 => o.optimize(p)
   n if o.has-optimize => joined(p, heaviest-first(parts-of(p, n), o.optimize, o.plan.optimize-threads))
   n => in-pieces(p, n, o.plan.optimize-threads, o.optimize, true)
@@ -484,7 +492,7 @@ fn heaviest-order(parts: [Node]) -> [Int] = sort i in [i for i in 0..len(parts)]
 fn part-weight(p: Node) -> Int = sum s in p.body.kids: weight(s)
 
 fn folded(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
-  _ if o.watch => watched-runs(p, 1)
+  _ if incremental?(o) => watched-runs(p, 1)
   n if n <= 1 => fold.run(p)
   n => in-pieces(p, n, o.plan.optimize-threads, fold.run, false)
 }
@@ -499,7 +507,7 @@ fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, prin
 # where its part landed. A part that ends where the printer dropped a `;` gets it back, as the
 # printer would have written it had the next part followed.
 fn rendered-in-parts(o: Options, p: Node) -> Rendered = match o.plan.print-parts {
-  _ if o.watch => pieces-joined(o, [rendered-run(match i { 0 => p.hashbang  _ => None() }, runs[i], o.pretty, o.sourcemap)
+  _ if incremental?(o) => pieces-joined(o, [rendered-run(match i { 0 => p.hashbang  _ => None() }, runs[i], o.pretty, o.sourcemap)
                                     for i in 0..len(runs)])
     where runs = stable-runs(p.body.kids)
   n if n <= 1 => js.render-tracked(p, o.pretty, o.sourcemap)
@@ -650,12 +658,45 @@ record Written { path: Text, text: Text, said: Text }
 
 # One bundle, or one per entry, or one split into chunks, each name looked up as the options say:
 # the files they make, written; or, with nowhere to write it, the one bundle printed.
-fn build(options: Options) -> Void = match options.watch {
-  true => watched(options)
-  false => timed(options.timing, "write", match printing?(options) {
+fn build(options: Options) -> Void = match options.watch, cached?(options) {
+  true, _ => watched(options)
+  false, true => cached-once(options)
+  false, false => timed(options.timing, "write", match printing?(options) {
     true => to-standard-output(files(options))
     false => written(files(options))
   })
+}
+
+# Whether a build keeps what it computes on disk, and starts from what an earlier one kept.
+fn cached?(o: Options) -> Bool = not o.no-cache and (o.cache or o.watch)
+
+# Whether a build is made of memo answers kept for the next: one that watches, or starts from the
+# cache. It runs its steps in runs of statements, each a memo, where another fuses them.
+fn incremental?(o: Options) -> Bool = o.watch or cached?(o)
+
+fn cache-path(o: Options) -> Text = o.cache-dir ++ "/" ++ hash-text(o.cache-key) ++ ".cache"
+
+# Dependencies tracked, and what an earlier run kept loaded, before anything is computed.
+fn tracked-start(o: Options) -> Void {
+  track-dependencies!()
+  if cached?(o) {
+    # There before anything is built: made later, it would change a listing a build read.
+    make-dirs!(o.cache-dir)
+    let start = now-us()
+    if cache-load!(cache-path(o)) and o.timing {
+      print "[cache] loaded {} in {}.{} ms", cache-path(o), (now-us() - start) / 1000, (now-us() - start) % 1000 / 100
+    }
+  }
+}
+
+fn cache-kept(o: Options) -> Void {
+  if cached?(o) { cache-save!(cache-path(o)) }
+}
+
+# `--cache` without `--watch`: one build, as a watched build makes it, from what the cache kept.
+fn cached-once(options: Options) -> Void {
+  tracked-start(options)
+  set-up(options, true)
 }
 
 # The files a build makes, not yet written.
@@ -664,7 +705,7 @@ fn files(options: Options) -> [Written] = set-up(options, false)
 # `--watch`: one bundle built and written, then built again whenever something a build read
 # changes, until the process is stopped.
 fn watched(options: Options) -> Void {
-  track-dependencies!()
+  tracked-start(options)
   set-up(options, true)
   print "[watch] stopped"
 }
@@ -676,7 +717,7 @@ fn set-up(options: Options, watching: Bool) -> [Written] =
       false => built(printable(options))
       true => match options.splitting, options.outfile, len(options.entries), options.entry {
         false, out, 1, entry if out != "" and not ends-with(entry, ".css") => one-set-up(options, true)
-        _, _, _, _ => panic "--watch builds one JavaScript entry to --outfile, for now"
+        _, _, _, _ => panic "--watch and --cache build one JavaScript entry to --outfile, for now"
       }
     }
   }
@@ -759,7 +800,9 @@ fn one-set-up(options: Options, watching: Bool) -> [Written] = match options.ent
   _ if options.pretty and options.jsx.runtime == jsx.Preserve =>
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
   _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, false, f),
-            e.emitting = emitting-of(o, f), e.chunk-parts = none, printing = printing-of(o), m.names = names-new() {
+            e.emitting = emitting-of(o, f), e.chunk-parts = none, printing = printing-of(o),
+            # A build started from the cache keeps the names it interned, so a name keeps its id.
+            m.names = if-given(m.names) ?? names-new() {
          match watching {
            false => loaded-built(timed(o.timing, "startup", o), f)
            true => rebuilding(o, f)
@@ -782,16 +825,28 @@ fn rebuilding(o: Options, f: Format) -> [Written] = match o.hmr {
 
 fn plain-rebuilding(o: Options, f: Format) -> [Written] {
   var builds = 0
-  while true {
+  var going = true
+  while going {
     let start = now-us()
     let before = memo-computed()
     written(loaded-built(o, f))
     builds = builds + 1
     let took = now-us() - start
-    print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
-      memo-computed() - before, inputs-watched()
-    let changed = wait-for-changes!(o.watch-interval)
-    print "[watch] changed: {}", join(changed, " ")
+    let computed = memo-computed() - before
+    # Kept before the build says it is done, so what it said is on disk when it says it.
+    let saving = now-us()
+    cache-kept(o)
+    if o.timing and cached?(o) { print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100 }
+    if o.watch {
+      print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
+        computed, inputs-watched()
+    }
+    if o.watch {
+      let changed = wait-for-changes!(o.watch-interval)
+      print "[watch] changed: {}", join(changed, " ")
+    } else {
+      going = false
+    }
   }
   []
 }
@@ -814,8 +869,10 @@ fn dev-rebuilding(o: Options) -> [Written] {
     written([Written(path: o.outfile, text: step.dev.text, said: said-of(step.dev.text, o.outfile))])
     builds = builds + 1
     let took = now-us() - start
+    let made = memo-computed() - computed
+    cache-kept(o)
     print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
-      memo-computed() - computed, inputs-watched()
+      made, inputs-watched()
     if builds > 1 {
       match step.sent {
         some(sent) => {
@@ -897,7 +954,7 @@ fn named-built(o: Options, f: Format) -> [Written] =
   ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
   where emission = e.program(),
         emitted = timed(o.timing, "emit: rewrite identifiers", run-entry(emission.tree, f)),
-        fused = fusable?(o) and not o.watch,
+        fused = fusable?(o) and not incremental?(o),
         p = timed(o.timing, "minify rules", match fused, o.minify-syntax {
           true, _ => emitted
           false, true => for-target(o, optimized(o, emitted))

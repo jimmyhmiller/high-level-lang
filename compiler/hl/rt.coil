@@ -7,7 +7,8 @@
 (module hl.rt)
 (import "coil.alloc"
         :use
-        [malloc-allocator overflow-arena-allocator box! Allocator alloc])
+        [malloc-allocator overflow-arena-allocator box! Allocator alloc reallocate free])
+(import "coil.mem" :as mem)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
 (import "coil.hashmap" :use [HashMap i64-keyops])
@@ -1306,6 +1307,14 @@
     (for s (.strs ns) (intern! (mut out) s))
     out))
 
+;;; Whether two interners hold the same names, with the same ids.
+(defn names-same? [(a Names) (b Names)] (-> bool)
+  (and (= (len (.strs a)) (len (.strs b)))
+       (block :same
+              (for i (range 0 (len (.strs a)))
+                (unless (= (get (.strs a) i) (get (.strs b) i)) (return-from :same false)))
+              true)))
+
 (defn intern! [(ns (mut Names)) (s (slice u8))] (-> i64)
   (match (get (.ids ns) s)
     (Some [id] id)
@@ -1508,14 +1517,17 @@
       (set! i (+ i 1)))
     same))
 
-;;; A tree's identity: see `node-key` in the grammars. Its seven numbers as eight bytes each, a
-;;; key only ever hashed and compared, never read as text.
+;;; A tree's identity: see `node-key` in the grammars. Its numbers as eight bytes each, then its
+;;; text: a key only ever hashed and compared, never read as text. The text is there by what it
+;;; says, not where it is, so a leaf made again from the same words is the same leaf, in this run
+;;; or after a load from the cache; no children are no children wherever an empty list is.
 (defn node-identity [(kind i64) (lo i64) (hi i64) (text (slice u8)) (kids i64) (count i64)] (-> (slice u8))
   (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
-    (reserve! (mut b) 56)
-    (for v [kind lo hi (primitive/cast i64 (data text)) (len text) kids count]
+    (reserve! (mut b) (+ 40 (len text)))
+    (for v [kind lo hi (if (= count 0) 0 kids) count]
       (for i (range 0 8)
         (push! (mut b) (cast u8 (& (>> v (* i 8)) 255)))))
+    (when (> (len text) 0) (ArrayList::extend! (mut b) (data text) (len text)))
     (slice b)))
 
 ;;; A key `memo-key-of` made, back into its parts.
@@ -2588,6 +2600,8 @@
    (site-cols (ArrayList i64))
    ;; A site that reads a map by Text: the keys it has read, numbered in turn.
    (site-keys (ArrayList (ArrayList (slice u8))))
+   ;; Each site by its `site-key`.
+   (site-ids (HashMap (slice u8) i64))
    (site-key-ids (ArrayList (HashMap (slice u8) i64)))
    (setting-sites (HashMap (slice u8) (ArrayList i64)))
    ;; Numbered nodes, the elements read by index: leaves that only change and are read, so each
@@ -2630,6 +2644,7 @@
         (set! (.site-rels d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-cols d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.site-keys d) (ArrayList::new [(ArrayList (slice u8))] (malloc-allocator)))
+        (set! (.site-ids d) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
         (set! (.site-key-ids d) (ArrayList::new [(HashMap (slice u8) i64)] (malloc-allocator)))
         (set! (.setting-sites d) (HashMap::new [(slice u8) (ArrayList i64)] (malloc-allocator) (str/keyops)))
         (set! (.num-changed d) (ArrayList::new [i64] (malloc-allocator)))
@@ -2788,10 +2803,27 @@
   (let [known (atomic/read cache)]
     (if (> known 0)
         (- known 1)
-        (let [d (deps)]
+        (let [d (deps)
+              key (site-key setting prefix suffix)]
           (deps-lock! d)
+          (let [site (match (get (.site-ids d) key)
+                       (Some [known] known)
+                       (None [] (dep-new-site! d setting prefix suffix)))]
+            (deps-unlock! d)
+            (atomic/store cache (+ site 1))
+            site)))))
+
+;;; What names a site, where it is read and what it reads alike: the setting, the path before the
+;;; number and after. Two places in the program that read the same part share its nodes, and a
+;;; program run again finds the sites an earlier run kept.
+(defn site-key [(setting (slice u8)) (prefix (slice u8)) (suffix (slice u8))] (-> (slice u8))
+  (join setting (join "\0" (join prefix (join "\0" suffix)))))
+
+;;; A new site. Under the lock.
+(defn dep-new-site! [(d (ptr Deps)) (setting (slice u8)) (prefix (slice u8)) (suffix (slice u8))] (-> i64)
           (let [site (len (.sites d))
                 setting-id (dep-id! d setting)]
+            (set! (mut (.site-ids d)) (site-key setting prefix suffix) site)
             (push! (mut (.sites d)) (join setting prefix))
             (push! (mut (.site-settings d)) setting-id)
             (push! (mut (.site-prefixes d)) prefix)
@@ -2809,9 +2841,7 @@
                                 (None [] (ArrayList::new [i64] (malloc-allocator))))]
               (push! (mut sites) site)
               (set! (mut (.setting-sites d)) setting sites))
-            (deps-unlock! d)
-            (atomic/store cache (+ site 1))
-            site)))))
+            site))
 
 ;;; Element `index` of a setting was read, at a site (`dep-site!`), by the memo this worker is
 ;;; computing. Numbers all the way: the element's node and its path's text are made only the first
@@ -3404,17 +3434,7 @@
 
 ;;; A 64-bit hash of an input's bytes, eight at a time, as text: what it said, small enough to keep.
 (defn print-of [(bytes (slice u8))] (-> (slice u8))
-  (let [(mut h) (^ -3750763034362895579 (len bytes))
-        n (len bytes)
-        words (/ n 8)
-        base (data bytes)]
-    (for w (range 0 words)
-      (let [x (load (cast (ptr i64) (primitive/index base (* w 8))))]
-        (set! h (primitive/imul (^ h x) -7046029254386353131))
-        (set! h (^ h (>> h 29)))))
-    (for i (range (* words 8) n)
-      (set! h (primitive/imul (^ h (cast i64 (get bytes i))) 1099511628211)))
-    (num-text h)))
+  (num-text (bytes-hash bytes)))
 
 ;;; Where `struct stat` keeps a file's size and modification time on the platform compiled for:
 ;;; 64-bit Darwin on arm64, and Linux on x86-64 and arm64. Elsewhere -1, and a file is known by
@@ -3706,3 +3726,734 @@
         (do (spin-lock! (cast (ptr i64) s))
             (let [n (len (.clients s))] (spin-unlock! (cast (ptr i64) s)) n))
         0)))
+
+;; ---------------------------------------------------------------- the cache on disk
+
+;;; What a program computed, kept on disk so that a later run starts where an earlier one stopped:
+;;; the dependency graph above, and every memo answer, setting and state of the program's modules,
+;;; which their generated code writes through a Writer and reads through a Reader. Values go in
+;;; order, with no names or types, so only the build of the program that wrote them reads them
+;;; back, which the header checks. A text, or a tree's children, is written once and after that
+;;; referred to by number: what was one object is one object after a load, and a tree's identity
+;;; (`node-identity`, where its parts are) means after a load what it meant before the save.
+
+(defstruct Writer
+  [;; What is written so far: `pos` bytes of `mem`.
+   (mem (slice u8))
+   (pos i64)
+   ;; Objects written, by (tag, where, how long): open addressing over three columns, each slot's
+   ;; number kept plus one so a slot of zeros is empty.
+   (keys (ArrayList i64))
+   (ids (ArrayList i64))
+   (mask i64)
+   (filled i64)
+   ;; Values known by their bytes (`put-shared-value!`).
+   (shared (HashMap (slice u8) i64))
+   (counts (HashMap i64 i64))
+   (modules (HashMap (slice u8) i64))])
+
+(defstruct Reader
+  [(bytes (slice u8))
+   (at i64)
+   ;; Long texts, by number, as read so far.
+   (texts (ArrayList (slice u8)))
+   (modules (HashMap (slice u8) i64))
+   ;; Values shared by their bytes (`put-shared-value!`), by their type's name, as read so far.
+   (values (HashMap (slice u8) (ArrayList (slice u8))))
+   ;; Which load this is: tables of shared objects kept elsewhere start over with each.
+   (load i64)])
+
+(defn written-bytes [(w (ptr Writer))] (-> (slice u8))
+  (subslice (.mem w) 0 (.pos w)))
+
+;;; Room for `n` more bytes.
+(defn put-room! [(w (ptr Writer)) (n i64)] (-> void)
+  (when (> (+ (.pos w) n) (len (.mem w)))
+    (let [want (+ (* 2 (len (.mem w))) n 65536)]
+      (set! (.mem w)
+            (match (reallocate [u8] (malloc-allocator) (.mem w) want)
+              (Some [m] m)
+              (None [] (panic "no memory to write the cache"))))))
+  0)
+
+(defn put-byte! [(w (ptr Writer)) (b i64)] (-> void)
+  (put-room! w 1)
+  (store! (primitive/index (data (.mem w)) (.pos w)) (cast u8 (& b 255)))
+  (set! (.pos w) (+ (.pos w) 1))
+  0)
+
+;;; An integer's 64 bits, seven at a time, low first, each byte but the last with its top bit set.
+(defn put-varint! [(w (ptr Writer)) (v i64)] (-> void)
+  (put-room! w 10)
+  (let [base (data (.mem w))
+        (mut p) (.pos w)
+        (mut u) v]
+    (while (or (< u 0) (> u 127))
+      (store! (primitive/index base p) (cast u8 (| (& u 127) 128)))
+      (set! p (+ p 1))
+      (set! u (& (>> u 7) 144115188075855871)))
+    (store! (primitive/index base p) (cast u8 u))
+    (set! (.pos w) (+ p 1)))
+  0)
+
+;;; An integer of either sign, a small one short: zigzag, then `put-varint!`.
+(defn put-int! [(w (ptr Writer)) (v i64)] (-> void)
+  (put-varint! w (^ (<< v 1) (>> v 63))))
+
+(defn put-bool! [(w (ptr Writer)) (b bool)] (-> void)
+  (put-byte! w (if b 1 0)))
+
+(defn put-raw! [(w (ptr Writer)) (s (slice u8))] (-> void)
+  (when (> (len s) 0)
+    (put-room! w (len s))
+    (mem/copy (primitive/index (data (.mem w)) (.pos w)) (data s) (len s))
+    (set! (.pos w) (+ (.pos w) (len s))))
+  0)
+
+(defn take-byte [(r (ptr Reader))] (-> i64)
+  (when (>= (.at r) (len (.bytes r))) (panic "the cache ends before what it holds does"))
+  (let [b (cast i64 (get (.bytes r) (.at r)))]
+    (set! (.at r) (+ (.at r) 1))
+    b))
+
+(defn take-varint [(r (ptr Reader))] (-> i64)
+  (let [bytes (.bytes r)
+        n (len bytes)
+        base (data bytes)
+        (mut at) (.at r)
+        (mut out) 0
+        (mut shift) 0
+        (mut go) true]
+    (while go
+      (when (>= at n) (panic "the cache ends before what it holds does"))
+      (let [b (cast i64 (load (primitive/index base at)))]
+        (set! at (+ at 1))
+        (set! out (| out (<< (& b 127) shift)))
+        (set! shift (+ shift 7))
+        (when (< b 128) (set! go false))))
+    (set! (.at r) at)
+    out))
+
+(defn take-int [(r (ptr Reader))] (-> i64)
+  (let [u (take-varint r)]
+    (^ (& (>> u 1) 9223372036854775807) (- 0 (& u 1)))))
+
+(defn take-bool [(r (ptr Reader))] (-> bool)
+  (= (take-byte r) 1))
+
+(defn take-raw [(r (ptr Reader)) (n i64)] (-> (slice u8))
+  (let [at (.at r)]
+    (when (> (+ at n) (len (.bytes r))) (panic "the cache ends before what it holds does"))
+    (set! (.at r) (+ at n))
+    (subslice (.bytes r) at (+ at n))))
+
+;;; An object kept by where it is and how long, under `tag` (0 for texts; for others an address
+;;; that is theirs alone): the first time, true, and the caller writes it next; after that its number
+;;; is written, and false.
+(defn put-shared! [(w (ptr Writer)) (tag i64) (at i64) (n i64)] (-> bool)
+  (when (> (* (+ (.filled w) 1) 2) (+ (.mask w) 1)) (shared-grow! w))
+  (let [(mut i) (& (memo-hash (^ (memo-hash (^ (memo-hash tag) at)) n)) (.mask w))
+        (mut out) -1]
+    (while (< out 0)
+      (let [v (get (.ids w) i)]
+        (cond (= v 0)
+                (let [id (match (get (.counts w) tag) (Some [c] c) (None [] 0))]
+                  (set! (mut (.counts w)) tag (+ id 1))
+                  (set! (mut (.keys w)) (* i 3) tag)
+                  (set! (mut (.keys w)) (+ (* i 3) 1) at)
+                  (set! (mut (.keys w)) (+ (* i 3) 2) n)
+                  (set! (mut (.ids w)) i (+ id 1))
+                  (set! (.filled w) (+ (.filled w) 1))
+                  (set! out 0))
+              (and (= (get (.keys w) (* i 3)) tag)
+                   (= (get (.keys w) (+ (* i 3) 1)) at)
+                   (= (get (.keys w) (+ (* i 3) 2)) n))
+                (set! out v)
+              :else (set! i (& (+ i 1) (.mask w))))))
+    (put-varint! w out)
+    (= out 0)))
+
+;;; The table of objects written, twice as big, each where it falls now.
+(defn shared-grow! [(w (ptr Writer))] (-> void)
+  (let [old-keys (.keys w)
+        old-ids (.ids w)
+        cap (if (< (.mask w) 1023) 1024 (* (+ (.mask w) 1) 2))
+        (mut keys) (ArrayList::new [i64] (malloc-allocator))
+        (mut ids) (ArrayList::new [i64] (malloc-allocator))]
+    (ArrayList::extend-zeroed! (mut keys) (* cap 3))
+    (ArrayList::extend-zeroed! (mut ids) cap)
+    (for j (range 0 (len old-ids))
+      (let [v (get old-ids j)]
+        (when (> v 0)
+          (let [tag (get old-keys (* j 3))
+                at (get old-keys (+ (* j 3) 1))
+                n (get old-keys (+ (* j 3) 2))
+                (mut i) (& (memo-hash (^ (memo-hash (^ (memo-hash tag) at)) n)) (- cap 1))]
+            (while (!= (get ids i) 0) (set! i (& (+ i 1) (- cap 1))))
+            (set! (mut keys) (* i 3) tag)
+            (set! (mut keys) (+ (* i 3) 1) at)
+            (set! (mut keys) (+ (* i 3) 2) n)
+            (set! (mut ids) i v)))))
+    (let [(mut ok) old-keys (mut oi) old-ids] (free! (mut ok)) (free! (mut oi)))
+    (set! (.keys w) keys)
+    (set! (.ids w) ids)
+    (set! (.mask w) (- cap 1)))
+  0)
+
+;;; The same for a value of type `ty` (its name) known by its bytes, `n` of them at `at`, such as an
+;;; opaque one whose parts are where its bytes point: one value, written once wherever it was, is
+;;; one value when read back (see `take-shared-value`).
+(defn put-shared-value! [(w (ptr Writer)) (ty (slice u8)) (at (ptr u8)) (n i64)] (-> bool)
+  (let [tag (bytes-hash ty)
+        (mut key) (ArrayList::new [u8] (malloc-allocator))]
+    (for i (range 0 8) (push! (mut key) (cast u8 (& (>> tag (* i 8)) 255))))
+    (for i (range 0 n) (push! (mut key) (load (primitive/index at i))))
+    (let [found (get (.shared w) (slice key))]
+      (match found
+        (Some [id]
+              (free! (mut key))
+              (put-varint! w (+ id 1))
+              false)
+        (None []
+              (let [id (match (get (.counts w) tag) (Some [c] c) (None [] 0))]
+                (set! (mut (.counts w)) tag (+ id 1))
+                (set! (mut (.shared w)) (slice key) id)
+                (free! (mut key))
+                (put-varint! w 0)
+                true))))))
+
+;;; The values of type `ty` read so far, made when this is the first.
+(defn shared-values [(r (ptr Reader)) (ty (slice u8))] (-> (ArrayList (slice u8)))
+  (match (get (.values r) ty)
+    (Some [xs] xs)
+    (None []
+          (let [xs (ArrayList::new [(slice u8)] (malloc-allocator))]
+            (set! (mut (.values r)) ty xs)
+            xs))))
+
+;;; Value `id` of type `ty`, read before: where its bytes are.
+(defn shared-value-at [(r (ptr Reader)) (ty (slice u8)) (id i64)] (-> (ptr u8))
+  (data (get (shared-values r ty) id)))
+
+;;; A place for the next value of type `ty`, kept before it is read, since what it holds is
+;;; numbered after it; and its bytes, once read.
+(defn shared-value-reserve! [(r (ptr Reader)) (ty (slice u8))] (-> i64)
+  (let [(mut xs) (shared-values r ty)
+        at (len xs)]
+    (push! (mut xs) "")
+    (set! (mut (.values r)) ty xs)
+    at))
+
+(defn shared-value-set! [(r (ptr Reader)) (ty (slice u8)) (at i64) (bytes (ptr u8)) (n i64)] (-> void)
+  (let [(mut copy) (ArrayList::new [u8] (malloc-allocator))
+        (mut xs) (shared-values r ty)]
+    (ArrayList::extend! (mut copy) bytes n)
+    (set! (mut xs) at (slice copy))
+    (set! (mut (.values r)) ty xs))
+  0)
+
+;;; What `put-shared!` wrote: the number of an object read before, or -1 for one that follows. Its
+;;; reader numbers the objects of a tag in the order it reads them, as the writer did.
+(defn take-shared [(r (ptr Reader))] (-> i64)
+  (- (take-varint r) 1))
+
+;;; A text: a short one by its length (twice it) and bytes; a long one, such as a file's source,
+;;; once (1, then as `put-shared!`) and after that by number. Read back it is part of the cache's
+;;; bytes, which are kept for as long as the program runs, as texts are. A tree's identity is its
+;;; text's words, not where they are (see `node-identity`), so sharing only saves room.
+(defn put-text! [(w (ptr Writer)) (s (slice u8))] (-> void)
+  (if (< (len s) 64)
+      (do (put-varint! w (* (len s) 2))
+          (put-raw! w s))
+      (do (put-varint! w 1)
+          (when (put-shared! w 0 (primitive/cast i64 (data s)) (len s))
+            (put-varint! w (len s))
+            (put-raw! w s))
+          0)))
+
+(defn take-text [(r (ptr Reader))] (-> (slice u8))
+  (let [h (take-varint r)]
+    (if (= (& h 1) 0)
+        (take-raw r (/ h 2))
+        (let [id (take-shared r)]
+          (if (>= id 0)
+              (get (.texts r) id)
+              (let [t (take-raw r (take-varint r))]
+                (push! (mut (.texts r)) t)
+                t))))))
+
+;;; A function value: where it is from a function of this module, which is the same in each run of
+;;; the same build. 0 for none.
+(defn persist-base [] (-> i64) 0)
+
+(defn put-fn! [(w (ptr Writer)) (f i64)] (-> void)
+  (put-bool! w (!= f 0))
+  (when (!= f 0) (put-int! w (- f (persist-base-address))))
+  0)
+
+(defn take-fn [(r (ptr Reader))] (-> i64)
+  (if (take-bool r)
+      (+ (take-int r) (persist-base-address))
+      0))
+
+;;; Where `persist-base` is: a function value's bits, read as an integer.
+(defn persist-base-address [] (-> i64)
+  (let [(mut f) (fnptr-of persist-base)]
+    (load (cast (ptr i64) (mut f)))))
+
+;;; With HL_CACHE_SIZES set, how many bytes each part written takes, said once it is written: a
+;;; part starts at `put-part!`, and ends where the next starts.
+(defstruct SizeNotes [(known i64) (on i64) (label (slice u8)) (from i64)])
+
+(defn size-notes [] (-> (ptr SizeNotes))
+  (let [t (primitive/alloc-static SizeNotes)]
+    (when (= (.known t) 0)
+      (set! (.on t) (if (= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) "HL_CACHE_SIZES"))) 0) 0 1))
+      (set! (.known t) 1))
+    t))
+
+(defn put-part! [(w (ptr Writer)) (label (slice u8))] (-> void)
+  (let [t (size-notes)]
+    (when (= (.on t) 1)
+      (when (> (len (.label t)) 0)
+        (println "[cache] {} bytes  {}" (- (.pos w) (.from t)) (.label t)))
+      (set! (.label t) label)
+      (set! (.from t) (.pos w))))
+  0)
+
+;;; A module's part, once: true the first time, when its name is written as a mark.
+(defn put-module! [(w (ptr Writer)) (name (slice u8))] (-> bool)
+  (match (get (.modules w) name)
+    (Some [_] false)
+    (None []
+          (set! (mut (.modules w)) name 1)
+          true)))
+
+(defn take-module! [(r (ptr Reader)) (name (slice u8))] (-> bool)
+  (match (get (.modules r) name)
+    (Some [_] false)
+    (None []
+          (set! (mut (.modules r)) name 1)
+          true)))
+
+;;; A name written where a part starts, read back where the reader expects that part.
+(defn put-mark! [(w (ptr Writer)) (name (slice u8))] (-> void)
+  (put-varint! w (len name))
+  (put-raw! w name))
+
+(defn take-mark! [(r (ptr Reader)) (name (slice u8))] (-> void)
+  (let [found (take-raw r (take-varint r))]
+    (unless (= found name)
+      (panic "the cache has {} where this build wrote {}: its writer and reader disagree" found name)))
+  0)
+
+(defn put-ints! [(w (ptr Writer)) (xs (ArrayList i64))] (-> void)
+  (put-varint! w (len xs))
+  (for x xs (put-int! w x))
+  0)
+
+(defn take-ints [(r (ptr Reader))] (-> (ArrayList i64))
+  (let [n (take-varint r)
+        (mut out) (ArrayList::new [i64] (malloc-allocator))]
+    (reserve! (mut out) n)
+    (for _ (range 0 n) (push! (mut out) (take-int r)))
+    out))
+
+(defn put-texts! [(w (ptr Writer)) (xs (ArrayList (slice u8)))] (-> void)
+  (put-varint! w (len xs))
+  (for x xs (put-text! w x))
+  0)
+
+(defn take-texts [(r (ptr Reader))] (-> (ArrayList (slice u8)))
+  (let [n (take-varint r)
+        (mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (reserve! (mut out) n)
+    (for _ (range 0 n) (push! (mut out) (take-text r)))
+    out))
+
+(defn put-int-lists! [(w (ptr Writer)) (xs (ArrayList (ArrayList i64)))] (-> void)
+  (put-varint! w (len xs))
+  (for x xs (put-ints! w x))
+  0)
+
+(defn take-int-lists [(r (ptr Reader))] (-> (ArrayList (ArrayList i64)))
+  (let [n (take-varint r)
+        (mut out) (ArrayList::new [(ArrayList i64)] (malloc-allocator))]
+    (reserve! (mut out) n)
+    (for _ (range 0 n) (push! (mut out) (take-ints r)))
+    out))
+
+(defn put-text-ints-map! [(w (ptr Writer)) (m (HashMap (slice u8) (ArrayList i64)))] (-> void)
+  (put-varint! w (len m))
+  (for key m
+    (put-text! w key)
+    (match (get m key)
+      (Some [xs] (put-ints! w xs))
+      (None [] (panic "a map lost a key while it was written"))))
+  0)
+
+(defn take-text-ints-map [(r (ptr Reader))] (-> (HashMap (slice u8) (ArrayList i64)))
+  (let [n (take-varint r)
+        (mut out) (HashMap::new [(slice u8) (ArrayList i64)] (malloc-allocator) (str/keyops))]
+    (for _ (range 0 n)
+      (let [key (take-text r)]
+        (set! (mut out) key (take-ints r))))
+    out))
+
+;;; Interned names: each in the order of its id.
+(defn persist-encode-Names [(w (ptr Writer)) (ns Names)] (-> void)
+  (put-texts! w (.strs ns)))
+
+(defn persist-decode-Names [(r (ptr Reader))] (-> Names)
+  (let [(mut out) (names-new)]
+    (for s (take-texts r) (intern! (mut out) s))
+    out))
+
+;;; A relation: its rows, in order, and where its last round started and stopped. Its indexes are
+;;; made again as queries ask for them.
+(defn rel-encode! [(w (ptr Writer)) (x Rel)] (-> void)
+  (unless (= (len (.queue x)) 0)
+    (panic "a relation with rows still queued cannot be kept"))
+  (put-varint! w (.arity x))
+  (put-varint! w (.count x))
+  (for v (.data x) (put-int! w v))
+  (put-int! w (.seen x))
+  (put-int! w (.delta-from x))
+  (put-int! w (.delta-to x))
+  0)
+
+(defn rel-decode [(r (ptr Reader))] (-> Rel)
+  (let [arity (take-varint r)
+        count (take-varint r)
+        (mut x) (rel-new arity)]
+    (rel-reserve! (mut x) count)
+    (for _ (range 0 count)
+      (let [a (take-int r)
+            b (if (>= arity 2) (take-int r) 0)
+            c (if (>= arity 3) (take-int r) 0)
+            d (if (>= arity 4) (take-int r) 0)]
+        (unless (rel-add! (mut x) a b c d)
+          (panic "a relation in the cache holds a row twice"))))
+    (set! (.seen x) (take-int r))
+    (set! (.delta-from x) (take-int r))
+    (set! (.delta-to x) (take-int r))
+    x))
+
+;;; The dependency graph, as `Deps` holds it. What is found by text is found again from the texts.
+(defn deps-encode! [(w (ptr Writer)) (d (ptr Deps))] (-> void)
+  (put-mark! w "deps")
+  (put-int! w (atomic/read (field d revision)))
+  (put-int! w (.computed d))
+  (put-texts! w (.texts d))
+  (put-ints! w (.changed d))
+  (put-ints! w (.verified d))
+  (put-int-lists! w (.reads d))
+  (put-ints! w (.dep-heads d))
+  (put-ints! w (.edge-to d))
+  (put-ints! w (.edge-next d))
+  (put-varint! w (len (.dirty d)))
+  (for x (.dirty d) (put-bool! w x))
+  (put-texts! w (.prints d))
+  (put-texts! w (.stamps d))
+  (put-text-ints-map! w (.queries d))
+  (put-varint! w (len (.paths d)))
+  (for key (.paths d)
+    (put-text! w key)
+    (match (get (.paths d) key)
+      (Some [xs] (put-texts! w xs))
+      (None [] (panic "a map lost a key while it was written"))))
+  (put-texts! w (.sites d))
+  (put-ints! w (.site-settings d))
+  (put-texts! w (.site-prefixes d))
+  (put-texts! w (.site-suffixes d))
+  (put-texts! w (.site-rels d))
+  (put-ints! w (.site-cols d))
+  (put-varint! w (len (.site-keys d)))
+  (for keys (.site-keys d) (put-texts! w keys))
+  (put-text-ints-map! w (.setting-sites d))
+  (put-ints! w (.num-changed d))
+  (put-ints! w (.num-heads d))
+  (put-ints! w (.num-sites d))
+  (put-ints! w (.num-indexes d))
+  (put-varint! w (len (.site-pages d)))
+  (for pages (.site-pages d) (put-int-lists! w pages))
+  0)
+
+(defn deps-decode! [(r (ptr Reader)) (d (ptr Deps))] (-> void)
+  (take-mark! r "deps")
+  (atomic/store (field d revision) (take-int r))
+  (set! (.computed d) (take-int r))
+  (set! (.texts d) (take-texts r))
+  (set! (.changed d) (take-ints r))
+  (set! (.verified d) (take-ints r))
+  (set! (.reads d) (take-int-lists r))
+  (set! (.dep-heads d) (take-ints r))
+  (set! (.edge-to d) (take-ints r))
+  (set! (.edge-next d) (take-ints r))
+  (let [n (take-varint r)
+        (mut dirty) (ArrayList::new [bool] (malloc-allocator))]
+    (for _ (range 0 n) (push! (mut dirty) (take-bool r)))
+    (set! (.dirty d) dirty))
+  (set! (.prints d) (take-texts r))
+  (set! (.stamps d) (take-texts r))
+  (set! (.queries d) (take-text-ints-map r))
+  (let [n (take-varint r)
+        (mut paths) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops))]
+    (for _ (range 0 n)
+      (let [key (take-text r)]
+        (set! (mut paths) key (take-texts r))))
+    (set! (.paths d) paths))
+  (set! (.sites d) (take-texts r))
+  (set! (.site-settings d) (take-ints r))
+  (set! (.site-prefixes d) (take-texts r))
+  (set! (.site-suffixes d) (take-texts r))
+  (set! (.site-rels d) (take-texts r))
+  (set! (.site-cols d) (take-ints r))
+  (let [n (take-varint r)
+        (mut all) (ArrayList::new [(ArrayList (slice u8))] (malloc-allocator))
+        (mut ids) (ArrayList::new [(HashMap (slice u8) i64)] (malloc-allocator))]
+    (for _ (range 0 n)
+      (let [keys (take-texts r)
+            (mut by) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+        (for i (range 0 (len keys)) (set! (mut by) (get keys i) i))
+        (push! (mut all) keys)
+        (push! (mut ids) by)))
+    (set! (.site-keys d) all)
+    (set! (.site-key-ids d) ids))
+  (set! (.setting-sites d) (take-text-ints-map r))
+  (set! (.num-changed d) (take-ints r))
+  (set! (.num-heads d) (take-ints r))
+  (set! (.num-sites d) (take-ints r))
+  (set! (.num-indexes d) (take-ints r))
+  (let [n (take-varint r)
+        (mut all) (ArrayList::new [(ArrayList (ArrayList i64))] (malloc-allocator))]
+    (for _ (range 0 n) (push! (mut all) (take-int-lists r)))
+    (set! (.site-pages d) all))
+  ;; Found by text: nodes, and sites.
+  (let [(mut ids) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+    (for i (range 0 (len (.texts d))) (set! (mut ids) (get (.texts d) i) i))
+    (set! (.ids d) ids))
+  (let [(mut sites) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+    (for i (range 0 (len (.sites d)))
+      (set! (mut sites)
+            (site-key (get (.texts d) (get (.site-settings d) i))
+                      (get (.site-prefixes d) i)
+                      (get (.site-suffixes d) i))
+            i))
+    (set! (.site-ids d) sites))
+  0)
+
+;;; A memo answer's node, loaded: its text made again from its key as this run makes it, since a
+;;; key may hold where a tree is. Under no lock; only while loading.
+(defn dep-retext! [(id i64) (text (slice u8))] (-> void)
+  (let [d (deps)
+        loading (loading-state)
+        old (get (.texts d) id)]
+    (when (!= old text)
+      (match (get (.ids d) old)
+        (Some [x] (when (= x id) (HashMap::remove! (mut (.ids d)) old)))
+        (None [] 0))
+      (set! (mut (.texts d)) id text)
+      (set! (mut (.ids d)) text id))
+    (set! (mut (.confirmed loading)) id true))
+  0)
+
+;;; While a cache is loaded: which memo answers' nodes their stores have claimed. And what the cache
+;;; on disk holds, by the revision and how many answers had been computed: while both stay, a
+;;; save would write what is there (-1: nothing known to be there).
+(defstruct Loading [(confirmed (ArrayList bool)) (loads i64) (kept-revision i64) (kept-computed i64) (kept bool)])
+
+;;; The one cell of it (`alloc-static` makes one per place it is written).
+(defn loading-state [] (-> (ptr Loading))
+  (primitive/alloc-static Loading))
+
+;;; What wrote the cache and what reads it must be the same build of the program: the executable,
+;;; by where it is and its size and time.
+(defn exe-path [] (-> (slice u8))
+  (let [a0 (arg-at 0)]
+    (if (is-some-index? (index-of a0 "/"))
+        (real-path-raw a0)
+        (let [found (os/getenv (str/to-cstr (malloc-allocator) "PATH"))
+              (mut out) a0]
+          (unless (= (primitive/cast i64 found) 0)
+            (for dir (split (str/from-cstr found) ":")
+              (let [p (join dir (join "/" a0))]
+                (when (and (= out a0) (file-exists-raw? p)) (set! out (real-path-raw p))))))
+          out))))
+
+(defn is-some-index? [(o (Option i64))] (-> bool)
+  (match o (Some [_] true) (None [] false)))
+
+(defn exe-identity [] (-> (slice u8))
+  (let [p (exe-path)]
+    (join p (join "\0" (file-stamp p)))))
+
+(defn bytes-hash [(bytes (slice u8))] (-> i64)
+  (let [(mut h) (^ -3750763034362895579 (len bytes))
+        n (len bytes)
+        words (/ n 8)
+        base (data bytes)]
+    (for w (range 0 words)
+      (let [x (load (cast (ptr i64) (primitive/index base (* w 8))))]
+        (set! h (primitive/imul (^ h x) -7046029254386353131))
+        (set! h (^ h (>> h 29)))))
+    (for i (range (* words 8) n)
+      (set! h (primitive/imul (^ h (cast i64 (get bytes i))) 1099511628211)))
+    h))
+
+;;; What a program keeps: its main's functions that write and read every module's part, set as it
+;;; starts.
+(defstruct PersistRoot
+  [(save (fnptr (cc/C) [(ptr Writer)] void))
+   (load (fnptr (cc/C) [(ptr Reader)] void))
+   (set bool)])
+
+;;; The one cell of it.
+(defn persist-root-cell [] (-> (ptr PersistRoot))
+  (primitive/alloc-static PersistRoot))
+
+(defn persist-root! [(save (fnptr (cc/C) [(ptr Writer)] void)) (load (fnptr (cc/C) [(ptr Reader)] void))] (-> void)
+  (let [root (persist-root-cell)]
+    (set! (.save root) save)
+    (set! (.load root) load)
+    (set! (.set root) true))
+  0)
+
+(defn persist-root [] (-> (ptr PersistRoot))
+  (let [root (persist-root-cell)]
+    (unless (.set root) (panic "nothing says what to keep: a program's main sets that, as it starts"))
+    root))
+
+(defn cache-magic [] (-> (slice u8)) "hl.rt cache 1\n")
+
+;;; Everything kept, written to `path` whole: to a file beside it first, then moved into place, so
+;;; a reader finds the old cache or the new one, never part of one. Only while no memo computes.
+(defn cache-save! [(path (slice u8))] (-> void)
+  (let [d (deps)
+        root (persist-root)
+        w (primitive/alloc-static Writer)]
+    (unless (.tracking d) (panic "the cache keeps what tracked builds compute, and nothing is tracked"))
+    (unless (cache-current? d)
+      (cache-write! path d root w))
+    0))
+
+;;; Whether the cache on disk holds what is here: nothing changed, and nothing was computed, since
+;;; it was loaded or saved.
+(defn cache-current? [(d (ptr Deps))] (-> bool)
+  (let [l (loading-state)]
+    (and (.kept l)
+         (= (.kept-revision l) (atomic/read (field d revision)))
+         (= (.kept-computed l) (.computed d)))))
+
+(defn cache-kept! [(d (ptr Deps))] (-> void)
+  (let [l (loading-state)]
+    (set! (.kept l) true)
+    (set! (.kept-revision l) (atomic/read (field d revision)))
+    (set! (.kept-computed l) (.computed d)))
+  0)
+
+(defn cache-write! [(path (slice u8)) (d (ptr Deps)) (root (ptr PersistRoot)) (w (ptr Writer))] (-> void)
+  (do
+    (set! (.mem w) (match (alloc [u8] (malloc-allocator) 1048576)
+                     (Some [m] m)
+                     (None [] (panic "no memory to write the cache"))))
+    (set! (.pos w) 0)
+    (set! (.keys w) (ArrayList::new [i64] (malloc-allocator)))
+    (set! (.ids w) (ArrayList::new [i64] (malloc-allocator)))
+    (set! (.mask w) -1)
+    (set! (.filled w) 0)
+    (set! (.shared w) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+    (set! (.counts w) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
+    (set! (.modules w) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+    (put-raw! w (cache-magic))
+    (let [id (exe-identity)]
+      (put-varint! w (len id))
+      (put-raw! w id))
+    (put-part! w "dependencies")
+    (deps-encode! w d)
+    (let [save (.save root)] (save w))
+    (put-part! w "")
+    (put-mark! w "end")
+    (let [h (bytes-hash (written-bytes w))]
+      (for i (range 0 8) (put-byte! w (>> h (* i 8)))))
+    (let [tmp (join path ".new")]
+      (write-output tmp (written-bytes w))
+      (match (fs/rename-file (malloc-allocator) tmp path)
+        (Ok [_] 0)
+        (Err [_] (panic "cannot move {} to {}" tmp path))))
+    (free [u8] (malloc-allocator) (.mem w))
+    (free! (mut (.keys w)))
+    (free! (mut (.ids w)))
+    (HashMap::free! (mut (.shared w)))
+    (HashMap::free! (mut (.counts w)))
+    (HashMap::free! (mut (.modules w)))
+    (cache-kept! d))
+  0)
+
+;;; The cache at `path`, loaded, when there is one this build wrote: true, with every input checked
+;;; since, so what changed while nothing ran is changed now. False, saying why when there is a
+;;; cache it will not use, when there is none. Only before any memo computes.
+(defn cache-load! [(path (slice u8))] (-> bool)
+  (let [d (deps)]
+    (unless (.tracking d) (panic "a cache is loaded into tracked builds, and nothing is tracked"))
+    (when (> (len (.texts d)) 0) (panic "a cache is loaded before anything is computed"))
+    (if (not (file-exists-raw? path))
+        false
+        (let [bytes (read-all-raw path)
+              magic (cache-magic)
+              id (exe-identity)
+              n (len bytes)]
+          (cond (or (< n (+ (len magic) 8)) (!= (subslice bytes 0 (len magic)) magic))
+                  (do (println "[cache] {} is not a cache this program wrote; building from the start" path) false)
+                (!= (bytes-hash (subslice bytes 0 (- n 8)))
+                    (let [(mut h) 0]
+                      (for i (range 0 8)
+                        (set! h (| h (<< (cast i64 (get bytes (+ (- n 8) i))) (* i 8)))))
+                      h))
+                  (do (println "[cache] {} is damaged; building from the start" path) false)
+                :else
+                  (let [r (primitive/alloc-static Reader)
+                        loading (loading-state)]
+                    (set! (.bytes r) (subslice bytes 0 (- n 8)))
+                    (set! (.at r) (len magic))
+                    (set! (.modules r) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+                    (set! (.texts r) (ArrayList::new [(slice u8)] (malloc-allocator)))
+                    (set! (.values r) (HashMap::new [(slice u8) (ArrayList (slice u8))] (malloc-allocator) (str/keyops)))
+                    (set! (.loads loading) (+ (.loads loading) 1))
+                    (set! (.load r) (.loads loading))
+                    (if (!= (take-raw r (take-varint r)) id)
+                        (do (println "[cache] {} was written by another build of this program; building from the start" path)
+                            false)
+                        (do
+                          (deps-decode! r d)
+                          (cache-kept! d)
+                          (let [(mut confirmed) (ArrayList::new [bool] (malloc-allocator))]
+                            (for _ (range 0 (len (.texts d))) (push! (mut confirmed) false))
+                            (set! (.confirmed loading) confirmed))
+                          (let [load-all (.load (persist-root))] (load-all r))
+                          (take-mark! r "end")
+                          (unless (= (.at r) (len (.bytes r)))
+                            (panic "the cache holds more than its reader read"))
+                          (dep-unclaimed-changed!)
+                          (dep-changed-inputs!)
+                          true))))))))
+
+;;; Memo answers' nodes no store claimed while loading: their key cannot be made again, so nothing
+;;; finds them by text, and what read them counts them changed.
+(defn dep-unclaimed-changed! [] (-> void)
+  (let [d (deps)
+        loading (loading-state)
+        (mut dead) (ArrayList::new [i64] (malloc-allocator))]
+    (for i (range 0 (len (.texts d)))
+      (let [t (get (.texts d) i)]
+        (when (and (not (get (.confirmed loading) i)) (is-some-index? (index-of t "\0")))
+          (push! (mut dead) i))))
+    (for i dead
+      (HashMap::remove! (mut (.ids d)) (get (.texts d) i))
+      (set! (mut (.texts d)) i ""))
+    (for i dead (dep-changed-id! i)))
+  0)
+
+;;; Which load a reader is, for tables of shared objects kept outside it.
+(defn reader-load [(r (ptr Reader))] (-> i64)
+  (.load r))

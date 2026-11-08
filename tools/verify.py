@@ -363,6 +363,12 @@ fails = [l.strip() for l in out.splitlines() if l.strip().startswith("FAIL")]
 check(code == 0 and out.strip().endswith("all checks passed"),
       f"--hmr: {len([l for l in out.splitlines() if l.strip().startswith('ok')])} checks" + (f"; {fails[0]}" if fails else ""))
 
+# The cache on disk across runs: edits made while nothing runs, a run after one that computes
+# nothing, a damaged cache and another build's set aside, each run byte for byte a fresh build.
+code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache-check.py"), ESB, "datefns"],
+                                      8000, 600, quiet=True)
+check(code == 0 and out.strip().endswith("all identical"), f"--cache: {out.strip().splitlines()[-1] if out.strip() else err[-200:]}")
+
 print("== source maps")
 for a in ["named.js", "cjs.js", "features.js", "jsx/main.jsx"]:
     out = f"{SCRATCH}/{a.replace('/', '_')}.sm.js"
