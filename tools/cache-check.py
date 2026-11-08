@@ -42,7 +42,8 @@ def fresh(entry, root):
 
 def watched_run(entry, root, esb=ESB):
     """A watcher's first build: what it said, and how many memo answers it computed."""
-    p = subprocess.Popen([esb, entry, "--watch", "--outfile=out/out.js"], cwd=root, stdout=subprocess.PIPE,
+    # With --timing the watcher says when its save, on a thread of its own, is done.
+    p = subprocess.Popen([esb, entry, "--watch", "--timing", "--outfile=out/out.js"], cwd=root, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
     said, computed = [], None
     deadline = time.time() + 60
@@ -51,6 +52,7 @@ def watched_run(entry, root, esb=ESB):
         m = BUILD.search(line)
         if m:
             computed = int(m.group(2))
+        if computed is not None and ("[cache] saved in" in line or "[cache] nothing new to save" in line):
             break
         if time.time() > deadline:
             break

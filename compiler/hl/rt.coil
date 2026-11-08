@@ -3555,6 +3555,7 @@
 
 ;;; Wait until an input changes, looking every `ms` milliseconds; the paths that changed.
 (defn wait-for-changes! [(ms i64)] (-> (ArrayList (slice u8)))
+  (cache-saved!)
   (let [(mut out) (dep-changed-inputs!)]
     (while (= (len out) 0)
       (sleep (Duration :sec (/ ms 1000) :nsec (* (% ms 1000) 1000000)))
@@ -4329,6 +4330,11 @@
 ;;; Everything kept, written to `path` whole: to a file beside it first, then moved into place, so
 ;;; a reader finds the old cache or the new one, never part of one. Only while no memo computes.
 (defn cache-save! [(path (slice u8))] (-> void)
+  (cache-saved!)
+  (cache-save-now! path)
+  0)
+
+(defn cache-save-now! [(path (slice u8))] (-> void)
   (let [d (deps)
         root (persist-root)
         w (primitive/alloc-static Writer)]
@@ -4336,6 +4342,51 @@
     (unless (cache-current? d)
       (cache-write! path d root w))
     0))
+
+;;; A save on a thread of its own (`cache-save-later!`).
+(defstruct Saving [(running bool) (thread Thread) (path (slice u8)) (timing bool)])
+
+(defn saving [] (-> (ptr Saving))
+  (primitive/alloc-static Saving))
+
+;;; Everything kept, as `cache-save!` keeps it, on a thread of its own while this one goes on, which
+;;; must not change what builds computed until `cache-saved!`: a watcher saves while it waits for an
+;;; edit, and waits for the save before it looks. With `timing`, says when it is done.
+(defn cache-save-later! [(path (slice u8)) (timing bool)] (-> void)
+  (cache-saved!)
+  (let [s (saving)]
+    (if (cache-current? (deps))
+        (when timing (println "[cache] nothing new to save"))
+        (do
+          (set! (.path s) path)
+          (set! (.timing s) timing)
+          (set! (.running s) true)
+          ;; A tree is written as deep as it is: room for that, as a build has.
+          (when (!= (Thread::spawn-configured (field s thread)
+                                              (fnptr-of saver-run)
+                                              (cast (ptr i8) 0)
+                                              (ThreadConfig :stack-size 1073741824 :guard-size 0))
+                    (: 0 i32))
+            (panic "could not start the thread that saves the cache"))
+          0)))
+  0)
+
+(defn saver-run [(arg (ptr i8))] (-> (ptr i8))
+  (let [s (saving)
+        start (now-us)]
+    (cache-save-now! (.path s))
+    (when (.timing s)
+      (let [took (- (now-us) start)]
+        (println "[cache] saved in {}.{} ms" (/ took 1000) (/ (% took 1000) 100)))))
+  arg)
+
+;;; A save on its own thread, finished.
+(defn cache-saved! [] (-> void)
+  (let [s (saving)]
+    (when (.running s)
+      (join (field s thread))
+      (set! (.running s) false)))
+  0)
 
 ;;; Whether the cache on disk holds what is here: nothing changed, and nothing was computed, since
 ;;; it was loaded or saved.
