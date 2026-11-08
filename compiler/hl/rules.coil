@@ -1468,7 +1468,7 @@
 
 ;;; A module input's value, read where it has one. The check is on the storage, which the field is
 ;;; then read through, so a field of the value is read without copying the rest.
-(defn input-read [(k (mut Comp)) (x Global) (storage Code)] (-> Code)
+(defn input-read [(k (mut Comp)) (module (slice u8)) (x Global) (storage Code)] (-> Code)
   (let [st (fresh (mut k) "storage")]
     `(~(primitive/code-symbol "." (.name x)) (let [~(sym st) ~storage]
                                                (when (= (~(primitive/code-symbol "."
@@ -1477,6 +1477,9 @@
                                                  (panic ~(cat3 "the input "
                                                                (.name x)
                                                                " was read where nothing gave it a value")))
+                                               ;; A memo computing now is made from it.
+                                               (when (rt/dep-in-frame?)
+                                                 (rt/dep-note-literal! ~(cat4 "s:" module "." (.name x))))
                                                ~(sym st)))))
 
 (defn add-global! [(k (mut Comp))
@@ -1519,7 +1522,7 @@
 (defn global-read [(k (mut Comp)) (x Global)] (-> Code)
   (let [field
           `(~(primitive/code-symbol "." (.name x)) ~(storage-call (mut k) x))]
-    (cond (= (.attr x) 5) (input-read (mut k) x (storage-call (mut k) x))
+    (cond (= (.attr x) 5) (input-read (mut k) (.self k) x (storage-call (mut k) x))
           (= (.attr x) 2)
             `(do
                (when (= (.attrs-depth ~(storage-call (mut k) x)) 0)
@@ -4999,6 +5002,7 @@
                              (Some [x]
                                    (if (= (.attr x) 5)
                                        (te (input-read (mut k)
+                                                       module
                                                        x
                                                        (storage-of (mut k)
                                                                    module
@@ -5718,16 +5722,21 @@
                                                     (kid init 1)
                                                     (.ty x))
                                               (.ty x))
-                                    ;; Memos may have used the value it had: they start over, now and after.
+                                    ;; Memo answers made from the value it had are dead, now and after:
+                                    ;; while dependencies are tracked, exactly those; otherwise every
+                                    ;; answer of the module's.
+                                    changed `(rt/dep-changed! ~(cat4 "s:" module "." name))
                                     forget
                                       (match (find-func owner "forget-memos!")
                                         (Some [_]
-                                              (if (> dot 0)
-                                                  `(~(sym (qualified (mut k)
-                                                                     module
-                                                                     "forget-memos!")))
-                                                  `(forget-memos!)))
-                                        (None [] `0))]
+                                              `(if (rt/dep-tracking?)
+                                                   ~changed
+                                                   ~(if (> dot 0)
+                                                        `(~(sym (qualified (mut k)
+                                                                           module
+                                                                           "forget-memos!")))
+                                                        `(forget-memos!))))
+                                        (None [] changed))]
                                 (push! (mut saves) (sym saved))
                                 (push! (mut saves) field)
                                 (if (= (.attr x) 5)
@@ -7410,10 +7419,13 @@
 
 ;; ---------------------------------------------------------------- memo functions
 
-;;; `memo fn f(k: K) -> R`: each answer is computed once per build, by whichever worker asks
-;;; first, and every worker shares it; one that asks while another computes it waits. Each keeps a
-;;; table of its own in front of the shared one, so a question asked again costs no lock. The
-;;; answer must not be changed by whoever gets it.
+;;; `memo fn f(k: K) -> R`: each answer is computed once, by whichever worker asks first, and
+;;; every worker shares it; one that asks while another computes it waits. Each keeps a table of
+;;; its own in front of the shared one, so a question asked again costs no lock. The answer must not
+;;; be changed by whoever gets it. While dependencies are tracked it is kept until something it
+;;; was made from changes: a file it read, a setting, another memo's answer (see the dependencies in
+;;; hl.rt), so a long-running program computes again only what an edit reaches. Otherwise binding a
+;;; setting of the module starts all its memos over.
 (defn memo-check! [(k (mut Comp)) (d g/Node)] (-> Func)
   (let [f
           (match (find-func (self-mod (mut k)) (.text (kid d 0)))
@@ -7496,6 +7508,10 @@
         compute (cat "memo-compute--" name)
         near (primitive/code-symbol "." (memo-near name))
         near-gen (primitive/code-symbol "." (memo-near-gen name))
+        purge-fn (sym (cat "memo-purge--" name))
+        qname (cat3 (.self k) "." name)
+        key-ty (coil-type (mut k) (memo-key-type f))
+        key-text (if (= (memo-key-type f) "Int") `(rt/num-text key) `key)
         (mut params) (primitive/code-list-new)
         (mut args) (primitive/code-list-new)
         rt (coil-type (mut k) (.ret f))]
@@ -7504,14 +7520,32 @@
              `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
       (push! (mut args) (memo-arg i)))
     (emit! (mut out) (compile-fn-as (mut k) d compute))
-    ;; The lock word comes first, so the store's address is the word's.
+    ;; The lock word comes first, so the store's address is the word's. `epoch`: the dependency
+    ;; epoch its table was last cleared of dead answers in.
     (emit! (mut out)
            `(defstruct ~store
               [(lock i64)
                (ready bool)
                (gen i64)
+               (epoch i64)
                (table ~(coil-type (mut k) mt))
                (busy ~(coil-type (mut k) (memo-busy-type f)))]))
+    ;; Answers made from something that changed since are dropped, and the workers' near tables
+    ;; with them.
+    (emit! (mut out)
+           `(defn ~purge-fn [(s (ptr ~store))] (-> void)
+              (let [word (cast (ptr i64) s)]
+                (rt/spin-lock! word)
+                (let [now (rt/dep-epoch)]
+                  (when (!= (.epoch s) now)
+                    (let [(mut dead) (ArrayList::new [~key-ty] (malloc-allocator))]
+                      (for key (.table s)
+                        (when (rt/dep-dead? (rt/memo-node ~qname ~key-text)) (push! (mut dead) key)))
+                      (for key dead (remove! (mut (.table s)) key))
+                      (set! (.gen s) (rt/next-pass!))
+                      (set! (.epoch s) now))))
+                (rt/spin-unlock! word)
+                0)))
     (emit! (mut out)
            `(defn ~store-fn [] (-> (ptr ~store))
               (let [s (primitive/alloc-static ~store)]
@@ -7521,6 +7555,7 @@
                     (set! (.table s) ~(new-map (mut k) mt))
                     (set! (.busy s) ~(new-map (mut k) (memo-busy-type f)))
                     (set! (.gen s) (rt/next-pass!))
+                    (set! (.epoch s) (rt/dep-epoch))
                     (set! (.ready s) true))
                   (rt/init-unlock!))
                 s)))
@@ -7530,6 +7565,9 @@
                     t (rules-task)
                     s (~store-fn)
                     word (cast (ptr i64) s)]
+                (when (!= (.epoch s) (rt/dep-epoch)) (~purge-fn s))
+                ;; A memo computing now is made from this answer.
+                (when (rt/dep-in-frame?) (rt/dep-note-memo! ~qname ~key-text))
                 (when (!= (~near-gen t) (.gen s))
                   (set! (~near t) ~(new-map (mut k) mt))
                   (set! (~near-gen t) (.gen s)))
@@ -7565,8 +7603,12 @@
                                               (do
                                                 (set! (mut (.busy s)) key me)
                                                 (rt/spin-unlock! word)
+                                                (when (rt/dep-tracking?) (rt/dep-begin!))
                                                 (let [made
                                                         (~(sym compute) ~@args)]
+                                                  (when (rt/dep-tracking?)
+                                                    (rt/dep-end! (rt/memo-node ~qname ~key-text)))
+                                                  (rt/dep-untracked!)
                                                   (rt/spin-lock! word)
                                                   (set! (mut (.table s))
                                                         key
@@ -7579,7 +7621,8 @@
                             (Some [v] (do (set! (mut (~near t)) key v) v))
                             (None [] (panic "memo fn {} lost its answer" ~name)))))))))))
 
-;;; Every memo of the module starts over. Only while no other worker runs.
+;;; Every memo of the module starts over, when dependencies are not tracked. Only while no other
+;;; worker runs.
 (defn compile-forget! [(k (mut Comp)) (decls (ArrayList g/Node))] (-> Code)
   (let [(mut body) (primitive/code-list-new)]
     (for d decls

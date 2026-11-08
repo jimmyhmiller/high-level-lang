@@ -18,7 +18,7 @@
 (import "coil.path" :as cpath)
 (import "coil.primitive" :as primitive)
 (import "coil.unicode" :as u)
-(import "coil.time" :use [monotonic-now-ms monotonic-now Instant])
+(import "coil.time" :use [monotonic-now-ms monotonic-now Instant sleep Duration])
 (import "coil.thread" :use [Thread ThreadConfig available-parallelism])
 (import "coil.sync" :use [Mutex Condition])
 (import "coil.atomic" :as atomic)
@@ -1327,6 +1327,11 @@
 ;;; A whole file. A regular file is read into one buffer of its size: one seek to learn the size,
 ;;; then reads straight into the buffer. Anything that cannot seek goes the general way.
 (defn read-all [(path (slice u8))] (-> (slice u8))
+  (let [bytes (read-all-raw path)]
+    (when (dep-in-frame?) (dep-input! (join "f:" path) (print-of bytes)))
+    bytes))
+
+(defn read-all-raw [(path (slice u8))] (-> (slice u8))
   (let [a (malloc-allocator)
         fd
           (os/open (str/to-cstr a path)
@@ -1384,6 +1389,11 @@
 
 ;;; A path with its links resolved, as the file system has it; the path itself when nothing is there.
 (defn real-path [(path (slice u8))] (-> (slice u8))
+  (let [p (real-path-raw path)]
+    (when (dep-in-frame?) (dep-input! (join "r:" path) p))
+    p))
+
+(defn real-path-raw [(path (slice u8))] (-> (slice u8))
   (match (cpath/realpath-opt (malloc-allocator) path)
     (Some [p] p)
     (None [] path)))
@@ -1949,6 +1959,11 @@
   (.col (line-col src at)))
 
 (defn file-exists? [(path (slice u8))] (-> bool)
+  (let [there (file-exists-raw? path)]
+    (when (dep-in-frame?) (dep-input! (join "e:" path) (if there "1" "0")))
+    there))
+
+(defn file-exists-raw? [(path (slice u8))] (-> bool)
   (match (fs/exists? (malloc-allocator) path)
     (Ok [e] e)
     (Err [_] false)))
@@ -1957,6 +1972,11 @@
 ;;; for a directory, `l` for anything else (a link, which only a look at the target can settle).
 ;;; Empty if the directory cannot be opened. One system call per directory, not per question.
 (defn dir-listing [(path (slice u8))] (-> (slice u8))
+  (let [listing (dir-listing-raw path)]
+    (when (dep-in-frame?) (dep-input! (join "d:" path) (print-of listing)))
+    listing))
+
+(defn dir-listing-raw [(path (slice u8))] (-> (slice u8))
   (let [(mut out) (ArrayList::new [u8] (malloc-allocator))]
     (match (fs/Directory::open (malloc-allocator)
                                (if (= (len path) 0) "." path))
@@ -1981,10 +2001,17 @@
 
 ;;; Exists and can be read: a directory exists, but is not a file.
 (defn readable-file? [(path (slice u8))] (-> bool)
-  (and (file-exists? path)
-       (match (fs/read-file (malloc-allocator) path)
-         (Ok [_] true)
-         (Err [_] false))))
+  (let [print (file-print path)]
+    (when (dep-in-frame?) (dep-input! (join "f:" path) print))
+    (!= print "missing")))
+
+;;; What a file says, as an input's print: "missing" when it cannot be read.
+(defn file-print [(path (slice u8))] (-> (slice u8))
+  (if (file-exists-raw? path)
+      (match (fs/read-file (malloc-allocator) path)
+        (Ok [b] (print-of b))
+        (Err [_] "missing"))
+      "missing"))
 
 ;;; UTF-8 text as code points. A truncated sequence ends with a -1.
 (defn code-points-of [(s (slice u8))] (-> (ArrayList i64))
@@ -2393,3 +2420,317 @@
 
 (defn digit-i64? [(c i64)] (-> bool)
   (and (>= c 48) (<= c 57)))
+
+;; ---------------------------------------------------------------- dependencies
+
+;;; What each memo's answer was made from, so answers can be kept from one build to the next. A
+;;; node is named by text: a memo's answer (its function, a NUL, its key), a setting ("s:" and its
+;;; name), or an input: a file read ("f:"), a directory listed ("d:"), a path asked about ("e:",
+;;; "r:"). While a memo computes, every node it reads is noted in a frame of its worker's; when it
+;;; is done the notes become edges from each node to it. When a node changes, everything that
+;;; depends on it, through any number of memos, is dead: a memo store drops its dead answers the
+;;; next time it is asked anything, and computes them again when asked for them.
+
+;;; A frame's notes: inputs and settings by name, each once (`literals` holds the addresses of names
+;;; given as literals, which are the same each time a place reads them, so a setting read in a loop
+;;; is checked without hashing); memo answers as their function's name and their key, joined only
+;;; when the frame is done.
+(defstruct DepFrame
+  [(notes (ArrayList (slice u8)))
+   (seen (HashMap (slice u8) i64))
+   (literals (ArrayList i64))
+   (memo-names (ArrayList (slice u8)))
+   (memo-keys (ArrayList (slice u8)))])
+
+;;; The lock word comes first. `depth-key`: a thread-specific value holding how many frames the
+;;; thread has open, so outside any memo a read costs one lookup. `epoch` moves whenever something
+;;; dies.
+(defstruct Deps
+  [(lock i64)
+   (depth-key i64)
+   (epoch i64)
+   (ready bool)
+   (ids (HashMap (slice u8) i64))
+   (texts (ArrayList (slice u8)))
+   (dependents (ArrayList (ArrayList i64)))
+   (dead (ArrayList bool))
+   (prints (ArrayList (slice u8)))
+   (edges (HashMap i64 i64))
+   (stacks (ArrayList (ArrayList DepFrame)))
+   (computed i64)
+   (tracking bool)
+   (untracked i64)])
+
+(defn deps [] (-> (ptr Deps))
+  (let [d (primitive/alloc-static Deps)]
+    (unless (.ready d)
+      (init-lock!)
+      (unless (.ready d)
+        (set! (.ids d) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+        (set! (.texts d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.dependents d) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
+        (set! (.dead d) (ArrayList::new [bool] (malloc-allocator)))
+        (set! (.prints d) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.edges d) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
+        (set! (.stacks d) (ArrayList::new [(ArrayList DepFrame)] (malloc-allocator)))
+        (for _ (range 0 (max-workers))
+          (push! (mut (.stacks d)) (ArrayList::new [DepFrame] (malloc-allocator))))
+        (set! (.depth-key d) (key-new))
+        (atomic/store (field d epoch) 0)
+        (atomic/store (field d untracked) 0)
+        (set! (.ready d) true))
+      (init-unlock!))
+    d))
+
+(defn deps-lock! [(d (ptr Deps))] (-> void)
+  (spin-lock! (cast (ptr i64) d)))
+
+(defn deps-unlock! [(d (ptr Deps))] (-> void)
+  (spin-unlock! (cast (ptr i64) d)))
+
+;;; A node's id, made when it has none. Under the lock.
+(defn dep-id! [(d (ptr Deps)) (node (slice u8))] (-> i64)
+  (match (get (.ids d) node)
+    (Some [id] id)
+    (None []
+          (let [id (len (.texts d))]
+            (set! (mut (.ids d)) node id)
+            (push! (mut (.texts d)) node)
+            (push! (mut (.dependents d)) (ArrayList::new [i64] (malloc-allocator)))
+            (push! (mut (.dead d)) false)
+            (push! (mut (.prints d)) "")
+            id))))
+
+;;; Dependencies are tracked from here on, which only a program that builds more than once needs.
+;;; Before any memo has computed anything, since what it computed untracked could never die.
+(defn dep-track! [] (-> void)
+  (let [d (deps)]
+    (when (> (atomic/read (field d untracked)) 0)
+      (panic "dependencies are tracked only from before any memo computes"))
+    (set! (.tracking d) true)
+    0))
+
+(defn dep-tracking? [] (-> bool)
+  (.tracking (deps)))
+
+;;; A memo computed an answer while dependencies were not tracked.
+(defn dep-untracked! [] (-> void)
+  (let [d (deps)]
+    (unless (.tracking d) (atomic/add (field d untracked) 1))
+    0))
+
+;;; Whether this worker is computing a memo, so what it reads is noted.
+(defn dep-in-frame? [] (-> bool)
+  (let [d (deps)]
+    (and (.tracking d) (!= (primitive/cast i64 (key-get (.depth-key d))) 0))))
+
+(defn dep-top [(d (ptr Deps)) (slot i64)] (-> i64)
+  (- (len (get (.stacks d) slot)) 1))
+
+;;; `node` was read by the memo this worker is computing.
+(defn dep-note! [(node (slice u8))] (-> void)
+  (let [d (deps)
+        slot (worker-slot)
+        top (dep-top d slot)]
+    (when (>= top 0)
+      (match (get (.seen (get (get (.stacks d) slot) top)) node)
+        (Some [_] 0)
+        (None []
+              (set! (mut (.seen (elem (mut (elem (mut (.stacks d)) slot)) top))) node 1)
+              (push! (mut (.notes (elem (mut (elem (mut (.stacks d)) slot)) top))) node)
+              0))))
+  0)
+
+;;; The same, for a name given as a literal, whose address stands for it.
+(defn dep-note-literal! [(node (slice u8))] (-> void)
+  (let [d (deps)
+        slot (worker-slot)
+        top (dep-top d slot)
+        at (primitive/cast i64 (data node))]
+    (when (>= top 0)
+      (let [(mut seen) false]
+        (for x (.literals (get (get (.stacks d) slot) top)) (when (= x at) (set! seen true)))
+        (unless seen
+          (push! (mut (.literals (elem (mut (elem (mut (.stacks d)) slot)) top))) at)
+          (dep-note! node)))))
+  0)
+
+;;; A memo answer, by its function's name and its key, was read by the memo this worker is computing.
+(defn dep-note-memo! [(name (slice u8)) (key (slice u8))] (-> void)
+  (let [d (deps)
+        slot (worker-slot)
+        top (dep-top d slot)]
+    (when (>= top 0)
+      (push! (mut (.memo-names (elem (mut (elem (mut (.stacks d)) slot)) top))) name)
+      (push! (mut (.memo-keys (elem (mut (elem (mut (.stacks d)) slot)) top))) key)))
+  0)
+
+;;; A memo starts computing on this worker.
+(defn dep-begin! [] (-> void)
+  (let [d (deps)
+        slot (worker-slot)]
+    (push! (mut (elem (mut (.stacks d)) slot))
+           (DepFrame
+             :notes (ArrayList::new [(slice u8)] (malloc-allocator))
+             :seen (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+             :literals (ArrayList::new [i64] (malloc-allocator))
+             :memo-names (ArrayList::new [(slice u8)] (malloc-allocator))
+             :memo-keys (ArrayList::new [(slice u8)] (malloc-allocator))))
+    (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
+    0))
+
+;;; An edge from `from` to `me`, once. Under the lock.
+(defn dep-edge! [(d (ptr Deps)) (from i64) (me i64)] (-> void)
+  (let [edge (+ (* from 4294967296) me)]
+    (match (get (.edges d) edge)
+      (Some [_] 0)
+      (None []
+            (set! (mut (.edges d)) edge 1)
+            (push! (mut (elem (mut (.dependents d)) from)) me)
+            0))))
+
+;;; The memo this worker was computing is done, and is `node`: what it read leads to it, and it
+;;; is alive again.
+(defn dep-end! [(node (slice u8))] (-> void)
+  (let [d (deps)
+        slot (worker-slot)
+        frame (match (pop! (mut (elem (mut (.stacks d)) slot)))
+                (Some [f] f)
+                (None [] (panic "a memo finished that never started")))]
+    (key-set! (.depth-key d) (primitive/cast (ptr i8) (len (get (.stacks d) slot))))
+    (deps-lock! d)
+    (let [me (dep-id! d node)]
+      (set! (mut (.dead d)) me false)
+      (set! (.computed d) (+ (.computed d) 1))
+      (for read (.notes frame) (dep-edge! d (dep-id! d read) me))
+      (for i (range 0 (len (.memo-names frame)))
+        (dep-edge! d (dep-id! d (memo-node (get (.memo-names frame) i) (get (.memo-keys frame) i))) me)))
+    (deps-unlock! d)
+    0))
+
+;;; An input was read: noted, with what it said, when a memo reads it.
+(defn dep-input! [(node (slice u8)) (print (slice u8))] (-> void)
+  (when (dep-in-frame?)
+    (dep-note! node)
+    (let [d (deps)]
+      (deps-lock! d)
+      (set! (mut (.prints d)) (dep-id! d node) print)
+      (deps-unlock! d)))
+  0)
+
+;;; Every memo answer that depends on `node`, through any number of others, is dead. The edges
+;;; that led there are spent: what is computed again notes its own.
+(defn dep-changed! [(node (slice u8))] (-> void)
+  (let [d (deps)]
+    (deps-lock! d)
+    (match (get (.ids d) node)
+      (Some [start]
+            (let [(mut todo) (ArrayList::new [i64] (malloc-allocator))
+                  (mut killed) 0]
+              (push! (mut todo) start)
+              (while (> (len todo) 0)
+                (let [at (match (pop! (mut todo)) (Some [x] x) (None [] -1))
+                      outs (get (.dependents d) at)]
+                  (set! (mut (.dependents d)) at (ArrayList::new [i64] (malloc-allocator)))
+                  (for out outs
+                    (remove! (mut (.edges d)) (+ (* at 4294967296) out))
+                    (unless (get (.dead d) out)
+                      (set! (mut (.dead d)) out true)
+                      (set! killed (+ killed 1))
+                      (push! (mut todo) out)))))
+              (when (> killed 0) (atomic/add (field d epoch) 1))))
+      (None [] 0))
+    (deps-unlock! d)
+    0))
+
+(defn dep-epoch [] (-> i64)
+  (atomic/read (field (deps) epoch)))
+
+;;; Whether a memo answer is dead. Asked under its store's lock, after the epoch moved.
+(defn dep-dead? [(node (slice u8))] (-> bool)
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [out (match (get (.ids d) node) (Some [id] (get (.dead d) id)) (None [] false))]
+      (deps-unlock! d)
+      out)))
+
+;;; A memo answer's node: its function's name, a NUL, its key.
+(defn memo-node [(name (slice u8)) (key (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+    (push-str! (mut b) name)
+    (push-str! (mut b) "\0")
+    (push-str! (mut b) key)
+    (finish! (mut b))))
+
+;;; How many memo answers have been computed, ever.
+(defn dep-computed [] (-> i64)
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [n (.computed d)]
+      (deps-unlock! d)
+      n)))
+
+;;; A 64-bit hash of an input's bytes, eight at a time, as text: what it said, small enough to keep.
+(defn print-of [(bytes (slice u8))] (-> (slice u8))
+  (let [(mut h) (^ -3750763034362895579 (len bytes))
+        n (len bytes)
+        words (/ n 8)
+        base (data bytes)]
+    (for w (range 0 words)
+      (let [x (load (cast (ptr i64) (primitive/index base (* w 8))))]
+        (set! h (primitive/imul (^ h x) -7046029254386353131))
+        (set! h (^ h (>> h 29)))))
+    (for i (range (* words 8) n)
+      (set! h (primitive/imul (^ h (cast i64 (get bytes i))) 1099511628211)))
+    (num-text h)))
+
+;;; What an input says now, as `dep-input!` was told it.
+(defn input-print-now [(node (slice u8))] (-> (slice u8))
+  (let [path (subslice node 2 (len node))
+        kind (cast i64 (get node 0))]
+    ;; f, d, e, r
+    (cond (= kind 102) (file-print path)
+          (= kind 100) (print-of (dir-listing-raw path))
+          (= kind 101) (if (file-exists-raw? path) "1" "0")
+          (= kind 114) (real-path-raw path)
+          :else (panic "{} is no input" node))))
+
+;;; The inputs memos have read that say something else now, each marked changed, their dependents
+;;; dead. What they say now is what they said, from here on.
+(defn dep-changed-inputs! [] (-> (ArrayList (slice u8)))
+  (let [d (deps)
+        (mut changed) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut nodes) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut prints) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (deps-lock! d)
+    (for i (range 0 (len (.texts d)))
+      (when (> (len (get (.prints d) i)) 0)
+        (push! (mut nodes) (get (.texts d) i))
+        (push! (mut prints) (get (.prints d) i))))
+    (deps-unlock! d)
+    (for i (range 0 (len nodes))
+      (let [now (input-print-now (get nodes i))]
+        (when (!= now (get prints i))
+          (push! (mut changed) (get nodes i))
+          (deps-lock! d)
+          (set! (mut (.prints d)) (dep-id! d (get nodes i)) now)
+          (deps-unlock! d)
+          (dep-changed! (get nodes i)))))
+    changed))
+
+;;; How many inputs memos have read.
+(defn dep-inputs [] (-> i64)
+  (let [d (deps)
+        (mut n) 0]
+    (deps-lock! d)
+    (for p (.prints d) (when (> (len p) 0) (set! n (+ n 1))))
+    (deps-unlock! d)
+    n))
+
+;;; Wait until an input changes, looking every `ms` milliseconds; the paths that changed.
+(defn wait-for-changes! [(ms i64)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (dep-changed-inputs!)]
+    (while (= (len out) 0)
+      (sleep (Duration :sec (/ ms 1000) :nsec (* (% ms 1000) 1000000)))
+      (set! out (dep-changed-inputs!)))
+    out))

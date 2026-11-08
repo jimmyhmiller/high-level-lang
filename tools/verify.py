@@ -351,6 +351,12 @@ print("== the rules language")
 code, out = sh([os.path.join(os.path.dirname(ESB), "langtest")], 30)
 check(code == 0 and out.strip().endswith("all checks passed"), f"collection forms mean what they say: {out.strip().split(chr(10))[-1]}")
 
+print("== watching")
+# Rebuilds after edits, byte for byte what a fresh process builds, and none for a write that changes nothing.
+code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch-check.py"), ESB, "datefns"],
+                                      8000, 300, quiet=True)
+check(code == 0 and out.strip().endswith("all identical"), f"--watch: {out.strip().splitlines()[-1] if out.strip() else err[-200:]}")
+
 print("== source maps")
 for a in ["named.js", "cjs.js", "features.js", "jsx/main.jsx"]:
     out = f"{SCRATCH}/{a.replace('/', '_')}.sm.js"

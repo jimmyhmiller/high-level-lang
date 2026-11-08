@@ -79,6 +79,9 @@ record Options {
   minify-syntax: Bool,
   pretty: Bool,
   timing: Bool,
+  # `--watch`: build again whenever an input changes, looking every `watch-interval` milliseconds.
+  watch: Bool,
+  watch-interval: Int,
   sourcemap: Bool,
   defines: [DefineText],
   main-fields: [Text],
@@ -119,7 +122,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
   Options(entry: entry, entries: [entry], outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]",
           format: iife-format(), global-name: "",
-          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
+          minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, watch: false, watch-interval: 100, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
@@ -618,16 +621,35 @@ record Written { path: Text, text: Text, said: Text }
 
 # One bundle, or one per entry, or one split into chunks, each name looked up as the options say:
 # the files they make, written; or, with nowhere to write it, the one bundle printed.
-fn build(options: Options) -> Void = timed(options.timing, "write", match printing?(options) {
-  true => to-standard-output(files(options))
-  false => written(files(options))
-})
+fn build(options: Options) -> Void = match options.watch {
+  true => watched(options)
+  false => timed(options.timing, "write", match printing?(options) {
+    true => to-standard-output(files(options))
+    false => written(files(options))
+  })
+}
 
 # The files a build makes, not yet written.
-fn files(options: Options) -> [Written] =
+fn files(options: Options) -> [Written] = set-up(options, false)
+
+# `--watch`: one bundle built and written, then built again whenever something a build read
+# changes, until the process is stopped.
+fn watched(options: Options) -> Void {
+  track-dependencies!()
+  set-up(options, true)
+  print "[watch] stopped"
+}
+
+fn set-up(options: Options, watching: Bool) -> [Written] =
   with res.options = resolve-options(options), tsc.forced = options.tsconfig, ascii.braces = options.target >= 2015,
        cssb.loaders = loader-map(options) {
-    built(printable(options))
+    match watching {
+      false => built(printable(options))
+      true => match options.splitting, options.outfile, len(options.entries), options.entry {
+        false, out, 1, entry if out != "" and not ends-with(entry, ".css") => one-set-up(options, true)
+        _, _, _, _ => panic "--watch builds one JavaScript entry to --outfile, for now"
+      }
+    }
   }
 
 fn written(ws: [Written]) -> Void = write-files!([w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
@@ -701,19 +723,43 @@ fn module-assets(out-dir: Text) -> [cssb.Asset] =
   [cssb.asset-of(mo.path, out-dir) for mo in m.modules if mo.kind != m.External and m.loader-of(mo.path) == "file"]
 
 # One bundle, as the build's settings say how to load, link, emit and print it.
-fn one-built(options: Options) -> [Written] = match options.entry {
+fn one-built(options: Options) -> [Written] = one-set-up(options, false)
+
+fn one-set-up(options: Options, watching: Bool) -> [Written] = match options.entry {
   _ ++ ".css" => css-built(options)
   _ if options.pretty and options.jsx.runtime == jsx.Preserve =>
     panic "pretty output would change the text of JSX that is kept: --jsx=preserve with --pretty is not implemented"
   _ => with m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, false, f),
             e.emitting = emitting-of(o, f), e.chunk-parts = none, printing = printing-of(o), m.names = names-new() {
-         loaded-built(timed(o.timing, "startup", o), f)
+         match watching {
+           false => loaded-built(timed(o.timing, "startup", o), f)
+           true => rebuilding(o, f)
+         }
        }
     where o = with-node-env(options),
           f = match o.format.export-names or len(o.format.exports) > 0 {
             true => o.format
             false => named(o.format, o.global-name)
           }
+}
+
+# Built and written, then built again each time an input a build read says something else. What
+# the build set up stays given, so memo answers made from files nothing changed are kept: only what
+# an edit reaches is computed again.
+fn rebuilding(o: Options, f: Format) -> [Written] {
+  var builds = 0
+  while true {
+    let start = now-us()
+    let before = memo-computed()
+    with m.names = names-new() { written(loaded-built(o, f)) }
+    builds = builds + 1
+    let took = now-us() - start
+    print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
+      memo-computed() - before, inputs-watched()
+    let changed = wait-for-changes!(o.watch-interval)
+    print "[watch] changed: {}", join(changed, " ")
+  }
+  []
 }
 
 fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii)
