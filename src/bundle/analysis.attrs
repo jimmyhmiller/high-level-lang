@@ -48,6 +48,8 @@ record Linked {
   dynamic-roots: [Int],
   made: [Made],
   first-made: Int,
+  made-ids: [Int],
+  part-starts: {Int:Int},
   requires: {Int:Int},
   namespaces: {Int:Int},
   inits: {Int:Int},
@@ -503,8 +505,12 @@ fn made-once(x: Made) -> Int? = match x.purpose {
 }
 
 # The symbols made for one purpose, by whose they are.
-fn made-for(made: [Made], first: Int, purpose: Purpose) -> {Int:Int} =
-  {made[i].owner: first + i for i in 0..len(made) if made[i].purpose == purpose}
+fn made-for(made: [Made], ids: [Int], purpose: Purpose) -> {Int:Int} =
+  {made[i].owner: ids[i] for i in 0..len(made) if made[i].purpose == purpose}
+
+# What a made symbol is, the same from one build to the next while it is made at all.
+fn made-key(x: Made) -> Text = int-text(match x.purpose { Require => 0  Exports => 1  Init => 2  ImportVar => 3  ReexportName => 4 })
+  ++ " " ++ int-text(x.owner) ++ " " ++ x.exported
 
 # What a statement needs made: the variable an opaque import is held in, and the names re-exported
 # from it.
@@ -559,8 +565,8 @@ fn kept-star?(mo: m.Module, t: m.Module) -> Bool = kept?(t) and mo.id in m.entri
 # linking makes are numbered from `first`: the modules' own, then the import statements' variables,
 # then what the other statements need, each import variable made once.
 fn linked-of(calls: [[Node]], first: Int) -> Linked =
-  Linked(wrapped: wrapped, dynamic-roots: roots, made: made, first-made: first, requires: made-for(made, first, Require),
-         namespaces: made-for(made, first, Exports), inits: made-for(made, first, Init), import-vars: import-vars,
+  Linked(wrapped: wrapped, dynamic-roots: roots, made: made, first-made: first, made-ids: ids, requires: made-for(made, ids, Require),
+         namespaces: made-for(made, ids, Exports), inits: made-for(made, ids, Init), import-vars: import-vars,
          reexports: reexports,
          cjs-imports: {b.symbol: CjsImport(importer: id, import-var: symbol-in(import-vars, import-key(m.modules[id], b.target)),
                                            name: b.name, namespace: b.namespace)
@@ -571,7 +577,9 @@ fn linked-of(calls: [[Node]], first: Int) -> Linked =
                           for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for r in statement-reexports(mo, s)
                           if held?(m.modules[r.target])},
          ns-imports: {b.symbol: b.target for bs in bindings for b in bs if b.namespace and not opaque?(m.modules[b.target])},
-         part-stmt: [module-parts(m.modules[id], wrapped)... for id in m.order],
+         part-starts: {m.order[k]: starts[k] for k in 0..len(m.order)},
+         part-stmt: updated([None() for _ in 0..m.part-places-used()],
+                            {starts[k] + j: parts[k][j] for k in 0..len(m.order) for j in 0..len(parts[k])}),
          any-dynamic: any id in m.order for mo in [m.modules[id]] for s in linked-statements(mo): dynamic-star?(mo, s),
          any-reexport: any x in made: x.purpose == ReexportName)
   where loads = [loads-of(m.modules[m.order[i]], n)... for i in 0..len(m.order) for n in calls[i]],
@@ -584,8 +592,11 @@ fn linked-of(calls: [[Node]], first: Int) -> Linked =
                                if held?(m.modules[b.target])]
                            ++ [x for id in m.order for mo in [m.modules[id]] for s in linked-statements(mo) for x in statement-made(mo, s)]
                 distinct made-once(x)],
-        import-vars = made-for(made, first, ImportVar),
-        reexports = {reexport-key(made[i].owner, made[i].exported): first + i for i in 0..len(made) if made[i].purpose == ReexportName}
+        ids = m.made-ids!([made-key(x) for x in made]),
+        import-vars = made-for(made, ids, ImportVar),
+        reexports = {reexport-key(made[i].owner, made[i].exported): ids[i] for i in 0..len(made) if made[i].purpose == ReexportName},
+        parts = [module-parts(m.modules[id], wrapped) for id in m.order],
+        starts = m.part-starts!([m.modules[id].path for id in m.order], [len(ps) for ps in parts])
 
 # ---------------------------------------------------------------- the facts
 
@@ -597,11 +608,7 @@ fn facts(summaries: [[Summary]]) -> [link.Fact] =
   # Every name the facts use but `default` can come from `export *`: the names are interned as the
   # facts are made, so these come last.
   ++ [link.fact-not-default(id) for id in 0..name-count(m.names) if name-of(m.names, id) != "default"]
-  where starts = (fold s = Starts(next: 0, at: []) for id in m.order:
-                    s with { next: s.next + part-count(m.modules[id], linked.wrapped), at: s.at ++ [s.next] }).at
-
-# Where each module's parts start: they are numbered in module order.
-record Starts { next: Int, at: [Int] }
+  where starts = [linked.part-starts[id] ?? panic "{} has no parts", m.modules[id].path for id in m.order]
 
 fn entry-facts() -> [link.Fact] = match linking.splitting {
   true => [chunk-root(r)... for r in m.entries ++ linked.dynamic-roots]
@@ -809,7 +816,9 @@ fn export-from-facts(mo: m.Module, part: Int, t: Int, specs: [Node]) -> [link.Fa
 fn link(symbols: Int) -> Linked = linked-of(parallel-map(m.order, on-demand-calls, linking.facts-threads), symbols)
 
 # The modules' own tables joined, and the symbols linking makes after them.
-fn linked-table(parts: [sym.Table]) -> sym.Table = sym.joined(parts, [x.scope for x in linked.made], [x.name for x in linked.made])
+fn linked-table(g: m.Graph) -> sym.Table =
+  sym.joined-at(g.parts, g.scope-shifts, g.symbol-shifts, g.scopes, g.symbols, linked.made-ids,
+                [x.scope for x in linked.made], [x.name for x in linked.made])
 
 # Every module's facts, once linking has worked out what it does, and what the rules derive from them.
 fn solved-facts() -> link.Db = link.solved(facts(parallel-map(m.order, summaries-of, linking.facts-threads)))

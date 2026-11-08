@@ -985,7 +985,58 @@ fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] = match wave {
 # A program's modules, as the settings above hold them.
 # Its parts are the modules' own tables, in the order they join the shared one, which holds
 # `symbols` symbols before linking makes more.
-record Graph { modules: [Module], by-path: {Text:Int}, order: [Int], entries: [Int], parts: [sym.Table], symbols: Int }
+record Graph { modules: [Module], by-path: {Text:Int}, order: [Int], entries: [Int], parts: [sym.Table], symbols: Int,
+               scopes: Int, scope-shifts: [Int], symbol-shifts: [Int] }
+
+# Where each module's symbols, scopes and statements are numbered in the build's one table and its
+# facts: a block of each, kept from one build to the next while it is big enough, so a module that
+# grows, or appears, renumbers nothing but itself. The symbols linking makes have places of their
+# own among the symbols, by what they are for. A first build numbers everything in turn, as one
+# table after another; numbers a later build no longer uses stay empty.
+record Block { at: Int, size: Int }
+record Numbering { blocks: {Text:Block}, next: Int }
+record Placed { numbering: Numbering, at: [Int] }
+
+state symbol-places: Numbering = Numbering(blocks: {}, next: 0)
+state scope-places: Numbering = Numbering(blocks: {}, next: 0)
+state part-places: Numbering = Numbering(blocks: {}, next: 0)
+
+fn placed(n: Numbering, keys: [Text], sizes: [Int]) -> Placed =
+  fold p = Placed(numbering: n, at: []) for i in 0..len(keys): placed-one(p, keys[i], sizes[i])
+
+fn placed-one(p: Placed, key: Text, size: Int) -> Placed = match p.numbering.blocks[key] {
+  some(b) if b.size >= size => p with { at: p.at ++ [b.at] }
+  _ => Placed(numbering: Numbering(blocks: p.numbering.blocks ++ {key: Block(at: p.numbering.next, size: size)},
+                                   next: p.numbering.next + size),
+              at: p.at ++ [p.numbering.next])
+}
+
+# Where the modules' own tables land, by path, `keys[i]` for `tables[i]`.
+record Placement { scope-shifts: [Int], symbol-shifts: [Int], symbols: Int, scopes: Int }
+
+fn placement!(keys: [Text], tables: [sym.Table]) -> Placement {
+  let symbols = placed(symbol-places, keys, [sym.symbol-count(t) for t in tables])
+  let scopes = placed(scope-places, keys, [sym.scope-count(t) - 1 for t in tables])
+  symbol-places = symbols.numbering
+  scope-places = scopes.numbering
+  Placement(scope-shifts: scopes.at, symbol-shifts: symbols.at, symbols: symbols.numbering.next, scopes: scopes.numbering.next)
+}
+
+# The symbols linking makes, by what each is for.
+fn made-ids!(keys: [Text]) -> [Int] {
+  let made = placed(symbol-places, ["made " ++ k for k in keys], [1 for k in keys])
+  symbol-places = made.numbering
+  made.at
+}
+
+# Where each module's statements start among the facts' parts, by path; and how many places there are.
+fn part-starts!(keys: [Text], sizes: [Int]) -> [Int] {
+  let parts = placed(part-places, keys, sizes)
+  part-places = parts.numbering
+  parts.at
+}
+
+fn part-places-used() -> Int = part-places.next
 
 # Where an import leads: a file, or an import left for the runtime, named as a node of the graph;
 # and whether what it leads to may have side effects.
@@ -1090,7 +1141,8 @@ fn external?(key: Text) -> Bool = key is "external:" ++ _
 fn graph(runtime: Text, paths: [Text]) -> Graph =
   Graph(modules: [runtime-module(rt-tree, rt, runtime, lay)] ++ [module-at(w, i, ids, lay, parts, wholes) for i in 0..len(w.pre)],
         by-path: ids, order: [0] ++ [i + 1 for i in w.post if not external?(w.pre[i])],
-        entries: [ids[p] ?? (panic "{} was not loaded", p) for p in paths], parts: tables, symbols: lay.symbols)
+        entries: [ids[p] ?? (panic "{} was not loaded", p) for p in paths], parts: tables, symbols: lay.symbols,
+        scopes: lay.scopes, scope-shifts: lay.scope-shifts, symbol-shifts: lay.symbol-shifts)
   where w = depth-first(paths, led-to),
         ids = {w.pre[i]: i + 1 for i in 0..len(w.pre)},
         files = [key for key in w.pre if not external?(key)],
@@ -1101,17 +1153,17 @@ fn graph(runtime: Text, paths: [Text]) -> Graph =
         rt-tree = js.parse(runtime, "<runtime>"),
         rt = sc.analysis(rt-tree, []),
         tables = [rt.table] ++ [loaded(f).scopes for f in files],
-        lay = sym.layout(tables)
+        lay = placement!(["<runtime>"] ++ files, tables)
 
 # The runtime is an ordinary module that nothing makes live unless a part mentions one of its helpers.
-fn runtime-module(tree: Node, rt: sym.Analysis, text: Text, lay: sym.Layout) -> Module =
+fn runtime-module(tree: Node, rt: sym.Analysis, text: Text, lay: Placement) -> Module =
   blank-module(0, "<runtime>", Runtime, tree, rt.root + lay.scope-shifts[0]) with {
     bindings: rt.bindings, symbol-shift: lay.symbol-shifts[0], side-effects: false, base: "runtime", free: rt.free, text: text
   }
 
 # The module the walk reached `i`th: an outside import, or a file, with side effects as the import
 # that first reached it says, or as an entry has them.
-fn module-at(w: Walk, i: Int, ids: {Text:Int}, lay: sym.Layout, parts: {Text:Int}, wholes: {Text:Bool}) -> Module = match w.pre[i] {
+fn module-at(w: Walk, i: Int, ids: {Text:Int}, lay: Placement, parts: {Text:Int}, wholes: {Text:Bool}) -> Module = match w.pre[i] {
   "external:" ++ spec => blank-module(i + 1, spec, External, None(), bundle-scope)
   path => file-module(i + 1, loaded(path), effects, lay.scope-shifts[part], lay.symbol-shifts[part], ids, path in wholes)
     where part = parts[path] ?? (panic "{} has no scopes", path),

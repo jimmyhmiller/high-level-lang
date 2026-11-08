@@ -273,6 +273,87 @@
       (generated-symbol! (mut t) (get scopes i) (get names i)))
     t))
 
+;;; How many scopes a table has.
+(defn scope-count [(t Table)] (-> i64)
+  (len (.scopes t)))
+
+;;; `joined`, with each part at a place of its own: its scopes from `scope-shifts[i]` + 1 and its
+;;; symbols from `symbol-shifts[i]`, in a table of `scopes` scopes and `symbols` symbols whose other
+;;; places are empty (a scope nothing is in, a symbol no scope holds); then the symbols no source
+;;; names at `ids`. So a part keeps its numbers while the others' change.
+(defn joined-at [(parts (ArrayList Table))
+                 (scope-shifts (ArrayList i64))
+                 (symbol-shifts (ArrayList i64))
+                 (scopes i64)
+                 (symbols i64)
+                 (ids (ArrayList i64))
+                 (made-scopes (ArrayList i64))
+                 (names (ArrayList (slice u8)))] (-> Table)
+  (let [(mut t) (table-new)
+        (mut total) symbols]
+    (for id ids (when (>= id total) (set! total (+ id 1))))
+    (new-scope! (mut t) -1)
+    (while (< (len (.scopes t)) (+ scopes 1)) (new-scope! (mut t) -1))
+    (for _ (range 0 total)
+      (push! (mut (.symbols t)) (Symbol :name "" :scope -1 :uses 0 :final "" :pinned false)))
+    (for i (range 0 (len parts))
+      (graft-at! (mut t) (get parts i) 0 (get scope-shifts i) (get symbol-shifts i)))
+    (for i (range 0 (len ids))
+      (let [id (get ids i)
+            scope (get made-scopes i)]
+        (set! (mut (.symbols t)) id
+              (Symbol :name (get names i) :scope scope :uses 0 :final (get names i) :pinned false))
+        (push! (mut (.symbols (elem (mut (.scopes t)) scope))) id)))
+    t))
+
+;;; `graft!`, into places already there: `from`'s scope i at `scope-shift` + i, its symbol s at
+;;; `symbol-shift` + s.
+(defn graft-at! [(t (mut Table)) (from Table) (parent i64) (scope-shift i64) (symbol-shift i64)] (-> void)
+  (for i (range 1 (len (.scopes from)))
+    (let [sc (get (.scopes from) i)
+          (mut names) (names-map)
+          (mut symbols) (ArrayList::new [i64] (malloc-allocator))
+          (mut children) (ArrayList::new [i64] (malloc-allocator))]
+      (let [(mut src) (.names sc)]
+        (for-entries [k v (mut src)]
+                     (set! (mut names) (load k) (+ (load v) symbol-shift))))
+      (for s (.symbols sc) (push! (mut symbols) (+ s symbol-shift)))
+      (for c (.children sc) (push! (mut children) (+ c scope-shift)))
+      (set! (mut (.scopes t)) (+ scope-shift i)
+            (Scope
+              :parent (if (= (.parent sc) 0) parent (+ (.parent sc) scope-shift))
+              :names names
+              :symbols symbols
+              :children children
+              :dynamic (.dynamic sc)))))
+  (for c (.children (get (.scopes from) 0))
+    (push! (mut (.children (elem (mut (.scopes t)) parent))) (+ c scope-shift)))
+  (for i (range 0 (len (.symbols from)))
+    (let [sym (get (.symbols from) i)]
+      (set! (mut (.symbols t)) (+ symbol-shift i)
+            (Symbol
+              :name (.name sym)
+              :scope (if (= (.scope sym) 0) parent (+ (.scope sym) scope-shift))
+              :uses (.uses sym)
+              :final (.final sym)
+              :pinned (.pinned sym)))))
+  (when (.dynamic (get (.scopes from) 0)) (mark-dynamic! (mut t) parent))
+  (for o (.outer from)
+    (match (get (.outer from) o)
+      (Some [n]
+            (let [(mut sym) (get (.symbols t) o)]
+              (set! (.uses sym) (+ (.uses sym) n))
+              (set! (mut (.symbols t)) o sym)))
+      (None [] 0)))
+  (for name (.free from)
+    (match (get (.free from) name)
+      (Some [n]
+            (set! (mut (.free t))
+                  name
+                  (+ (match (get (.free t) name) (Some [m] m) (None [] 0)) n)))
+      (None [] 0)))
+  0)
+
 ;;; A copy of `t` with each of `parts` grafted under `parent` in turn.
 (defn grafted [(t Table) (parts (ArrayList Table)) (parent i64)] (-> Table)
   (let [(mut out) (table-copy t)]
