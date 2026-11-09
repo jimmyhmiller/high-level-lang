@@ -290,9 +290,9 @@ def tp_dev_edits(tp, root, entry, module, original, count):
         for _ in range(count):
             marker = edit(root, module, original)
             t0 = time.perf_counter()
-            deadline = time.time() + 120
+            deadline = time.time() + 30
             while True:
-                if time.time() > deadline: raise RuntimeError("turbopack dev never served the edit")
+                if time.time() > deadline: raise Unserved()
                 try:
                     # Once it is known which chunk holds the module, only that one is asked for.
                     if where is not None and marker in fetch(f"http://127.0.0.1:{port}{where}"): break
@@ -318,17 +318,16 @@ def bench_turbopack(r, name, tp, extra, root, entry, module, original):
     r["one-shot"][name] = [once(plain) for _ in range(runs)]
     r["one-shot --minify"][name] = [once(base) for _ in range(runs)]
     r["watch, first build"][name] = [tp_dev_first(tp, root, entry, []) for _ in range(runs)]
-    # An edit Turbopack leaves out of its output (a package that says it has no side effects lets it
-    # drop a statement made only for its effect) can be waited for for ever: looked for once first.
-    marker = edit(root, module, original)
-    once(plain)
-    seen = any(marker in open(os.path.join(root, "dist", f), errors="replace").read()
-               for f in os.listdir(os.path.join(root, "dist")) if f.endswith(".js"))
-    write(root, module, original)
-    if not seen:
-        return "rebuild not measured: its output leaves out the edit (the package says it has no side effects)"
-    r["watch, rebuild, one edit"][name] = tp_dev_edits(tp, root, entry, module, original, runs)
+    try:
+        r["watch, rebuild, one edit"][name] = tp_dev_edits(tp, root, entry, module, original, runs)
+    except Unserved:
+        # A package that says it has no side effects lets Turbopack drop a statement made only for
+        # its effect: an edit it never serves.
+        return "rebuild not measured: dev never served the edit (the package says it has no side effects)"
     return "done"
+
+class Unserved(Exception):
+    pass
 
 # ---------------------------------------------------------------- the runs and the tables
 
