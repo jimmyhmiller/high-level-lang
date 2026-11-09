@@ -9692,13 +9692,12 @@
                                  (set! (mut (.regions s)) key answer-region))
                                (HashMap::remove! (mut (.lazy s)) key)
                                (rt/spin-unlock! word))
-                            `(let [key-region (rt/answer-region-open! ~(cat "key " name))
+                            `(let [entered (rt/keys-region-enter! (field s keys-region) word)
                                    ~@binds
-                                   key-closed (rt/answer-region-close! key-region)
+                                   left (rt/keys-region-leave! entered)
                                    answer-region (rt/answer-region-open! ~name)
                                    answer ~(dec-code (mut k) (.ret f))
                                    closed (rt/answer-region-close! answer-region)]
-                               (rt/region-ref-id! answer-region key-region)
                                (rt/reader-return! r)
                                (rt/spin-lock! word)
                                (set! (mut (.args s))
@@ -9708,8 +9707,6 @@
                                           `(~args-ty ~@inits)))
                                (set! (mut (.table s)) key answer)
                                (when (!= answer-region 0)
-                                 (match (get (.key-regions s) key) (Some [old] (rt/region-release-id! old)) (None [] 0))
-                                 (set! (mut (.key-regions s)) key key-region)
                                  (match (get (.regions s) key) (Some [old] (rt/region-release-id! old)) (None [] 0))
                                  (set! (mut (.regions s)) key answer-region))
                                (HashMap::remove! (mut (.lazy s)) key)
@@ -10144,29 +10141,25 @@
                (last-key ~(coil-type (mut k) (memo-key-type f)))
                (has-last bool)
                ;; While the run reclaims memory: the region each answer was made in, which the
-               ;; table holds; and the region each key's arguments were copied into, which the
-               ;; store holds for as long as it keeps the key.
+               ;; table holds; and the region its keys' arguments are copied into, which lasts as
+               ;; long as the store, as its keys do.
                (regions (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
-               (key-regions (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))]))
+               (keys-region i64)]))
     (emit! (mut out)
-           `(defstruct ~(sym (cat "MemoOwned--" name)) [(args ~args-ty) (region i64)]))
-    ;; A key's arguments, the store's own: copied into a region of the key's own the first time the
-    ;; key is computed, so an answer made from them points at nothing its caller made.
+           `(defstruct ~(sym (cat "MemoOwned--" name)) [(args ~args-ty)]))
+    ;; A key's arguments, the store's own: copied into the store's region the first time the key is
+    ;; computed, so an answer made from them points at nothing its caller made.
     (emit! (mut out)
            `(defn ~(sym (cat "memo-own--" name)) [(s (ptr ~store)) (key ~(coil-type (mut k) (memo-key-type f))) ~@params]
               (-> ~(sym (cat "MemoOwned--" name)))
               (let [word (cast (ptr i64) s)]
                 (rt/spin-lock! word)
-                (let [had (get (.key-regions s) key)
-                      known (get (.args s) key)]
+                (let [known (get (.args s) key)]
                   (rt/spin-unlock! word)
-                  (match had
-                    (Some [r]
-                          (match known
-                            (Some [a] (~(sym (cat "MemoOwned--" name)) :args a :region r))
-                            (None [] (panic "memo fn {} kept a key with no arguments" ~name))))
+                  (match known
+                    (Some [a] (~(sym (cat "MemoOwned--" name)) :args a))
                     (None []
-                          (let [r (rt/answer-region-open! ~(cat "key " name))
+                          (let [entered (rt/keys-region-enter! (field s keys-region) word)
                                 a ~(if (= (len (.params f)) 0)
                                        `(zeroed ~args-ty)
                                        `(~args-ty ~@(let [(mut inits) (primitive/code-list-new)]
@@ -10176,12 +10169,11 @@
                                                         (push! (mut inits)
                                                                (own-code (mut k) (.ty (get (.params f) i)) (memo-arg i))))
                                                       inits)))]
-                            (rt/answer-region-close! r)
+                            (rt/keys-region-leave! entered)
                             (rt/spin-lock! word)
-                            (set! (mut (.key-regions s)) key r)
                             (set! (mut (.args s)) key a)
                             (rt/spin-unlock! word)
-                            (~(sym (cat "MemoOwned--" name)) :args a :region r))))))))
+                            (~(sym (cat "MemoOwned--" name)) :args a))))))))
     ;; The last answer made, when there is one and the cache or the table still holds it.
     (emit! (mut out)
            `(defn ~(sym (cat "memo-last--" name)) [(s (ptr ~store))]
@@ -10307,7 +10299,7 @@
                           ~(runtime-map (mut k)
                                     (cat3 "{" (memo-key-type f) ":Int}")))
                     (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type f)))
-                    (set! (.key-regions s) ~(runtime-map (mut k) (memo-busy-type f)))
+                    (set! (.keys-region s) 0)
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
                   (rt/init-unlock!)
@@ -10557,15 +10549,13 @@
                                                           (~(sym (cat "MemoOwned--" name))
                                                             :args ~(if (= (len (.params f)) 0)
                                                                        `(zeroed ~args-ty)
-                                                                       `(~args-ty ~@arg-inits))
-                                                            :region 0))
+                                                                       `(~args-ty ~@arg-inits))))
                                                     ~@(let [(mut rebinds) (primitive/code-list-new)]
                                                         (for i (range 0 (len (.params f)))
                                                           (push! (mut rebinds) (memo-arg i))
                                                           (push! (mut rebinds)
                                                                  `(~(primitive/code-symbol "." (cat "memo-arg-" (rt/num-text i))) (.args owned))))
                                                         rebinds)
-                                                    key-region (.region owned)
                                                     (mut fresh-region) 0
                                                     (mut kept-old) false
                                                     made
@@ -10603,7 +10593,6 @@
                                                                                 same
                                                                                   ~same-now]
                                                                             (set! fresh-region region)
-                                                                            (rt/region-ref-id! region key-region)
                                                                             (when same (set! kept-old true))
                                                                             (if (= check
                                                                                    0)
@@ -10642,7 +10631,6 @@
                                                                         ~made-code
                                                                       closed (rt/answer-region-close! region)]
                                                                   (set! fresh-region region)
-                                                                  (rt/region-ref-id! region key-region)
                                                                   (when tracking
                                                                     (if (= check
                                                                            0)
