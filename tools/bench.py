@@ -95,22 +95,55 @@ def edit(root, module, original):
     write(root, module, f'console.log("{marker}");\n' + original)
     return marker
 
-def usage(err):
-    instr = re.search(r"(\d+)\s+instructions retired", err)
-    peak = re.search(r"(\d+)\s+peak memory footprint", err)
-    return (int(instr.group(1)) if instr else None), (int(peak.group(1)) if peak else None)
+MAC = sys.platform == "darwin"
+PERF_OUT = os.path.join(WORK, ".perf")
+
+def measuring(cmd):
+    """`cmd` run so that its instructions and peak memory can be read when it ends: under
+    /usr/bin/time -l on macOS; under perf stat on Linux, its peak memory from wait4."""
+    if MAC: return ["/usr/bin/time", "-l"] + cmd
+    return ["perf", "stat", "-x,", "-e", "instructions", "-o", PERF_OUT, "--"] + cmd
+
+def usage_of(err, ru):
+    """Instructions and peak bytes: from /usr/bin/time -l's report on macOS, from perf stat's and
+    the process's rusage on Linux."""
+    if MAC:
+        instr = re.search(r"(\d+)\s+instructions retired", err)
+        peak = re.search(r"(\d+)\s+peak memory footprint", err)
+        return (int(instr.group(1)) if instr else None), (int(peak.group(1)) if peak else None)
+    instr = None
+    for line in open(PERF_OUT).read().splitlines():
+        f = line.split(",")
+        if len(f) > 2 and f[2].startswith("instructions") and f[0].isdigit(): instr = int(f[0])
+    return instr, ru.ru_maxrss * 1024
+
+def reap(p):
+    _, status, ru = os.wait4(p.pid, 0)
+    p.returncode = os.waitstatus_to_exitcode(status)
+    return ru
+
+def finished(p, err):
+    """Wait for a process started with `measuring`, whose stderr has been read: its exit code,
+    instructions, peak bytes."""
+    ru = reap(p)
+    instr, peak = usage_of(err, ru)
+    return p.returncode, instr, peak
 
 def timed(cmd, root):
     """A fresh process, from outside: wall seconds, instructions, peak bytes."""
     t0 = time.perf_counter()
-    p = subprocess.run(["/usr/bin/time", "-l"] + cmd, cwd=root, capture_output=True, text=True)
+    with open(os.path.join(WORK, ".out"), "w") as o, open(os.path.join(WORK, ".err"), "w") as e:
+        p = subprocess.Popen(measuring(cmd), cwd=root, stdout=o, stderr=e)
+        ru = reap(p)
     wall = time.perf_counter() - t0
-    if p.returncode != 0: raise RuntimeError(f"{cmd}: {(p.stdout + p.stderr)[-1500:]}")
-    instr, peak = usage(p.stderr)
+    out, err = open(os.path.join(WORK, ".out")).read(), open(os.path.join(WORK, ".err")).read()
+    if p.returncode != 0: raise RuntimeError(f"{cmd}: {(out + err)[-1500:]}")
+    instr, peak = usage_of(err, ru)
     return {"wall": wall, "instr": instr, "peak": peak}
 
-def kill_child(time_pid):
-    for c in subprocess.run(["pgrep", "-P", str(time_pid)], capture_output=True, text=True).stdout.split():
+def kill_child(pid):
+    """The command a `measuring` wrapper runs, stopped, so the wrapper reports and ends."""
+    for c in subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split():
         os.kill(int(c), signal.SIGKILL)
 
 # ---------------------------------------------------------------- this bundler
@@ -121,7 +154,7 @@ def esb_watch_first(esb, root, entry, flags, extra):
     """A watcher up to its first build (and its save, when it saves): wall seconds to the build,
     the build's own ms, the answers it computed, the process's instructions and peak memory."""
     t0 = time.perf_counter()
-    p = subprocess.Popen(["/usr/bin/time", "-l", esb, entry, "--watch", "--timing", "--watch-interval=5", "--outfile=out/out.js"] + flags + extra, cwd=root,
+    p = subprocess.Popen(measuring([esb, entry, "--watch", "--timing", "--watch-interval=5", "--outfile=out/out.js"] + flags + extra), cwd=root,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     wall, ms, answers, said = None, None, None, []
     deadline = time.time() + 300
@@ -133,9 +166,9 @@ def esb_watch_first(esb, root, entry, flags, extra):
         if ms is not None and (any(s in line for s in SAVED) or "--no-cache" in flags): break
         if time.time() > deadline: break
     kill_child(p.pid)
-    err = p.stderr.read(); p.wait()
+    err = p.stderr.read()
+    _, instr, peak = finished(p, err)
     if ms is None: raise RuntimeError(f"{esb}: no first build:\n" + "".join(said)[-1500:] + err[-1500:])
-    instr, peak = usage(err)
     return {"wall": wall, "ms": ms, "answers": answers, "instr": instr, "peak": peak}
 
 def esb_watch_edits(esb, root, entry, module, original, count, extra):
@@ -225,8 +258,8 @@ def chunks_of(port):
 
 def tp_dev(tp, root, entry, flags):
     port = free_port()
-    p = subprocess.Popen(["/usr/bin/time", "-l", tp, "dev", entry, "--eager-compile", "--no-open", "-p", str(port),
-                          "-H", "127.0.0.1"] + flags, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen(measuring([tp, "dev", entry, "--eager-compile", "--no-open", "-p", str(port),
+                                    "-H", "127.0.0.1"] + flags), cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     return p, port
 
 def tp_ready(port, deadline):
@@ -245,8 +278,8 @@ def tp_dev_first(tp, root, entry, flags):
     tp_ready(port, time.time() + 300)
     wall = time.perf_counter() - t0
     kill_child(p.pid)
-    err = p.stderr.read(); p.wait()
-    instr, peak = usage(err)
+    err = p.stderr.read()
+    _, instr, peak = finished(p, err)
     return {"wall": wall, "instr": instr, "peak": peak}
 
 def tp_dev_edits(tp, root, entry, module, original, count):
@@ -273,7 +306,7 @@ def tp_dev_edits(tp, root, entry, module, original, count):
             results.append({"ms": (time.perf_counter() - t0) * 1000})
         return results
     finally:
-        kill_child(p.pid); p.wait()
+        kill_child(p.pid); p.stderr.read(); finished(p, "")
 
 def bench_turbopack(r, name, tp, extra, root, entry, module, original):
     base = [tp, "build", entry, "--target", "browser", "--no-sourcemap"]
@@ -328,7 +361,8 @@ def cell(samples):
     if "answers" in s0: parts.append(f"{med([s['answers'] for s in samples]):.0f} answers")
     return " · ".join(parts)
 
-load = subprocess.run(["sysctl", "-n", "vm.loadavg"], capture_output=True, text=True).stdout.strip()
+load = (subprocess.run(["sysctl", "-n", "vm.loadavg"], capture_output=True, text=True).stdout.strip() if MAC
+        else open("/proc/loadavg").read().split(" ")[:3])
 lines = [f"# Build times, {time.strftime('%Y-%m-%d %H:%M')}", "",
          f"Median of {runs} runs; least–most in brackets. G: instructions retired, all threads (load-independent). "
          f"MB: peak memory. Load average at the end: {load}.", ""]
