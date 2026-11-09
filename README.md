@@ -462,6 +462,46 @@ changed are sent; `hmr.facts` (Datalog, 4 rules) finds which modules run again, 
 that call `import.meta.hot.accept()`, and reloads when an entry that does not accept changed.
 `import.meta.hot.dispose` and `hot.data` carry state across a replacement.
 
+### Memory while watching
+
+A run that builds once keeps every value until it exits. A watcher lets go of what its builds no
+longer need, and nothing in `src/bundle` says how: every value lives in a *region* (`hl.rt`), memory
+taken in chunks and let go whole, and each region has an owner the incremental machinery already
+knows.
+
+- **An answer** is made in a region of its own, which its memo table holds. Made again, the new
+  region replaces the old; made again the same (`cutoff equal`), the new one is let go and the old
+  answer stays; evicted (`lean`, `generational`), its region goes with it.
+- **Who uses a value holds its region.** Asking for an answer, or reading a setting, makes the
+  region being made in hold the region the value is in, so an old answer lives as long as anything
+  made from it.
+- **A memo's arguments** are copied, the first time a key is computed, into a region of the store's,
+  and the answer is computed from the copies, so no answer points into what its caller made.
+- **A setting's value** (`with`, or given for good) is made in a region the setting holds while it is
+  given and while it is held for the next build to compare against.
+- **A relation** is a region of its own, since it is indexed after it is made, from any thread. A
+  database brought up to date from the last (`update by`) holds the relations it shares with the
+  last and its own new ones, not the last, which is let go once replaced.
+- **The top of the program** (the watch loop, outside any memo) gives each turn of a statement loop
+  a region, let go when the next turn starts; a `var` from before the loop that a turn gives a value
+  holds a copy in a region of its own, and a loop with a `return` or that changes something from
+  before it in place keeps its turns in the region around it.
+- **The runtime's own tables** (the dependency graph, interned names, places, versions, watched
+  paths) keep their own copies of the texts they keep, and free what they replace.
+
+Regions nothing holds are let go at the end of each build, once the last save of the cache is done,
+when no value on any stack can be in one; the cache's writer, which knows values by where they are,
+forgets those addresses. Big chunks are pages of their own, given back to the system. One-shot
+builds use the thread's own region, as before.
+
+`tools/memory-check.py` runs a watcher through a hundred edits of two kinds, each making answers it
+never made before or changing what linking derives, and checks that its regions hold what they held
+after the twentieth build and that its footprint stays within 3%. `HL_REGION_CHECK=1` maps every
+chunk and makes it unreadable once let go, so a value read after its region was let go stops the
+program where it is read; the watch, HMR, cache and mechanism checks all pass under it.
+`HL_REGION_TRACE=1` prints what each build's end let go and what is held, and `HL_REGION_LABELS=1`
+which functions' answers hold the most.
+
 `tools/watch-check.py` checks every rebuild byte for byte against a fresh process, across edits to
 a module, to the entry, a new file, a `package.json`, and a write that changes nothing.
 `tools/hmr-check.py` runs a served bundle in Node and checks updates, reloads, kept state and
