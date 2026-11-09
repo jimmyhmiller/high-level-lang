@@ -437,7 +437,9 @@
 
 (defn parse-file [(k (mut Comp)) (src (slice u8)) (path (slice u8))] (-> g/Node)
   (match (g/parse-result src path 0)
-    (Ok [t] (with-keeps (mut k) (with-accumulators (with-everywhere src path t)) src path))
+    ;; Kept first: a kept function is a memo, which a caller asks, never split into a twin that adds
+    ;; its answer to the caller's list (`with-accumulators`), which would go round the memo.
+    (Ok [t] (with-accumulators (with-keeps (mut k) (with-everywhere src path t) src path)))
     (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
 
 ;; ---------------------------------------------------------------- what is kept
@@ -8862,14 +8864,23 @@
                     word (cast (ptr i64) s)
                     prepared (~(sym (cat "memo-prepare--" name)) s)
                     text (rt/dep-memo-key id)
-                    key ~(if (= (memo-key-type f) "Int") `(rt/parse-int text) `text)]
-                (~(sym (cat "memo-fault--" name)) s key)
-                (rt/spin-lock! word)
-                (let [found (get (.args s) key)]
-                  (rt/spin-unlock! word)
-                  (match found
-                    (Some [a] (do (~entry ~@stored) 0))
-                    (None [] (panic "memo fn {} has no arguments for {}" ~name text)))))))
+                    key ~(if (= (memo-key-type f) "Int") `(rt/parse-int text) `text)
+                    unread (do (rt/spin-lock! word)
+                               (let [l (match (get (.lazy s) key) (Some [_] true) (None [] false))]
+                                 (rt/spin-unlock! word)
+                                 l))]
+                ;; Checking an answer asks only whether it is current: one the cache holds and this
+                ;; run has not read, all of whose inputs are unchanged, is, and stays unread.
+                (if (and unread (or (rt/dep-current-id? id) (rt/dep-still-id? id)))
+                    0
+                    (do
+                      (~(sym (cat "memo-fault--" name)) s key)
+                      (rt/spin-lock! word)
+                      (let [found (get (.args s) key)]
+                        (rt/spin-unlock! word)
+                        (match found
+                          (Some [a] (do (~entry ~@stored) 0))
+                          (None [] (panic "memo fn {} has no arguments for {}" ~name text)))))))))
     ;; Its answers forgotten, when a setting it reads is given again while nothing is tracked.
     (emit! (mut out)
            `(defn ~(sym (cat "memo-forget--" name)) [] (-> void)

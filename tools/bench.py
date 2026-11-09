@@ -14,7 +14,10 @@
 # Tools, as NAME=KIND:PATH (KIND esb when left out):
 #   esb        this bundler. Fresh processes measured from outside (/usr/bin/time -l: wall time,
 #              instructions retired, peak memory). --watch: the build's own time and how many memo
-#              answers it computed; the first build also from outside, up to when it is done.
+#              answers it computed; the first build also from outside, up to when it is done. The
+#              watcher looks for edits every 5 ms: after the default 100 ms of sleep the same
+#              rebuild takes two to three times as long on a busy machine (a CPU gone cold), which
+#              esbuild's rebuild(), called at once, and Turbopack's file events never wait out.
 #   esbuild    PATH is the esbuild package's directory. One-shot runs its command line. Watch is
 #              its incremental API: a context's first build, then ctx.rebuild() after each edit,
 #              timed in the process (tools/bench-esbuild.mjs). It has no persistent cache.
@@ -118,7 +121,7 @@ def esb_watch_first(esb, root, entry, flags, extra):
     """A watcher up to its first build (and its save, when it saves): wall seconds to the build,
     the build's own ms, the answers it computed, the process's instructions and peak memory."""
     t0 = time.perf_counter()
-    p = subprocess.Popen(["/usr/bin/time", "-l", esb, entry, "--watch", "--timing", "--outfile=out/out.js"] + flags + extra, cwd=root,
+    p = subprocess.Popen(["/usr/bin/time", "-l", esb, entry, "--watch", "--timing", "--watch-interval=5", "--outfile=out/out.js"] + flags + extra, cwd=root,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     wall, ms, answers, said = None, None, None, []
     deadline = time.time() + 300
@@ -137,7 +140,7 @@ def esb_watch_first(esb, root, entry, flags, extra):
 
 def esb_watch_edits(esb, root, entry, module, original, count, extra):
     """One watcher, `count` edits one after another: each rebuild's own ms and answers."""
-    p = subprocess.Popen([esb, entry, "--watch", "--timing", "--outfile=out/out.js"] + extra, cwd=root, stdout=subprocess.PIPE,
+    p = subprocess.Popen([esb, entry, "--watch", "--timing", "--watch-interval=5", "--outfile=out/out.js"] + extra, cwd=root, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
     results, builds, said = [], 0, []
     deadline = time.time() + 600
