@@ -10,7 +10,7 @@
 # regions alive, and their bytes) and its resident memory. The regions must hold no more than
 # they did after build WARM, give or take 2%; the process's memory (its footprint on macOS, its
 # resident set elsewhere) may grow by at most 3% or 4 MB.
-#   usage: memory-check.py ESB [APP...] [--edits=N] [--warm=N]       (APP: zod, rx, datefns, three, …)
+#   usage: memory-check.py ESB [APP...] [--edits=N] [--warm=N]   (APP: zod, rx, datefns, three, …, manyzod: twelve zods)
 import json, os, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guard
@@ -45,9 +45,20 @@ def resident(pid):
 def prepare(app):
     if os.path.exists(WORK): shutil.rmtree(WORK)
     os.makedirs(os.path.join(WORK, "out"))
-    shutil.copytree(os.path.join(TESTS, "apps"), os.path.join(WORK, "apps"), symlinks=True)
-    shutil.copytree(os.path.join(TESTS, "node_modules"), os.path.join(WORK, "node_modules"), symlinks=True)
-    entry = next(os.path.join("apps", f) for f in sorted(os.listdir(os.path.join(WORK, "apps"))) if f.split(".")[0] == app)
+    if app == "manyzod":
+        # Twelve copies of zod, each its own package.
+        os.makedirs(os.path.join(WORK, "node_modules"))
+        for i in range(1, 13):
+            shutil.copytree(os.path.join(TESTS, "node_modules", "zod"), os.path.join(WORK, "node_modules", f"zod{i}"), symlinks=True)
+        os.makedirs(os.path.join(WORK, "apps"))
+        with open(os.path.join(WORK, "apps", "manyzod.js"), "w") as f:
+            for i in range(1, 13):
+                f.write(f'import {{ z as z{i} }} from "zod{i}"; console.log(z{i}.string().parse("a{i}"));\n')
+        entry = "apps/manyzod.js"
+    else:
+        shutil.copytree(os.path.join(TESTS, "apps"), os.path.join(WORK, "apps"), symlinks=True)
+        shutil.copytree(os.path.join(TESTS, "node_modules"), os.path.join(WORK, "node_modules"), symlinks=True)
+        entry = next(os.path.join("apps", f) for f in sorted(os.listdir(os.path.join(WORK, "apps"))) if f.split(".")[0] == app)
     p = subprocess.run([ESB, entry, "--sourcemap", "--outfile=out/map.js"], cwd=WORK, capture_output=True, text=True)
     if p.returncode != 0: sys.exit(f"{app}: the build for its source map failed: {p.stderr[-1000:]}")
     sources = [s for s in json.load(open(os.path.join(WORK, "out", "map.js.map")))["sources"] if "node_modules/" in s]
