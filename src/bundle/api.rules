@@ -54,16 +54,14 @@ record DefineText { key: Text, value: Text }
 record Plan {
   name: Text,
   load-threads: Int,
-  optimize-parts: Int,
   optimize-threads: Int,
-  print-parts: Int,
   print-threads: Int,
   facts-threads: Int,
   emit-threads: Int
 }
 
 fn serial-plan() -> Plan =
-  Plan(name: "serial", load-threads: 1, optimize-parts: 1, optimize-threads: 1, print-parts: 1, print-threads: 1, facts-threads: 1, emit-threads: 1)
+  Plan(name: "serial", load-threads: 1, optimize-threads: 1, print-threads: 1, facts-threads: 1, emit-threads: 1)
 
 record Options {
   entry: Text,
@@ -176,22 +174,23 @@ fn target-year(name: Text) -> Int? = match name {
 fn names-in-use() -> [Text] =
   nm.finals ++ [f for mo in m.modules for f in mo.free] ++ nm.keywords
 
-fn for-target(o: Options, p: Node) -> Node = match o.charset-ascii {
-  true => in-parts(o, lowered, fin.ascii-only, ascii-run)
-  false => lowered
-} where dropped = match o.drop-console or o.drop-debugger {
-          true => without-dropped(o, p)
-          false => p
-        },
-        lowered = match o.target {
-          t if t >= lower.no-lowering => dropped
-          t => lower.run(dropped, t, names-in-use(), o.minify-identifiers)
-        }
+# What is dropped dropped, lowered for the target, and made ASCII: what code splitting does to each
+# chunk's program, whole.
+fn for-target(o: Options, p: Node) -> Node = ascii-of(o, lowered-of(o, dropped-of(o, p)))
 
-# `f` on each part of the program at once.
-fn in-parts(o: Options, p: Node, f: Fn(Node)->Node, run: Fn([Node])->[Node]) -> Node = match o.plan.optimize-parts {
-  n if n <= 1 => in-runs(p, run)
-  n => in-pieces(p, n, o.plan.optimize-threads, f, false)
+fn dropped-of(o: Options, p: Node) -> Node = match o.drop-console or o.drop-debugger {
+  true => without-dropped(o, p)
+  false => p
+}
+
+fn lowered-of(o: Options, p: Node) -> Node = match o.target {
+  t if t >= lower.no-lowering => p
+  t => lower.run(p, t, names-in-use(), o.minify-identifiers)
+}
+
+fn ascii-of(o: Options, p: Node) -> Node = match o.charset-ascii {
+  true => fin.ascii-only(p)
+  false => p
 }
 
 # `--drop:console` and `--drop:debugger`. Names are final here, and every free name was kept free, so
@@ -216,12 +215,6 @@ fn clear-words() -> [Text] = []
 
 # A define's value is a JavaScript expression in text: `false`, `"production"`, `1`.
 fn define-value(text: Text) -> Node = js.parse(text ++ ";", "<define>").body.kids[0].expr
-
-fn program-plus(p: Node, s: Node) -> Node = p with { body: List(p.body.kids ++ [s]...) }
-
-# An entry that is itself wrapped only runs if something calls it. A format that exports the entry
-# calls CommonJS for the value it exports.
-fn run-entry(p: Node, f: Format) -> Node = fold whole = p for s in entry-calls(f): program-plus(program-plus(whole, Flag()), s)
 
 # The call that runs the entry, when it must be called: its own group, after the modules'.
 fn entry-calls(f: Format) -> [Node] = match m.modules[m.entry] {
@@ -262,12 +255,9 @@ fn exported(name: Text, s: Int) -> Exported = match e.symbol-read(s) {
 # source map positions.
 record Printed { text: Text, base: Int, marks: [Mark] }
 
-fn printed(o: Options, p: Node, prefix: Text, suffix: Text) -> Printed =
-  Printed(text: prefix ++ r.text ++ suffix, base: len(prefix), marks: r.marks) where r = rendered-in-parts(o, p)
 
-# ---------------------------------------------------------------- work in parts
+# ---------------------------------------------------------------- work in runs
 
-# A program's statements in `n` runs of about the same length, each a program of its own.
 # Whether no rule joins this statement to the one after it: the optimiser merges a statement into
 # its neighbour only when it is an expression, a `var`, `let` or `const`, or an `if`.
 fn closed?(s: Node) -> Bool = match s {
@@ -277,187 +267,12 @@ fn closed?(s: Node) -> Bool = match s {
   _ => false
 }
 
-# How much work a statement is, near enough: its length in the source, or one when it was made.
-fn weight(s: Node) -> Int = max(1, s.hi - s.lo)
-
-# The same for a node the build made around source, such as CommonJS's wrapper: its children's.
-fn mass(n: Node) -> Int = match n.hi - n.lo {
-  size if size > 0 => size
-  _ => sum k in n.kids: mass(k)
-}
-
-# Statements cut into about `n` runs of about equal weight, each cut just after a declaration, so
-# the runs optimise as the whole list would. Fewer when there are not such places enough.
-fn runs-of(stmts: [Node], n: Int) -> [[Node]] = match stmts {
-  _ if n <= 1 or len(stmts) <= 1 => [stmts]
-  _ => [stmts[ends[i]..ends[i + 1]] for i in 0..len(cuts)]
-    where before = [0] ++ (scan w = 0 for s in stmts: w + weight(s)),
-          total = last(before),
-          # Each cut is the first after the last at which its share of the weight is reached, after
-          # a statement that closes.
-          cuts = fold cs = [0] for i in 1..n:
-            cs ++ [j for j in first k in last(cs) + 1..len(stmts) if before[k] >= total * i / n and closed?(stmts[k - 1]): k],
-          ends = cuts ++ [len(stmts)]
-}
-
-# A program's statements in runs that stay put from one build to the next: each ends after a
-# statement that closes, where cutting changes nothing the optimiser does (see `closed?`), so an
-# edit changes only the runs it touches. Done in one part, each run is minified, folded, made ASCII
-# and printed apart.
+# A program's statements in runs, each ending after a statement that closes (see `closed?`): what
+# is done to a run is what would be done to it in the whole, and the runs are done at once.
 fn stable-runs(stmts: [Node]) -> [[Node]] = [stmts[ends[i]..ends[i + 1]] for i in 0..len(ends) - 1]
   where ends = [0] ++ [k + 1 for k in 0..len(stmts) if closed?(stmts[k]) and k + 1 < len(stmts)] ++ [len(stmts)]
 
-fn in-runs(p: Node, f: Fn([Node])->[Node]) -> Node = p with { body: List([s for r in stable-runs(p.body.kids) for s in f(r)]...) }
-
-fn optimized-run(stmts: [Node]) -> [Node] = default-optimize(program-of(None(), stmts)).body.kids
-fn folded-run(stmts: [Node]) -> [Node] = fold.run(program-of(None(), stmts)).body.kids
-fn ascii-run(stmts: [Node]) -> [Node] = fin.ascii-only(program-of(None(), stmts)).body.kids
-
-fn rendered-run(hashbang: Node, stmts: [Node], pretty: Bool, maps: Bool) -> Rendered =
-  js.render-tracked(program-of(hashbang, stmts), pretty, maps)
-
-# A program cut into runs of its statements, each a program of its own.
-fn parts-of(p: Node, n: Int) -> [Node] = match runs-of(p.body.kids, n) {
-  [_] => [p]
-  runs => [program-of(match i { 0 => p.hashbang  _ => None() }, runs[i]) for i in 0..len(runs)]
-}
-
 fn program-of(hashbang: Node, stmts: [Node]) -> Node = Program(hashbang, List(stmts...))
-
-fn joined(p: Node, parts: [Node]) -> Node = p with { body: List([s for part in parts for s in part.body.kids]...) }
-
-# ---------------------------------------------------------------- bodies in parts
-
-# A CommonJS module is one statement, its wrapper, and so is a library inside one function: the
-# work is in a single function body. Such a body is taken out of its statement, which keeps a hole,
-# and cut into runs as a program is; the runs fill the hole again once they are done.
-record Hole { at: Int, stmts: [Node] }
-record Hollowed { shell: Node, holes: [Hole], total: Int }
-record Taken { node: Node, stmts: [Node] }
-
-# A hole's mark: an identifier no source can spell, which every pass leaves be and prints as it is.
-fn hole-name(at: Int) -> Text = byte-text(1) ++ "hole" ++ int-text(at) ++ byte-text(1)
-
-fn hole-mark(at: Int) -> Node = ExprStmt(Ident(hole-name(at)) with { lo: -1, hi: -1 }) with { lo: -1, hi: -1 }
-
-# Each statement heavier than a part's share gives up the body most of it is in, when that body
-# can be cut.
-fn hollowed(p: Node, n: Int) -> Hollowed =
-  Hollowed(shell: p with { body: List([taken-or(takes[i], stmts[i]) for i in 0..len(stmts)]...) },
-           holes: [Hole(at: i, stmts: t.stmts) for i in 0..len(stmts) if let some(t) = takes[i]],
-           total: total)
-  where stmts = p.body.kids,
-        weights = [max(1, mass(s)) for s in stmts],
-        total = sum w in weights: w,
-        takes = [heavy-taken(stmts[i], i, weights[i] * n > total, total, n) for i in 0..len(stmts)]
-
-fn heavy-taken(s: Node, i: Int, heavy: Bool, total: Int, n: Int) -> Taken? = match heavy {
-  true => cut-body(taken(s, hole-mark(i)), total, n)
-  false => none
-}
-
-fn cut-body(t: Taken?, total: Int, n: Int) -> Taken? = match t {
-  some(x) if len(runs-of(x.stmts, share(x.stmts, total, n))) > 1 => t
-  _ => none
-}
-
-# How many parts a run of statements gets of `n` for all `total`.
-fn share(stmts: [Node], total: Int, n: Int) -> Int = max(1, n * (sum s in stmts: max(1, mass(s))) / total)
-
-fn taken-or(t: Taken?, s: Node) -> Node = match t {
-  some(x) => x.node
-  none => s
-}
-
-# The deepest function body holding nearly all of a node's work, swapped for `mark`.
-fn taken(n: Node, mark: Node) -> Taken? = match n {
-  FuncBody(List(ss...)) => match taken-below(n, mark), ss {
-    some(t), _ => some(t)
-    none, [_, _, ...] => some(Taken(node: n with { stmts: n.stmts with { kids: [mark] } }, stmts: ss))
-    none, _ => none
-  }
-  _ => taken-below(n, mark)
-}
-
-# Through the child that holds nearly all of a node's work, if one does.
-fn taken-below(n: Node, mark: Node) -> Taken? =
-  first i in 0..len(n.kids) if mass(n.kids[i]) * 10 >= mass(n) * 9 for t in taken(n.kids[i], mark):
-    Taken(node: n with { kids: [n.kids[0..i]..., t.node, n.kids[i + 1..len(n.kids)]...] }, stmts: t.stmts)
-
-# A hole filled with its body's statements.
-everywhere fn filled(n: Node, bodies: {Text:[Node]}) -> Node = match n {
-  FuncBody(List(ExprStmt(Ident(x)))) if x in bodies => n with { stmts: n.stmts with { kids: bodies[x] ?? panic "lost a body" } }
-}
-
-# A body's runs, as many as its share of the work.
-fn body-parts(hole: Hole, total: Int, n: Int) -> [Node] =
-  [program-of(None(), r) for r in runs-of(hole.stmts, share(hole.stmts, total, n))]
-
-# Where each body's parts start among all the parts, the shell's first; and where the last ends.
-fn body-starts(shell-parts: Int, bodies: [[Node]]) -> [Int] = [shell-parts] ++ (scan at = shell-parts for b in bodies: at + len(b))
-
-# Whether a rule for a function body's end would have changed the body these statements end: a
-# `return;` last, or an `if (c) return;` with anything after it. Then the body is done whole.
-record Ends { bare: Bool, early: Bool, early-last: Bool }
-
-fn ends-of(ss: [Node]) -> Ends =
-  Ends(bare: len(ss) > 0 and last(ss) is Return(None()),
-       early: any s in ss[0..max(0, len(ss) - 1)]: early-return?(s),
-       early-last: len(ss) > 0 and early-return?(last(ss)))
-
-fn early-return?(s: Node) -> Bool = s is If(_, Return(None()), None())
-
-fn end-changed?(es: [Ends]) -> Bool =
-  len(es) > 0 and ((any e in es: e.early) or (any k in 0..len(es) - 1: es[k].early-last) or last(es).bare)
-
-# `f` of each part at once, the program's runs and its bodies' runs, put back together. When `f`
-# minifies and a body's end would have changed, all of it is done in top-level parts instead.
-fn in-pieces(p: Node, n: Int, threads: Int, f: Fn(Node)->Node, minifying: Bool) -> Node = match hollowed(p, n) {
-  h if len(h.holes) == 0 => joined(p, heaviest-first(parts-of(p, n), f, threads))
-  h => match minifying and (any b in made: end-changed?([ends-of(b)])) {
-    true => joined(p, heaviest-first(parts-of(p, n), f, threads))
-    false => filled(joined(h.shell, done[0..len(shell-parts)]), {hole-name(h.holes[k].at): made[k] for k in 0..len(made)})
-  }
-    where shell-parts = parts-of(h.shell, n),
-          bodies = [body-parts(hole, h.total, n) for hole in h.holes],
-          done = heaviest-first(shell-parts ++ [x for b in bodies for x in b], f, threads),
-          starts = body-starts(len(shell-parts), bodies),
-          made = [[s for d in done[starts[k]..starts[k + 1]] for s in d.body.kids] for k in 0..len(bodies)]
-}
-
-# The optimiser on each part at once. Parts end after declarations, which nothing merges with
-# what follows, so this is the program the optimiser would make of the whole. A spec's own
-# optimiser is given top-level parts only: what it does to a body with a hole is its own.
-fn optimized(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
-  n if n <= 1 and o.has-optimize => o.optimize(p)
-  n if n <= 1 => in-runs(p, optimized-run)
-  n if o.has-optimize => joined(p, heaviest-first(parts-of(p, n), o.optimize, o.plan.optimize-threads))
-  n => in-pieces(p, n, o.plan.optimize-threads, o.optimize, true)
-}
-
-
-# `f` of each part at once, the heaviest started first, so the last to finish is a light one; the
-# results in the parts' order.
-fn heaviest-first(parts: [Node], f: Fn(Node)->Node, threads: Int) -> [Node] =
-  [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
-  where order = heaviest-order(parts),
-        done = parallel-map([parts[i] for i in order], f, threads),
-        place = {order[k]: k for k in 0..len(order)}
-
-fn heaviest-rendered(parts: [Node], threads: Int) -> [Rendered] =
-  [done[place[i] ?? panic "a part that was not done"] for i in 0..len(parts)]
-  where order = heaviest-order(parts),
-        done = parallel-map([parts[i] for i in order], render-part, threads),
-        place = {order[k]: k for k in 0..len(order)}
-
-fn heaviest-order(parts: [Node]) -> [Int] = sort i in [i for i in 0..len(parts)] by part-weight(parts[i]) desc
-
-fn part-weight(p: Node) -> Int = sum s in p.body.kids: weight(s)
-
-fn folded(o: Options, p: Node) -> Node = match o.plan.optimize-parts {
-  n if n <= 1 => in-runs(p, folded-run)
-  n => in-pieces(p, n, o.plan.optimize-threads, fold.run, false)
-}
 
 # How parts are printed, which the threads that print them read: set with the build's other settings.
 record Printing { pretty: Bool, maps: Bool, ascii: Bool }
@@ -465,63 +280,9 @@ setting printing: Printing
 
 fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, printing.maps)
 
-# Each part printed at once, the texts joined end to end, and every source map mark moved to
-# where its part landed. A part that ends where the printer dropped a `;` gets it back, as the
-# printer would have written it had the next part followed.
-fn rendered-in-parts(o: Options, p: Node) -> Rendered = match o.plan.print-parts {
-  n if n <= 1 => pieces-joined(o, [rendered-run(match i { 0 => p.hashbang  _ => None() }, runs[i], o.pretty, o.sourcemap)
-                                   for i in 0..len(runs)])
-    where runs = stable-runs(p.body.kids)
-  n => rendered-pieces(o, p, n, o.plan.print-threads)
-}
-
-# Each part printed at once, and the texts put together: each body's parts joined, and spliced into
-# the shell's text where its hole printed, the marks after it moved along.
-fn rendered-pieces(o: Options, p: Node, n: Int, threads: Int) -> Rendered = match hollowed(p, n) {
-  h if len(h.holes) == 0 => whole-pieces(o, p, n, threads)
-  h => spliced(shell, [hole-name(hole.at) for hole in h.holes], texts) ?? whole-pieces(o, p, n, threads)
-    where shell-parts = parts-of(h.shell, n),
-          bodies = [body-parts(hole, h.total, n) for hole in h.holes],
-          done = heaviest-rendered(shell-parts ++ [x for b in bodies for x in b], threads),
-          starts = body-starts(len(shell-parts), bodies),
-          shell = pieces-joined(o, done[0..len(shell-parts)]),
-          texts = [pieces-joined(o, done[starts[k]..starts[k + 1]]) for k in 0..len(bodies)]
-}
-
-# Only top-level parts, each printed, joined.
-fn whole-pieces(o: Options, p: Node, n: Int, threads: Int) -> Rendered =
-  pieces-joined(o, heaviest-rendered(parts-of(p, n), threads))
-
-# Each body where its hole printed, in one pass: the shell's text between holes and the bodies'
-# texts written out in turn, and each mark moved by what the holes before it grew by. Nothing when
-# the holes did not print once each, in order.
-fn spliced(shell: Rendered, names: [Text], bodies: [Rendered]) -> Rendered? = match at {
-  _ if len(at) != len(names) or not (all k in 0..len(at): at?(shell.text, at[k], names[k])) => none
-  _ => some(Rendered(text: join([shell.text[from[k]..upto[k]] ++ body-text(bodies, k) for k in 0..len(at) + 1], ""),
-                     marks: marks, open: shell.open))
-    where # `grown[k]`: how much longer the text is before hole k than the shell's; `from[k]`: where
-          # the shell's text after hole k - 1 starts.
-          grown = [0] ++ (scan d = 0 for k in 0..len(at): d + len(bodies[k].text) - len(names[k])),
-          from = [0] ++ [at[k] + len(names[k]) for k in 0..len(at)],
-          upto = at ++ [len(shell.text)],
-          # The shell's marks after hole k - 1 up to hole k, a mark on the hole itself being the first
-          # of the body's tokens, then body k's.
-          outs = [mk.out for mk in shell.marks],
-          cut = [0] ++ [bisect(outs, a) for a in at] ++ [len(outs)],
-          marks = [mk for k in 0..len(at) + 1
-                      for mk in [Mark(out: m.out + grown[k], src: m.src) for m in shell.marks[cut[k]..cut[k + 1]]]
-                                ++ [Mark(out: m.out + at[k] + grown[k], src: m.src) for b in bodies[k..min(k + 1, len(bodies))] for m in b.marks]]
-} where at = occurrences(shell.text, [byte-text(1) ++ "hole"])
-
-# Body k's text, after the shell's text before hole k; nothing after the last.
-fn body-text(bodies: [Rendered], k: Int) -> Text = match k {
-  _ if k < len(bodies) => bodies[k].text
-  _ => ""
-}
-
-# Rendered pieces one after another, a `;` between two where the first left a statement open, and
-# each piece's marks moved by where it starts.
-# A piece with no text is no piece: it leaves open what the one before it left open.
+# Texts printed apart, joined end to end, and every source map mark moved to where its text landed.
+# A text that ends where the printer dropped a `;` gets it back, as the printer would have written it
+# had the next text followed.
 fn pieces-joined(o: Options, all: [Rendered]) -> Rendered = some-pieces-joined(o, [p for p in all if len(p.text) > 0])
 
 fn some-pieces-joined(o: Options, pieces: [Rendered]) -> Rendered =
@@ -550,8 +311,6 @@ fn export-statements(f: Format) -> [Node] = match f {
   _ => [js.parse(fill-in(f.exports, js.render(entry-value(), false)), "<format>").body.kids[0]]
 }
 
-fn wrap-format(o: Options, f: Format, p: Node) -> Printed =
-  printed(o, fold whole = p for x in export-statements(f): program-plus(whole, x), f.prefix, f.suffix)
 
 # `--global-name`: an IIFE whose value is the entry's namespace.
 fn named(f: Format, global-name: Text) -> Format = match global-name {
@@ -820,14 +579,54 @@ fn named-built(o: Options, f: Format) -> [Written] =
         css = [cssb.bundle(sheets, css-out, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
                for s in [sheets] if len(s) > 0]
 
-# The output made from the whole program at once.
-fn flat-output(o: Options, f: Format) -> Printed = wrap-format(o, f, p)
-  where emission = e.program(),
-        emitted = timed(o.timing, "emit: rewrite identifiers", run-entry(emission.tree, f)),
-        p = timed(o.timing, "minify rules", match o.minify-syntax {
-          true => for-target(o, optimized(o, emitted))
-          false => for-target(o, folded(o, emitted))
-        })
+# The output when something needs the whole program: lowering, which adds helpers and names, or a
+# spec's own optimiser. Each group is optimised and dropped by itself (nothing the optimiser does
+# crosses a group), the program they make lowered whole, and the lowered program made ASCII and
+# printed run by run (see `stable-runs`), on many threads at once.
+fn flat-output(o: Options, f: Format) -> Printed =
+  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
+  where groups = match o.has-optimize {
+          true => [spec-optimized(o, e.group-made(g)) for g in e.groups()]
+          false => parallel-map(e.groups(), group-optimized, o.plan.optimize-threads)
+        },
+        entry = match o.has-optimize {
+          true => spec-optimized(o, entry-calls(f))
+          false => optimized-stmts(o, entry-calls(f))
+        },
+        lowered = timed(o.timing, "lower", lowered-of(o, program-of(None(), flagged(groups ++ [entry])))),
+        exports = export-statements(f),
+        all = pieces-joined(o, parallel-map(stable-runs(lowered.body.kids), run-printed, o.plan.print-threads)
+                               ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
+
+# Lists of statements one after another, a `Flag()` between each that has any and the one before.
+fn flagged(lists: [[Node]]) -> [Node] =
+  [s for k in 0..len(lists) if len(lists[k]) > 0
+     for s in [Flag() for x in [k] if any j in 0..k: len(lists[j]) > 0] ++ lists[k]]
+
+# A group's statements optimised, or folded, and what is dropped dropped: by the bundler's own
+# optimiser, which is all a group's answer may read of the build's options.
+fn group-optimized(g: e.Group) -> [Node] = optimized-stmts(building.options, e.group-made(g))
+
+fn optimized-stmts(o: Options, stmts: [Node]) -> [Node] = dropped-of(o, steps).body.kids
+  where p = program-of(None(), stmts),
+        steps = match o.minify-syntax {
+          true => default-optimize(p)
+          false => fold.run(p)
+        }
+
+# A spec's own optimiser, a function value no answer is kept by, given each group.
+fn spec-optimized(o: Options, stmts: [Node]) -> [Node] = dropped-of(o, steps).body.kids
+  where p = program-of(None(), stmts),
+        steps = match o.minify-syntax {
+          true => o.optimize(p)
+          false => fold.run(p)
+        }
+
+# A run of the lowered program, made ASCII and printed.
+fn run-printed(stmts: [Node]) -> Rendered = rendered-of(building.options, stmts)
+
+fn rendered-of(o: Options, stmts: [Node]) -> Rendered =
+  js.render-tracked(ascii-of(o, program-of(None(), stmts)), o.pretty, o.sourcemap)
 
 # With the bundler's own optimiser and nothing to lower, the output is made group by group (see
 # `e.groups`), each group's text from its own units alone, on many threads at once, and the texts
@@ -845,20 +644,7 @@ fn group-output(g: e.Group) -> Rendered = group-rendered(building.options, e.gro
 
 # Statements as the output has them: minified or folded, what is dropped dropped, made ASCII, and
 # printed. A group is a module's, the finest a change to the output is followed, as Turbopack's is.
-fn group-rendered(o: Options, stmts: [Node]) -> Rendered = js.render-tracked(made, o.pretty, o.sourcemap)
-  where p = program-of(None(), stmts),
-        steps = match o.minify-syntax {
-          true => default-optimize(p)
-          false => fold.run(p)
-        },
-        dropped = match o.drop-console or o.drop-debugger {
-          true => without-dropped(o, steps)
-          false => steps
-        },
-        made = match o.charset-ascii {
-          true => fin.ascii-only(dropped)
-          false => dropped
-        }
+fn group-rendered(o: Options, stmts: [Node]) -> Rendered = rendered-of(o, optimized-stmts(o, stmts))
 
 # ---------------------------------------------------------------- code splitting
 
