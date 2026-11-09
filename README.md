@@ -443,16 +443,16 @@ rebuild: zod 27–35 M instructions against 53 M solving afresh; twelve copies o
 against 593–607 M. What remains whole-program in a rebuild is the facts' list and the database's
 copy, the joined symbol table, and naming.
 
-Rebuilds after one edit, on Linux (`tools/bench.py`, 2026-11-09, median of 7; esbuild 0.28.2 and
-Turbopack's CLI built from next.js sources):
+Rebuilds after one edit, on Linux (`tools/bench.py`, 2026-11-09 at 0e2a2f6, median of 7; esbuild
+0.28.2 and Turbopack's CLI built from next.js sources). The edit is to a module the app imports:
 
-| App | Rebuild (`--watch`) | esbuild `context().rebuild()` | Turbopack dev |
-|---|---|---|---|
-| zod (96 modules) | 3.9 ms | 16.7 ms | 14.8 ms |
-| date-fns | 3.7 ms | 16.3 ms | 12.7 ms |
-| rx (225 modules) | 3.2 ms | 12.0 ms | 11.7 ms |
-| three | 26.0 ms | 51.4 ms | not observable (the package says it has no side effects, and dev never serves the edit) |
-| 12 copies of zod | 35.9 ms | 78.8 ms | 21.0 ms |
+| App | Rebuild (`--watch`) | esbuild `context().rebuild()` | Turbopack dev | One-shot, ours / esbuild |
+|---|---|---|---|---|
+| zod (96 modules) | 3.3 ms | 14.9 ms | 15.1 ms | 111 ms / 29 ms |
+| date-fns | 4.0 ms | 14.8 ms | 12.6 ms | 55 ms / 31 ms |
+| rx (225 modules) | 3.0 ms | 12.0 ms | 12.5 ms | 53 ms / 29 ms |
+| three | 25.8 ms | 54.6 ms | not observable (the package says it has no side effects, and dev never serves the edit) | 135 ms / 71 ms |
+| 12 copies of zod | 35.0 ms | 81.6 ms | 20.9 ms | 909 ms (302 ms on all threads) / 115 ms |
 
 `--hmr` watches too, writing a development format: no scope hoisting or renaming, each module a
 function registered with `hmr_runtime.js` by path, its imports read through live namespace objects
