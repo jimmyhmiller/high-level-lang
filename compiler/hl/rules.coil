@@ -8122,31 +8122,6 @@
                       (None [] false))))))
 
 ;;; A value's text, as a key: see `keyable?`.
-(defn key-part-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
-  (cond (= t "Int") `(rt/num-text ~v)
-        (= t "Text") v
-        (= t "Bool") `(if ~v "1" "0")
-        (list? t)
-          (let [e (fresh (mut k) "e")
-                ps (fresh (mut k) "parts")]
-            `(let [(mut ~(sym ps)) (ArrayList::new [(slice u8)] (malloc-allocator))]
-               (for ~(sym e) ~v (push! (mut ~(sym ps)) ~(key-part-code (mut k) (elem-of t) (sym e))))
-               (rt/memo-key-of ~(sym ps))))
-        :else
-          (let [mo (mod-at (mut k) (type-module t))]
-            (if (= (.sort mo) (SGrammar))
-                `(~(sym (qualified (mut k) (type-module t) "node-key")) ~v)
-                (let [r (match (find-rec mo (type-name t)) (Some [r] r) (None [] (panic "rules: no record {}" t)))
-                      ps (fresh (mut k) "parts")
-                      (mut pushes) (primitive/code-list-new)]
-                  (for fd (.fields r)
-                    (push! (mut pushes)
-                           `(push! (mut ~(sym ps))
-                                   ~(key-part-code (mut k) (.ty fd) `(~(primitive/code-symbol "." (.name fd)) ~v)))))
-                  `(let [(mut ~(sym ps)) (ArrayList::new [(slice u8)] (malloc-allocator))]
-                     ~@pushes
-                     (rt/memo-key-of ~(sym ps))))))))
-
 ;;; What a memo is looked up by: its one argument when that is an Int or Text, or else its
 ;;; arguments' text joined.
 (defn memo-key-type [(f Func)] (-> (slice u8))
@@ -8164,13 +8139,35 @@
       (memo-arg 0)
       (if (and (= (len (.params f)) 1) (= (.ty (get (.params f) 0)) "Text"))
           (memo-arg 0)
-          (let [(mut pushes) (primitive/code-list-new)]
+          (let [(mut writes) (primitive/code-list-new)]
             (for i (range 0 (len (.params f)))
-              (push! (mut pushes)
-                     `(push! (mut memo-parts) ~(key-part-code (mut k) (.ty (get (.params f) i)) (memo-arg i)))))
-            `(let [(mut memo-parts) (ArrayList::new [(slice u8)] (malloc-allocator))]
-               ~@pushes
-               (rt/memo-key-of memo-parts))))))
+              (push! (mut writes) (key-write-code (mut k) (.ty (get (.params f) i)) (memo-arg i))))
+            `(let [(mut memo-key-buf) (rt/key-buf-new)]
+               ~@writes
+               (rt/key-done! (mut memo-key-buf)))))))
+
+;;; A value of type `t` written into the key being made (see `rt/key-buf-new`).
+(defn key-write-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
+  (cond (= t "Int") `(rt/key-int! (mut memo-key-buf) ~v)
+        (= t "Text") `(rt/key-text! (mut memo-key-buf) ~v)
+        (= t "Bool") `(rt/key-int! (mut memo-key-buf) (if ~v 1 0))
+        (list? t)
+          (let [e (fresh (mut k) "e")
+                xs (fresh (mut k) "xs")]
+            `(let [~(sym xs) ~v]
+               (rt/key-count! (mut memo-key-buf) (len ~(sym xs)))
+               (for ~(sym e) ~(sym xs) ~(key-write-code (mut k) (elem-of t) (sym e)))))
+        :else
+          (let [mo (mod-at (mut k) (type-module t))]
+            (if (= (.sort mo) (SGrammar))
+                `(rt/key-text! (mut memo-key-buf) (~(sym (qualified (mut k) (type-module t) "node-key")) ~v))
+                (let [r (match (find-rec mo (type-name t)) (Some [r] r) (None [] (panic "rules: no record {}" t)))
+                      x (fresh (mut k) "rec")
+                      (mut writes) (primitive/code-list-new)]
+                  (for fd (.fields r)
+                    (push! (mut writes)
+                           (key-write-code (mut k) (.ty fd) `(~(primitive/code-symbol "." (.name fd)) ~(sym x)))))
+                  `(let [~(sym x) ~v] ~@writes 0))))))
 
 (defn memo-map-type [(f Func)] (-> (slice u8))
   (cat4 "{" (memo-key-type f) ":" (cat (.ret f) "}")))
