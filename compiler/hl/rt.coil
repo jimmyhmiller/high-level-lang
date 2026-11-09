@@ -3555,14 +3555,146 @@
     (deps-unlock! d)
     n))
 
-;;; Wait until an input changes, looking every `ms` milliseconds; the paths that changed.
+;;; Wait until an input changes; the paths that changed. Where the system says when a file or a
+;;; directory changes (kqueue: macOS and the BSDs), each input and the directory it is in are
+;;; watched, and a change is looked for as soon as one says so; elsewhere, and for what cannot be
+;;; watched, every `ms` milliseconds. Either way what changed is what `dep-changed-inputs!` finds:
+;;; an event only says when to look.
 (defn wait-for-changes! [(ms i64)] (-> (ArrayList (slice u8)))
   (cache-saved!)
   (let [(mut out) (dep-changed-inputs!)]
     (while (= (len out) 0)
-      (sleep (Duration :sec (/ ms 1000) :nsec (* (% ms 1000) 1000000)))
+      (if (watch-events?)
+          (watch-wait! (watch-inputs!) ms)
+          (sleep (Duration :sec (/ ms 1000) :nsec (* (% ms 1000) 1000000))))
       (set! out (dep-changed-inputs!)))
     out))
+
+;;; The kqueue, and what is open on it: each watched path's descriptor, and each descriptor's path.
+(defstruct Watch [(known i64) (kq i32) (fds (HashMap (slice u8) i64)) (paths (HashMap i64 (slice u8)))])
+
+(defn watch-state [] (-> (ptr Watch))
+  (primitive/alloc-static Watch))
+
+(defn kqueue-fn [] (-> (ptr i8))
+  (os/dlsym-cached (primitive/alloc-static (ptr i8)) c"kqueue" (primitive/cast (ptr i8) -2)))
+
+(defn kevent-fn [] (-> (ptr i8))
+  (os/dlsym-cached (primitive/alloc-static (ptr i8)) c"kevent" (primitive/cast (ptr i8) -2)))
+
+;;; Whether the system has kqueue; the first time, one is made, and as many files may be open as
+;;; the system allows (up to 10240), since each watched path holds one.
+(defn watch-events? [] (-> bool)
+  (let [w (watch-state)]
+    (when (= (.known w) 0)
+      (set! (.kq w) (: -1 i32))
+      (when (and (!= (primitive/cast i64 (kqueue-fn)) 0) (!= (primitive/cast i64 (kevent-fn)) 0))
+        (set! (.kq w) (primitive/call-ptr (primitive/cast (fnptr (cc/C) [] i32) (kqueue-fn))))
+        (set! (.fds w) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+        (set! (.paths w) (HashMap::new [i64 (slice u8)] (malloc-allocator) (i64-keyops)))
+        (raise-open-files!))
+      (set! (.known w) 1))
+    (>= (.kq w) (: 0 i32))))
+
+(extern getrlimit :cc (cc/C) [i32 (ptr i8)] (-> i32))
+(extern setrlimit :cc (cc/C) [i32 (ptr i8)] (-> i32))
+
+;;; RLIMIT_NOFILE, 8 where kqueue is: the soft limit raised to the hard one, at most 10240.
+(defn raise-open-files! [] (-> void)
+  (let [lim (primitive/alloc-stack (array u8 16))
+        at (primitive/cast (ptr i8) lim)]
+    (when (= (getrlimit (: 8 i32) at) (: 0 i32))
+      (let [hard (load (primitive/cast (ptr i64) (primitive/index at 8)))
+            want (if (or (< hard 0) (> hard 10240)) 10240 hard)]
+        (when (> want (load (primitive/cast (ptr i64) at)))
+          (store! (primitive/cast (ptr i64) at) want)
+          (setrlimit (: 8 i32) at))))
+    0))
+
+;;; Each path an input reads, and the directory it is in (a file written whole elsewhere and moved
+;;; into place changes its directory, not the file it replaced), on the kqueue. How many could not
+;;; be opened: those only a timeout looks at again.
+(defn watch-inputs! [] (-> i64)
+  (let [d (deps)
+        (mut paths) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut missed) 0]
+    (deps-lock! d)
+    (for i (range 0 (len (.texts d)))
+      (when (> (len (get (.prints d) i)) 0)
+        (let [node (get (.texts d) i)
+              path (subslice node 2 (len node))
+              kind (cast i64 (get node 0))]
+          (if (= kind 100)
+              (push! (mut paths) (if (= (len path) 0) "." path))
+              (do (push! (mut paths) path)
+                  (push! (mut paths) (dir-of-path path)))))))
+    (deps-unlock! d)
+    (for p paths
+      (unless (watch-path! p) (set! missed (+ missed 1))))
+    missed))
+
+(defn dir-of-path [(path (slice u8))] (-> (slice u8))
+  (let [(mut cut) -1]
+    (for i (range 0 (len path)) (when (= (get path i) #\/) (set! cut i)))
+    (cond (< cut 0) "."
+          (= cut 0) "/"
+          :else (subslice path 0 cut))))
+
+;;; One path on the kqueue, once: for writes, growth, attributes, removal, renaming, links. False
+;;; when it cannot be opened (it does not exist yet, say: its directory is watched).
+(defn watch-path! [(path (slice u8))] (-> bool)
+  (let [w (watch-state)]
+    (match (get (.fds w) path)
+      (Some [_] true)
+      (None []
+            ;; O_EVTONLY: open only to be told of events, which does not keep a volume busy.
+            (let [fd (os/open (str/to-cstr (malloc-allocator) path) (: 32768 i32) 0)]
+              (if (< fd (: 0 i32))
+                  false
+                  (let [event (primitive/alloc-stack (array u8 32))
+                        e (primitive/cast (ptr i8) event)]
+                    (store! (primitive/cast (ptr u64) e) (primitive/cast u64 fd))
+                    ;; EVFILT_VNODE; EV_ADD | EV_CLEAR; NOTE_DELETE | WRITE | EXTEND | ATTRIB | LINK | RENAME | REVOKE
+                    (store! (primitive/cast (ptr i16) (primitive/index e 8)) (: -4 i16))
+                    (store! (primitive/cast (ptr u16) (primitive/index e 10)) (: 33 u16))
+                    (store! (primitive/cast (ptr u32) (primitive/index e 12)) (: 127 u32))
+                    (store! (primitive/cast (ptr i64) (primitive/index e 16)) 0)
+                    (store! (primitive/cast (ptr i64) (primitive/index e 24)) 0)
+                    (if (< (primitive/call-ptr (primitive/cast (fnptr (cc/C) [i32 (ptr i8) i32 (ptr i8) i32 (ptr i8)] i32) (kevent-fn))
+                                               (.kq w) e (: 1 i32) (primitive/cast (ptr i8) 0) (: 0 i32) (primitive/cast (ptr i8) 0))
+                           (: 0 i32))
+                        (do (os/close fd) false)
+                        (do (set! (mut (.fds w)) path (primitive/cast i64 fd))
+                            (set! (mut (.paths w)) (primitive/cast i64 fd) path)
+                            true)))))))))
+
+;;; Until the kqueue says something changed; at most `ms` milliseconds when some path could not be
+;;; watched, else a second, which only bounds how long a missed event could go unseen. A path that
+;;; was removed or renamed is let go, and watched again, as whatever is there, next time.
+(defn watch-wait! [(missed i64) (ms i64)] (-> void)
+  (let [w (watch-state)
+        wait (if (> missed 0) ms 1000)
+        timeout (primitive/alloc-stack (array u8 16))
+        t (primitive/cast (ptr i8) timeout)
+        events (primitive/alloc-stack (array u8 2048))
+        es (primitive/cast (ptr i8) events)]
+    (store! (primitive/cast (ptr i64) t) (/ wait 1000))
+    (store! (primitive/cast (ptr i64) (primitive/index t 8)) (* (% wait 1000) 1000000))
+    (let [n (primitive/call-ptr (primitive/cast (fnptr (cc/C) [i32 (ptr i8) i32 (ptr i8) i32 (ptr i8)] i32) (kevent-fn))
+                                (.kq w) (primitive/cast (ptr i8) 0) (: 0 i32) es (: 64 i32) t)]
+      (for i (range 0 (primitive/cast i64 n))
+        (let [e (primitive/index es (* i 32))
+              fd (primitive/cast i64 (load (primitive/cast (ptr u64) e)))
+              fflags (primitive/cast i64 (load (primitive/cast (ptr u32) (primitive/index e 12))))]
+          ;; NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE: the path names something else now, if anything.
+          (unless (= (& fflags 97) 0)
+            (match (get (.paths w) fd)
+              (Some [path] (do (HashMap::remove! (mut (.fds w)) path)
+                               (HashMap::remove! (mut (.paths w)) fd)
+                               (os/close (primitive/cast i32 fd))
+                               0))
+              (None [] 0))))))
+    0))
 
 ;; ---------------------------------------------------------------- serving
 
@@ -5091,3 +5223,23 @@
                             (/ (.us r) 1000) (/ (% (.us r) 1000) 100)))
             (None [] 0))))))
   0)
+
+;; ---------------------------------------------------------------- the process's counters
+
+;;; The instructions and cycles the process has retired, all threads, where the system counts them
+;;; (proc_pid_rusage's RUSAGE_INFO_V4, macOS); -1 elsewhere. What a build did, apart from how fast
+;;; the CPU did it.
+(defn rusage-v4-at [(offset i64)] (-> i64)
+  (let [f (os/dlsym-cached (primitive/alloc-static (ptr i8)) c"proc_pid_rusage" (primitive/cast (ptr i8) -2))]
+    (if (= (primitive/cast i64 f) 0)
+        -1
+        (let [buf (primitive/alloc-stack (array u8 512))
+              at (primitive/cast (ptr i8) buf)
+              pid (primitive/cast i32 (os/getpid))]
+          ;; RUSAGE_INFO_V4
+          (if (= (primitive/call-ptr (primitive/cast (fnptr (cc/C) [i32 i32 (ptr i8)] i32) f) pid (: 4 i32) at) (: 0 i32))
+              (load (primitive/cast (ptr i64) (primitive/index at offset)))
+              -1)))))
+
+(defn instructions-retired [] (-> i64) (rusage-v4-at 248))
+(defn cycles-elapsed [] (-> i64) (rusage-v4-at 256))
