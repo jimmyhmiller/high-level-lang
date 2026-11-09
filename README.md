@@ -376,14 +376,74 @@ itself when every `f(c)` is `c`. Minifying got 11–20% faster.
 Per core this bundler still does about twice esbuild's work: most of the rest is the number of
 passes over a tree, about a dozen to esbuild's three. Attribute grammars are how they become fewer.
 
-## Watching and hot module replacement
+## Watching, the cache, and how answers are kept
 
-`--watch` builds, writes, and builds again whenever an input the build read changes. A `memo fn`'s
-answer records what it was made from: the files it read (by content, so a write that changes
-nothing rebuilds nothing), the settings it read, and the other memo answers it used (`hl.rt`'s
-dependency graph, which the rules compiler feeds). A change kills only what depends on it, so an
-edit to one file parses and analyses that file again and nothing else. Tracking is opt-in: a
-one-shot build pays nothing for it. Inputs are polled every 100 ms, as esbuild's watch polls.
+How answers are kept is not part of the bundler. `src/bundle` is plain functions with one code path;
+`src/app/build.pipeline` says, by function name, which of them a run keeps (a *strategy*) and how (a
+*mechanism*), and the rules compiler applies it, as it applies the pipeline's parallel stages. A
+run picks one with `--strategy=NAME`; `--watch` and `--cache` use the one marked `watching`.
+
+```
+mechanism red-green          # the mechanism of old
+  store memory disk          # kept while the program runs, and saved with the cache
+  check reads                # used again once everything it read is shown unchanged
+  cutoff equal               # made again the same, it changes nothing that read it
+  evict none
+end
+
+strategy incremental
+  from once                  # everything `once` keeps, and its own
+  tracks
+  persists
+  watching
+  uses red-green
+  keep with frozen bundle.modules/runtime-parsed
+  keep bundle.modules/graph bundle.modules/parsed-alone …
+end
+```
+
+Each part of a mechanism is a policy or a function of the strategy's own (`… by F`, in
+`src/app/versions.rules`): `store memory disk by F` saves only the answers F picks; `check by F`
+uses an answer again while F, a version such as a content hash, gives what it gave; `cutoff by F`
+decides when an answer made again counts as the same; `evict by F` lets answers go after each
+build. Strategies today: `once` (one build's repeated work: files read, names resolved), the
+default; `incremental`; `lean` (at most 2000 answers per function, never saved); `trusting`
+(packages under `node_modules` never checked); `coarse` (kept while nothing changes); `versioned`
+(package.json and directory listings by content version); `tailored` (what three builds did not ask
+for let go, only packages' answers saved, a package.json's layout ignored). Every strategy makes the
+same bytes (`tools/strategy-check.py`); each that tracks is checked from the cache and while
+watching against fresh builds, across edits to the entry, a module, a new file and a package.json
+(`tools/mechanism-check.py`).
+
+An answer kept by `check reads` records what it was made from: the files it read (by content, so a
+write that changes nothing rebuilds nothing), the parts of the settings it read (by field path), and
+the other answers it used (`hl.rt`'s dependency graph). A change marks only what depends on it, and
+an answer made again the same stops the change there. Settings a build gives with `with` are
+compared with what the last build gave, part by part. The cache on disk is an append-only log of
+answers, read lazily; the watcher uses kqueue on macOS and inotify on Linux.
+
+Granularity against Turbopack's (its sources at next.js 4ebb2b7; zod, 96 modules). `incremental`
+keeps 2,193 answers; Turbopack's build runs about 10,850 tasks (`TURBOPACK_TRACING=turbo-tasks`).
+Both keep a file's parse and analysis, its references, its side effects and its generated code per
+module; a resolution per directory and specifier; a file's existence from its directory's listing;
+and a package.json per package. Ours prints per group of a module's statements, where Turbopack
+joins and minifies a whole chunk in one task, and ours saves every kept answer, where Turbopack
+saves no parse, chunk item content or module graph. Turbopack is finer in two places: it splits
+modules into parts (1,282 part modules for zod) and answers each export question as a task of its
+own (`follow_reexports`, `is_export_missing`, about 1,000), where linking here is one Datalog
+solve over every module's facts. That solve is most of a rebuild: 40.6 M of a zod rebuild's 60 M
+instructions.
+
+Rebuilds after one edit, on Linux (`tools/bench.py`, 2026-11-09, median of 7; esbuild 0.28.2 and
+Turbopack's CLI built from next.js sources):
+
+| App | Rebuild (`--watch`) | esbuild `context().rebuild()` | Turbopack dev |
+|---|---|---|---|
+| zod (96 modules) | 3.9 ms | 16.7 ms | 14.8 ms |
+| date-fns | 3.7 ms | 16.3 ms | 12.7 ms |
+| rx (225 modules) | 3.2 ms | 12.0 ms | 11.7 ms |
+| three | 26.0 ms | 51.4 ms | not observable (the package says it has no side effects, and dev never serves the edit) |
+| 12 copies of zod | 35.9 ms | 78.8 ms | 21.0 ms |
 
 `--hmr` watches too, writing a development format: no scope hoisting or renaming, each module a
 function registered with `hmr_runtime.js` by path, its imports read through live namespace objects
@@ -393,14 +453,6 @@ changed are sent; `hmr.facts` (Datalog, 4 rules) finds which modules run again, 
 that call `import.meta.hot.accept()`, and reloads when an entry that does not accept changed.
 `import.meta.hot.dispose` and `hot.data` carry state across a replacement.
 
-| App, one edit | First build | Rebuild (`--watch`) | Fresh process | Rebuild (`--hmr`) |
-|---|---|---|---|---|
-| datefns (305 modules) | 27 ms | 7 ms | 30 ms | 4–6 ms |
-| rx (225 modules) | 26 ms | 7 ms | 29 ms | |
-| zod (96 modules) | 58 ms | 28 ms | 64 ms | 4–5 ms |
-
-A production rebuild still links, names, emits and prints the whole program: that half is not
-incremental, and it is most of zod's 28 ms. The development format has no such half.
 `tools/watch-check.py` checks every rebuild byte for byte against a fresh process, across edits to
 a module, to the entry, a new file, a `package.json`, and a write that changes nothing.
 `tools/hmr-check.py` runs a served bundle in Node and checks updates, reloads, kept state and

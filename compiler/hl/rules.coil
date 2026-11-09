@@ -49,7 +49,10 @@
 
 (defstruct Mutator [(key (slice u8)) (calls (ArrayList g/Node))])
 
-(defstruct CheckHooks [(key (slice u8)) (fns (ArrayList (slice u8)))])
+;;; A kept function's functions for one part of how strategies keep it (`store by`, `check by`,
+;;; `cutoff by`, `evict by`: role 0 to 3), as `module/function`, in the order the pipeline numbers
+;;; them (see `pl/hooks-of`).
+(defstruct Hooks [(key (slice u8)) (role i64) (fns (ArrayList (slice u8)))])
 
 (defstruct Func
   [(name (slice u8))
@@ -134,9 +137,8 @@
    ;; Foreign functions that change their first argument in place, as `module/function`, and the
    ;; calls of the module's functions that say what may change (`changes` in a foreign block).
    (mutators (ArrayList Mutator))
-   ;; Each kept function's `check by` functions, as `module/function`, in the order the pipeline
-   ;; numbers them (see `pl/check-hooks`).
-   (check-hooks (ArrayList CheckHooks))
+   ;; Each kept function's functions for how strategies keep it (`… by F`).
+   (hooks (ArrayList Hooks))
    (staged (ArrayList (slice u8)))  ; every stage's own functions
    (checker pl/Checker)])
 
@@ -475,9 +477,10 @@
             (set! (.keeps k) (.kept all))
             (set! (.default-keeps k) (pl/strategy-keeps all (.default all) made))
             (for x (.kept all)
-              (let [hooks (pl/check-hooks all made x)]
-                (when (> (len hooks) 0)
-                  (push! (mut (.check-hooks k)) (CheckHooks :key x :fns hooks))))))
+              (for role (range 0 4)
+                (let [hooks (pl/hooks-of all made x role)]
+                  (when (> (len hooks) 0)
+                    (push! (mut (.hooks k)) (Hooks :key x :role role :fns hooks)))))))
           (for m made (push! (mut (.made k)) m))
           (for d (.kids (get (.kids tree) 4))
             (let [fns (if (= (.kind d) (gpl/KPerStage)) (get (.kids d) 2) (get (.kids d) 1))]
@@ -1587,14 +1590,17 @@
 (defn bound-field [(name (slice u8))] (-> (slice u8))
   (cat name "--bound"))
 
-;;; A module input's value, read where it has one. The check is on the storage, which the field is
-;;; then read through, so a field of the value is read without copying the rest.
+;;; A module input's value, read where it has one: where a binding gives it, or else the value last
+;;; given it, which it holds (see `held-field`). So an answer made in an earlier build, checked or
+;;; made again before what gives the setting runs, reads what that build gave, as an input of an
+;;; incremental computation keeps its value from one revision to the next. Read where nothing ever
+;;; gave it a value, it is an error. The check is on the storage, which the field is then read
+;;; through, so a field of the value is read without copying the rest.
 (defn input-read [(k (mut Comp)) (module (slice u8)) (x Global) (storage Code)] (-> Code)
   (let [st (fresh (mut k) "storage")]
     `(~(primitive/code-symbol "." (.name x)) (let [~(sym st) ~storage]
-                                               (when (= (~(primitive/code-symbol "."
-                                                                                 (bound-field (.name x))) ~(sym st))
-                                                        0)
+                                               (when (and (= (~(primitive/code-symbol "." (bound-field (.name x))) ~(sym st)) 0)
+                                                          (= (~(primitive/code-symbol "." (held-field (.name x))) ~(sym st)) 0))
                                                  (panic ~(cat3 "the input "
                                                                (.name x)
                                                                " was read where nothing gave it a value")))
@@ -6476,8 +6482,11 @@
                                               (.ty x))
                                     ;; Memo answers made from the value it had are dead, now and after.
                                     bound-now `(~(primitive/code-symbol "." (bound-field name)) ~storage)
-                                    ;; After the binding counts itself, it had one before if more than one.
-                                    changed-in (setting-changed-code (mut k) module name (.ty x) (sym saved) field `(> ~bound-now 1))
+                                    held `(~(primitive/code-symbol "." (held-field name)) ~storage)
+                                    ;; After the binding counts itself, it had one before if more than one, or
+                                    ;; holds what the last binding gave it.
+                                    changed-in (setting-changed-code (mut k) module name (.ty x) (sym saved) field
+                                                                     `(or (> ~bound-now 1) (> ~held 0)))
                                     ;; Before it uncounts itself, the value it goes back to was given if more than one.
                                     changed-out (setting-changed-code (mut k) module name (.ty x) field (sym saved) `(> ~bound-now 1))]
                                 (push! (mut saves) (sym saved))
@@ -6493,11 +6502,14 @@
                                       (push! (mut sets)
                                              `(set! ~bound (+ ~bound 1)))
                                       (push! (mut sets) changed-in)
-                                      (push! (mut restores) changed-out)
+                                      (push! (mut sets) `(set! ~held 1))
+                                      ;; Back to what an outer binding gave it; or, with none, its own
+                                      ;; value held for the next to be compared with (see `held-field`).
                                       (push! (mut restores)
-                                             `(set! ~field ~(sym saved)))
-                                      (push! (mut restores)
-                                             `(set! (~(primitive/code-symbol "." (dirty-field name)) ~storage) 1))
+                                             `(when (> ~bound-now 1)
+                                                ~changed-out
+                                                (set! ~field ~(sym saved))
+                                                (set! (~(primitive/code-symbol "." (dirty-field name)) ~storage) 1)))
                                       (push! (mut restores)
                                              `(set! ~bound (- ~bound 1))))
                                     (do
@@ -6823,12 +6835,14 @@
                             storage (if (= (.module sp) (.self k))
                                         (storage-call (mut k) (.x sp))
                                         (storage-of (mut k) (.module sp) (.x sp)))
-                            bound `(~(primitive/code-symbol "." (bound-field (.name (.x sp)))) ~storage)]
+                            bound `(~(primitive/code-symbol "." (bound-field (.name (.x sp)))) ~storage)
+                            held `(~(primitive/code-symbol "." (held-field (.name (.x sp)))) ~storage)]
                         (te `(let [~(sym old) ~(.code p)
-                                   given (> ~bound 0)]
+                                   given (or (> ~bound 0) (> ~held 0))]
                                (set! ~(.code p) ~(.code v))
                                (set! (~(primitive/code-symbol "." (dirty-field (.name (.x sp)))) ~storage) 1)
                                (when (= ~bound 0) (set! ~bound 1))
+                               (set! ~held 1)
                                ~(setting-changed-code (mut k) (.module sp) (.name (.x sp)) (.ty (.x sp)) (sym old) (.code p) `given)
                                0)
                             "Void"))))
@@ -8703,6 +8717,8 @@
         disk (if (>= number 0) `(rt/kept-disk? ~number) `true)
         ;; One kept while no input changes is marked by any change, as it is read back too.
         any-change (if (>= number 0) `(let [c (rt/kept-check ~number)] (or (= c 1) (>= c 3))) `false)
+        ;; Whether the answer for `key` is saved, as the run's `store … by` says.
+        stored (if (>= number 0) `(~(sym (cat "memo-stored?--" name)) s key) `true)
         (mut puts) (primitive/code-list-new)
         (mut binds) (primitive/code-list-new)
         (mut inits) (primitive/code-list-new)]
@@ -8721,9 +8737,9 @@
            (when (and full (or (> (len (.lazy s)) 0) (> (len (.pending s)) 0)))
              (panic "memo fn {} is written whole with answers still unread" ~name))
            (cond (not ~disk) 0
-                 full (for key (.table s) (push! (mut keys) key))
+                 full (for key (.table s) (when ~stored (push! (mut keys) key)))
                  :else (for key (.dirty s)
-                         (match (get (.table s) key) (Some [_] (push! (mut keys) key)) (None [] 0))))
+                         (match (get (.table s) key) (Some [_] (when ~stored (push! (mut keys) key))) (None [] 0))))
            (rt/put-varint! x (len keys))
            (for key keys
              (match (get (.args s) key)
@@ -8906,11 +8922,12 @@
                             0))
                   (push! (mut puts)
                          `(if (or full (> (~dirty st) 0))
-                              (let [given (> (~bound st) 0)]
+                              (let [given (or (> (~bound st) 0) (> (~(primitive/code-symbol "." (held-field g-name)) st) 0))]
                                 (when (> (atomic/read (field st ~lazy-name)) 0)
                                   (panic "setting {} is written while still unread" ~g-name))
                                 (rt/put-bool! x true)
                                 (rt/put-bool! x given)
+                                (rt/put-bool! x (> (~bound st) 0))
                                 (rt/put-varint! x (rt/writer-at w))
                                 (when given ~(enc-code (mut k) (.ty x) `(~field st)))
                                 (set! (~dirty st) 0))
@@ -8918,8 +8935,10 @@
                   (push! (mut gets)
                          `(when (rt/take-bool r)
                             (let [given (rt/take-bool r)
+                                  bound-then (rt/take-bool r)
                                   at (rt/take-varint r)]
-                              (set! (~bound st) (if given 1 0))
+                              (set! (~bound st) (if bound-then 1 0))
+                              (set! (~(primitive/code-symbol "." (held-field g-name)) st) (if given 1 0))
                               (set! (~dirty st) 0)
                               (atomic/store (field st ~lazy-name) (if given (+ at 1) 0)))))
                   (push! (mut forces) `(~accessor)))
@@ -8967,6 +8986,13 @@
 (defn lazy-field [(name (slice u8))] (-> (slice u8))
   (cat name "--lazy"))
 
+;;; Whether a setting holds a value given it, bound now or not: what the next value given it is
+;;; compared with, and what it reads where no binding gives it one (see `input-read`). A `with` that
+;;; ends where no outer one gives the setting a value leaves its own there, held, so the next
+;;; build's `with` changes only what differs from it.
+(defn held-field [(name (slice u8))] (-> (slice u8))
+  (cat name "--held"))
+
 (defn dirty-field [(name (slice u8))] (-> (slice u8))
   (cat name "--dirty"))
 
@@ -8981,38 +9007,69 @@
          (panic "{}: a stage makes this, and many threads at once asked for it before it was made" ~(cat3 (.self k) "/" name)))
       `0))
 
-;;; The shared table, its lock and generation; the function; the computation under another name.
-;;; A kept function's version, as the run's `check by` function for it gives it (see `check by` in the
-;;; pipeline language): the i-th of its check functions when its check is 3 + i, else "". Each is a
-;;; function of its module that takes what the kept function takes and answers Text.
-(defn check-version-code [(k (mut Comp)) (d g/Node) (f Func) (name (slice u8))] (-> Code)
+;;; A kept function's functions for one part of how strategies keep it (see `Hooks`).
+(defn hook-fns [(k (mut Comp)) (name (slice u8)) (role i64)] (-> (ArrayList (slice u8)))
   (let [full (cat3 (.self k) "/" name)
-        (mut fns) (text-list)
-        (mut arms) (primitive/code-list-new)
-        (mut args) (primitive/code-list-new)]
-    (for h (.check-hooks k) (when (= (.key h) full) (set! fns (.fns h))))
-    (for i (range 0 (len (.params f))) (push! (mut args) (memo-arg i)))
+        (mut fns) (text-list)]
+    (for h (.hooks k) (when (and (= (.key h) full) (= (.role h) role)) (set! fns (.fns h))))
+    fns))
+
+;;; The calls of a kept function's functions for one part of how strategies keep it (role 0 store,
+;;; 1 check, 2 cutoff, 3 evict; see `Hooks`), as `cond` arms: the i-th when `sel` is `base` + i.
+;;; Each must take `want` and answer `ret`; it is called with `args`.
+(defn hook-arms [(k (mut Comp)) (d g/Node) (name (slice u8)) (role i64) (base i64) (sel Code)
+                 (want (ArrayList (slice u8))) (ret (slice u8)) (args CodeBuilder)] (-> CodeBuilder)
+  (let [full (cat3 (.self k) "/" name)
+        what (cond (= role 0) "store by " (= role 1) "check by " (= role 2) "cutoff by " :else "evict by ")
+        fns (hook-fns (mut k) name role)
+        (mut arms) (primitive/code-list-new)]
     (for i (range 0 (len fns))
       (let [hook (get fns i)
             slash (rt/name-end-at hook 47)
             module (subslice hook 0 slash)
-            fname (subslice hook (+ slash 1) (len hook))]
-        (unless (= module (.self k))
-          (die (mut k) d (cat4 "check by " hook ": a check function is one of the module of what it checks, " (.self k))))
-        (let [g (match (find-func (self-mod (mut k)) fname)
-                  (Some [g] g)
-                  (None [] (die (mut k) d (cat "check by: no function named " hook))))]
-          (unless (= (.ret g) "Text")
-            (die (mut k) d (cat3 "check by " hook ": a check function answers Text")))
-          (unless (and (= (len (.params g)) (len (.params f)))
-                       (let [(mut same) true]
-                         (for j (range 0 (len (.params f)))
-                           (unless (= (.ty (get (.params g) j)) (.ty (get (.params f) j))) (set! same false)))
-                         same))
-            (die (mut k) d (cat4 "check by " hook ": a check function takes what " (cat name " takes"))))
-          (push! (mut arms) `(= check ~(+ 3 i)))
-          (push! (mut arms) `(~(sym (.coil g)) ~@args)))))
-    (if (= (len fns) 0) `"" `(cond ~@arms :else ""))))
+            fname (subslice hook (+ slash 1) (len hook))
+            g (match (find-func (mod-at (mut k) module) fname)
+                (Some [g] g)
+                (None [] (die (mut k) d (cat3 what "no function named " hook))))]
+        (unless (= (.ret g) ret)
+          (die (mut k) d (cat4 what hook (cat ": it answers " ret) (cat ", for " full))))
+        (unless (and (= (len (.params g)) (len want))
+                     (let [(mut same) true]
+                       (for j (range 0 (len want))
+                         (unless (= (.ty (get (.params g) j)) (get want j)) (set! same false)))
+                       same))
+          (die (mut k) d (cat4 what hook (cat ": it takes " (rt/joined want ", ")) (cat ", for " full))))
+        (push! (mut arms) `(= ~sel ~(+ base i)))
+        (push! (mut arms) `(~(sym (qualified (mut k) module (.coil g))) ~@args))))
+    arms))
+
+;;; The types of a kept function's parameters.
+(defn param-types [(f Func)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (text-list)]
+    (for p (.params f) (push! (mut out) (.ty p)))
+    out))
+
+;;; A kept function's version, as the run's `check by` function for it gives it (see `check by` in the
+;;; pipeline language): the i-th of its check functions when its check is 3 + i, else "".
+(defn check-version-code [(k (mut Comp)) (d g/Node) (f Func) (name (slice u8))] (-> Code)
+  (let [(mut args) (primitive/code-list-new)]
+    (for i (range 0 (len (.params f))) (push! (mut args) (memo-arg i)))
+    (let [arms (hook-arms (mut k) d name 1 3 `check (param-types f) "Text" args)]
+      (if (= (len (hook-fns (mut k) name 1)) 0) `"" `(cond ~@arms :else "")))))
+
+;;; Whether an answer made again counts as the one it replaces, as the run's cutoff for the function
+;;; says: never (0), when equal (1), when its `cutoff by` function says (2 + i).
+(defn cutoff-code [(k (mut Comp)) (d g/Node) (f Func) (name (slice u8)) (old Code) (fresh Code)] (-> Code)
+  (let [(mut want) (text-list)
+        (mut args) (primitive/code-list-new)]
+    (push! (mut want) (.ret f))
+    (push! (mut want) (.ret f))
+    (push! (mut args) old)
+    (push! (mut args) fresh)
+    (let [arms (hook-arms (mut k) d name 2 2 `cutoff want "Bool" args)]
+      `(cond (= cutoff 1) ~(same-code (mut k) (.ret f) old fresh)
+             ~@arms
+             :else false))))
 
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
   (let [f (memo-check! (mut k) d)
@@ -9027,6 +9084,7 @@
         number (kept-number (mut k) name)
         entry (if (>= number 0) (sym (cat "memo-kept--" name)) (sym name))
         version-code (check-version-code (mut k) d f name)
+        same-now (cutoff-code (mut k) d f name `old `fresh)
         near (primitive/code-symbol "." (memo-near name))
         near-gen (primitive/code-symbol "." (memo-near-gen name))
         near-rev (primitive/code-symbol "." (memo-near-rev name))
@@ -9131,11 +9189,27 @@
                     (set! (.ready s) true))
                   (rt/init-unlock!)
                   (rt/dep-ensurer! ~qname (fnptr-of ~ensure))
+                  ~(if (>= number 0) `(rt/sweeper! ~qname (fnptr-of ~(sym (cat "memo-sweep--" name)))) `0)
                   ~@(let [(mut regs) (primitive/code-list-new)]
                       (for r (pl/reads-of (mut (.checker k)) (.self k) name)
                         (push! (mut regs) `(rt/forget-when! ~r (fnptr-of ~(sym (cat "memo-forget--" name))))))
                       regs))
                 s)))
+    ;; Whether an answer is saved with the cache, as the run's `store … by` function says, given what
+    ;; the answer was made from.
+    (when (>= number 0)
+      (let [(mut fields) (primitive/code-list-new)]
+        (for i (range 0 (len (.params f)))
+          (push! (mut fields) `(~(primitive/code-symbol "." (cat "memo-arg-" (rt/num-text i))) a)))
+        (let [arms (hook-arms (mut k) d name 0 0 `by (param-types f) "Bool" fields)]
+          (emit! (mut out)
+                 `(defn ~(sym (cat "memo-stored?--" name)) [(s (ptr ~store)) (key ~(coil-type (mut k) (memo-key-type f)))] (-> bool)
+                    (let [by (rt/kept-store-by ~number)]
+                      (if (< by 0)
+                          true
+                          (match (get (.args s) key)
+                            (Some [a] ~(if (= (len (hook-fns (mut k) name 0)) 0) `true `(cond ~@arms :else true)))
+                            (None [] (panic "memo fn {} kept an answer with no arguments" ~name))))))))))
     (emit! (mut out) (memo-persist-code (mut k) f name))
     ;; Down to `keep` answers, those asked for longest ago let go, under the store's lock. One let go
     ;; is made again when it is next asked for; what read it then counts it changed.
@@ -9155,6 +9229,33 @@
                   ;; Every worker's table in front of this one forgets what it had.
                   (set! (.gen s) (rt/next-pass!))))
               0))
+    ;; After each build, each answer the run's `evict by` function says to let go, given how many
+    ;; builds since the answer was last asked for (0: this one), and how many answers it keeps. One
+    ;; let go is made again when it is next asked for.
+    (when (>= number 0)
+      (let [arms (hook-arms (mut k) d name 3 0 `by (let [(mut w) (text-list)] (push! (mut w) "Int") (push! (mut w) "Int") w)
+                            "Bool" (let [(mut a) (primitive/code-list-new)] (push! (mut a) `idle) (push! (mut a) `kept) a))]
+        (emit! (mut out)
+               `(defn ~(sym (cat "memo-sweep--" name)) [] (-> i64)
+                  (let [by (rt/kept-evict-by ~number)]
+                    (when (>= by 0)
+                      (let [s (~store-fn)
+                            word (cast (ptr i64) s)
+                            (mut drop) (ArrayList::new [~(coil-type (mut k) (memo-key-type f))] (malloc-allocator))]
+                        (rt/spin-lock! word)
+                        (let [kept (len (.table s))]
+                          (for key (.table s)
+                            (let [idle (- (rt/builds-swept) (match (get (.uses s) key) (Some [n] n) (None [] 0)))]
+                              (when ~(if (= (len (hook-fns (mut k) name 3)) 0) `false `(cond ~@arms :else false))
+                                (push! (mut drop) key))))
+                          (for key drop
+                            (HashMap::remove! (mut (.table s)) key)
+                            (HashMap::remove! (mut (.uses s)) key))
+                          (when (> (len drop) 0)
+                            (set! (.gen s) (rt/next-pass!))
+                            (when (rt/dep-tracing?) (println "[deps] let go {} of {} answers of {}" (len drop) kept ~qname))))
+                        (rt/spin-unlock! word))))
+                  0))))
     ;; While dependencies are tracked, an answer from an earlier revision is current only once each
     ;; thing it read is shown unchanged, and an answer computed again that is the same as the one
     ;; it replaces is kept, and does not count as changed.
@@ -9165,8 +9266,11 @@
                     ;; what it read (0), by no input changing (1), never (2); whether an answer made
                     ;; again the same changes nothing; at most how many answers.
                     check ~(if (>= number 0) `(rt/kept-check ~number) `0)
-                    cutoff ~(if (>= number 0) `(rt/kept-cutoff? ~number) `true)
+                    cutoff ~(if (>= number 0) `(rt/kept-cutoff ~number) `1)
                     evict ~(if (>= number 0) `(rt/kept-evict ~number) `0)
+                    ;; When each answer was last asked for, for a bound (by asks) and for an `evict by`
+                    ;; function (by builds; see `memo-sweep--`).
+                    counted (or (> evict 0) ~(if (>= number 0) `(>= (rt/kept-evict-by ~number) 0) `false))
                     t (rules-task)
                     s (~store-fn)
                     word (cast (ptr i64) s)
@@ -9211,9 +9315,9 @@
                                             (None [] false))]
                               (if current
                                   (do
-                                    (when (> evict 0)
+                                    (when counted
                                       (set! (.clock s) (+ (.clock s) 1))
-                                      (set! (mut (.uses s)) key (.clock s)))
+                                      (set! (mut (.uses s)) key (if (> evict 0) (.clock s) (rt/builds-swept))))
                                     (rt/spin-unlock! word)
                                     (set! answer found)
                                     (set! go false))
@@ -9248,7 +9352,7 @@
                                                                       (if (and (>= check 3) (> (len version) 0) (= version (rt/version-of node)))
                                                                           (do (rt/dep-end-same-version! node) old)
                                                                           (let [fresh (~(sym compute) ~@args)
-                                                                                same (and cutoff ~(same-code (mut k) (.ret f) `old `fresh))]
+                                                                                same ~same-now]
                                                                             (if (= check 0)
                                                                                 (rt/dep-end-id! node same)
                                                                                 (rt/dep-end-ignoring-reads! node same (or (= check 1) (>= check 3))))
@@ -9280,10 +9384,10 @@
                                                 (set! (mut (.busy s)) key 0)
                                                 ;; At most `evict` answers: once there are a quarter more, those
                                                 ;; asked for longest ago let go.
-                                                (when (> evict 0)
+                                                (when counted
                                                   (set! (.clock s) (+ (.clock s) 1))
-                                                  (set! (mut (.uses s)) key (.clock s))
-                                                  (when (> (len (.table s)) (+ evict (/ evict 4) 1))
+                                                  (set! (mut (.uses s)) key (if (> evict 0) (.clock s) (rt/builds-swept)))
+                                                  (when (and (> evict 0) (> (len (.table s)) (+ evict (/ evict 4) 1)))
                                                     (~(sym (cat "memo-evict--" name)) s evict)))
                                                 (rt/spin-unlock! word)
                                                 (set! answer (Some made))
@@ -9417,7 +9521,7 @@
             :default-keeps (text-list)
             :made (text-list)
             :mutators (ArrayList::new [Mutator] (malloc-allocator))
-            :check-hooks (ArrayList::new [CheckHooks] (malloc-allocator))
+            :hooks (ArrayList::new [Hooks] (malloc-allocator))
             :staged (text-list)
             :checker (pl/checker-new (dsl/manifest-entries (meta/read-context-manifest context))))
         manifest (meta/read-context-manifest context)]
@@ -9431,6 +9535,13 @@
       (set! (.self k) name)
       (set! (.src k) src)
       (set! (.path k) path)
+      ;; The modules of the `… by F` functions of what this module keeps: what a strategy says,
+      ;; outside the code it keeps.
+      (for h (.hooks k)
+        (when (= (subslice (.key h) 0 (rt/name-end-at (.key h) 47)) name)
+          (for hook (.fns h)
+            (let [module (subslice hook 0 (rt/name-end-at hook 47))]
+              (unless (= module name) (ensure-loaded! (mut k) module))))))
       ;; What each kept function reads is known before anything is written: the files that says it
       ;; are what this module is compiled from too.
       (for d decls
@@ -9505,6 +9616,9 @@
                                `(set! (~(primitive/code-symbol "."
                                                                (bound-field g-name)) s)
                                       ~(if (setting-root? d) `1 `0)))
+                        (push! (mut state-fields) `(~(sym (held-field g-name)) i64))
+                        (push! (mut state-inits)
+                               `(set! (~(primitive/code-symbol "." (held-field g-name)) s) ~(if (setting-root? d) `1 `0)))
                         ;; Where the cache holds its value, plus one, until it is read; and
                         ;; whether it was given one since the cache was last written.
                         (push! (mut state-fields) `(~(sym (lazy-field g-name)) i64))
@@ -9630,7 +9744,9 @@
                       tl (fresh (mut k) "kept")
                       lazy `(~(primitive/code-symbol "." (lazy-field (.name x))) (rules-state))
                       td (fresh (mut k) "kept")
-                      dirty `(~(primitive/code-symbol "." (dirty-field (.name x))) (rules-state))]
+                      dirty `(~(primitive/code-symbol "." (dirty-field (.name x))) (rules-state))
+                      th (fresh (mut k) "kept")
+                      held `(~(primitive/code-symbol "." (held-field (.name x))) (rules-state))]
                   (push! (mut keeps) (sym t))
                   (push! (mut keeps) field)
                   (push! (mut keeps) (sym tb))
@@ -9639,10 +9755,13 @@
                   (push! (mut keeps) lazy)
                   (push! (mut keeps) (sym td))
                   (push! (mut keeps) dirty)
+                  (push! (mut keeps) (sym th))
+                  (push! (mut keeps) held)
                   (push! (mut puts) `(set! ~field ~(sym t)))
                   (push! (mut puts) `(set! ~bound ~(sym tb)))
                   (push! (mut puts) `(set! ~lazy ~(sym tl)))
-                  (push! (mut puts) `(set! ~dirty ~(sym td))))))
+                  (push! (mut puts) `(set! ~dirty ~(sym td)))
+                  (push! (mut puts) `(set! ~held ~(sym th))))))
             (emit! (mut out)
                    `(defn reset-state! [] (-> void)
                       (let [~@keeps]

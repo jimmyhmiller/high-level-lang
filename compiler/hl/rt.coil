@@ -1335,6 +1335,50 @@
 (defn known-name [(ns Names) (s (slice u8))] (-> i64)
   (match (get (.ids ns) s) (Some [id] id) (None [] -1)))
 
+;;; Blocks of numbers by key: where each key's block starts, kept from one use to the next while it
+;;; is big enough; a key whose block is too small, or that has none, gets a new one at the end. So a
+;;; key that grows, or appears, moves nothing but itself. Numbers no key uses any more stay empty.
+(defstruct Places [(at (HashMap (slice u8) i64)) (size (HashMap (slice u8) i64)) (keys (ArrayList (slice u8))) (end i64)])
+
+(defn places-new [] (-> Places)
+  (Places
+    :at (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :size (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :keys (ArrayList::new [(slice u8)] (malloc-allocator))
+    :end 0))
+
+;;; Where `key`'s block of `size` numbers starts: its block if it holds that many, else a new one.
+(defn place! [(p (mut Places)) (key (slice u8)) (size i64)] (-> i64)
+  (let [fits (match (get (.size p) key) (Some [n] (>= n size)) (None [] false))]
+    (if fits
+        (match (get (.at p) key) (Some [a] a) (None [] (panic "place {} has a size and no start" key)))
+        (let [a (.end p)]
+          (match (get (.at p) key) (Some [_] 0) (None [] (do (push! (mut (.keys p)) key) 0)))
+          (set! (mut (.at p)) key a)
+          (set! (mut (.size p)) key size)
+          (set! (.end p) (+ a size))
+          a))))
+
+;;; Where `key`'s block starts, or -1 when it has none: a lookup that changes nothing.
+(defn place-of [(p Places) (key (slice u8))] (-> i64)
+  (match (get (.at p) key) (Some [a] a) (None [] -1)))
+
+;;; The first number no block holds.
+(defn places-end [(p Places)] (-> i64)
+  (.end p))
+
+;;; Whether two have the same blocks, in the same places.
+(defn places-same? [(a Places) (b Places)] (-> bool)
+  (and (= (.end a) (.end b))
+       (= (len (.keys a)) (len (.keys b)))
+       (block :same
+              (for key (.keys a)
+                (unless (and (= (place-of a key) (place-of b key))
+                             (= (match (get (.size a) key) (Some [n] n) (None [] -1))
+                                (match (get (.size b) key) (Some [n] n) (None [] -1))))
+                  (return-from :same false)))
+              true)))
+
 ;; ---------------------------------------------------------------- files
 
 (extern lseek :cc (cc/C) [i32 i64 i32] (-> i64))
@@ -4610,7 +4654,28 @@
         (set! (mut out) key (take-ints r))))
     out))
 
-;;; Interned names: each in the order of its id.
+;;; Blocks of numbers: each key with its block's start and size, and where they end.
+(defn persist-encode-Places [(w (ptr Writer)) (p Places)] (-> void)
+  (put-varint! w (len (.keys p)))
+  (for key (.keys p)
+    (put-text! w key)
+    (put-int! w (place-of p key))
+    (put-int! w (match (get (.size p) key) (Some [n] n) (None [] (panic "place {} has a start and no size" key)))))
+  (put-int! w (.end p)))
+
+(defn persist-decode-Places [(r (ptr Reader))] (-> Places)
+  (let [(mut out) (places-new)
+        n (take-varint r)]
+    (for _ (range 0 n)
+      (let [key (take-text r)
+            a (take-int r)
+            size (take-int r)]
+        (push! (mut (.keys out)) key)
+        (set! (mut (.at out)) key a)
+        (set! (mut (.size out)) key size)))
+    (set! (.end out) (take-int r))
+    out))
+
 ;;; Interned names: each in the order of its id.
 (defn persist-encode-Names [(w (ptr Writer)) (ns Names)] (-> void)
   (put-texts! w (.strs ns)))
@@ -5338,13 +5403,23 @@
 (defstruct Kept
   [(chosen bool)
    (on (ArrayList bool))
-   ;; How each is kept (see `mechanism` in the pipeline language): saved with the cache; how a kept
-   ;; answer is checked (0 what it read, 1 that no input changed, 2 never); whether an answer made
-   ;; again the same changes nothing; at most how many answers (0: no bound).
+   ;; How each is kept (see `mechanism` in the pipeline language): saved with the cache, and which
+   ;; of its `store … by` functions says which answers are (-1: none, all are); how a kept answer is
+   ;; checked (0 what it read, 1 that no input changed, 2 never, 3 + i by its i-th `check by`
+   ;; function); when an answer made again counts as the one it replaces (0 never, 1 when equal,
+   ;; 2 + i when its i-th `cutoff by` function says); at most how many answers (0: no bound); which
+   ;; of its `evict by` functions lets answers go after each build (-1: none).
    (disk (ArrayList bool))
+   (store-by (ArrayList i64))
    (check (ArrayList i64))
-   (cutoff (ArrayList bool))
-   (evict (ArrayList i64))])
+   (cutoff (ArrayList i64))
+   (evict (ArrayList i64))
+   (evict-by (ArrayList i64))
+   ;; Each kept function's sweep (`evict by`), by its name, once its answers are first kept.
+   (sweeps (HashMap (slice u8) (fnptr (cc/C) [] i64)))
+   (sweeps-ready bool)
+   ;; How many builds have ended (each sweeps once).
+   (swept i64)])
 
 (defn kept-state [] (-> (ptr Kept))
   (primitive/alloc-static Kept))
@@ -5358,28 +5433,36 @@
     (for i on (set! (mut flags) i true))
     (set! (.on s) flags)
     (let [(mut disk) (ArrayList::new [bool] (malloc-allocator))
+          (mut store-by) (ArrayList::new [i64] (malloc-allocator))
           (mut check) (ArrayList::new [i64] (malloc-allocator))
-          (mut cutoff) (ArrayList::new [bool] (malloc-allocator))
-          (mut evict) (ArrayList::new [i64] (malloc-allocator))]
+          (mut cutoff) (ArrayList::new [i64] (malloc-allocator))
+          (mut evict) (ArrayList::new [i64] (malloc-allocator))
+          (mut evict-by) (ArrayList::new [i64] (malloc-allocator))]
       (for _ (range 0 count)
         (push! (mut disk) true)
+        (push! (mut store-by) -1)
         (push! (mut check) 0)
-        (push! (mut cutoff) true)
-        (push! (mut evict) 0))
+        (push! (mut cutoff) 1)
+        (push! (mut evict) 0)
+        (push! (mut evict-by) -1))
       (set! (.disk s) disk)
+      (set! (.store-by s) store-by)
       (set! (.check s) check)
       (set! (.cutoff s) cutoff)
-      (set! (.evict s) evict))
+      (set! (.evict s) evict)
+      (set! (.evict-by s) evict-by))
     (set! (.chosen s) true)
     0))
 
 ;;; How function `index` is kept this run, as its strategy's mechanism for it says.
-(defn keep-policy! [(index i64) (disk bool) (check i64) (cutoff bool) (evict i64)] (-> void)
+(defn keep-policy! [(index i64) (disk bool) (store-by i64) (check i64) (cutoff i64) (evict i64) (evict-by i64)] (-> void)
   (let [s (kept-state)]
     (set! (mut (.disk s)) index disk)
+    (set! (mut (.store-by s)) index store-by)
     (set! (mut (.check s)) index check)
     (set! (mut (.cutoff s)) index cutoff)
     (set! (mut (.evict s)) index evict)
+    (set! (mut (.evict-by s)) index evict-by)
     0))
 
 ;;; Until a run chooses, every function is kept as the mechanism of old: saved, checked by what it
@@ -5390,11 +5473,44 @@
 (defn kept-check [(index i64)] (-> i64)
   (let [s (kept-state)] (if (.chosen s) (get (.check s) index) 0)))
 
-(defn kept-cutoff? [(index i64)] (-> bool)
-  (let [s (kept-state)] (if (.chosen s) (get (.cutoff s) index) true)))
+(defn kept-store-by [(index i64)] (-> i64)
+  (let [s (kept-state)] (if (.chosen s) (get (.store-by s) index) -1)))
+
+(defn kept-cutoff [(index i64)] (-> i64)
+  (let [s (kept-state)] (if (.chosen s) (get (.cutoff s) index) 1)))
 
 (defn kept-evict [(index i64)] (-> i64)
   (let [s (kept-state)] (if (.chosen s) (get (.evict s) index) 0)))
+
+(defn kept-evict-by [(index i64)] (-> i64)
+  (let [s (kept-state)] (if (.chosen s) (get (.evict-by s) index) -1)))
+
+;;; Kept function `name` can let answers go after a build (`evict by`): `f` does it.
+(defn sweeper! [(name (slice u8)) (f (fnptr (cc/C) [] i64))] (-> void)
+  (let [s (kept-state)]
+    (init-lock!)
+    (unless (.sweeps-ready s)
+      (set! (.sweeps s) (HashMap::new [(slice u8) (fnptr (cc/C) [] i64)] (malloc-allocator) (str/keyops)))
+      (set! (.sweeps-ready s) true))
+    (set! (mut (.sweeps s)) name f)
+    (init-unlock!))
+  0)
+
+;;; After a build, with nothing running: each kept function's answers its `evict by` function says
+;;; to let go, let go; then the next build begins.
+(defn sweep-kept! [] (-> void)
+  (let [s (kept-state)]
+    (when (.sweeps-ready s)
+      (for name (.sweeps s)
+        (match (get (.sweeps s) name)
+          (Some [f] (f))
+          (None [] 0))))
+    (set! (.swept s) (+ (.swept s) 1)))
+  0)
+
+;;; How many builds have ended: the number of the one running.
+(defn builds-swept [] (-> i64)
+  (.swept (kept-state)))
 
 ;; ---------------------------------------------------------------- inputs a run trusts
 
