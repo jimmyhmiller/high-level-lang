@@ -7,7 +7,7 @@
 #   exports      the entry exports a new name each time (ES module output), so linking's facts
 #                change and its database is brought up to date from the last one (`update by`)
 # After build WARM and after the last, it reads what the watcher's regions hold (HL_REGION_TRACE:
-# regions alive, and their bytes) and its resident memory. The regions must hold no more than
+# regions alive, and their bytes), and its memory at its lowest over the five builds to each. The regions must hold no more than
 # they did after build WARM, give or take 2%; the process's memory (its footprint on macOS, its
 # resident set elsewhere) may grow by at most 3% or 4 MB.
 #   usage: memory-check.py ESB [APP...] [--edits=N] [--warm=N]   (APP: zod, rx, datefns, three, …, manyzod: twelve zods)
@@ -67,7 +67,7 @@ def prepare(app):
 
 def session(entry, rel, change, flags):
     """A watcher through EDITS edits of `rel` (each `change(original, i)`): what its regions held and
-    its resident memory after build WARM and after the last build."""
+    its memory at its lowest over the five builds to WARM and over the last five."""
     original = open(os.path.join(WORK, rel)).read()
     env = dict(os.environ, HL_REGION_TRACE="1")
     p = subprocess.Popen([ESB, entry, "--watch", "--no-cache", "--watch-interval=5", "--outfile=out/out.js"] + flags,
@@ -83,8 +83,11 @@ def session(entry, rel, change, flags):
             if r:
                 # The regions as the build's end left them, after what nothing held was let go.
                 held[builds] = (int(r.group(1)), int(r.group(2)) * 1024)
-                if builds in (WARM, EDITS + 1):
-                    time.sleep(0.2)
+                # The process's memory over the five builds that end at WARM and the five last:
+                # malloc gives back what is freed when it will, so one reading may be high, and a
+                # leak raises them all.
+                if WARM - 4 <= builds <= WARM or builds > EDITS - 4:
+                    time.sleep(0.05)
                     seen[builds] = resident(p.pid)
                 if builds > EDITS: break
                 write(rel, change(original, builds))
@@ -94,7 +97,9 @@ def session(entry, rel, change, flags):
         write(rel, original)
     if builds <= EDITS or WARM not in held:
         sys.exit("the watcher stopped early:\n" + "".join(said)[-2000:])
-    return held[WARM], held[EDITS + 1], seen.get(WARM), seen.get(EDITS + 1)
+    early = [v for b, v in seen.items() if b <= WARM and v is not None]
+    late = [v for b, v in seen.items() if b > EDITS - 4 and v is not None]
+    return held[WARM], held[EDITS + 1], (min(early) if early else None), (min(late) if late else None)
 
 def check(ok, what):
     global failures

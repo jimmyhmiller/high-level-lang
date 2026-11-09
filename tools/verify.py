@@ -377,10 +377,10 @@ fails = [l.strip() for l in out.splitlines() if l.strip().startswith("FAIL")]
 check(code == 0 and out.strip().endswith("all mechanisms check out"),
       f"mechanisms: {len([l for l in out.splitlines() if l.strip().startswith('ok')])} checks" + (f"; {fails[0]}" if fails else ""))
 
-# Memory while watching: through forty edits that each make answers never made before, and forty
-# that each change what linking derives, what the watcher holds stays what it held.
+# Memory while watching: through fifty edits that each make answers never made before, and fifty
+# that each change what linking derives, what the watcher holds stays what it held at build 20.
 code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory-check.py"), ESB, "zod",
-                                       "--edits=40", "--warm=10"],
+                                       "--edits=50", "--warm=20"],
                                       8000, 600, quiet=True)
 fails = [l.strip() for l in out.splitlines() if l.strip().startswith("FAIL")]
 check(code == 0 and out.strip().endswith("memory holds steady"),
