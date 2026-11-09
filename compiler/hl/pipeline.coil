@@ -892,6 +892,7 @@
   [(name (slice u8))
    (from (slice u8))
    (tracks bool)
+   (persists bool)
    (default bool)
    (watching bool)
    (own (ArrayList (slice u8)))])
@@ -942,6 +943,7 @@
       (let [name (.text (kid-of d 0))
             (mut from) ""
             (mut tracks) false
+            (mut persists) false
             (mut is-default) false
             (mut is-watching) false
             (mut own) (texts)]
@@ -956,6 +958,7 @@
                          (Some [_] (set! from f))
                          (None [] (strategy-fail src path item (dsl/join3 "no strategy named " f " before this one"))))))
             (g/KTracks [] (set! tracks true))
+            (g/KPersists [] (set! persists true))
             (g/KDefault [] (set! is-default true))
             (g/KWatching [] (set! is-watching true))
             (g/KKeep [] (for t (.kids (kid-of item 0)) (add-unique! (mut own) (.text t))))
@@ -970,9 +973,11 @@
           (set! watching name))
         (when (and (> (len from) 0) (match (find-strategy decls from) (Some [p] (.tracks p)) (None [] false)))
           (set! tracks true))
+        (when (and persists (not tracks))
+          (strategy-fail src path d "a strategy that persists must track: an answer read back is checked by what it was made from"))
         (for x own (add-unique! (mut union) x))
         (push! (mut decls)
-               (StrategyDecl :name name :from from :tracks tracks :default is-default :watching is-watching :own own))))
+               (StrategyDecl :name name :from from :tracks tracks :persists persists :default is-default :watching is-watching :own own))))
     (when (and (> (len decls) 0) (= (len default) 0))
       (strategy-fail src path tree "no strategy is marked default"))
     (when (and (> (len decls) 0) (= (len watching) 0))
@@ -1186,6 +1191,7 @@
           all (strategies-of src path tree (made-of tree))
           (mut uses) (primitive/code-list-new)
           (mut tracking) (primitive/code-list-new)
+          (mut persisting) (primitive/code-list-new)
           (mut strategy-names) (primitive/code-list-new)]
       (for d (.decls all)
         (let [(mut ons) (primitive/code-list-new)]
@@ -1200,6 +1206,8 @@
                     0))
           (push! (mut tracking) `(= name ~(.name d)))
           (push! (mut tracking) (if (.tracks d) `true `false))
+          (push! (mut persisting) `(= name ~(.name d)))
+          (push! (mut persisting) (if (.persists d) `true `false))
           (push! (mut strategy-names) `(push! (mut out) ~(.name d)))))
       (for d (.depends chk) (push! (mut deps) `~d))
       (dsl/render `(do
@@ -1221,6 +1229,27 @@
                        (cond ~@uses :else (panic "no strategy named {}: the pipeline has {}" name (rt/joined (strategy-names) ", "))))
                      (defn strategy-tracks? [(name (slice u8))] (-> bool)
                        (cond ~@tracking :else (panic "no strategy named {}" name)))
+                     (defn strategy-persists? [(name (slice u8))] (-> bool)
+                       (cond ~@persisting :else (panic "no strategy named {}" name)))
+                     ;; A run's start: its strategy used, and with a cache, what that strategy kept
+                     ;; loaded from it, when it persists. Whether there was one to load.
+                     (defn run-started! [(name (slice u8)) (cache (slice u8))] (-> bool)
+                       (use-strategy! name)
+                       (if (= (len cache) 0)
+                           false
+                           (do
+                             (unless (strategy-persists? name)
+                               (panic "strategy {} keeps nothing from one run to the next, and the run asks for a cache" name))
+                             ;; There before anything is built: made later, it would change a
+                             ;; listing a build read.
+                             (rt/make-dirs! (rt/dir-of-path cache))
+                             (rt/cache-load! cache))))
+                     ;; After each build: with a cache, what the strategy keeps saved to it, on a
+                     ;; thread of its own when `later` (a watcher waits meanwhile).
+                     (defn build-done! [(name (slice u8)) (cache (slice u8)) (later bool) (timing bool)] (-> void)
+                       (when (> (len cache) 0)
+                         (if later (rt/cache-save-later! cache timing) (rt/cache-save! cache)))
+                       0)
                      (defn default-strategy [] (-> (slice u8)) ~(.default all))
                      (defn watching-strategy [] (-> (slice u8)) ~(.watching all))
                      (defn strategy-names [] (-> (ArrayList (slice u8)))
