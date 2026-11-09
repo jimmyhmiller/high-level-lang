@@ -47,6 +47,8 @@
 
 (defstruct Param [(name (slice u8)) (ty (slice u8)) (by-ref bool)])
 
+(defstruct Mutator [(key (slice u8)) (calls (ArrayList g/Node))])
+
 (defstruct Func
   [(name (slice u8))
    (coil (slice u8))
@@ -127,6 +129,9 @@
    (keeps (ArrayList (slice u8)))
    (default-keeps (ArrayList (slice u8)))
    (made (ArrayList (slice u8)))
+   ;; Foreign functions that change their first argument in place, as `module/function`, and the
+   ;; calls of the module's functions that say what may change (`changes` in a foreign block).
+   (mutators (ArrayList Mutator))
    (staged (ArrayList (slice u8)))  ; every stage's own functions
    (checker pl/Checker)])
 
@@ -1395,6 +1400,11 @@
                                :name (.text (kid p 0))
                                :ty (resolve-type (mut k) module (kid p 1))
                                :by-ref (= (.kind (kid p 1)) (g/KTMut)))))
+                    (when (and (> (len (.kids item)) 4) (not (none? (kid item 4))))
+                      (unless (and (> (len (.params f)) 0) (.by-ref (get (.params f) 0)))
+                        (die (mut k) item "a function that changes something takes it first, as mut"))
+                      (push! (mut (.mutators k))
+                             (Mutator :key (cat3 module "/" name) :calls (list-kids (kid item 4)))))
                     (match (find-func (get (.mods k) ix) name)
                       (None []
                             (push! (mut (.funcs (elem (mut (.mods k)) ix))) f))
@@ -3324,8 +3334,101 @@
   (match (accessor-read (mut k) n module f args)
     (Some [t] t)
     (None []
-          (let [cs (args-code (mut k) n module f args)]
-            (te `(~(sym (qualified (mut k) module (.coil f))) ~@cs) (.ret f))))))
+          (match (mutated-setting (mut k) n module f args)
+            (Some [t] t)
+            (None []
+                  (let [cs (args-code (mut k) n module f args)]
+                    (te `(~(sym (qualified (mut k) module (.coil f))) ~@cs) (.ret f))))))))
+
+;;; A foreign function that changes a setting in place, one whose declaration says what it may
+;;; change (`changes`): each of those read before and after, and what is not the same changed, as a
+;;; setting given again changes what read it (see `setting-changed-code`); the setting is to be saved
+;;; again. Which of the module's functions read it are named with the mutator's parameters.
+(defn mutated-setting [(k (mut Comp)) (n g/Node) (module (slice u8)) (f Func) (args (ArrayList g/Node))]
+  (-> (Option TE))
+  (let [key (cat3 module "/" (.name f))
+        (mut calls) (None [(ArrayList g/Node)])]
+    (for m (.mutators k) (when (= (.key m) key) (set! calls (Some (.calls m)))))
+    (match calls
+      (None [] (None [TE]))
+      (Some [cs]
+            (match (if (> (len args) 0) (setting-part (mut k) (get args 0)) (None [SettingPart]))
+              (None [] (None [TE]))
+              (Some [sp]
+                    (if (> (len (.fields sp)) 0)
+                        (None [TE])
+                        (let [node (cat4 "s:" (.module sp) "." (.name (.x sp)))
+                              target (place (mut k) (get args 0))
+                              storage (if (= (.module sp) (.self k))
+                                          (storage-call (mut k) (.x sp))
+                                          (storage-of (mut k) (.module sp) (.x sp)))
+                              (mut binds) (primitive/code-list-new)
+                              (mut arg-syms) (ArrayList::new [Code] (malloc-allocator))
+                              (mut call-args) (primitive/code-list-new)
+                              (mut befores) (primitive/code-list-new)
+                              (mut afters) (primitive/code-list-new)
+                              (mut checks) (primitive/code-list-new)
+                              result (fresh (mut k) "mutated")
+                              any (fresh (mut k) "changed")]
+                          (push! (mut call-args) `(mut ~(.code target)))
+                          (for i (range 1 (len args))
+                            (let [p (get (.params f) i)
+                                  v (fresh (mut k) "arg")]
+                              (push! (mut binds) (sym v))
+                              (push! (mut binds) (.code (expect (mut k) (get args i) (expr (mut k) (get args i) (.ty p)) (.ty p))))
+                              (push! (mut arg-syms) (sym v))
+                              (push! (mut call-args) (sym v))))
+                          (for c cs
+                            (unless (and (= (.kind c) (g/KCall)) (= (.kind (kid c 0)) (g/KName)))
+                              (die (mut k) c "changes names calls of the module's functions"))
+                            (let [g (match (find-func (mod-at (mut k) module) (.text (kid c 0)))
+                                      (Some [g] g)
+                                      (None [] (die (mut k) c (cat "no function named " (.text (kid c 0))))))
+                                  b (fresh (mut k) "before")
+                                  a (fresh (mut k) "after")
+                                  (mut gargs) (primitive/code-list-new)
+                                  (mut parts) (primitive/code-list-new)
+                                  cargs (list-kids (kid c 1))]
+                              (when (and (= (len (.params g)) 2) (= (.ty (get (.params g) 1)) "Int"))
+                                (die (mut k) c "changes cannot name a function read by number"))
+                              (for j (range 0 (len cargs))
+                                (let [at (param-at f (.text (get cargs j)))]
+                                  (when (< at 0) (die (mut k) (get cargs j) "changes names the function's own parameters"))
+                                  (if (= j 0)
+                                      (do (unless (= at 0) (die (mut k) (get cargs j) "what changes is the first argument"))
+                                          (push! (mut gargs) (.code target)))
+                                      (let [v (get arg-syms (- at 1))]
+                                        (push! (mut gargs) v)
+                                        (push! (mut parts) `(push! (mut parts) ~(plain-text-code (.ty (get (.params g) j)) v)))))))
+                              (let [fcall `(~(sym (qualified (mut k) module (.coil g))) ~@gargs)
+                                    path `(~(if (any-text-param? g) `rt/call-path-text `rt/call-path) ~(.name g)
+                                            (let [(mut parts) (ArrayList::new [(slice u8)] (malloc-allocator))] ~@parts parts))]
+                                (push! (mut befores) (sym b))
+                                (push! (mut befores) fcall)
+                                (push! (mut afters) (sym a))
+                                (push! (mut afters) fcall)
+                                (push! (mut checks)
+                                       `(unless ~(same-code (mut k) (.ret g) (sym b) (sym a))
+                                          (set! ~(sym any) true)
+                                          (when (rt/dep-tracking?) (rt/dep-changed! (rt/join ~node ~path))))))))
+                          (Some (te `(let [~@binds
+                                           ~@befores
+                                           ~(sym result) (~(sym (qualified (mut k) module (.coil f))) ~@call-args)
+                                           ~@afters
+                                           (mut ~(sym any)) false]
+                                       ~@checks
+                                       (when ~(sym any)
+                                         (set! (~(primitive/code-symbol "." (dirty-field (.name (.x sp)))) ~storage) 1)
+                                         (if (rt/dep-tracking?)
+                                             (rt/dep-changed! ~node)
+                                             (rt/forget-readers! ~(cat3 (.module sp) "." (.name (.x sp))))))
+                                       ~(sym result))
+                                    (.ret f)))))))))))
+
+(defn param-at [(f Func) (name (slice u8))] (-> i64)
+  (let [(mut at) -1]
+    (for i (range 0 (len (.params f))) (when (= (.name (get (.params f) i)) name) (set! at i)))
+    at))
 
 ;;; A foreign module's function that looks into one value, given plain values besides: what
 ;;; `sym.symbol-at(table, s)` is. Applied to a setting, it reads just what it answers.
@@ -9161,6 +9264,7 @@
             :keeps (text-list)
             :default-keeps (text-list)
             :made (text-list)
+            :mutators (ArrayList::new [Mutator] (malloc-allocator))
             :staged (text-list)
             :checker (pl/checker-new (dsl/manifest-entries (meta/read-context-manifest context))))
         manifest (meta/read-context-manifest context)]
