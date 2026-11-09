@@ -69,10 +69,30 @@ fn cjs-read(ci: an.CjsImport) -> Node = match ci.namespace {
   false => Member(Ident(final-of(ci.import-var)), PropName(ci.name))
 }
 
-# The symbol an export name means in a module, preferring one that is not an import: the last
-# candidate that is not itself an import, or failing that the first.
-fn resolved-export(module: Int, name: Int) -> Int? =
-  (last m.db.resolved(module, name, ?c) if not import-symbol?(c): c) ?? first m.db.resolved(module, name, ?c): c
+# The symbol an export name means in a module: the one it resolves to that is not itself an import;
+# with none, the one import it stops at (one from CommonJS, whose names are only known at run time),
+# or the module's own. Two that are not imports (two `export *` giving the name) make it ambiguous,
+# and, as esbuild has it, nothing exports it.
+fn resolved-export(module: Int, name: Int) -> Int? = match p.final, p.finals, p.held, p.helds {
+  f, 1, _, _ => some(f)
+  _, 0, h, 1 => some(h)
+  _, 0, _, 0 => none
+  _, 0, _, _ => first m.db.local-export(module, name, ?s): s
+  _, _, _, _ => none
+} where p = fold seen = Candidates(final: -1, finals: 0, held: -1, helds: 0) for m.db.resolved(module, name, ?c): candidate(seen, c)
+
+# What an export name resolves to, seen one candidate at a time: the first that is not an import and
+# how many different ones there are (two: more than one), and the same of the imports.
+record Candidates { final: Int, finals: Int, held: Int, helds: Int }
+
+fn candidate(p: Candidates, c: Int) -> Candidates = match import-symbol?(c), p.finals, p.helds {
+  false, 0, _ => p with { final: c, finals: 1 }
+  false, 1, _ if c != p.final => p with { finals: 2 }
+  false, _, _ => p
+  true, _, 0 => p with { held: c, helds: 1 }
+  true, _, 1 if c != p.held => p with { helds: 2 }
+  true, _, _ => p
+}
 
 # What reading a symbol looks like in the output.
 fn symbol-read(s: Int) -> Node = match an.linked.cjs-imports[t] {
@@ -388,9 +408,9 @@ fn cjs-part() -> Node = match an.linking.compact {
 
 fn plain-key?(s: Text) -> Bool = len(s) > 0 and host.name-start-byte?(s[0]) and (all c in s: host.name-byte?(c))
 
-fn export-getter(name-id: Int) -> Node = Prop(key, exp`() => $target`)
+fn export-getter(name-id: Int, s: Int) -> Node = Prop(key, exp`() => $target`)
   where name = name-of(m.names, name-id),
-        target = symbol-read(resolved-export(here.id, name-id) ?? panic "{}: lost export {}", here.path, name),
+        target = symbol-read(s),
         key = match name {
           _ if plain-key?(name) => PropName(name)
           _ => Str(quote-text(name))
@@ -399,7 +419,8 @@ fn export-getter(name-id: Int) -> Node = Prop(key, exp`() => $target`)
 # `var x_exports = {}; __export(x_exports, { a: () => a, … });`, names sorted.
 fn namespace-stmts() -> [Node] = [stmt`var $ns = {};`] ++ [stmt`$export_all($ns, { $$getters });` for g in [getters] if len(g) > 0]
   where ns = final-of(an.ns-sym(here)),
-        getters = [export-getter(n) for n in sort n in [n for m.db.resolved(here.id, ?n, _) distinct n] by name-of(m.names, n)],
+        getters = [export-getter(n, s) for n in sort n in [n for m.db.resolved(here.id, ?n, _) distinct n] by name-of(m.names, n)
+                   if let some(s) = resolved-export(here.id, n)],
         export-all = helper-name("__export")
 
 # A binding pattern says the same thing as an assignment target, in other nodes.

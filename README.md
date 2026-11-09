@@ -406,7 +406,9 @@ Each part of a mechanism is a policy or a function of the strategy's own (`… b
 `src/app/versions.rules`): `store memory disk by F` saves only the answers F picks; `check by F`
 uses an answer again while F, a version such as a content hash, gives what it gave; `cutoff by F`
 decides when an answer made again counts as the same; `evict by F` lets answers go after each
-build. Strategies today: `once` (one build's repeated work: files read, names resolved), the
+build; `update by F` makes an answer from the last one instead of afresh. A strategy's functions are
+called through what the pipeline registers when a run picks it, so they may read anything the
+bundler has. Strategies today: `once` (one build's repeated work: files read, names resolved), the
 default; `incremental`; `lean` (at most 2000 answers per function, never saved); `trusting`
 (packages under `node_modules` never checked); `coarse` (kept while nothing changes); `versioned`
 (package.json and directory listings by content version); `tailored` (what three builds did not ask
@@ -428,11 +430,18 @@ Both keep a file's parse and analysis, its references, its side effects and its 
 module; a resolution per directory and specifier; a file's existence from its directory's listing;
 and a package.json per package. Ours prints per group of a module's statements, where Turbopack
 joins and minifies a whole chunk in one task, and ours saves every kept answer, where Turbopack
-saves no parse, chunk item content or module graph. Turbopack is finer in two places: it splits
-modules into parts (1,282 part modules for zod) and answers each export question as a task of its
-own (`follow_reexports`, `is_export_missing`, about 1,000), where linking here is one Datalog
-solve over every module's facts. That solve is most of a rebuild: 40.6 M of a zod rebuild's 60 M
-instructions.
+saves no parse, chunk item content or module graph. Turbopack splits modules into parts (1,282
+part modules for zod) and answers each export question as a task of its own (`follow_reexports`,
+`is_export_missing`, about 1,000). Linking here is Datalog over every module's facts, and
+`incremental` keeps it `update by app.versions/solved-again`: the facts language's `solved-from`
+brings the last database up to date by deleting and deriving again (DRed), group by group of
+relations that derive each other, so what an edit's facts do not reach is not derived again. A
+group where an edit takes out more than a quarter of the rows (a change reaching most of the tree
+shaking, which Turbopack's build also does over the whole graph) is solved afresh from the groups
+below it. Set `HL_CHECK_DATALOG` to check every update against solving afresh. The Datalog lap of a
+rebuild: zod 27–35 M instructions against 53 M solving afresh; twelve copies of zod 318–366 M
+against 593–607 M. What remains whole-program in a rebuild is the facts' list and the database's
+copy, the joined symbol table, and naming.
 
 Rebuilds after one edit, on Linux (`tools/bench.py`, 2026-11-09, median of 7; esbuild 0.28.2 and
 Turbopack's CLI built from next.js sources):

@@ -5,7 +5,8 @@
 #   a build with the cache, cold and then warm;
 #   a watcher's build after the entry is edited, and after a module under node_modules is;
 #   a watcher's build after a new file is added beside the entry and imported by it (its directory's
-#   listing changes), and after a package's package.json is edited to start it at another file;
+#   listing changes), after a package's package.json is edited to start it at another file, and after
+#   a name in the entry is made an export (ES module output, which lists them);
 #   a run with the cache after all of those edits, made while nothing ran, and after they are undone.
 # Every output must be byte for byte what a fresh build with no cache makes of the files as they
 # are, but where the strategy trusts a path: an edit there is not seen, and the output is what it
@@ -50,12 +51,12 @@ def write(root, rel, text):
     os.replace(staged, os.path.join(root, rel))
 
 def fresh(root, entry):
-    p = subprocess.run([ESB, entry, "--no-cache", "--outfile=out/fresh.js"], cwd=root, capture_output=True, text=True, timeout=300)
+    p = subprocess.run([ESB, entry, "--no-cache", "--format=esm", "--outfile=out/fresh.js"], cwd=root, capture_output=True, text=True, timeout=300)
     if p.returncode != 0: sys.exit("fresh build failed: " + p.stderr[-1500:])
     return open(os.path.join(root, "out", "fresh.js")).read()
 
 def cached(root, entry, strategy):
-    p = subprocess.run([ESB, entry, "--cache", f"--strategy={strategy}", "--outfile=out/out.js"], cwd=root,
+    p = subprocess.run([ESB, entry, "--cache", f"--strategy={strategy}", "--format=esm", "--outfile=out/out.js"], cwd=root,
                        capture_output=True, text=True, timeout=300)
     if p.returncode != 0: sys.exit(f"--cache --strategy={strategy} failed: " + (p.stdout + p.stderr)[-1500:])
     return open(os.path.join(root, "out", "out.js")).read()
@@ -65,7 +66,7 @@ def watched(root, entry, strategy, edits):
     the output after each: after its rebuild, or a few seconds on when it should not rebuild (and
     did not)."""
     import queue, threading
-    p = subprocess.Popen([ESB, entry, "--watch", "--timing", f"--strategy={strategy}", "--outfile=out/out.js"], cwd=root,
+    p = subprocess.Popen([ESB, entry, "--watch", "--timing", f"--strategy={strategy}", "--format=esm", "--outfile=out/out.js"], cwd=root,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     lines, said = queue.Queue(), []
     threading.Thread(target=lambda: [lines.put(l) for l in p.stdout], daemon=True).start()
@@ -107,6 +108,9 @@ def trusted(paths, rel):
     import fnmatch
     return any(fnmatch.fnmatch(rel, p.replace("**/", "*").replace("/**", "/*")) for p in paths)
 
+EXPORTS = 'export const b = 2;\nconst x = 0;\nexport const d = 4;\nconsole.log(x);\n'
+EXPORTED = 'export const b = 2;\nexport const a = 1;\nexport const d = 4;\nconsole.log(a);\n'
+
 def add_package(root, entry):
     """A package of the check's own, which the entry imports first: its package.json names the file
     it starts at, which an edit changes. Its package.json, as a path in the tree."""
@@ -116,7 +120,9 @@ def add_package(root, entry):
         with open(os.path.join(pkg, f + ".js"), "w") as out: out.write(f'console.log("mechanism-pkg {f}");\n')
     with open(os.path.join(pkg, "package.json"), "w") as out: out.write('{\n  "name": "mechanism-pkg",\n  "main": "a.js"\n}\n')
     text = open(os.path.join(root, entry)).read()
-    with open(os.path.join(root, entry), "w") as out: out.write('import "mechanism-pkg";\n' + text)
+    # Exports, which ES module output lists, around a name that an edit makes one of them.
+    with open(os.path.join(root, entry), "w") as out:
+        out.write('import "mechanism-pkg";\n' + EXPORTS + text)
     return "node_modules/mechanism-pkg/package.json"
 
 def prepare(app):
@@ -169,13 +175,17 @@ for app in APPS:
                    entry: 'import "./mechanism-extra.js";\n' + start[entry] + 'console.log("mechanism edit 3");\n'}), True),
             # The file a package starts at.
             (edit({pj: start[pj].replace('"a.js"', '"b.js"')}), not trusted(trust, pj)),
+            # A name made an export, the entry's names as many as before: its export listed where a
+            # fresh build lists it.
+            (edit({entry: files[entry].replace(EXPORTS, EXPORTED, 1)}), True),
         ]
         final = dict(files)
         # Back as they were, for the watcher to start from.
         for rel in (entry, module, pj): write(root, rel, start[rel])
         if os.path.exists(os.path.join(root, extra)): os.remove(os.path.join(root, extra))
         outs, log = watched(root, entry, strategy, edits)
-        names = ["the entry edited", "a module edited", "a file added beside the entry and imported", "a package.json edited"]
+        names = ["the entry edited", "a module edited", "a file added beside the entry and imported", "a package.json edited",
+                 "a name made an export"]
         made = []
         for i, (state, out) in enumerate(zip(states, outs)):
             for rel, text in state.items(): write(root, rel, text)

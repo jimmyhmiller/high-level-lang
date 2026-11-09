@@ -913,6 +913,7 @@
    (check-by (slice u8))
    (cutoff-by (slice u8))
    (evict-by (slice u8))
+   (update-by (slice u8))
    (disk i64)
    (check i64)
    (cutoff i64)
@@ -923,11 +924,11 @@
 ;;; an answer made again changing nothing when it is the same (1), never (0), when `cutoff-by` says
 ;;; (2); at most so many answers (0: all, -1: as `evict-by` says).
 (defstruct Policy [(disk bool) (store-by (slice u8)) (check i64) (check-by (slice u8)) (cutoff i64) (cutoff-by (slice u8))
-                   (evict i64) (evict-by (slice u8))])
+                   (evict i64) (evict-by (slice u8)) (update-by (slice u8))])
 
 ;;; The mechanism of old's policy: saved, checked by reads, cut off when equal, every answer kept.
 (defn old-policy [] (-> Policy)
-  (Policy :disk true :store-by "" :check 0 :check-by "" :cutoff 1 :cutoff-by "" :evict 0 :evict-by ""))
+  (Policy :disk true :store-by "" :check 0 :check-by "" :cutoff 1 :cutoff-by "" :evict 0 :evict-by "" :update-by ""))
 
 ;;; Every strategy: what each keeps, what is kept by any (each function's place in that list is its
 ;;; number, the same for every compiler that reads the file), and which are used when a run does not
@@ -949,7 +950,7 @@
   (let [(mut out) (ArrayList::new [MechanismDecl] (malloc-allocator))]
     (for d (.kids (kid-of tree 2))
       (let [name (.text (kid-of d 0))
-            (mut m) (MechanismDecl :name name :from "" :store-by "" :check-by "" :cutoff-by "" :evict-by ""
+            (mut m) (MechanismDecl :name name :from "" :store-by "" :check-by "" :cutoff-by "" :evict-by "" :update-by ""
                                    :disk -1 :check -1 :cutoff -1 :evict -1)]
         (match (find-mechanism out name)
           (Some [_] (strategy-fail src path d (dsl/join2 "a second mechanism named " name)))
@@ -991,6 +992,7 @@
                                 (g/KEvictBy [] -1)
                                 (_ 0)))
                         (when (= (.kind how) (g/KEvictBy)) (set! (.evict-by m) (.text (kid-of how 0))))))
+            (g/KUpdateBy [] (set! (.update-by m) (.text (kid-of item 0))))
             (_ (strategy-fail src path item "not a mechanism's item"))))
         (push! (mut out) m)))
     out))
@@ -1020,7 +1022,8 @@
         ;; Unsaid is -1 with no function; `evict by F` is -1 with F.
         (when (or (>= (.evict m) 0) (> (len (.evict-by m)) 0))
           (set! (.evict p) (.evict m))
-          (set! (.evict-by p) (.evict-by m)))))
+          (set! (.evict-by p) (.evict-by m)))
+        (when (> (len (.update-by m)) 0) (set! (.update-by p) (.update-by m)))))
     p))
 
 ;;; The mechanism strategy `name` keeps function `f` by: a `keep with` naming it, here or in a
@@ -1046,13 +1049,14 @@
         (old-policy)
         (mechanism-policy (.mechanisms all) m))))
 
-;;; A policy's function for one of its parts (`… by F`): 0 store, 1 check, 2 cutoff, 3 evict; "" for
-;;; none.
+;;; A policy's function for one of its parts (`… by F`): 0 store, 1 check, 2 cutoff, 3 evict, 4
+;;; update; "" for none.
 (defn policy-hook [(p Policy) (role i64)] (-> (slice u8))
   (cond (= role 0) (.store-by p)
         (= role 1) (.check-by p)
         (= role 2) (.cutoff-by p)
-        :else (.evict-by p)))
+        (= role 3) (.evict-by p)
+        :else (.update-by p)))
 
 ;;; The functions any strategy gives kept function `f` for one part of its policy (see
 ;;; `policy-hook`), in order: a strategy's choice among them is its place in this list.
@@ -1416,7 +1420,22 @@
           (mut uses) (primitive/code-list-new)
           (mut tracking) (primitive/code-list-new)
           (mut persisting) (primitive/code-list-new)
-          (mut strategy-names) (primitive/code-list-new)]
+          (mut strategy-names) (primitive/code-list-new)
+          (mut hook-modules) (texts)
+          (mut hook-imports) (primitive/code-list-new)
+          (mut hook-registers) (primitive/code-list-new)]
+      ;; The modules of the functions the strategies' mechanisms name, each registering them.
+      (for d (.decls all)
+        (for x (strategy-keeps all (.name d) (made-of tree))
+          (let [p (strategy-policy all (.name d) x)]
+            (for role (range 0 5)
+              (let [h (policy-hook p role)]
+                (when (> (len h) 0)
+                  (add-unique! (mut hook-modules) (subslice h 0 (rt/name-end-at h 47)))))))))
+      (for m hook-modules
+        (let [alias (dsl/join2 "hooks-" (rt/joined (rt/split m ".") "-"))]
+          (push! (mut hook-imports) `(import ~m :as ~(primitive/code-symbol alias)))
+          (push! (mut hook-registers) `(~(primitive/code-symbol alias "/register-hooks!")))))
       (for d (.decls all)
         (let [(mut ons) (primitive/code-list-new)]
           (for x (strategy-keeps all (.name d) (made-of tree))
@@ -1429,7 +1448,7 @@
                 (push! (mut policies)
                        `(rt/keep-policy! ~(kept-index all x) ~(if (.disk p) `true `false) ~(hook-index all (made-of tree) x p 0)
                                          ~(policy-check all (made-of tree) x p) ~(policy-cutoff all (made-of tree) x p)
-                                         ~(.evict p) ~(hook-index all (made-of tree) x p 3)))))
+                                         ~(.evict p) ~(hook-index all (made-of tree) x p 3) ~(hook-index all (made-of tree) x p 4)))))
             (for x (strategy-paths all (.name d) true) (push! (mut trusts) `(push! (mut trust) ~x)))
             (for x (strategy-paths all (.name d) false) (push! (mut rechecks) `(push! (mut recheck) ~x)))
             (push! (mut uses) `(= name ~(.name d)))
@@ -1454,6 +1473,7 @@
       (for d (.depends chk) (push! (mut deps) `~d))
       (dsl/render `(do
                      (import ~record-module :as plan-module)
+                     ~@hook-imports
                      (import "hl.rt" :as rt)
                      (import "coil.arraylist" :use [ArrayList])
                      (import "coil.alloc" :use [malloc-allocator])
@@ -1468,6 +1488,8 @@
                          out))
                      ;; The run keeps what this strategy keeps, and tracks dependencies if it does.
                      (defn use-strategy! [(name (slice u8))] (-> void)
+                       ;; The strategies' functions, for the code they serve to call.
+                       ~@hook-registers
                        (cond ~@uses :else (panic "no strategy named {}: the pipeline has {}" name (rt/joined (strategy-names) ", "))))
                      (defn strategy-tracks? [(name (slice u8))] (-> bool)
                        (cond ~@tracking :else (panic "no strategy named {}" name)))

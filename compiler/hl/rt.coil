@@ -1198,6 +1198,69 @@
       (init-unlock!))
     (index-rows (elem (mut (.pair-index r)) slot) (pair-key k1 k2))))
 
+;; -------------------------------------------------------------- relations updated, not solved again
+
+;;; One of `r`'s rows, its columns as `rel-add!` takes them.
+(defn row-col [(r (mut Rel)) (row i64) (col i64)] (-> i64)
+  (if (< col (.arity r)) (rel-at (mut r) row col) 0))
+
+;;; A relation of its own with `r`'s rows in `r`'s order, but those `gone` has; its indexes made again
+;;; as queries ask for them, and every row counted seen.
+(defn rel-without [(r (mut Rel)) (gone (mut Rel))] (-> Rel)
+  (let [(mut out) (rel-new (.arity r))]
+    (rel-reserve! (mut out) (.count r))
+    (for row (range 0 (.count r))
+      (let [a (row-col (mut r) row 0) b (row-col (mut r) row 1) c (row-col (mut r) row 2) d (row-col (mut r) row 3)]
+        (unless (and (> (.count gone) 0) (rel-has? (mut gone) a b c d))
+          (rel-add! (mut out) a b c d))))
+    (set! (.seen out) (.count out))
+    out))
+
+;;; A list of its own with `xs`'s items.
+(defn ints-copy [(xs (ArrayList i64))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (malloc-allocator))]
+    (reserve! (mut out) (len xs))
+    (for x xs (push! (mut out) x))
+    out))
+
+;;; A relation of its own with `r`'s rows in `r`'s order: one to add to while `r` stays as it is. Its
+;;; rows and their hashes are copied as they are; its indexes are made again as queries ask for them.
+(defn rel-clone [(r (mut Rel))] (-> Rel)
+  (let [(mut out) (rel-new (.arity r))
+        (mut present) (ArrayList::new [u8] (malloc-allocator))]
+    (for x (.present r) (push! (mut present) x))
+    (set! (.data out) (ints-copy (.data r)))
+    (set! (.next out) (ints-copy (.next r)))
+    (set! (.heads out) (IntTable :keys (ints-copy (.keys (.heads r))) :vals (ints-copy (.vals (.heads r)))
+                                 :count (.count (.heads r)) :mask (.mask (.heads r))))
+    (set! (.present out) present)
+    (set! (.count out) (.count r))
+    (set! (.seen out) (.count r))
+    out))
+
+;;; Rows `from` to `to` of `a` that `b` has not, added to `out`. Answers how many.
+(defn rel-range-diff-into! [(a (mut Rel)) (from i64) (to i64) (b (mut Rel)) (out (mut Rel))] (-> i64)
+  (let [(mut n) 0]
+    (for row (range from to)
+      (let [x0 (row-col (mut a) row 0) x1 (row-col (mut a) row 1) x2 (row-col (mut a) row 2) x3 (row-col (mut a) row 3)]
+        (unless (rel-has? (mut b) x0 x1 x2 x3)
+          (when (rel-add! (mut out) x0 x1 x2 x3) (set! n (+ n 1))))))
+    n))
+
+;;; Rows of `a` that `b` has not, added to `out`. Answers how many.
+(defn rel-diff-into! [(a (mut Rel)) (b (mut Rel)) (out (mut Rel))] (-> i64)
+  (rel-range-diff-into! (mut a) 0 (.count a) (mut b) (mut out)))
+
+;;; Whether `a` and `b` hold the same rows, whatever their order.
+(defn rel-same-rows? [(a (mut Rel)) (b (mut Rel))] (-> bool)
+  (and (= (.count a) (.count b))
+       (let [(mut none) (rel-new (.arity a))]
+         (= (rel-diff-into! (mut a) (mut b) (mut none)) 0))))
+
+;;; Whether the environment variable `name` is set.
+(defn env-on? [(name (slice u8))] (-> bool)
+  (!= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) name))) 0))
+
 ;;; Start a round: what arrived since the last start is now the delta. True when there is any.
 (defn rel-advance! [(r (mut Rel))] (-> bool)
   (set! (.delta-from r) (.seen r))
@@ -5415,6 +5478,8 @@
    (cutoff (ArrayList i64))
    (evict (ArrayList i64))
    (evict-by (ArrayList i64))
+   ;; Which of its `update by` functions makes its answers from the last one (-1: none).
+   (update-by (ArrayList i64))
    ;; Each kept function's sweep (`evict by`), by its name, once its answers are first kept.
    (sweeps (HashMap (slice u8) (fnptr (cc/C) [] i64)))
    (sweeps-ready bool)
@@ -5437,8 +5502,10 @@
           (mut check) (ArrayList::new [i64] (malloc-allocator))
           (mut cutoff) (ArrayList::new [i64] (malloc-allocator))
           (mut evict) (ArrayList::new [i64] (malloc-allocator))
-          (mut evict-by) (ArrayList::new [i64] (malloc-allocator))]
+          (mut evict-by) (ArrayList::new [i64] (malloc-allocator))
+          (mut update-by) (ArrayList::new [i64] (malloc-allocator))]
       (for _ (range 0 count)
+        (push! (mut update-by) -1)
         (push! (mut disk) true)
         (push! (mut store-by) -1)
         (push! (mut check) 0)
@@ -5450,12 +5517,13 @@
       (set! (.check s) check)
       (set! (.cutoff s) cutoff)
       (set! (.evict s) evict)
-      (set! (.evict-by s) evict-by))
+      (set! (.evict-by s) evict-by)
+      (set! (.update-by s) update-by))
     (set! (.chosen s) true)
     0))
 
 ;;; How function `index` is kept this run, as its strategy's mechanism for it says.
-(defn keep-policy! [(index i64) (disk bool) (store-by i64) (check i64) (cutoff i64) (evict i64) (evict-by i64)] (-> void)
+(defn keep-policy! [(index i64) (disk bool) (store-by i64) (check i64) (cutoff i64) (evict i64) (evict-by i64) (update-by i64)] (-> void)
   (let [s (kept-state)]
     (set! (mut (.disk s)) index disk)
     (set! (mut (.store-by s)) index store-by)
@@ -5463,6 +5531,7 @@
     (set! (mut (.cutoff s)) index cutoff)
     (set! (mut (.evict s)) index evict)
     (set! (mut (.evict-by s)) index evict-by)
+    (set! (mut (.update-by s)) index update-by)
     0))
 
 ;;; Until a run chooses, every function is kept as the mechanism of old: saved, checked by what it
@@ -5484,6 +5553,43 @@
 
 (defn kept-evict-by [(index i64)] (-> i64)
   (let [s (kept-state)] (if (.chosen s) (get (.evict-by s) index) -1)))
+
+(defn kept-update-by [(index i64)] (-> i64)
+  (let [s (kept-state)] (if (.chosen s) (get (.update-by s) index) -1)))
+
+;;; A strategy's functions (`… by F` in the pipeline language), by `module/function`: each as the bits
+;;; of its function value, registered by its module when a run picks its strategy, so the code it
+;;; serves calls it without importing its module (which may read anything the program has).
+(defstruct Hooks [(lock i64) (ready bool) (by (HashMap (slice u8) i64))])
+
+(defn hooks [] (-> (ptr Hooks))
+  (let [h (primitive/alloc-static Hooks)]
+    (unless (.ready h)
+      (init-lock!)
+      (unless (.ready h)
+        (set! (.by h) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+        (set! (.ready h) true))
+      (init-unlock!))
+    h))
+
+(defn hook-register! [(name (slice u8)) (bits i64)] (-> void)
+  (let [h (hooks)]
+    (spin-lock! (cast (ptr i64) h))
+    (set! (mut (.by h)) name bits)
+    (spin-unlock! (cast (ptr i64) h))
+    0))
+
+;;; Function `name`'s value, its bits in `cell` (a call site's own) from the first call on.
+(defn hook-cell [(name (slice u8)) (cell (ptr i64))] (-> (ptr i64))
+  (when (= (atomic/read cell) 0)
+    (let [h (hooks)]
+      (spin-lock! (cast (ptr i64) h))
+      (let [found (get (.by h) name)]
+        (spin-unlock! (cast (ptr i64) h))
+        (match found
+          (Some [bits] (atomic/store cell bits))
+          (None [] (panic "the strategy's function {} was never registered: its module's register-hooks! did not run" name))))))
+  cell)
 
 ;;; Kept function `name` can let answers go after a build (`evict by`): `f` does it.
 (defn sweeper! [(name (slice u8)) (f (fnptr (cc/C) [] i64))] (-> void)
