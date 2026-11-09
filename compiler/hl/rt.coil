@@ -3302,6 +3302,39 @@
 ;;; The memo this worker was computing is done, and is node `me`: it read what was noted, and is
 ;;; current in this revision; changed in it unless its answer is the one it had (`same`).
 (defn dep-end-id! [(me i64) (same bool)] (-> void)
+  (dep-end-with! me same true))
+
+;;; The same for an answer checked otherwise than by what it read (see `check` in the pipeline
+;;; language): it reads nothing, so nothing it read changes it; one kept while no input changes is
+;;; noted, so any change marks it.
+(defn dep-end-ignoring-reads! [(me i64) (same bool) (any-change bool)] (-> void)
+  (dep-end-with! me same false)
+  (when any-change (dep-any-change-node! me))
+  0)
+
+(defstruct AnyChange [(lock i64) (ready bool) (ids (ArrayList i64)) (seen (HashMap i64 bool))])
+
+(defn any-change-nodes [] (-> (ptr AnyChange))
+  (let [a (primitive/alloc-static AnyChange)]
+    (unless (.ready a)
+      (init-lock!)
+      (unless (.ready a)
+        (set! (.seen a) (HashMap::new [i64 bool] (malloc-allocator) (i64-keyops)))
+        (set! (.ids a) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.ready a) true))
+      (init-unlock!))
+    a))
+
+(defn dep-any-change-node! [(id i64)] (-> void)
+  (let [a (any-change-nodes)]
+    (spin-lock! (cast (ptr i64) a))
+    (match (get (.seen a) id)
+      (Some [_] 0)
+      (None [] (do (set! (mut (.seen a)) id true) (push! (mut (.ids a)) id) 0)))
+    (spin-unlock! (cast (ptr i64) a))
+    0))
+
+(defn dep-end-with! [(me i64) (same bool) (keep-reads bool)] (-> void)
   (let [d (deps)
         slot (worker-slot)
         (mut frame) (match (pop! (mut (elem (mut (.stacks d)) slot)))
@@ -3311,6 +3344,9 @@
     (deps-lock! d)
     (frame-resolve! d (mut frame))
     (frame-free! (mut frame))
+    (unless keep-reads
+      (let [(mut read) (.notes frame)] (free! (mut read)))
+      (set! (.notes frame) (ArrayList::new [i64] (malloc-allocator))))
     (let [now (atomic/read (field d revision))
           before (get (.reads d) me)
           ;; Read just what it read last time, in the same order: its edges are there already.
@@ -3361,8 +3397,8 @@
 ;;; An input was read: noted, with what it said, when a memo reads it. `stamp`: its size and time
 ;;; (see `file-stamp`), taken before it was read, so a change while it was read changes the stamp
 ;;; too; "" for an input no stamp settles.
-(defn dep-input! [(node (slice u8)) (print (slice u8)) (stamp (slice u8))] (-> void)
-  (when (dep-in-frame?)
+(defn dep-input! [(node (slice u8)) (print (slice u8)) (stamp0 (slice u8))] (-> void)
+  (when (and (dep-in-frame?) (not (trusted-path? (subslice node 2 (len node)))))
     (dep-note! node)
     (let [d (deps)]
       (deps-lock! d)
@@ -3370,7 +3406,7 @@
         (when (= (len (get (.prints d) id)) 0)
           (set! (mut (.changed d)) id (atomic/read (field d revision))))
         (set! (mut (.prints d)) id print)
-        (set! (mut (.stamps d)) id stamp))
+        (set! (mut (.stamps d)) id (if (rechecked-path? (subslice node 2 (len node))) "" stamp0)))
       (deps-unlock! d)))
   0)
 
@@ -3562,7 +3598,8 @@
 (defn input-stamp [(node (slice u8))] (-> (slice u8))
   (let [path (subslice node 2 (len node))
         kind (cast i64 (get node 0))]
-    (cond (= kind 102) (file-stamp path)
+    (cond (rechecked-path? path) ""
+          (= kind 102) (file-stamp path)
           (= kind 100) (file-stamp (if (= (len path) 0) "." path))
           (= kind 101) (file-stamp path)
           :else "")))
@@ -3608,7 +3645,35 @@
                 (set! (mut (.prints d)) (dep-id! d node) now)
                 (deps-unlock! d)
                 (dep-changed! node)))))))
+    (when (> (len changed) 0) (dep-any-change-dirty!))
     changed))
+
+;;; An input changed: every answer kept only while none does (see `check any-change`), and what read
+;;; those, through any number of answers, may have changed.
+(defn dep-any-change-dirty! [] (-> void)
+  (let [d (deps)
+        anys (any-change-nodes)
+        (mut todo) (ArrayList::new [i64] (malloc-allocator))]
+    (when (.tracking d)
+      (deps-lock! d)
+      (atomic/store (field d revision) (+ (atomic/read (field d revision)) 1))
+      (spin-lock! (cast (ptr i64) anys))
+      (for a (.ids anys)
+        (unless (get (.dirty d) a)
+          (set! (mut (.dirty d)) a true)
+          (push! (mut todo) a)))
+      (spin-unlock! (cast (ptr i64) anys))
+      (while (> (len todo) 0)
+        (let [at (match (pop! (mut todo)) (Some [x] x) (None [] -1))]
+          (let [(mut e) (dep-head d at)]
+            (while (>= e 0)
+              (let [out (get (.edge-to d) e)]
+                (unless (get (.dirty d) out)
+                  (set! (mut (.dirty d)) out true)
+                  (push! (mut todo) out)))
+              (set! e (get (.edge-next d) e))))))
+      (deps-unlock! d))
+    0))
 
 ;;; How many inputs memos have read.
 (defn dep-inputs [] (-> i64)
@@ -5263,7 +5328,16 @@
 ;;; The strategy a run uses (see `strategy` in the pipeline language): for each function some
 ;;; strategy keeps, by its number, whether this run keeps it. Until a run chooses, each function
 ;;; is kept as the default strategy says, which its code knows.
-(defstruct Kept [(chosen bool) (on (ArrayList bool))])
+(defstruct Kept
+  [(chosen bool)
+   (on (ArrayList bool))
+   ;; How each is kept (see `mechanism` in the pipeline language): saved with the cache; how a kept
+   ;; answer is checked (0 what it read, 1 that no input changed, 2 never); whether an answer made
+   ;; again the same changes nothing; at most how many answers (0: no bound).
+   (disk (ArrayList bool))
+   (check (ArrayList i64))
+   (cutoff (ArrayList bool))
+   (evict (ArrayList i64))])
 
 (defn kept-state [] (-> (ptr Kept))
   (primitive/alloc-static Kept))
@@ -5276,8 +5350,102 @@
     (for _ (range 0 count) (push! (mut flags) false))
     (for i on (set! (mut flags) i true))
     (set! (.on s) flags)
+    (let [(mut disk) (ArrayList::new [bool] (malloc-allocator))
+          (mut check) (ArrayList::new [i64] (malloc-allocator))
+          (mut cutoff) (ArrayList::new [bool] (malloc-allocator))
+          (mut evict) (ArrayList::new [i64] (malloc-allocator))]
+      (for _ (range 0 count)
+        (push! (mut disk) true)
+        (push! (mut check) 0)
+        (push! (mut cutoff) true)
+        (push! (mut evict) 0))
+      (set! (.disk s) disk)
+      (set! (.check s) check)
+      (set! (.cutoff s) cutoff)
+      (set! (.evict s) evict))
     (set! (.chosen s) true)
     0))
+
+;;; How function `index` is kept this run, as its strategy's mechanism for it says.
+(defn keep-policy! [(index i64) (disk bool) (check i64) (cutoff bool) (evict i64)] (-> void)
+  (let [s (kept-state)]
+    (set! (mut (.disk s)) index disk)
+    (set! (mut (.check s)) index check)
+    (set! (mut (.cutoff s)) index cutoff)
+    (set! (mut (.evict s)) index evict)
+    0))
+
+;;; Until a run chooses, every function is kept as the mechanism of old: saved, checked by what it
+;;; read, an answer made again the same changing nothing, no bound.
+(defn kept-disk? [(index i64)] (-> bool)
+  (let [s (kept-state)] (if (.chosen s) (get (.disk s) index) true)))
+
+(defn kept-check [(index i64)] (-> i64)
+  (let [s (kept-state)] (if (.chosen s) (get (.check s) index) 0)))
+
+(defn kept-cutoff? [(index i64)] (-> bool)
+  (let [s (kept-state)] (if (.chosen s) (get (.cutoff s) index) true)))
+
+(defn kept-evict [(index i64)] (-> i64)
+  (let [s (kept-state)] (if (.chosen s) (get (.evict s) index) 0)))
+
+;; ---------------------------------------------------------------- inputs a run trusts
+
+;;; Paths a run's strategy trusts (read as they are, never what an answer is made from) and those it
+;;; compares by what they hold, never by size and time (see `trust` and `recheck` in the pipeline
+;;; language): patterns with `*` within a directory, `**` across directories.
+(defstruct InputPolicy [(trust (ArrayList (slice u8))) (recheck (ArrayList (slice u8)))])
+
+(defn input-policy [] (-> (ptr InputPolicy))
+  (primitive/alloc-static InputPolicy))
+
+(defn trust-paths! [(patterns (ArrayList (slice u8)))] (-> void)
+  (set! (.trust (input-policy)) patterns)
+  0)
+
+(defn recheck-paths! [(patterns (ArrayList (slice u8)))] (-> void)
+  (set! (.recheck (input-policy)) patterns)
+  0)
+
+(defn matches-any? [(patterns (ArrayList (slice u8))) (path (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for p patterns (when (glob-match? p path) (set! hit true)))
+    hit))
+
+(defn trusted-path? [(path (slice u8))] (-> bool)
+  (matches-any? (.trust (input-policy)) path))
+
+(defn rechecked-path? [(path (slice u8))] (-> bool)
+  (matches-any? (.recheck (input-policy)) path))
+
+;;; Whether `path` matches `pattern`: `**` any run of characters, `*` any run without a `/`, `?`
+;;; one character but `/`, anything else itself.
+(defn glob-match? [(pattern (slice u8)) (path (slice u8))] (-> bool)
+  (glob-from? pattern 0 path 0))
+
+(defn glob-from? [(p (slice u8)) (i i64) (s (slice u8)) (j i64)] (-> bool)
+  (cond (= i (len p)) (= j (len s))
+        (and (= (get p i) #\*) (< (+ i 1) (len p)) (= (get p (+ i 1)) #\*))
+          ;; `**/` also matches nothing at all.
+          (let [next (if (and (< (+ i 2) (len p)) (= (get p (+ i 2)) #\/)) (+ i 3) (+ i 2))
+                (mut k) j
+                (mut hit) false]
+            (when (and (> next (+ i 2)) (glob-from? p next s j)) (set! hit true))
+            (while (and (not hit) (<= k (len s)))
+              (when (glob-from? p (+ i 2) s k) (set! hit true))
+              (set! k (+ k 1)))
+            hit)
+        (= (get p i) #\*)
+          (let [(mut k) j
+                (mut hit) false
+                (mut going) true]
+            (while (and going (not hit) (<= k (len s)))
+              (when (glob-from? p (+ i 1) s k) (set! hit true))
+              (if (and (< k (len s)) (!= (get s k) #\/)) (set! k (+ k 1)) (set! going false)))
+            hit)
+        (= j (len s)) false
+        (= (get p i) #\?) (and (!= (get s j) #\/) (glob-from? p (+ i 1) s (+ j 1)))
+        :else (and (= (get p i) (get s j)) (glob-from? p (+ i 1) s (+ j 1)))))
 
 (defn kept? [(index i64) (default bool)] (-> bool)
   (let [s (kept-state)]

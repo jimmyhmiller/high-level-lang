@@ -470,7 +470,7 @@
             (set! (.keeps k) (.kept all))
             (set! (.default-keeps k) (pl/strategy-keeps all (.default all) made)))
           (for m made (push! (mut (.made k)) m))
-          (for d (.kids (get (.kids tree) 3))
+          (for d (.kids (get (.kids tree) 4))
             (let [fns (if (= (.kind d) (gpl/KPerStage)) (get (.kids d) 2) (get (.kids d) 1))]
               (for n (.kids fns) (push! (mut (.staged k)) (.text n)))))
           (for m made
@@ -8689,6 +8689,11 @@
         int-key (= (memo-key-type f) "Int")
         tree (tree-keyed? (mut k) f)
         key-text (if int-key `(rt/num-text key) `key)
+        number (kept-number (mut k) name)
+        ;; Whether this run's mechanism for it saves its answers (`store memory disk`).
+        disk (if (>= number 0) `(rt/kept-disk? ~number) `true)
+        ;; One kept while no input changes is marked by any change, as it is read back too.
+        any-change (if (>= number 0) `(= (rt/kept-check ~number) 1) `false)
         (mut puts) (primitive/code-list-new)
         (mut binds) (primitive/code-list-new)
         (mut inits) (primitive/code-list-new)]
@@ -8706,10 +8711,10 @@
                (mut keys) (ArrayList::new [~keyty] (malloc-allocator))]
            (when (and full (or (> (len (.lazy s)) 0) (> (len (.pending s)) 0)))
              (panic "memo fn {} is written whole with answers still unread" ~name))
-           (if full
-               (for key (.table s) (push! (mut keys) key))
-               (for key (.dirty s)
-                 (match (get (.table s) key) (Some [_] (push! (mut keys) key)) (None [] 0))))
+           (cond (not ~disk) 0
+                 full (for key (.table s) (push! (mut keys) key))
+                 :else (for key (.dirty s)
+                         (match (get (.table s) key) (Some [_] (push! (mut keys) key)) (None [] 0))))
            (rt/put-varint! x (len keys))
            (for key keys
              (match (get (.args s) key)
@@ -8735,12 +8740,14 @@
                    (for _ (range 0 n)
                      (let [id (rt/take-int r)
                            at (rt/take-varint r)]
+                       (when ~any-change (rt/dep-any-change-node! id))
                        (push! (mut (.pending s)) id)
                        (push! (mut (.pending s)) at))))
                 `(for _ (range 0 n)
                    (let [key ~(if int-key `(rt/take-int r) `(rt/take-text r))
                          id (rt/take-int r)
                          at (rt/take-varint r)]
+                     (when ~any-change (rt/dep-any-change-node! id))
                      (set! (mut (.lazy s)) key at)
                      (set! (mut (.node-ids s)) key id)
                      (rt/dep-claim! id)))))
@@ -9012,7 +9019,10 @@
                ;; and data of answers whose keys are not made yet.
                (lazy (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
                (dirty (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
-               (pending (ArrayList i64))]))
+               (pending (ArrayList i64))
+               ;; When each answer was last asked for, by `clock`: what an eviction bound lets go first.
+               (uses ~(coil-type (mut k) (cat3 "{" (memo-key-type f) ":Int}")))
+               (clock i64)]))
     ;; An answer asked for by its node, as checking an answer that read it asks: its key from the
     ;; node's text, once the store has made its keys, and the arguments it was computed from, which
     ;; its store keeps.
@@ -9067,6 +9077,7 @@
                     (set! (.lazy s) ~(new-map (mut k) (cat3 "{" (memo-key-type f) ":Int}")))
                     (set! (.dirty s) ~(new-map (mut k) (cat3 "{" (memo-key-type f) ":Int}")))
                     (set! (.pending s) (ArrayList::new [i64] (malloc-allocator)))
+                    (set! (.uses s) ~(new-map (mut k) (cat3 "{" (memo-key-type f) ":Int}")))
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
                   (rt/init-unlock!)
@@ -9077,12 +9088,36 @@
                       regs))
                 s)))
     (emit! (mut out) (memo-persist-code (mut k) f name))
+    ;; Down to `keep` answers, those asked for longest ago let go, under the store's lock. One let go
+    ;; is made again when it is next asked for; what read it then counts it changed.
+    (emit! (mut out)
+           `(defn ~(sym (cat "memo-evict--" name)) [(s (ptr ~store)) (keep i64)] (-> void)
+              (let [(mut keys) (ArrayList::new [~(coil-type (mut k) (memo-key-type f))] (malloc-allocator))
+                    (mut stamps) (ArrayList::new [i64] (malloc-allocator))]
+                (for key (.table s)
+                  (push! (mut keys) key)
+                  (push! (mut stamps) (match (get (.uses s) key) (Some [n] n) (None [] 0))))
+                (let [order (rt/sort-order-int stamps false)
+                      drop (- (len keys) keep)]
+                  (for i (range 0 drop)
+                    (let [key (get keys (get order i))]
+                      (HashMap::remove! (mut (.table s)) key)
+                      (HashMap::remove! (mut (.uses s)) key)))
+                  ;; Every worker's table in front of this one forgets what it had.
+                  (set! (.gen s) (rt/next-pass!))))
+              0))
     ;; While dependencies are tracked, an answer from an earlier revision is current only once each
     ;; thing it read is shown unchanged, and an answer computed again that is the same as the one
     ;; it replaces is kept, and does not count as changed.
     (emit! (mut out)
            `(defn ~entry [~@params] (-> ~rt)
               (let [key ~(memo-key-code (mut k) f)
+                    ;; How this run keeps it (see `mechanism` in the pipeline language): checked by
+                    ;; what it read (0), by no input changing (1), never (2); whether an answer made
+                    ;; again the same changes nothing; at most how many answers.
+                    check ~(if (>= number 0) `(rt/kept-check ~number) `0)
+                    cutoff ~(if (>= number 0) `(rt/kept-cutoff? ~number) `true)
+                    evict ~(if (>= number 0) `(rt/kept-evict ~number) `0)
                     t (rules-task)
                     s (~store-fn)
                     word (cast (ptr i64) s)
@@ -9123,10 +9158,13 @@
                             (rt/spin-lock! word)
                             (let [found (get (.table s) key)
                                   current (match found
-                                            (Some [_] (or (not tracking) (rt/dep-current-id? node)))
+                                            (Some [_] (or (not tracking) (= check 2) (rt/dep-current-id? node)))
                                             (None [] false))]
                               (if current
                                   (do
+                                    (when (> evict 0)
+                                      (set! (.clock s) (+ (.clock s) 1))
+                                      (set! (mut (.uses s)) key (.clock s)))
                                     (rt/spin-unlock! word)
                                     (set! answer found)
                                     (set! go false))
@@ -9150,14 +9188,16 @@
                                               (let [made
                                                       (match found
                                                         (Some [old]
-                                                              (if (rt/dep-still-id? node)
+                                                              (if (and (= check 0) (rt/dep-still-id? node))
                                                                   old
                                                                   (do
                                                                     ~(made-check (mut k) name)
                                                                     (rt/dep-begin!)
                                                                     (let [fresh (~(sym compute) ~@args)
-                                                                          same ~(same-code (mut k) (.ret f) `old `fresh)]
-                                                                      (rt/dep-end-id! node same)
+                                                                          same (and cutoff ~(same-code (mut k) (.ret f) `old `fresh))]
+                                                                      (if (= check 0)
+                                                                          (rt/dep-end-id! node same)
+                                                                          (rt/dep-end-ignoring-reads! node same (= check 1)))
                                                                       (unless same (set! new-answer true))
                                                                       (if same old fresh)))))
                                                         (None []
@@ -9165,7 +9205,10 @@
                                                                 ~(made-check (mut k) name)
                                                                 (when tracking (rt/dep-begin!))
                                                                 (let [fresh (~(sym compute) ~@args)]
-                                                                  (when tracking (rt/dep-end-id! node false))
+                                                                  (when tracking
+                                                                    (if (= check 0)
+                                                                        (rt/dep-end-id! node false)
+                                                                        (rt/dep-end-ignoring-reads! node false (= check 1))))
                                                                   (rt/dep-untracked!)
                                                                   (set! new-answer true)
                                                                   fresh))))]
@@ -9178,6 +9221,13 @@
                                                       key
                                                       made)
                                                 (set! (mut (.busy s)) key 0)
+                                                ;; At most `evict` answers: once there are a quarter more, those
+                                                ;; asked for longest ago let go.
+                                                (when (> evict 0)
+                                                  (set! (.clock s) (+ (.clock s) 1))
+                                                  (set! (mut (.uses s)) key (.clock s))
+                                                  (when (> (len (.table s)) (+ evict (/ evict 4) 1))
+                                                    (~(sym (cat "memo-evict--" name)) s evict)))
                                                 (rt/spin-unlock! word)
                                                 (set! answer (Some made))
                                                 (set! go false))))))))

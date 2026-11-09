@@ -895,16 +895,137 @@
    (persists bool)
    (default bool)
    (watching bool)
-   (own (ArrayList (slice u8)))])
+   (own (ArrayList (slice u8)))
+   ;; `uses`: the mechanism of what it keeps ("" for its `from`'s, or the mechanism of old); `keep
+   ;; with`: functions by a mechanism of their own; and the inputs it trusts, and rechecks.
+   (uses (slice u8))
+   (with-names (ArrayList (slice u8)))
+   (with-mechanisms (ArrayList (slice u8)))
+   (trust (ArrayList (slice u8)))
+   (recheck (ArrayList (slice u8)))])
+
+;;; A mechanism as the file declares it: each policy, or -1 where it says nothing (its `from`'s, or
+;;; the mechanism of old's).
+(defstruct MechanismDecl
+  [(name (slice u8))
+   (from (slice u8))
+   (disk i64)
+   (check i64)
+   (cutoff i64)
+   (evict i64)])
+
+;;; How a function is kept: saved with the cache; checked by what it read (0), by no input changing
+;;; (1), never (2); an answer made again the same changing nothing; at most so many answers (0: all).
+(defstruct Policy [(disk bool) (check i64) (cutoff bool) (evict i64)])
 
 ;;; Every strategy: what each keeps, what is kept by any (each function's place in that list is its
 ;;; number, the same for every compiler that reads the file), and which are used when a run does not
-;;; say.
+;;; say; and the mechanisms.
 (defstruct Strategies
   [(decls (ArrayList StrategyDecl))
    (kept (ArrayList (slice u8)))
    (default (slice u8))
-   (watching (slice u8))])
+   (watching (slice u8))
+   (mechanisms (ArrayList MechanismDecl))])
+
+(defn find-mechanism [(ms (ArrayList MechanismDecl)) (name (slice u8))] (-> (Option MechanismDecl))
+  (let [(mut out) (None [MechanismDecl])]
+    (for m ms (when (= (.name m) name) (set! out (Some m))))
+    out))
+
+;;; The mechanisms of a pipeline file's tree, checked: each named once, `from` one before it.
+(defn mechanisms-of [(src (slice u8)) (path (slice u8)) (tree g/Node)] (-> (ArrayList MechanismDecl))
+  (let [(mut out) (ArrayList::new [MechanismDecl] (malloc-allocator))]
+    (for d (.kids (kid-of tree 2))
+      (let [name (.text (kid-of d 0))
+            (mut m) (MechanismDecl :name name :from "" :disk -1 :check -1 :cutoff -1 :evict -1)]
+        (match (find-mechanism out name)
+          (Some [_] (strategy-fail src path d (dsl/join2 "a second mechanism named " name)))
+          (None [] 0))
+        (for item (.kids (kid-of d 1))
+          (match (.kind item)
+            (g/KFrom []
+                     (let [f (.text (kid-of item 0))]
+                       (match (find-mechanism out f)
+                         (Some [_] (set! (.from m) f))
+                         (None [] (strategy-fail src path item (dsl/join3 "no mechanism named " f " before this one"))))))
+            (g/KStore []
+                      (let [(mut memory) false (mut disk) false]
+                        (for w (.kids (kid-of item 0))
+                          (if (= (.kind w) (g/KDisk)) (set! disk true) (set! memory true)))
+                        (unless memory (strategy-fail src path item "answers are kept in memory, and on disk besides or not"))
+                        (set! (.disk m) (if disk 1 0))))
+            (g/KCheck []
+                      (set! (.check m) (match (.kind (kid-of item 0))
+                                         (g/KReads [] 0)
+                                         (g/KAnyChange [] 1)
+                                         (_ 2))))
+            (g/KCutoff [] (set! (.cutoff m) (if (= (.kind (kid-of item 0)) (g/KEqual)) 1 0)))
+            (g/KEvict []
+                      (let [how (kid-of item 0)]
+                        (set! (.evict m)
+                              (if (= (.kind how) (g/KLru))
+                                  (let [n (rt/parse-int (.text (kid-of how 0)))]
+                                    (when (< n 1) (strategy-fail src path item "a bound of at least one answer"))
+                                    n)
+                                  0))))
+            (_ (strategy-fail src path item "not a mechanism's item"))))
+        (push! (mut out) m)))
+    out))
+
+;;; A mechanism's policies: the mechanism of old's, then each `from`'s in turn, then its own.
+(defn mechanism-policy [(ms (ArrayList MechanismDecl)) (name (slice u8))] (-> Policy)
+  (let [(mut chain) (ArrayList::new [MechanismDecl] (malloc-allocator))
+        (mut at) name
+        (mut p) (Policy :disk true :check 0 :cutoff true :evict 0)]
+    (while (> (len at) 0)
+      (match (find-mechanism ms at)
+        (Some [m] (do (push! (mut chain) m) (set! at (.from m))))
+        (None [] (panic "no mechanism named {}" at))))
+    (for i (range 0 (len chain))
+      (let [m (get chain (- (- (len chain) 1) i))]
+        (when (>= (.disk m) 0) (set! (.disk p) (= (.disk m) 1)))
+        (when (>= (.check m) 0) (set! (.check p) (.check m)))
+        (when (>= (.cutoff m) 0) (set! (.cutoff p) (= (.cutoff m) 1)))
+        (when (>= (.evict m) 0) (set! (.evict p) (.evict m)))))
+    p))
+
+;;; The mechanism strategy `name` keeps function `f` by: a `keep with` naming it, here or in a
+;;; strategy it is `from`; else the nearest `uses`; else "" (the mechanism of old).
+(defn strategy-mechanism [(all Strategies) (name (slice u8)) (f (slice u8))] (-> (slice u8))
+  (let [(mut at) name
+        (mut with) ""
+        (mut uses) ""]
+    (while (> (len at) 0)
+      (match (find-strategy (.decls all) at)
+        (Some [d]
+              (do (for i (range 0 (len (.with-names d)))
+                    (when (and (= (len with) 0) (= (get (.with-names d) i) f))
+                      (set! with (get (.with-mechanisms d) i))))
+                  (when (and (= (len uses) 0) (> (len (.uses d)) 0)) (set! uses (.uses d)))
+                  (set! at (.from d))))
+        (None [] (panic "no strategy named {}" at))))
+    (if (> (len with) 0) with uses)))
+
+(defn strategy-policy [(all Strategies) (name (slice u8)) (f (slice u8))] (-> Policy)
+  (let [m (strategy-mechanism all name f)]
+    (if (= (len m) 0)
+        (Policy :disk true :check 0 :cutoff true :evict 0)
+        (mechanism-policy (.mechanisms all) m))))
+
+;;; The paths strategy `name` trusts, or rechecks, with those of every strategy it is `from`.
+(defn strategy-paths [(all Strategies) (name (slice u8)) (trusting bool)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (texts)
+        (mut at) name]
+    (while (> (len at) 0)
+      (match (find-strategy (.decls all) at)
+        (Some [d] (do (for x (if trusting (.trust d) (.recheck d)) (add-unique! (mut out) x))
+                      (set! at (.from d))))
+        (None [] (panic "no strategy named {}" at))))
+    out))
+
+(defn unquoted [(t (slice u8))] (-> (slice u8))
+  (subslice t 1 (- (len t) 1)))
 
 (defn strategy-fail [(src (slice u8)) (path (slice u8)) (n g/Node) (msg (slice u8))] (-> never)
   (let [at (rt/line-col src (.lo n))]
@@ -935,18 +1056,24 @@
 ;;; The strategies of a pipeline file's tree, checked: each named once, `from` one before it, one
 ;;; marked `default`, one marked `watching`, and that one tracks.
 (defn strategies-of [(src (slice u8)) (path (slice u8)) (tree g/Node) (made (ArrayList (slice u8)))] (-> Strategies)
-  (let [(mut decls) (ArrayList::new [StrategyDecl] (malloc-allocator))
+  (let [mechanisms (mechanisms-of src path tree)
+        (mut decls) (ArrayList::new [StrategyDecl] (malloc-allocator))
         (mut default) ""
         (mut watching) ""
         (mut union) (texts)]
-    (for d (.kids (kid-of tree 2))
+    (for d (.kids (kid-of tree 3))
       (let [name (.text (kid-of d 0))
             (mut from) ""
             (mut tracks) false
             (mut persists) false
             (mut is-default) false
             (mut is-watching) false
-            (mut own) (texts)]
+            (mut own) (texts)
+            (mut uses) ""
+            (mut with-names) (texts)
+            (mut with-mechanisms) (texts)
+            (mut trust) (texts)
+            (mut recheck) (texts)]
         (match (find-strategy decls name)
           (Some [_] (strategy-fail src path d (dsl/join2 "a second strategy named " name)))
           (None [] 0))
@@ -962,6 +1089,22 @@
             (g/KDefault [] (set! is-default true))
             (g/KWatching [] (set! is-watching true))
             (g/KKeep [] (for t (.kids (kid-of item 0)) (add-unique! (mut own) (.text t))))
+            (g/KUses []
+                     (let [m (.text (kid-of item 0))]
+                       (match (find-mechanism mechanisms m)
+                         (Some [_] (set! uses m))
+                         (None [] (strategy-fail src path item (dsl/join2 "no mechanism named " m))))))
+            (g/KKeepWith []
+                         (let [m (.text (kid-of item 0))]
+                           (match (find-mechanism mechanisms m)
+                             (Some [_] 0)
+                             (None [] (strategy-fail src path item (dsl/join2 "no mechanism named " m))))
+                           (for t (.kids (kid-of item 1))
+                             (add-unique! (mut own) (.text t))
+                             (push! (mut with-names) (.text t))
+                             (push! (mut with-mechanisms) m))))
+            (g/KTrust [] (push! (mut trust) (unquoted (.text (kid-of item 0)))))
+            (g/KRecheck [] (push! (mut recheck) (unquoted (.text (kid-of item 0)))))
             (_ (strategy-fail src path item "not a strategy's item"))))
         (when is-default
           (when (> (len default) 0) (strategy-fail src path d "a second strategy marked default"))
@@ -971,19 +1114,23 @@
           (unless (or tracks (match (find-strategy decls from) (Some [p] (.tracks p)) (None [] false)))
             (strategy-fail src path d "the strategy used while watching must track: answers kept from one build to the next are checked by what they were made from"))
           (set! watching name))
+        ;; From a strategy that tracks, or persists, so does this one.
         (when (and (> (len from) 0) (match (find-strategy decls from) (Some [p] (.tracks p)) (None [] false)))
           (set! tracks true))
+        (when (and (> (len from) 0) (match (find-strategy decls from) (Some [p] (.persists p)) (None [] false)))
+          (set! persists true))
         (when (and persists (not tracks))
           (strategy-fail src path d "a strategy that persists must track: an answer read back is checked by what it was made from"))
         (for x own (add-unique! (mut union) x))
         (push! (mut decls)
-               (StrategyDecl :name name :from from :tracks tracks :persists persists :default is-default :watching is-watching :own own))))
+               (StrategyDecl :name name :from from :tracks tracks :persists persists :default is-default :watching is-watching :own own
+                             :uses uses :with-names with-names :with-mechanisms with-mechanisms :trust trust :recheck recheck))))
     (when (and (> (len decls) 0) (= (len default) 0))
       (strategy-fail src path tree "no strategy is marked default"))
     (when (and (> (len decls) 0) (= (len watching) 0))
       (strategy-fail src path tree "no strategy is marked watching"))
     (for m made (add-unique! (mut union) m))
-    (Strategies :decls decls :kept (texts-sorted union) :default default :watching watching)))
+    (Strategies :decls decls :kept (texts-sorted union) :default default :watching watching :mechanisms mechanisms)))
 
 ;;; Each function's number among those any strategy keeps; -1 for one none does.
 (defn kept-index [(all Strategies) (name (slice u8))] (-> i64)
@@ -995,7 +1142,7 @@
 ;;; The functions stages make, which every strategy keeps.
 (defn made-of [(tree g/Node)] (-> (ArrayList (slice u8)))
   (let [(mut out) (texts)]
-    (for d (.kids (kid-of tree 3))
+    (for d (.kids (kid-of tree 4))
       (let [makes (if (= (.kind d) (g/KPerStage)) (kid-of d 3) (kid-of d 2))]
         (unless (= (.kind makes) (g/KNone))
           (for t (.kids (kid-of makes 0)) (add-unique! (mut out) (.text t))))))
@@ -1096,12 +1243,15 @@
         (mut names) (primitive/code-list-new)]
     ;; What is kept is the rules compiler's to apply (see `keep` in the rules compiler): here each is
     ;; only a function's name, and a run's choice of strategy is a switch for each.
-    (for d (.kids (kid-of tree 2))
+    (for d (.kids (kid-of tree 3))
       (for item (.kids (kid-of d 1))
         (when (= (.kind item) (g/KKeep))
           (for t (.kids (kid-of item 0))
+            (split-fn (mut c) (tok-of src t))))
+        (when (= (.kind item) (g/KKeepWith))
+          (for t (.kids (kid-of item 1))
             (split-fn (mut c) (tok-of src t))))))
-    (for d (.kids (kid-of tree 3))
+    (for d (.kids (kid-of tree 4))
       (let [(mut fns) (texts)
             (mut makes) (texts)
             per (= (.kind d) (g/KPerStage))
@@ -1122,7 +1272,7 @@
                  :functions fns
                  :makes makes
                  :tok (tok-of src d)))))
-    (for p (.kids (kid-of tree 4))
+    (for p (.kids (kid-of tree 5))
       (let [plan-name (.text (kid-of p 0))
             (mut threads) `1
             (mut fields) (primitive/code-list-new)
@@ -1201,13 +1351,30 @@
         (let [(mut ons) (primitive/code-list-new)]
           (for x (strategy-keeps all (.name d) (made-of tree))
             (push! (mut ons) `(push! (mut on) ~(kept-index all x))))
-          (push! (mut uses) `(= name ~(.name d)))
-          (push! (mut uses)
-                 `(let [(mut on) (ArrayList::new [i64] (malloc-allocator))]
-                    ~@ons
-                    (rt/keep-only! ~(len (.kept all)) on)
-                    ~(if (.tracks d) `(rt/dep-track!) `0)
-                    0))
+          (let [(mut policies) (primitive/code-list-new)
+                (mut trusts) (primitive/code-list-new)
+                (mut rechecks) (primitive/code-list-new)]
+            (for x (strategy-keeps all (.name d) (made-of tree))
+              (let [p (strategy-policy all (.name d) x)]
+                (push! (mut policies)
+                       `(rt/keep-policy! ~(kept-index all x) ~(if (.disk p) `true `false) ~(.check p)
+                                         ~(if (.cutoff p) `true `false) ~(.evict p)))))
+            (for x (strategy-paths all (.name d) true) (push! (mut trusts) `(push! (mut trust) ~x)))
+            (for x (strategy-paths all (.name d) false) (push! (mut rechecks) `(push! (mut recheck) ~x)))
+            (push! (mut uses) `(= name ~(.name d)))
+            (push! (mut uses)
+                   `(let [(mut on) (ArrayList::new [i64] (malloc-allocator))
+                          (mut trust) (ArrayList::new [(slice u8)] (malloc-allocator))
+                          (mut recheck) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                      ~@ons
+                      (rt/keep-only! ~(len (.kept all)) on)
+                      ~@policies
+                      ~@trusts
+                      ~@rechecks
+                      (rt/trust-paths! trust)
+                      (rt/recheck-paths! recheck)
+                      ~(if (.tracks d) `(rt/dep-track!) `0)
+                      0)))
           (push! (mut tracking) `(= name ~(.name d)))
           (push! (mut tracking) (if (.tracks d) `true `false))
           (push! (mut persisting) `(= name ~(.name d)))

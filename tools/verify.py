@@ -369,6 +369,14 @@ code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(o
                                       8000, 600, quiet=True)
 check(code == 0 and out.strip().endswith("all identical"), f"--cache: {out.strip().splitlines()[-1] if out.strip() else err[-200:]}")
 
+# Mechanisms: each strategy that tracks, built from the cache and while watching, edits seen (or,
+# where it trusts a path, not), every output a fresh build's.
+code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mechanism-check.py"), ESB, "zod"],
+                                      8000, 900, quiet=True)
+fails = [l.strip() for l in out.splitlines() if l.strip().startswith("FAIL")]
+check(code == 0 and out.strip().endswith("all mechanisms check out"),
+      f"mechanisms: {len([l for l in out.splitlines() if l.strip().startswith('ok')])} checks" + (f"; {fails[0]}" if fails else ""))
+
 # Strategies: the same bytes whatever a run keeps, and what each keeps enough for one build.
 code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy-check.py"), ESB],
                                       8000, 900, quiet=True)
