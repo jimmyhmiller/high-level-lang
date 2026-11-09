@@ -7,8 +7,8 @@
 (module hl.rt)
 (import "coil.alloc"
         :use
-        [malloc-allocator overflow-arena-allocator box! Allocator alloc
-         reallocate free])
+        [malloc-allocator overflow-arena-allocator box! Allocator AllocRequest alloc
+         reallocate free create unwrap-ptr oom-at])
 (import "coil.mem" :as mem)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
@@ -135,12 +135,157 @@
   (atomic/store (init-lock-word) 0)
   0)
 
-;;; Syntax trees live until the process exits, so they come from a growing arena: allocating a
-;;; node's children is then a pointer bump. One arena per thread, found through a thread-specific
-;;; value, so threads never share one. A gigabyte each, of address space; only what is used is
-;;; memory, and past it the arena goes on in malloc.
-;;; The thread-specific key of tree allocators, plus one, as each place that asks keeps it: the
-;;; key never changes once made, so a place asks `workers` only the first time.
+;; ---------------------------------------------------------------- regions
+
+;;; Values live in regions. A region is memory taken in chunks and given out by bumping a pointer,
+;;; and is let go whole: nothing in it is freed on its own. Who holds a region is what the
+;;; program already knows lives on: a memo's answer holds the region it was made in, a setting's
+;;; value its own, a loop's turn at the top of the program its own. A region that holds a value
+;;; from another region says so (`region-ref!`), so the other lives as long as it does. A region
+;;; nothing holds is let go at a safe point (`regions-let-go!`), when no build runs and nothing on
+;;; any stack points into it.
+;;;
+;;; A thread allocates through its cursor into the region on top of its stack (`value-allocator`).
+;;; Each thread's stack starts with a region of its own that lives as long as the program, which
+;;; is all a run that keeps nothing from one build to the next ever uses.
+
+;;; A chunk's first word is the chunk before it in its region, its second its size in bytes.
+(defn chunk-header-bytes [] (-> i64) 16)
+
+;;; `count`: who holds the region and how many regions refer to it; when it falls to 0 the region
+;;; waits in the queue to be let go. A lasting region (a thread's own) is never counted or let go.
+;;; `refs`: the regions this one refers to, each once (`ref-seen` tells them apart).
+(defstruct Region
+  [(lock i64)
+   (count i64)
+   (lasting bool)
+   (queued bool)
+   (chunks i64)
+   (bytes i64)
+   (grow-limit i64)
+   (refs (ArrayList i64))
+   (ref-seen IntTable)
+   (last-ref i64)
+   (cursors (ArrayList i64))])
+
+;;; Where one thread allocates in one region: the free bytes of its current chunk, `at` up to
+;;; `end`; the start of the last allocation, which can grow or be taken back in place; and the size
+;;; of the next chunk.
+(defstruct Cursor
+  [(region (ptr Region)) (at i64) (end i64) (last i64) (grow i64)])
+
+(defn region-make [(lasting bool) (grow-limit i64)] (-> (ptr Region))
+  (let [r (unwrap-ptr (create [Region] (malloc-allocator)))]
+    (store! r
+            (Region
+              :lock 0
+              :count 1
+              :lasting lasting
+              :queued false
+              :chunks 0
+              :bytes 0
+              :grow-limit grow-limit
+              :refs (ArrayList::new [i64] (malloc-allocator))
+              :ref-seen (int-table 0)
+              :last-ref 0
+              :cursors (ArrayList::new [i64] (malloc-allocator))))
+    r))
+
+(defn cursor-make [(r (ptr Region))] (-> (ptr Cursor))
+  (let [c (unwrap-ptr (create [Cursor] (malloc-allocator)))]
+    (store! c (Cursor :region r :at 0 :end 0 :last 0 :grow 1024))
+    (spin-lock! (field r lock))
+    (push! (mut (.cursors r)) (primitive/cast i64 c))
+    (spin-unlock! (field r lock))
+    c))
+
+(defn align-to [(x i64) (a i64)] (-> i64)
+  (& (+ x (- a 1)) (- 0 a)))
+
+;;; A chunk of `size` bytes, its header filled, added to its region. Its first byte for values.
+(defn chunk-add! [(r (ptr Region)) (size i64)] (-> i64)
+  (let [p (primitive/cast i64 (chunk-memory size))]
+    (when (= p 0) (oom-at c"a region's chunk" size))
+    (spin-lock! (field r lock))
+    (store! (primitive/cast (ptr i64) p) (.chunks r))
+    (store! (primitive/cast (ptr i64) (+ p 8)) size)
+    (set! (.chunks r) p)
+    (set! (.bytes r) (+ (.bytes r) size))
+    (spin-unlock! (field r lock))
+    (+ p (chunk-header-bytes))))
+
+(defn cursor-allocate [(c (ptr Cursor)) (bytes i64) (align i64)] (-> (ptr i8))
+  (let [p (align-to (.at c) align)]
+    (if (and (> (.at c) 0) (<= (+ p bytes) (.end c)))
+        (do (set! (.at c) (+ p bytes))
+            (set! (.last c) p)
+            (primitive/cast (ptr i8) p))
+        (cursor-allocate-slow c bytes align))))
+
+;;; A new chunk: one of its own for an allocation bigger than half the next chunk, which leaves
+;;; the cursor where it was; else the next chunk, each twice the last up to the region's limit.
+(defn cursor-allocate-slow [(c (ptr Cursor)) (bytes i64) (align i64)] (-> (ptr i8))
+  (let [r (.region c)
+        grow (.grow c)]
+    (if (> (+ bytes align) (/ grow 2))
+        (let [base (chunk-add! r (+ bytes align (chunk-header-bytes)))]
+          (primitive/cast (ptr i8) (align-to base align)))
+        (let [base (chunk-add! r grow)
+              p (align-to base align)]
+          (set! (.end c) (+ base (- grow (chunk-header-bytes))))
+          (set! (.at c) (+ p bytes))
+          (set! (.last c) p)
+          (when (< (* grow 2) (+ (.grow-limit r) 1)) (set! (.grow c) (* grow 2)))
+          (primitive/cast (ptr i8) p)))))
+
+(impl Allocator Cursor
+  (allocate [(self (ptr Cursor)) (request (ref AllocRequest))]
+            (-> (Option (ptr i8)))
+            (Some (cursor-allocate self
+                                   (load (field request bytes))
+                                   (load (field request align)))))
+  ;; Only the last allocation grows in place; anything shrinks in place.
+  (resize [(self (ptr Cursor))
+           (memory (ptr i8))
+           (old (ref AllocRequest))
+           (new (ref AllocRequest))]
+          (-> bool)
+          (let [m (primitive/cast i64 memory)
+                want (load (field new bytes))]
+            (cond (<= want (load (field old bytes))) true
+                  (and (= m (.last self)) (<= (+ m want) (.end self)))
+                    (do (set! (.at self) (+ m want)) true)
+                  :else false)))
+  (remap [(self (ptr Cursor))
+          (memory (ptr i8))
+          (old (ref AllocRequest))
+          (new (ref AllocRequest))]
+         (-> (Option (ptr i8)))
+         (let [m (primitive/cast i64 memory)
+               want (load (field new bytes))
+               had (load (field old bytes))]
+           (cond (<= want had) (Some memory)
+                 (and (= m (.last self)) (<= (+ m want) (.end self)))
+                   (do (set! (.at self) (+ m want)) (Some memory))
+                 :else
+                   (let [p (cursor-allocate self want (load (field new align)))]
+                     (mem/copy [u8] (primitive/cast (ptr u8) p) (primitive/cast (ptr u8) memory) had)
+                     (Some p)))))
+  ;; Memory goes back with its region; only the last allocation is taken back at once.
+  (deallocate [(self (ptr Cursor))
+               (memory (ptr i8))
+               (request (ref AllocRequest))]
+              (-> i64)
+              (when (and (= (primitive/cast i64 memory) (.last self))
+                         (= (+ (.last self) (load (field request bytes))) (.at self)))
+                (set! (.at self) (.last self)))
+              0))
+
+;;; A thread's stack of regions: the cursor on top is where its values go.
+(defstruct ThreadRegions [(top (ptr Cursor)) (stack (ArrayList i64))])
+
+;;; The thread-specific key of the threads' region stacks, plus one, as each place that asks keeps
+;;; it: the key never changes once made, so a place asks `workers` only the first time.
 (defstruct TreeKeySeen [(key1 i64)])
 
 (defn tree-key-from! [(seen (ptr i64))] (-> i64)
@@ -148,20 +293,175 @@
     (atomic/store seen (+ k 1))
     k))
 
-(defn tree-allocator :inline (Always) [] (-> (dyn Allocator))
+(defn thread-regions :inline (Always) [] (-> (ptr ThreadRegions))
   (let [seen (primitive/cast (ptr i64) (primitive/alloc-static TreeKeySeen))
         key1 (atomic/read seen)
         key (if (= key1 0) (tree-key-from! seen) (- key1 1))
         found (pthread_getspecific key)]
     (if (= (primitive/cast i64 found) 0)
-        (new-tree-allocator)
-        (load (cast (ptr (dyn Allocator)) found)))))
+        (thread-regions-new)
+        (primitive/cast (ptr ThreadRegions) found))))
 
-(defn new-tree-allocator [] (-> (dyn Allocator))
-  (let [made (overflow-arena-allocator 1073741824)
-        cell (box! (malloc-allocator) (dyn Allocator) made)]
-    (pthread_setspecific (.tree-key (workers)) (cast (ptr i8) cell))
-    made))
+;;; A thread's first region: its own, as long as the program runs. Its chunks grow to 4 MB, so a
+;;; build that keeps everything takes few of them.
+(defn thread-regions-new [] (-> (ptr ThreadRegions))
+  (let [t (unwrap-ptr (create [ThreadRegions] (malloc-allocator)))
+        c (cursor-make (region-make true 4194304))]
+    (store! t (ThreadRegions :top c :stack (ArrayList::new [i64] (malloc-allocator))))
+    (push! (mut (.stack t)) (primitive/cast i64 c))
+    (pthread_setspecific (.tree-key (workers)) (primitive/cast (ptr i8) t))
+    t))
+
+;;; Where values go on this thread: the region on top of its stack.
+(defn value-allocator :inline (Always) [] (-> (dyn Allocator))
+  (primitive/make-dyn Allocator (.top (thread-regions))))
+
+(defn tree-allocator :inline (Always) [] (-> (dyn Allocator))
+  (value-allocator))
+
+(defn region-current [] (-> (ptr Region))
+  (.region (.top (thread-regions))))
+
+;;; A region for values that will be held: by whoever made it, until they let it go.
+(defn region-new [] (-> (ptr Region))
+  (region-make false 262144))
+
+;;; Values made on this thread go to `r`, until `region-leave!`.
+(defn region-enter! [(r (ptr Region))] (-> void)
+  (let [t (thread-regions)
+        c (cursor-make r)]
+    (push! (mut (.stack t)) (primitive/cast i64 c))
+    (set! (.top t) c)
+    0))
+
+(defn region-leave! [] (-> void)
+  (let [t (thread-regions)]
+    (when (<= (len (.stack t)) 1) (panic "a region was left that was never entered"))
+    (pop! (mut (.stack t)))
+    (set! (.top t) (primitive/cast (ptr Cursor) (get (.stack t) (- (len (.stack t)) 1))))
+    0))
+
+(defn region-hold! [(r (ptr Region))] (-> void)
+  (unless (.lasting r) (atomic/add (field r count) 1))
+  0)
+
+;;; One holder fewer; with none left, the region waits to be let go.
+(defn region-release! [(r (ptr Region))] (-> void)
+  (unless (.lasting r)
+    (let [was (atomic/add (field r count) -1)]
+      (cond (= was 1) (regions-queue! r)
+            (< was 1) (panic "a region was let go more often than it was held"))))
+  0)
+
+;;; `from` holds a value of `to`'s: `to` lives at least as long as `from`.
+(defn region-ref! [(from (ptr Region)) (to (ptr Region))] (-> void)
+  (unless (or (.lasting to) (= (primitive/cast i64 from) (primitive/cast i64 to))
+              (.lasting from) (= (.last-ref from) (primitive/cast i64 to)))
+    (let [key (primitive/cast i64 to)]
+      (spin-lock! (field from lock))
+      (when (< (int-get (mut (.ref-seen from)) key) 0)
+        (int-put! (mut (.ref-seen from)) key 1)
+        (push! (mut (.refs from)) key)
+        (region-hold! to))
+      (set! (.last-ref from) key)
+      (spin-unlock! (field from lock))))
+  0)
+
+;;; What this thread is making holds a value of `to`'s.
+(defn region-uses! [(to (ptr Region))] (-> void)
+  (region-ref! (region-current) to))
+
+(defstruct RegionQueue [(lock i64) (ready bool) (waiting (ArrayList i64)) (let-go i64) (bytes-let-go i64)])
+
+(defn region-queue [] (-> (ptr RegionQueue))
+  (let [q (primitive/alloc-static RegionQueue)]
+    (unless (.ready q)
+      (init-lock!)
+      (unless (.ready q)
+        (set! (.waiting q) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.ready q) true))
+      (init-unlock!))
+    q))
+
+(defn regions-queue! [(r (ptr Region))] (-> void)
+  (let [q (region-queue)]
+    (spin-lock! (field q lock))
+    (when (.queued r) (spin-unlock! (field q lock)) (panic "a region was queued twice"))
+    (set! (.queued r) true)
+    (push! (mut (.waiting q)) (primitive/cast i64 r))
+    (spin-unlock! (field q lock))
+    0))
+
+;;; Every region nothing holds, let go, and so whatever only they held: at a safe point only, when
+;;; no build runs and no value on any stack is in one of them. Each chunk let go is first told to
+;;; `forget-range` (the cache's writer knows values by where they are).
+(defn regions-let-go! [(forget-range (fnptr (cc/C) [i64 i64] i64))] (-> i64)
+  (let [q (region-queue)
+        (mut n) 0]
+    (spin-lock! (field q lock))
+    (while (> (len (.waiting q)) 0)
+      (let [r (primitive/cast (ptr Region) (match (pop! (mut (.waiting q))) (Some [x] x) (None [] 0)))]
+        (spin-unlock! (field q lock))
+        (when (!= (atomic/read (field r count)) 0)
+          (panic "a region was let go while something held it"))
+        (for to (.refs r) (region-release! (primitive/cast (ptr Region) to)))
+        (let [(mut at) (.chunks r)]
+          (while (!= at 0)
+            (let [before (load (primitive/cast (ptr i64) at))
+                  size (load (primitive/cast (ptr i64) (+ at 8)))]
+              (forget-range at (+ at size))
+              (chunk-let-go! at size)
+              (set! at before))))
+        (set! (.bytes-let-go q) (+ (.bytes-let-go q) (.bytes r)))
+        (for c (.cursors r) (primitive/free (primitive/cast (ptr i8) c)))
+        (free! (mut (.refs r)))
+        (free! (mut (.cursors r)))
+        (free! (mut (.keys (.ref-seen r))))
+        (free! (mut (.vals (.ref-seen r))))
+        (primitive/free (primitive/cast (ptr i8) r))
+        (set! n (+ n 1))
+        (spin-lock! (field q lock))))
+    (set! (.let-go q) (+ (.let-go q) n))
+    (spin-unlock! (field q lock))
+    n))
+
+;;; Chunks come from malloc and go back to it; with HL_REGION_CHECK set they are pages of their
+;;; own that are never used again once let go, and can be read by nobody, so a value read after
+;;; its region was let go stops the program where it is read.
+(defstruct RegionCheck [(ready bool) (on bool)])
+
+(defn region-check? [] (-> bool)
+  (let [c (primitive/alloc-static RegionCheck)]
+    (unless (.ready c)
+      (set! (.on c) (!= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) "HL_REGION_CHECK"))) 0))
+      (set! (.ready c) true))
+    (.on c)))
+
+(extern malloc :cc (cc/C) [isize] (-> (ptr i8)))
+
+;;; hygiene: the platform's flag enters this module's namespace on purpose.
+(defn gen-map-anon-private [] (-> Code)
+  `(const ~(primitive/syntax->datum `MAP-ANON-PRIVATE)
+          ~(match (target-os) (Linux [] 34) (Darwin [] 4098) (Wasm [] 34) (BareMetal [] 34))))
+
+(gen-map-anon-private)
+
+(extern mmap :cc (cc/C) [(ptr i8) isize i32 i32 i32 i64] (-> (ptr i8)))
+(extern mprotect :cc (cc/C) [(ptr i8) isize i32] (-> i32))
+
+(defn chunk-memory [(size i64)] (-> (ptr i8))
+  (if (region-check?)
+      ;; PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON (macOS 0x1002, Linux 0x22)
+      (let [p (mmap (primitive/cast (ptr i8) 0) (primitive/cast isize size) (: 3 i32)
+                    (primitive/cast i32 MAP-ANON-PRIVATE) (: -1 i32) 0)]
+        (if (= (primitive/cast i64 p) -1) (primitive/cast (ptr i8) 0) p))
+      (malloc (primitive/cast isize size))))
+
+(defn chunk-let-go! [(at i64) (size i64)] (-> void)
+  (if (region-check?)
+      (mprotect (primitive/cast (ptr i8) at) (primitive/cast isize size) (: 0 i32))
+      (primitive/free (primitive/cast (ptr i8) at)))
+  0)
 
 ;; ---------------------------------------------------------------- tokens
 
