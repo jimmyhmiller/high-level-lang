@@ -168,7 +168,9 @@
    (last-ref i64)
    (cursors (ArrayList i64))
    ;; A cursor any thread may allocate through, under `lock` (see `region-shared-allocator`).
-   (shared i64)])
+   (shared i64)
+   ;; What made it, for the trace (see `regions-labels`).
+   (label (slice u8))])
 
 ;;; Where one thread allocates in one region: the free bytes of its current chunk, `at` up to
 ;;; `end`; the start of the last allocation, which can grow or be taken back in place; and the size
@@ -191,7 +193,8 @@
               :ref-seen (int-table 0)
               :last-ref 0
               :cursors (ArrayList::new [i64] (malloc-allocator))
-              :shared 0))
+              :shared 0
+              :label ""))
     r))
 
 (defn cursor-make [(r (ptr Region))] (-> (ptr Cursor))
@@ -215,6 +218,7 @@
     (set! (.chunks r) p)
     (set! (.bytes r) (+ (.bytes r) size))
     (spin-unlock! (field r lock))
+    (unless (.lasting r) (atomic/add (field (region-queue) bytes-made) size))
     (+ p (chunk-header-bytes))))
 
 (defn cursor-allocate [(c (ptr Cursor)) (bytes i64) (align i64)] (-> (ptr i8))
@@ -402,6 +406,7 @@
 
 ;;; A region for values that will be held: by whoever made it, until they let it go.
 (defn region-new [] (-> (ptr Region))
+  (atomic/add (field (region-queue) made) 1)
   (region-make false 262144))
 
 ;;; Values made on this thread go to `r`, until `region-leave!`.
@@ -479,7 +484,9 @@
 (defn region-uses! [(to (ptr Region))] (-> void)
   (region-ref! (region-current) to))
 
-(defstruct RegionQueue [(lock i64) (ready bool) (waiting (ArrayList i64)) (let-go i64) (bytes-let-go i64)])
+;;; Regions waiting to be let go; and how many were made and let go, and their bytes, for the trace.
+(defstruct RegionQueue [(lock i64) (ready bool) (waiting (ArrayList i64)) (let-go i64) (bytes-let-go i64)
+                        (made i64) (bytes-made i64)])
 
 (defn region-queue [] (-> (ptr RegionQueue))
   (let [q (primitive/alloc-static RegionQueue)]
@@ -513,6 +520,7 @@
         (spin-unlock! (field q lock))
         (when (!= (atomic/read (field r count)) 0)
           (panic "a region was let go while something held it"))
+        (when (region-labels?) (regions-live-remove! r))
         (for to (.refs r) (region-release! (primitive/cast (ptr Region) to)))
         (let [(mut at) (.chunks r)]
           (while (!= at 0)
@@ -554,14 +562,77 @@
   (unless (env-on? "HL_RECLAIM_OFF") (set! (.on (reclaim-cell)) true))
   0)
 
-;;; A memo's answer is made in a region of its own, held by the memo's table from then on. 0 when
-;;; the run reclaims nothing.
-(defn answer-region-open! [] (-> i64)
+;;; A memo's answer is made in a region of its own, held by the memo's table from then on (and so
+;;; a setting's value, a key's arguments, a var's value), `label` saying what made it. 0 when the
+;;; run reclaims nothing.
+(defn answer-region-open! [(label (slice u8))] (-> i64)
   (if (reclaiming?)
       (let [r (region-new)]
+        (set! (.label r) label)
+        (when (region-labels?) (regions-live-add! r))
         (region-enter! r)
         (primitive/cast i64 r))
       0))
+
+;;; With HL_REGION_LABELS set, every region a label names is kept track of while it lives, and each
+;;; safe point says which labels hold the most.
+(defstruct RegionLabels [(ready bool) (on bool) (lock i64) (live (HashMap i64 bool))])
+
+(defn region-labels-state [] (-> (ptr RegionLabels))
+  (let [l (primitive/alloc-static RegionLabels)]
+    (unless (.ready l)
+      (init-lock!)
+      (unless (.ready l)
+        (set! (.on l) (env-on? "HL_REGION_LABELS"))
+        (set! (.live l) (HashMap::new [i64 bool] (malloc-allocator) (i64-keyops)))
+        (set! (.ready l) true))
+      (init-unlock!))
+    l))
+
+(defn region-labels? [] (-> bool)
+  (.on (region-labels-state)))
+
+(defn regions-live-add! [(r (ptr Region))] (-> void)
+  (let [l (region-labels-state)]
+    (spin-lock! (field l lock))
+    (set! (mut (.live l)) (primitive/cast i64 r) true)
+    (spin-unlock! (field l lock)))
+  0)
+
+(defn regions-live-remove! [(r (ptr Region))] (-> void)
+  (let [l (region-labels-state)]
+    (spin-lock! (field l lock))
+    (HashMap::remove! (mut (.live l)) (primitive/cast i64 r))
+    (spin-unlock! (field l lock)))
+  0)
+
+;;; The labels whose live regions hold the most, with how many and how much.
+(defn regions-labels-report! [] (-> void)
+  (let [l (region-labels-state)
+        (mut counts) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+        (mut bytes) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+    (spin-lock! (field l lock))
+    (for key (.live l)
+      (let [r (primitive/cast (ptr Region) key)
+            label (.label r)]
+        (set! (mut counts) label (+ 1 (match (get counts label) (Some [n] n) (None [] 0))))
+        (set! (mut bytes) label (+ (.bytes r) (match (get bytes label) (Some [n] n) (None [] 0))))))
+    (spin-unlock! (field l lock))
+    (let [(mut names) (ArrayList::new [(slice u8)] (malloc-allocator))
+          (mut sizes) (ArrayList::new [i64] (malloc-allocator))]
+      (for key bytes
+        (push! (mut names) key)
+        (push! (mut sizes) (match (get bytes key) (Some [n] n) (None [] 0))))
+      (let [order (sort-order-int sizes true)]
+        (for i (range 0 (if (< (len order) 12) (len order) 12))
+          (let [name (get names (get order i))]
+            (println "[regions]   {} KB in {} regions: {}"
+                     (/ (get sizes (get order i)) 1024)
+                     (match (get counts name) (Some [n] n) (None [] 0))
+                     name)))))
+    (free! (mut counts))
+    (free! (mut bytes)))
+  0)
 
 (defn answer-region-close! [(r i64)] (-> i64)
   (when (!= r 0) (region-leave!))
@@ -584,6 +655,44 @@
   (region-enter! (primitive/cast (ptr Region) r))
   0)
 
+;;; A statement loop at the top of a program that watches (no memo computing): where this thread's
+;;; regions are, before the loop; each turn lets the last turn's region go and, while the run
+;;; reclaims memory, makes its own; the loop's end lets the last go. Elsewhere nothing happens.
+(defn iteration-mark [] (-> i64)
+  (len (.stack (thread-regions))))
+
+(defn iteration-begin! [(mark i64)] (-> void)
+  (iteration-end! mark)
+  (when (and (reclaiming?) (not (dep-in-frame?)))
+    (let [r (region-new)]
+      (set! (.label r) "a loop's turn")
+      (when (region-labels?) (regions-live-add! r))
+      (region-enter! r)))
+  0)
+
+(defn iteration-end! [(mark i64)] (-> void)
+  (let [t (thread-regions)]
+    (while (> (len (.stack t)) mark)
+      (let [r (region-current)]
+        (region-leave!)
+        (region-release! r))))
+  0)
+
+;;; Whether a turn of the loop marked `mark` has a region of its own.
+(defn iterating-since? [(mark i64)] (-> bool)
+  (> (len (.stack (thread-regions))) mark))
+
+;;; A region a `var` held, taken over by the region values go to now when the var's block ends: it
+;;; lives as long as that region, which may hold the var's value. One the program's own region
+;;; would take over stays held.
+(defn region-adopt-id! [(r i64)] (-> void)
+  (when (!= r 0)
+    (let [cur (region-current)]
+      (unless (.lasting cur)
+        (region-ref! cur (primitive/cast (ptr Region) r))
+        (region-release-id! r))))
+  0)
+
 ;;; A text's own copy, in the region values go to now.
 (defn text-copy [(s (slice u8))] (-> (slice u8))
   (if (= (len s) 0)
@@ -591,6 +700,21 @@
       (match (alloc [u8] (value-allocator) (len s))
         (Some [m] (do (mem/copy [u8] (data m) (data s) (len s)) m))
         (None [] (panic "no memory to copy a text")))))
+
+;;; A text the runtime keeps in place of another it kept: its own copy, the one it replaces let go.
+;;; The empty text is no copy.
+(defn stored-text-set! [(at (ptr (slice u8))) (s (slice u8))] (-> void)
+  (let [old (load at)]
+    (unless (and (= (len old) (len s)) (= (primitive/cast i64 (data old)) (primitive/cast i64 (data s))))
+      (store! at (own-text s))
+      (when (> (len old) 0) (free [u8] (malloc-allocator) old))))
+  0)
+
+;;; Each text's own copy, in place.
+(defn owned-texts [(xs (ArrayList (slice u8)))] (-> (ArrayList (slice u8)))
+  (let [(mut out) xs]
+    (for i (range 0 (len out)) (set! (mut out) i (own-text (get out i))))
+    out))
 
 ;;; A text's copy that the runtime keeps, for as long as it keeps it: on malloc.
 (defn own-text [(s (slice u8))] (-> (slice u8))
@@ -679,9 +803,15 @@
           (mut ranges) (regions-let-go!)]
       (when (> (len ranges) 0) (writer-forget-ranges! (the-writer) ranges))
       (when (env-on? "HL_REGION_TRACE")
-        (println "[regions] let go {} regions, {} KB"
+        (println "[regions] let go {} regions, {} KB; {} alive, {} KB"
                  (- (.let-go q) before)
-                 (/ (- (.bytes-let-go q) bytes-before) 1024)))
+                 (/ (- (.bytes-let-go q) bytes-before) 1024)
+                 (- (atomic/read (field q made)) (.let-go q))
+                 (/ (- (atomic/read (field q bytes-made)) (.bytes-let-go q)) 1024))
+        (when (region-labels?) (regions-labels-report!))
+        (let [d (deps)]
+          (println "[regions] graph: {} nodes, {} edges, {} sites"
+                   (len (.texts d)) (len (.edge-to d)) (len (.sites d)))))
       (free! (mut ranges))))
   0)
 
@@ -707,20 +837,38 @@
 (gen-map-anon-private)
 
 (extern mmap :cc (cc/C) [(ptr i8) isize i32 i32 i32 i64] (-> (ptr i8)))
+(extern munmap :cc (cc/C) [(ptr i8) isize] (-> i32))
 (extern mprotect :cc (cc/C) [(ptr i8) isize i32] (-> i32))
 
+;;; A big chunk is pages of its own, from the system and given back to it when its region is let
+;;; go, so what a build no longer needs is no longer the program's: malloc keeps what is freed for
+;;; its next use, and a run of builds whose big chunks differ in size (a big file parsed again)
+;;; would leave it holding more and more it cannot reuse. Small chunks, which it reuses well, are
+;;; malloc's. Pages are counted in 64 KB, a multiple of every page size.
+(defn big-chunk? [(size i64)] (-> bool)
+  (>= size 131072))
+
+(defn chunk-pages [(size i64)] (-> i64)
+  (align-to size 65536))
+
+(defn pages-new [(size i64)] (-> (ptr i8))
+  ;; PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON (macOS 0x1002, Linux 0x22)
+  (let [p (mmap (primitive/cast (ptr i8) 0) (primitive/cast isize (chunk-pages size)) (: 3 i32)
+                (primitive/cast i32 MAP-ANON-PRIVATE) (: -1 i32) 0)]
+    (if (= (primitive/cast i64 p) -1) (primitive/cast (ptr i8) 0) p)))
+
 (defn chunk-memory [(size i64)] (-> (ptr i8))
-  (if (region-check?)
-      ;; PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON (macOS 0x1002, Linux 0x22)
-      (let [p (mmap (primitive/cast (ptr i8) 0) (primitive/cast isize size) (: 3 i32)
-                    (primitive/cast i32 MAP-ANON-PRIVATE) (: -1 i32) 0)]
-        (if (= (primitive/cast i64 p) -1) (primitive/cast (ptr i8) 0) p))
+  (if (or (region-check?) (big-chunk? size))
+      (pages-new size)
       (malloc (primitive/cast isize size))))
 
 (defn chunk-let-go! [(at i64) (size i64)] (-> void)
-  (if (region-check?)
-      (mprotect (primitive/cast (ptr i8) at) (primitive/cast isize size) (: 0 i32))
-      (primitive/free (primitive/cast (ptr i8) at)))
+  (cond (region-check?)
+          (mprotect (primitive/cast (ptr i8) at) (primitive/cast isize (chunk-pages size)) (: 0 i32))
+        (big-chunk? size)
+          (munmap (primitive/cast (ptr i8) at) (primitive/cast isize (chunk-pages size)))
+        :else
+          (primitive/free (primitive/cast (ptr i8) at)))
   0)
 
 ;; ---------------------------------------------------------------- tokens
@@ -1560,12 +1708,34 @@
    (seen i64)
    (delta-from i64)
    (delta-to i64)
-   ;; Where all of its memory comes from, as it grows and is indexed: its region's (see
-   ;; `owned-allocator`), whichever thread asks.
-   (alc (dyn Allocator))])
+   ;; Where all of its memory comes from, as it grows and is indexed, whichever thread asks: while
+   ;; the run reclaims memory, a region of its own (`region`), which the region it is made in holds,
+   ;; and anything else that holds the relation holds too (`rel-held!`); else malloc's.
+   (alc (dyn Allocator))
+   (region i64)])
+
+;;; A relation's memory, of its own: what it is made in holds it. 0 where the run keeps everything.
+(defn rel-region-new [] (-> i64)
+  (let [cur (region-current)]
+    (if (and (reclaiming?) (not (.lasting cur)))
+        (let [r (region-new)]
+          (set! (.label r) "a relation")
+          (when (region-labels?) (regions-live-add! r))
+          (region-ref! cur r)
+          (region-release! r)
+          (primitive/cast i64 r))
+        0)))
+
+;;; What is being made now holds `r`.
+(defn rel-held! [(r Rel)] (-> void)
+  (region-uses-id! (.region r))
+  0)
 
 (defn rel-new [(arity i64)] (-> Rel)
-  (let [a (owned-allocator)
+  (let [region (rel-region-new)
+        a (if (= region 0)
+              (malloc-allocator)
+              (region-shared-allocator (primitive/cast (ptr Region) region)))
         (mut index) (ArrayList::new [Index] a)
         (mut indexed) (ArrayList::new [i64] a)
         (mut dense)
@@ -1581,6 +1751,7 @@
       (push! (mut pair-indexed) 0))
     (Rel
       :alc a
+      :region region
       :arity arity
       :data (ArrayList::new [i64] a)
       :count 0
@@ -1853,7 +2024,10 @@
 
 ;;; Whether the environment variable `name` is set.
 (defn env-on? [(name (slice u8))] (-> bool)
-  (!= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) name))) 0))
+  (let [c (str/to-cstr (malloc-allocator) name)
+        on (!= (primitive/cast i64 (os/getenv c)) 0)]
+    (primitive/free (primitive/cast (ptr i8) c))
+    on))
 
 ;;; Start a round: what arrived since the last start is now the delta. True when there is any.
 (defn rel-advance! [(r (mut Rel))] (-> bool)
@@ -1976,9 +2150,11 @@
   (match (get (.ids ns) s)
     (Some [id] id)
     (None []
-          (let [id (len (.strs ns))]
-            (set! (mut (.ids ns)) s id)
-            (push! (mut (.strs ns)) s)
+          ;; Its own copy: the text is a value, of whatever region made it.
+          (let [id (len (.strs ns))
+                kept (own-text s)]
+            (set! (mut (.ids ns)) kept id)
+            (push! (mut (.strs ns)) kept)
             id))))
 
 ;;; An id's string, and nothing for an id it never gave: so asking a table of another build, which
@@ -2019,7 +2195,7 @@
         (let [a (.end p)]
           (match (get (.at p) key)
             (Some [_] 0)
-            (None [] (do (push! (mut (.keys p)) key) 0)))
+            (None [] (do (push! (mut (.keys p)) (own-text key)) 0)))
           (set! (mut (.at p)) key a)
           (set! (mut (.size p)) key size)
           (set! (.end p) (+ a size))
@@ -2155,12 +2331,6 @@
   (let [(mut sb) (str/StrBuf::new (value-allocator))]
     (push-str! (mut sb) a)
     (push-str! (mut sb) b)
-    (finish! (mut sb))))
-
-;;; `s` in memory of its own, kept however long whatever made `s` keeps its own.
-(defn copy-text [(s (slice u8))] (-> (slice u8))
-  (let [(mut sb) (str/StrBuf::new (value-allocator))]
-    (push-str! (mut sb) s)
     (finish! (mut sb))))
 
 (defn parse-int [(s (slice u8))] (-> i64)
@@ -2770,7 +2940,7 @@
     there))
 
 (defn file-exists-raw? [(path (slice u8))] (-> bool)
-  (match (fs/exists? (malloc-allocator) path)
+  (match (fs/exists? (value-allocator) path)
     (Ok [e] e)
     (Err [_] false)))
 
@@ -3674,10 +3844,11 @@
   (let [site (len (.sites d))
         setting-id (dep-id! d setting)]
     (set! (mut (.site-ids d)) (site-key setting prefix suffix) site)
-    (push! (mut (.sites d)) (join setting prefix))
+    ;; The graph's own copies: these are values, of whatever region made them.
+    (push! (mut (.sites d)) (own-text (join setting prefix)))
     (push! (mut (.site-settings d)) setting-id)
-    (push! (mut (.site-prefixes d)) prefix)
-    (push! (mut (.site-suffixes d)) suffix)
+    (push! (mut (.site-prefixes d)) (own-text prefix))
+    (push! (mut (.site-suffixes d)) (own-text suffix))
     (push! (mut (.site-pages d))
            (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
     (push! (mut (.site-keys d))
@@ -3690,7 +3861,7 @@
             (and (> (len prefix) 0)
                  (= (cast i64 (get prefix 0)) 46)
                  (< open (len prefix)))]
-      (push! (mut (.site-rels d)) (if query (subslice prefix 1 open) ""))
+      (push! (mut (.site-rels d)) (if query (own-text (subslice prefix 1 open)) ""))
       (push! (mut (.site-cols d))
              (if query (count-byte prefix open (len prefix) 44) -1)))
     (let [(mut sites)
@@ -3738,7 +3909,7 @@
                 (Some [i] i)
                 (None []
                       (let [i (len (get (.site-keys d) site))
-                            kept (copy-text key)]
+                            kept (own-text key)]
                         (push! (mut (elem (mut (.site-keys d)) site)) kept)
                         (set! (mut (elem (mut (.site-key-ids d)) site)) kept i)
                         i)))]
@@ -3749,7 +3920,7 @@
 ;;; The keys a keyed site has numbered, by number.
 (defn site-keys [(site i64)] (-> (ArrayList (slice u8)))
   (let [d (deps)
-        (mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+        (mut out) (ArrayList::new [(slice u8)] (value-allocator))]
     (deps-lock! d)
     (for k (get (.site-keys d) site) (push! (mut out) k))
     (deps-unlock! d)
@@ -3830,7 +4001,7 @@
                                 (None []
                                       (ArrayList::new [(slice u8)]
                                                       (malloc-allocator))))]
-                        (push! (mut paths) path)
+                        (push! (mut paths) (own-text path))
                         (set! (mut (.paths d)) setting paths)
                         (query-index! d setting path i)
                         i)))]
@@ -3860,7 +4031,7 @@
                                         (None []
                                               (ArrayList::new [(slice u8)]
                                                               (malloc-allocator))))]
-                                (push! (mut paths) path)
+                                (push! (mut paths) (own-text path))
                                 (set! (mut (.paths d)) setting paths)
                                 (query-index! d setting path i)
                                 i)))]
@@ -3872,7 +4043,7 @@
 ;;; The numbered sites memos have read a setting at, and each one's fixed text and (index, node) pairs.
 (defn dep-sites [(setting (slice u8))] (-> (ArrayList i64))
   (let [d (deps)
-        (mut out) (ArrayList::new [i64] (malloc-allocator))]
+        (mut out) (ArrayList::new [i64] (value-allocator))]
     (deps-lock! d)
     (match (get (.setting-sites d) setting)
       (Some [xs] (for x xs (push! (mut out) x)))
@@ -3892,7 +4063,7 @@
 
 (defn site-nodes [(site i64)] (-> (ArrayList i64))
   (let [d (deps)
-        (mut out) (ArrayList::new [i64] (malloc-allocator))]
+        (mut out) (ArrayList::new [i64] (value-allocator))]
     (deps-lock! d)
     (let [pages (get (.site-pages d) site)]
       (for p (range 0 (len pages))
@@ -3908,7 +4079,7 @@
 ;;; The paths memos have read of a setting.
 (defn dep-paths [(setting (slice u8))] (-> (ArrayList (slice u8)))
   (let [d (deps)
-        (mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+        (mut out) (ArrayList::new [(slice u8)] (value-allocator))]
     (deps-lock! d)
     (match (get (.paths d) setting)
       (Some [ps] (for p ps (push! (mut out) p)))
@@ -4280,10 +4451,9 @@
       (let [id (dep-id! d node)]
         (when (= (len (get (.prints d) id)) 0)
           (set! (mut (.changed d)) id (atomic/read (field d revision))))
-        (set! (mut (.prints d)) id (own-text print))
-        (set! (mut (.stamps d))
-              id
-              (if (rechecked-path? (subslice node 2 (len node))) "" (own-text stamp0))))
+        (stored-text-set! (elem (mut (.prints d)) id) print)
+        (stored-text-set! (elem (mut (.stamps d)) id)
+                          (if (rechecked-path? (subslice node 2 (len node))) "" stamp0)))
       (deps-unlock! d)))
   0)
 
@@ -4317,7 +4487,8 @@
                   (unless (get (.dirty d) out)
                     (set! (mut (.dirty d)) out true)
                     (push! (mut todo) out)))
-                (set! e (get (.edge-next d) e)))))))
+                (set! e (get (.edge-next d) e))))))
+        (free! (mut todo)))
       (deps-unlock! d)
       (when (dep-tracing?) (println "[deps] changed {}" (dep-node-text d id))))
     0))
@@ -4525,14 +4696,17 @@
           (unless (and (> (len stamp) 0) (= stamp (get stamps i)))
             (let [now (input-print-now node)]
               (deps-lock! d)
-              (set! (mut (.stamps d)) (dep-id! d node) stamp)
+              (stored-text-set! (elem (mut (.stamps d)) (dep-id! d node)) stamp)
               (deps-unlock! d)
               (when (!= now (get prints i))
                 (push! (mut changed) node)
                 (deps-lock! d)
-                (set! (mut (.prints d)) (dep-id! d node) now)
+                (stored-text-set! (elem (mut (.prints d)) (dep-id! d node)) now)
                 (deps-unlock! d)
-                (dep-changed! node)))))))
+                (dep-changed! node))))))
+      (free! (mut stamps)))
+    (free! (mut nodes))
+    (free! (mut prints))
     (when (> (len changed) 0) (dep-any-change-dirty!))
     changed))
 
@@ -4561,6 +4735,7 @@
                   (push! (mut todo) out)))
               (set! e (get (.edge-next d) e))))))
       (deps-unlock! d))
+    (free! (mut todo))
     0))
 
 ;;; How many inputs memos have read.
@@ -4686,6 +4861,7 @@
     (deps-unlock! d)
     (for p paths
       (unless (watch-path! p) (set! missed (+ missed 1))))
+    (free! (mut paths))
     missed))
 
 (defn dir-of-path [(path (slice u8))] (-> (slice u8))
@@ -4720,7 +4896,7 @@
         false
         (do
           (set! (mut (.fds w)) path (primitive/cast i64 wd))
-          (set! (mut (.paths w)) (primitive/cast i64 wd) path)
+          (set! (mut (.paths w)) (primitive/cast i64 wd) (own-text path))
           true))))
 
 (defn kqueue-watch! [(w (ptr Watch)) (path (slice u8))] (-> bool)
@@ -4756,7 +4932,7 @@
               (do (os/close fd) false)
               (do
                 (set! (mut (.fds w)) path (primitive/cast i64 fd))
-                (set! (mut (.paths w)) (primitive/cast i64 fd) path)
+                (set! (mut (.paths w)) (primitive/cast i64 fd) (own-text path))
                 true))))))
 
 ;;; Until something watched changes; at most `ms` milliseconds when some path could not be watched,
@@ -4809,6 +4985,7 @@
                                 (do
                                   (HashMap::remove! (mut (.fds w)) path)
                                   (HashMap::remove! (mut (.paths w)) wd)
+                                  (free [u8] (malloc-allocator) path)
                                   0))
                           (None [] 0)))
                       (set! at (+ at 16 name-len))))))))))
@@ -4854,6 +5031,7 @@
                     (do
                       (HashMap::remove! (mut (.fds w)) path)
                       (HashMap::remove! (mut (.paths w)) fd)
+                      (free [u8] (malloc-allocator) path)
                       (os/close (primitive/cast i32 fd))
                       0))
               (None [] 0))))))
@@ -5320,14 +5498,19 @@
         (if (<= (get ranges (* mid 2)) x) (set! lo (+ mid 1)) (set! hi mid))))
     (and (> lo 0) (< x (get ranges (+ (* (- lo 1) 2) 1))))))
 
+;;; The order of (start, end) pairs by their starts.
+(defn ranges-order [(ranges (ArrayList i64))] (-> (ArrayList i64))
+  (let [(mut starts) (ArrayList::new [i64] (malloc-allocator))]
+    (for i (range 0 (/ (len ranges) 2)) (push! (mut starts) (get ranges (* i 2))))
+    (let [order (sort-order-int starts false)]
+      (free! (mut starts))
+      order)))
+
 ;;; Memory that was let go (`ranges`, as `regions-let-go!` gives them), forgotten by a writer that
 ;;; knows objects by where they are: one there now is another object. Texts and lists it knew there
 ;;; are written again whole when next written; opaque values whose bytes point there, likewise.
 (defn writer-forget-ranges! [(w (ptr Writer)) (ranges (ArrayList i64))] (-> void)
-  (let [order (sort-order-int (let [(mut starts) (ArrayList::new [i64] (malloc-allocator))]
-                                (for i (range 0 (/ (len ranges) 2)) (push! (mut starts) (get ranges (* i 2))))
-                                starts)
-                              false)
+  (let [order (ranges-order ranges)
         (mut sorted) (ArrayList::new [i64] (malloc-allocator))]
     (for i order
       (push! (mut sorted) (get ranges (* i 2)))
@@ -5833,8 +6016,9 @@
         (mut dirty) (ArrayList::new [bool] (malloc-allocator))]
     (for _ (range 0 n) (push! (mut dirty) (take-bool r)))
     (set! (.dirty d) dirty))
-  (set! (.prints d) (take-texts r))
-  (set! (.stamps d) (take-texts r))
+  ;; Each the graph's own copy, as `stored-text-set!` replaces them.
+  (set! (.prints d) (owned-texts (take-texts r)))
+  (set! (.stamps d) (owned-texts (take-texts r)))
   (set! (.queries d) (take-text-ints-map r))
   (let [n (take-varint r)
         (mut paths)
@@ -5930,8 +6114,9 @@
         (match (get (.ids d) old)
           (Some [x] (when (= x id) (HashMap::remove! (mut (.ids d)) old)))
           (None [] 0))
-        (set! (mut (.texts d)) id text)
-        (set! (mut (.ids d)) text id)))
+        (let [kept (own-text text)]
+          (set! (mut (.texts d)) id kept)
+          (set! (mut (.ids d)) kept id))))
     (dep-claim-locked! d id)
     (deps-unlock! d))
   0)

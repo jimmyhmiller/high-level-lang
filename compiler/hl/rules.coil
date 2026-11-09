@@ -101,10 +101,16 @@
    (memos (ArrayList (slice u8)))])
 
 (defstruct Local
-  [(name (slice u8)) (ty (slice u8)) (sym (slice u8)) (mutable bool)])
+  [(name (slice u8)) (ty (slice u8)) (sym (slice u8)) (mutable bool)
+   ;; How many loops with a region of their own enclose it (see `scoped-loop?`).
+   (depth i64)])
 
 (defstruct Comp
-  [(mods (ArrayList Mod))
+  [;; The marks of the loops with a region of their own around what is being compiled, outermost
+   ;; first; and the `var`s given a value from inside one, which hold a region for it.
+   (loop-marks (ArrayList (slice u8)))
+   (escaped (ArrayList (slice u8)))
+   (mods (ArrayList Mod))
    (self (slice u8))
    (table (ArrayList Alias))  ; module name -> file, from the manifest
    (base (slice u8))  ; the manifest's directory
@@ -1736,7 +1742,8 @@
              :name name
              :ty ty
              :sym s
-             :mutable mutable))
+             :mutable mutable
+             :depth (len (.loop-marks k))))
     s))
 
 (defn find-local [(k (mut Comp)) (name (slice u8))] (-> (Option Local))
@@ -6558,14 +6565,18 @@
                       n
                       "cannot return from inside `with`: its context would not be restored"))
                (set! (.returned k) true)
-               (if (none? (kid n 0))
-                   (te `(return-from :fn 0) "Never")
-                   (let [v
-                           (expect (mut k)
-                                   (kid n 0)
-                                   (expr (mut k) (kid n 0) (.ret k))
-                                   (.ret k))]
-                     (te `(return-from :fn ~(.code v)) "Never"))))
+               (let [adopts (return-adopts (mut k))
+                     adopting (any-escaped? (mut k))]
+                 (if (none? (kid n 0))
+                     (te `(do ~@adopts (return-from :fn 0)) "Never")
+                     (let [v
+                             (expect (mut k)
+                                     (kid n 0)
+                                     (expr (mut k) (kid n 0) (.ret k))
+                                     (.ret k))]
+                       (if (not adopting)
+                           (te `(return-from :fn ~(.code v)) "Never")
+                           (te `(let [returned ~(.code v)] ~@adopts (return-from :fn returned)) "Never"))))))
     (_ (die (mut k)
             n
             (cat "this is not an expression: " (g/kind-name (.kind n)))))))
@@ -6749,20 +6760,26 @@
   (match (.kind s)
     (g/KFor []
             (let [_ (bounded! (mut k) (kid s 0))
+                  scoped (scoped-loop? (mut k) (kid s 1))
+                  it (loop-open! (mut k) scoped)
                   mark (locals-mark (mut k))
                   h (head-open! (mut k) (kid s 0))
                   body (expr (mut k) (kid s 1) "Void")
-                  code (head-wrap (mut k) h (.code body))]
+                  code (head-wrap (mut k) h (loop-turn it (.code body)))]
               (locals-reset! (mut k) mark)
-              (te code "Void")))
+              (loop-close! (mut k) it)
+              (te (loop-around it code) "Void")))
     (g/KWhile []
-              (let [c
+              (let [scoped (scoped-loop? (mut k) (kid s 1))
+                    c
                       (expect (mut k)
                               (kid s 0)
                               (expr (mut k) (kid s 0) "Bool")
                               "Bool")
+                    it (loop-open! (mut k) scoped)
                     body (expr (mut k) (kid s 1) "Void")]
-                (te `(while ~(.code c) ~(.code body)) "Void")))
+                (loop-close! (mut k) it)
+                (te (loop-around it `(while ~(.code c) ~(loop-turn it (.code body)))) "Void")))
     (g/KAssert []
                (let [call-node (kid s 0)]
                  (unless (and (= (.kind call-node) (g/KCall))
@@ -6882,7 +6899,7 @@
                                       ;; The value made in a region of its own (while the run
                                       ;; reclaims memory), which the setting holds from now on.
                                       (push! (mut sets)
-                                             `(let [~(sym made-in) (rt/answer-region-open!)
+                                             `(let [~(sym made-in) (rt/answer-region-open! ~(cat "with " name))
                                                     ~(sym given) ~(.code v)]
                                                 (rt/answer-region-close! ~(sym made-in))
                                                 (set! ~field ~(sym given))
@@ -6957,6 +6974,132 @@
                    (die (mut k) s (cat "++= extends a list, not " t)))
                  (te (extend-code (mut k) (kid s 1) (.code p) t) "Void")))
     (_ (expr (mut k) s want))))
+
+;; ---------------------------------------------------------------- loops with regions of their own
+
+;;; A statement loop run where no memo is computing (the top of a program that watches) makes each
+;;; turn's values in a region of the turn's own, let go when the next turn starts: what one build
+;;; made at the top is gone by the next. What a turn keeps is copied out when it gives a `var` from
+;;; before the loop a value (`escape-assign`). A loop gets one only when nothing else leaves a turn:
+;;; no `return` in it, and nothing changed in place that it did not make (a list grown, an element
+;;; or field set, a module's state given a value).
+(defn scoped-loop? [(k (mut Comp)) (body g/Node)] (-> bool)
+  (and (not (has-kind? body (g/KReturn)))
+       (not (outer-change? (mut k) body))))
+
+(defn outer-change? [(k (mut Comp)) (n g/Node)] (-> bool)
+  (or (match (.kind n)
+        (g/KAssign []
+                   (let [target (kid n 0)]
+                     (if (= (.kind target) (g/KName))
+                         ;; A local from before the loop is given a copy; a module's state is kept
+                         ;; as it is given; a local of the loop's own is the loop's.
+                         (match (find-local (mut k) (.text target))
+                           (Some [_] false)
+                           (None []
+                                 (match (find-global (self-mod (mut k)) (.text target))
+                                   (Some [_] true)
+                                   (None [] false))))
+                         (outer-base? (mut k) target))))
+        (g/KAppend []
+                   (let [target (kid n 0)]
+                     (if (= (.kind target) (g/KName))
+                         (match (find-local (mut k) (.text target))
+                           (Some [l] (not (scalar-type? (.ty l))))
+                           (None [] (outer-base? (mut k) target)))
+                         (outer-base? (mut k) target))))
+        (g/KExtend [] (outer-base? (mut k) (kid n 0)))
+        (_ false))
+      (let [(mut hit) false]
+        (for c (.kids n) (when (and (not hit) (outer-change? (mut k) c)) (set! hit true)))
+        hit)))
+
+;;; Whether a place is in something from before the loop: a local declared before it (they are all
+;;; that `find-local` knows while the loop is looked at), this module's state, or another module's
+;;; (`m.x`). Any other name is one the loop declares.
+(defn outer-base? [(k (mut Comp)) (target g/Node)] (-> bool)
+  (match (.kind target)
+    (g/KName []
+             (match (find-local (mut k) (.text target))
+               (Some [_] true)
+               (None []
+                     (match (find-global (self-mod (mut k)) (.text target))
+                       (Some [_] true)
+                       (None [] false)))))
+    (g/KFieldE []
+               (match (module-prefix (mut k) (kid target 0))
+                 (Some [_] true)
+                 (None [] (outer-base? (mut k) (kid target 0)))))
+    (g/KIndex [] (outer-base? (mut k) (kid target 0)))
+    (g/KGroup [] (outer-base? (mut k) (kid target 0)))
+    (_ true)))
+
+(defn scalar-type? [(t (slice u8))] (-> bool)
+  (or (= t "Int") (= t "Bool") (= t "Float") (= t "Char")))
+
+;;; A loop being compiled: whether it has regions of its own, and its mark's name.
+(defstruct LoopInfo [(scoped bool) (mark (slice u8))])
+
+(defn loop-open! [(k (mut Comp)) (scoped bool)] (-> LoopInfo)
+  (if scoped
+      (let [m (fresh (mut k) "loop-mark")]
+        (push! (mut (.loop-marks k)) m)
+        (LoopInfo :scoped true :mark m))
+      (LoopInfo :scoped false :mark "")))
+
+(defn loop-close! [(k (mut Comp)) (it LoopInfo)] (-> void)
+  (when (.scoped it) (pop! (mut (.loop-marks k))))
+  0)
+
+;;; Each turn starts by letting the last turn's region go and making its own (see `rt/iteration-begin!`).
+(defn loop-turn [(it LoopInfo) (body Code)] (-> Code)
+  (if (.scoped it)
+      `(do (rt/iteration-begin! ~(sym (.mark it))) ~body)
+      body))
+
+(defn loop-around [(it LoopInfo) (loop Code)] (-> Code)
+  (if (.scoped it)
+      `(let [~(sym (.mark it)) (rt/iteration-mark)]
+         ~loop
+         (rt/iteration-end! ~(sym (.mark it)))
+         0)
+      loop))
+
+;;; `x = v`, `x` a `var` from before a loop with a region of its own: while the loop's turns have
+;;; regions, `v` is copied into a region of the var's own, which it holds until it is given another.
+(defn escape-assign [(k (mut Comp)) (l Local) (v TE)] (-> Code)
+  (if (or (>= (.depth l) (len (.loop-marks k))) (scalar-type? (.ty l)))
+      `(set! ~(sym (.sym l)) ~(.code v))
+      (let [mark (get (.loop-marks k) (.depth l))
+            region (sym (cat (.sym l) "--region"))
+            given (fresh (mut k) "given")
+            made-in (fresh (mut k) "made-in")]
+        (unless (has-text? (.escaped k) (.sym l)) (push! (mut (.escaped k)) (.sym l)))
+        `(let [~(sym given) ~(.code v)]
+           (if (rt/iterating-since? ~(sym mark))
+               (let [~(sym made-in) (rt/answer-region-open! ~"var")
+                     copied ~(own-code (mut k) (.ty l) (sym given))]
+                 (rt/answer-region-close! ~(sym made-in))
+                 (rt/region-release-id! ~region)
+                 (set! ~region ~(sym made-in))
+                 (set! ~(sym (.sym l)) copied))
+               (set! ~(sym (.sym l)) ~(sym given)))
+           0))))
+
+;;; Whether a `var` in scope holds a region (see `escape-assign`).
+(defn any-escaped? [(k (mut Comp))] (-> bool)
+  (let [(mut hit) false]
+    (for l (.locals k) (when (has-text? (.escaped k) (.sym l)) (set! hit true)))
+    hit))
+
+;;; Before a `return`: the regions of the `var`s in scope that hold one taken over by what the
+;;; function returns to, since what it returns may be one of theirs.
+(defn return-adopts [(k (mut Comp))] (-> CodeBuilder)
+  (let [(mut out) (primitive/code-list-new)]
+    (for l (.locals k)
+      (when (has-text? (.escaped k) (.sym l))
+        (push! (mut out) `(rt/region-adopt-id! ~(sym (cat (.sym l) "--region"))))))
+    out))
 
 ;;; `xs ++= e`: a list literal's items, or a comprehension's, go straight into `xs`, with no list
 ;;; made for them on the way.
@@ -7247,8 +7390,18 @@
                               `(~(primitive/code-symbol "."
                                                         (held-field (.name (.x sp)))) ~storage)]
                         (te `(let [~(sym old) ~(.code p)
-                                   given (or (> ~bound 0) (> ~held 0))]
-                               (set! ~(.code p) ~(.code v))
+                                   given (or (> ~bound 0) (> ~held 0))
+                                   ;; Made in a region of its own, which the setting holds from
+                                   ;; now on in place of the one it held.
+                                   made-in (rt/answer-region-open! ~(cat "set " (.name (.x sp))))
+                                   value ~(.code v)
+                                   closed (rt/answer-region-close! made-in)]
+                               (set! ~(.code p) value)
+                               (rt/region-release-id! (~(primitive/code-symbol "."
+                                                                                (region-field (.name (.x sp)))) ~storage))
+                               (set! (~(primitive/code-symbol "."
+                                                              (region-field (.name (.x sp)))) ~storage)
+                                     made-in)
                                (set! (~(primitive/code-symbol "."
                                                               (dirty-field (.name (.x sp)))) ~storage)
                                      1)
@@ -7263,7 +7416,12 @@
                                                       `given)
                                0)
                             "Void"))))
-            (None [] (te `(set! ~(.code p) ~(.code v)) "Void")))))))
+            (None []
+                  (if (= (.kind target) (g/KName))
+                      (match (find-local (mut k) (.text target))
+                        (Some [l] (te (escape-assign (mut k) l v) "Void"))
+                        (None [] (te `(set! ~(.code p) ~(.code v)) "Void")))
+                      (te `(set! ~(.code p) ~(.code v)) "Void"))))))))
 
 (defn plain-append [(k (mut Comp)) (s g/Node)] (-> TE)
   (let [p (place (mut k) (kid s 0))
@@ -7320,7 +7478,8 @@
       (let [s (get stmts j)
             at-end (= j (- n 1))]
         (if (let-like? s)
-            (let [(mut binds) (primitive/code-list-new)]
+            (let [(mut binds) (primitive/code-list-new)
+                  (mut var-syms) (text-list)]
               (while (and (< j n) (let-like? (get stmts j)))
                 (let [b (get stmts j)
                       is-var (= (.kind b) (g/KVar))
@@ -7346,12 +7505,29 @@
                       local
                         (bind-local! (mut k) (.text (kid b 0)) (.ty v) is-var)]
                   (if is-var
-                      (push! (mut binds) `(mut ~(sym local)))
+                      (do (push! (mut binds) `(mut ~(sym local)))
+                          (push! (mut var-syms) local))
                       (push! (mut binds) (sym local)))
                   (push! (mut binds) init))
                 (set! j (+ j 1)))
-              (let [rest (block-from (mut k) stmts j want)]
-                (push! (mut forms) `(let [~@binds] ~(.code rest)))
+              (let [rest (block-from (mut k) stmts j want)
+                    ;; A `var` given a value from inside a loop with a region of its own holds a
+                    ;; region for it (see `escape-assign`); when its block ends, whatever the block
+                    ;; is in takes it over, since the block's value may be the var's.
+                    (mut adopts) (primitive/code-list-new)
+                    (mut adopting) false]
+                (for name var-syms
+                  (when (has-text? (.escaped k) name)
+                    (let [region (cat name "--region")]
+                      (set! adopting true)
+                      (push! (mut binds) `(mut ~(sym region)))
+                      (push! (mut binds) `0)
+                      (push! (mut adopts) `(rt/region-adopt-id! ~(sym region))))))
+                (push! (mut forms)
+                       (cond (not adopting) `(let [~@binds] ~(.code rest))
+                             (= (.ty rest) "Never") `(let [~@binds] ~(.code rest))
+                             (= (.ty rest) "Void") `(let [~@binds] ~(.code rest) ~@adopts 0)
+                             :else `(let [~@binds] (let [block-value ~(.code rest)] ~@adopts block-value))))
                 (set! ty (.ty rest))
                 (set! go false)))
             (let [e (stmt (mut k) s (if at-end want "Void"))]
@@ -9505,7 +9681,7 @@
                        ;; arguments into the key's, the answer into the answer's, which the table
                        ;; holds from then on.
                        ~(if tree
-                            `(let [answer-region (rt/answer-region-open!)
+                            `(let [answer-region (rt/answer-region-open! ~name)
                                    answer ~(dec-code (mut k) (.ret f))
                                    closed (rt/answer-region-close! answer-region)]
                                (rt/reader-return! r)
@@ -9516,10 +9692,10 @@
                                  (set! (mut (.regions s)) key answer-region))
                                (HashMap::remove! (mut (.lazy s)) key)
                                (rt/spin-unlock! word))
-                            `(let [key-region (rt/answer-region-open!)
+                            `(let [key-region (rt/answer-region-open! ~(cat "key " name))
                                    ~@binds
                                    key-closed (rt/answer-region-close! key-region)
-                                   answer-region (rt/answer-region-open!)
+                                   answer-region (rt/answer-region-open! ~name)
                                    answer ~(dec-code (mut k) (.ret f))
                                    closed (rt/answer-region-close! answer-region)]
                                (rt/region-ref-id! answer-region key-region)
@@ -9608,7 +9784,7 @@
                             (let [at (atomic/read (field st ~lazy-name))]
                               (when (> at 0)
                                 (let [r (rt/the-reader)
-                                      made-in (rt/answer-region-open!)]
+                                      made-in (rt/answer-region-open! ~(cat "load " g-name))]
                                   (rt/reader-seek! r (- at 1))
                                   (set! (~field st) ~(dec-code (mut k) (.ty x)))
                                   (rt/answer-region-close! made-in)
@@ -9856,6 +10032,14 @@
              ~@arms :else
              false))))
 
+;;; An answer made from the last (`update by`) holds what it shares with it: a database, exactly its
+;;; relations (each a region of its own), so the last is let go once replaced, but for those; any
+;;; other value, the last's whole region.
+(defn update-holds [(k (mut Comp)) (f Func) (name (slice u8))] (-> Code)
+  (if (= (persist-kind (mut k) (.ret f)) "db")
+      `(~(sym (qualified (mut k) (type-module (.ret f)) "regions-held!")) made)
+      `(rt/region-uses-id! (~(sym (cat "memo-last-region--" name)) s))))
+
 ;;; An answer made: by the run's `update by` function for it from the arguments and the last answer
 ;;; made, when it has one and there is a last answer; else computed as written.
 (defn made-code [(k (mut Comp)) (d g/Node) (f Func) (name (slice u8))] (-> Code)
@@ -9874,7 +10058,10 @@
           `(match (if (>= update 0)
                       (~(sym (cat "memo-last--" name)) s)
                       (None [~(coil-type (mut k) (.ret f))]))
-             (Some [last] (cond ~@arms :else (~compute ~@args)))
+             (Some [last]
+                   (let [made (cond ~@arms :else (~compute ~@args))]
+                     ~(update-holds (mut k) f name)
+                     made))
              (None [] (~compute ~@args)))))))
 
 ;;; A value's own copy, in the region values go to now: numbers and truths as they are, a text's
@@ -9979,7 +10166,7 @@
                             (Some [a] (~(sym (cat "MemoOwned--" name)) :args a :region r))
                             (None [] (panic "memo fn {} kept a key with no arguments" ~name))))
                     (None []
-                          (let [r (rt/answer-region-open!)
+                          (let [r (rt/answer-region-open! ~(cat "key " name))
                                 a ~(if (= (len (.params f)) 0)
                                        `(zeroed ~args-ty)
                                        `(~args-ty ~@(let [(mut inits) (primitive/code-list-new)]
@@ -10008,13 +10195,20 @@
                       (do
                         (~(sym (cat "memo-fault--" name)) s key)
                         (rt/spin-lock! word)
-                        (let [found (get (.table s) key)
-                              region (match (get (.regions s) key) (Some [r] r) (None [] 0))]
+                        (let [found (get (.table s) key)]
                           (rt/spin-unlock! word)
-                          ;; What is made from the last answer may hold some of it.
-                          (rt/region-uses-id! region)
                           found))
                       (None [~(coil-type (mut k) (.ret f))]))))))
+    ;; The region the last answer made is in, or 0.
+    (emit! (mut out)
+           `(defn ~(sym (cat "memo-last-region--" name)) [(s (ptr ~store))] (-> i64)
+              (let [word (cast (ptr i64) s)]
+                (rt/spin-lock! word)
+                (let [r (if (.has-last s)
+                            (match (get (.regions s) (.last-key s)) (Some [r] r) (None [] 0))
+                            0)]
+                  (rt/spin-unlock! word)
+                  r))))
     ;; An answer asked for by its node, as checking an answer that read it asks: its key from the
     ;; node's text, once the store has made its keys, and the arguments it was computed from, which
     ;; its store keeps.
@@ -10402,7 +10596,7 @@
                                                                             (rt/dep-end-same-version! node)
                                                                             (set! kept-old true)
                                                                             old)
-                                                                          (let [region (rt/answer-region-open!)
+                                                                          (let [region (rt/answer-region-open! ~qname)
                                                                                 fresh
                                                                                   ~made-code
                                                                                 closed (rt/answer-region-close! region)
@@ -10443,7 +10637,7 @@
                                                                                      3))
                                                                             ~version-code
                                                                             "")
-                                                                      region (rt/answer-region-open!)
+                                                                      region (rt/answer-region-open! ~qname)
                                                                       fresh
                                                                         ~made-code
                                                                       closed (rt/answer-region-close! region)]
@@ -10640,6 +10834,8 @@
         path (dsl/path-of context)
         (mut k)
           (Comp
+            :loop-marks (text-list)
+            :escaped (text-list)
             :mods (ArrayList::new [Mod] (malloc-allocator))
             :self ""
             :table (ArrayList::new [Alias] (malloc-allocator))
