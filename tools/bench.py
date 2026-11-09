@@ -98,15 +98,18 @@ def edit(root, module, original):
 MAC = sys.platform == "darwin"
 PERF_OUT = os.path.join(WORK, ".perf")
 
+PEAK_OUT = os.path.join(WORK, ".peak")
+
 def measuring(cmd):
     """`cmd` run so that its instructions and peak memory can be read when it ends: under
-    /usr/bin/time -l on macOS; under perf stat on Linux, its peak memory from wait4."""
+    /usr/bin/time -l on macOS; on Linux under perf stat, and under GNU time inside it for its peak
+    memory (perf's own, about 60 MB, is in the peak wait4 gives for perf)."""
     if MAC: return ["/usr/bin/time", "-l"] + cmd
-    return ["perf", "stat", "-x,", "-e", "instructions", "-o", PERF_OUT, "--"] + cmd
+    return ["perf", "stat", "-x,", "-e", "instructions", "-o", PERF_OUT, "--", "/usr/bin/time", "-f", "%M", "-o", PEAK_OUT] + cmd
 
-def usage_of(err, ru):
+def usage_of(err):
     """Instructions and peak bytes: from /usr/bin/time -l's report on macOS, from perf stat's and
-    the process's rusage on Linux."""
+    GNU time's on Linux."""
     if MAC:
         instr = re.search(r"(\d+)\s+instructions retired", err)
         peak = re.search(r"(\d+)\s+peak memory footprint", err)
@@ -115,18 +118,16 @@ def usage_of(err, ru):
     for line in open(PERF_OUT).read().splitlines():
         f = line.split(",")
         if len(f) > 2 and f[2].startswith("instructions") and f[0].isdigit(): instr = int(f[0])
-    return instr, ru.ru_maxrss * 1024
+    kb = [l for l in open(PEAK_OUT).read().splitlines() if l.strip().isdigit()]
+    os.remove(PEAK_OUT)
+    return instr, (int(kb[-1]) * 1024 if kb else None)
 
-def reap(p):
-    _, status, ru = os.wait4(p.pid, 0)
-    p.returncode = os.waitstatus_to_exitcode(status)
-    return ru
 
 def finished(p, err):
     """Wait for a process started with `measuring`, whose stderr has been read: its exit code,
     instructions, peak bytes."""
-    ru = reap(p)
-    instr, peak = usage_of(err, ru)
+    p.wait()
+    instr, peak = usage_of(err)
     return p.returncode, instr, peak
 
 def timed(cmd, root):
@@ -134,17 +135,19 @@ def timed(cmd, root):
     t0 = time.perf_counter()
     with open(os.path.join(WORK, ".out"), "w") as o, open(os.path.join(WORK, ".err"), "w") as e:
         p = subprocess.Popen(measuring(cmd), cwd=root, stdout=o, stderr=e)
-        ru = reap(p)
+        p.wait()
     wall = time.perf_counter() - t0
     out, err = open(os.path.join(WORK, ".out")).read(), open(os.path.join(WORK, ".err")).read()
     if p.returncode != 0: raise RuntimeError(f"{cmd}: {(out + err)[-1500:]}")
-    instr, peak = usage_of(err, ru)
+    instr, peak = usage_of(err)
     return {"wall": wall, "instr": instr, "peak": peak}
 
-def kill_child(pid):
-    """The command a `measuring` wrapper runs, stopped, so the wrapper reports and ends."""
+def kill_child(pid, depth=1 if MAC else 2):
+    """The command a `measuring` wrapper runs, stopped, so the wrappers report and end: the
+    wrapper's child on macOS; on Linux its grandchild, with GNU time between perf and it."""
     for c in subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split():
-        os.kill(int(c), signal.SIGKILL)
+        if depth > 1: kill_child(int(c), depth - 1)
+        else: os.kill(int(c), signal.SIGKILL)
 
 # ---------------------------------------------------------------- this bundler
 
