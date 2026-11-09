@@ -3560,8 +3560,8 @@
     n))
 
 ;;; Wait until an input changes; the paths that changed. Where the system says when a file or a
-;;; directory changes (kqueue: macOS and the BSDs), each input and the directory it is in are
-;;; watched, and a change is looked for as soon as one says so; elsewhere, and for what cannot be
+;;; directory changes (kqueue: macOS and the BSDs; inotify: Linux), each input and the directory it
+;;; is in are watched, and a change is looked for as soon as one says so; elsewhere, and for what cannot be
 ;;; watched, every `ms` milliseconds. Either way what changed is what `dep-changed-inputs!` finds:
 ;;; an event only says when to look.
 (defn wait-for-changes! [(ms i64)] (-> (ArrayList (slice u8)))
@@ -3574,8 +3574,9 @@
       (set! out (dep-changed-inputs!)))
     out))
 
-;;; The kqueue, and what is open on it: each watched path's descriptor, and each descriptor's path.
-(defstruct Watch [(known i64) (kq i32) (fds (HashMap (slice u8) i64)) (paths (HashMap i64 (slice u8)))])
+;;; What tells of changes, kqueue's or inotify's (`kind`: 0 none, 1 kqueue, 2 inotify), and what is
+;;; watched on it: each path's descriptor (kqueue) or watch (inotify), and each of those's path.
+(defstruct Watch [(known i64) (kind i64) (kq i32) (fds (HashMap (slice u8) i64)) (paths (HashMap i64 (slice u8)))])
 
 (defn watch-state [] (-> (ptr Watch))
   (primitive/alloc-static Watch))
@@ -3586,19 +3587,32 @@
 (defn kevent-fn [] (-> (ptr i8))
   (os/dlsym-cached (primitive/alloc-static (ptr i8)) c"kevent" (rtld-default)))
 
-;;; Whether the system has kqueue; the first time, one is made, and as many files may be open as
-;;; the system allows (up to 10240), since each watched path holds one.
+;;; Whether the system tells of changes: kqueue, else inotify. The first time, one is made; for
+;;; kqueue, as many files may be open as the system allows (up to 10240), since each watched path
+;;; holds one.
 (defn watch-events? [] (-> bool)
   (let [w (watch-state)]
     (when (= (.known w) 0)
       (set! (.kq w) (: -1 i32))
-      (when (and (!= (primitive/cast i64 (kqueue-fn)) 0) (!= (primitive/cast i64 (kevent-fn)) 0))
-        (set! (.kq w) (primitive/call-ptr (primitive/cast (fnptr (cc/C) [] i32) (kqueue-fn))))
-        (set! (.fds w) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
-        (set! (.paths w) (HashMap::new [i64 (slice u8)] (malloc-allocator) (i64-keyops)))
-        (raise-open-files!))
+      (set! (.fds w) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+      (set! (.paths w) (HashMap::new [i64 (slice u8)] (malloc-allocator) (i64-keyops)))
+      (cond (and (!= (primitive/cast i64 (kqueue-fn)) 0) (!= (primitive/cast i64 (kevent-fn)) 0))
+              (do (set! (.kq w) (primitive/call-ptr (primitive/cast (fnptr (cc/C) [] i32) (kqueue-fn))))
+                  (set! (.kind w) 1)
+                  (raise-open-files!))
+            (and (!= (primitive/cast i64 (inotify-init-fn)) 0) (!= (primitive/cast i64 (inotify-add-fn)) 0))
+              ;; IN_NONBLOCK | IN_CLOEXEC
+              (do (set! (.kq w) (primitive/call-ptr (primitive/cast (fnptr (cc/C) [i32] i32) (inotify-init-fn)) (: 526336 i32)))
+                  (set! (.kind w) 2))
+            :else 0)
       (set! (.known w) 1))
     (>= (.kq w) (: 0 i32))))
+
+(defn inotify-init-fn [] (-> (ptr i8))
+  (os/dlsym-cached (primitive/alloc-static (ptr i8)) c"inotify_init1" (rtld-default)))
+
+(defn inotify-add-fn [] (-> (ptr i8))
+  (os/dlsym-cached (primitive/alloc-static (ptr i8)) c"inotify_add_watch" (rtld-default)))
 
 (extern getrlimit :cc (cc/C) [i32 (ptr i8)] (-> i32))
 (extern setrlimit :cc (cc/C) [i32 (ptr i8)] (-> i32))
@@ -3644,13 +3658,28 @@
           (= cut 0) "/"
           :else (subslice path 0 cut))))
 
-;;; One path on the kqueue, once: for writes, growth, attributes, removal, renaming, links. False
-;;; when it cannot be opened (it does not exist yet, say: its directory is watched).
+;;; One path watched, once: for writes, growth, attributes, removal, renaming, links, and in a
+;;; directory, entries made and removed. False when it cannot be (it does not exist yet, say: its
+;;; directory is watched).
 (defn watch-path! [(path (slice u8))] (-> bool)
   (let [w (watch-state)]
     (match (get (.fds w) path)
       (Some [_] true)
       (None []
+            (if (= (.kind w) 2) (inotify-watch! w path) (kqueue-watch! w path))))))
+
+;;; IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE |
+;;; IN_DELETE_SELF | IN_MOVE_SELF
+(defn inotify-watch! [(w (ptr Watch)) (path (slice u8))] (-> bool)
+  (let [wd (primitive/call-ptr (primitive/cast (fnptr (cc/C) [i32 (ptr i8) u32] i32) (inotify-add-fn))
+                               (.kq w) (str/to-cstr (malloc-allocator) path) (: 4046 u32))]
+    (if (< wd (: 0 i32))
+        false
+        (do (set! (mut (.fds w)) path (primitive/cast i64 wd))
+            (set! (mut (.paths w)) (primitive/cast i64 wd) path)
+            true))))
+
+(defn kqueue-watch! [(w (ptr Watch)) (path (slice u8))] (-> bool)
             ;; O_EVTONLY: open only to be told of events, which does not keep a volume busy.
             (let [fd (os/open (str/to-cstr (malloc-allocator) path) (: 32768 i32) 0)]
               (if (< fd (: 0 i32))
@@ -3670,12 +3699,52 @@
                         (do (os/close fd) false)
                         (do (set! (mut (.fds w)) path (primitive/cast i64 fd))
                             (set! (mut (.paths w)) (primitive/cast i64 fd) path)
-                            true)))))))))
+                            true))))))
 
-;;; Until the kqueue says something changed; at most `ms` milliseconds when some path could not be
-;;; watched, else a second, which only bounds how long a missed event could go unseen. A path that
-;;; was removed or renamed is let go, and watched again, as whatever is there, next time.
+;;; Until something watched changes; at most `ms` milliseconds when some path could not be watched,
+;;; else a second, which only bounds how long a missed event could go unseen. A path that was
+;;; removed or renamed is let go, and watched again, as whatever is there, next time.
 (defn watch-wait! [(missed i64) (ms i64)] (-> void)
+  (if (= (.kind (watch-state)) 2)
+      (inotify-wait! (if (> missed 0) ms 1000))
+      (kqueue-wait! missed ms)))
+
+(extern poll :cc (cc/C) [(ptr i8) u32 i32] (-> i32))
+
+;;; Until inotify has something to say, or `wait` milliseconds: its events read, each watch whose
+;;; path went away (IN_DELETE_SELF, IN_MOVE_SELF, IN_IGNORED) let go.
+(defn inotify-wait! [(wait i64)] (-> void)
+  (let [w (watch-state)
+        pfd (primitive/alloc-stack (array u8 8))
+        p (primitive/cast (ptr i8) pfd)]
+    (store! (primitive/cast (ptr i32) p) (.kq w))
+    ;; POLLIN
+    (store! (primitive/cast (ptr i16) (primitive/index p 4)) (: 1 i16))
+    (store! (primitive/cast (ptr i16) (primitive/index p 6)) (: 0 i16))
+    (when (> (poll p (: 1 u32) (primitive/cast i32 wait)) (: 0 i32))
+      (let [buf (primitive/alloc-stack (array u8 8192))
+            b (primitive/cast (ptr i8) buf)
+            (mut more) true]
+        (while more
+          (let [n (primitive/cast i64 (read (.kq w) b (: 8192 isize)))]
+            (if (<= n 0)
+                (set! more false)
+                (let [(mut at) 0]
+                  (while (< at n)
+                    (let [e (primitive/index b at)
+                          wd (primitive/cast i64 (load (primitive/cast (ptr i32) e)))
+                          mask (primitive/cast i64 (load (primitive/cast (ptr u32) (primitive/index e 4))))
+                          name-len (primitive/cast i64 (load (primitive/cast (ptr u32) (primitive/index e 12))))]
+                      (unless (= (& mask 35840) 0)
+                        (match (get (.paths w) wd)
+                          (Some [path] (do (HashMap::remove! (mut (.fds w)) path)
+                                           (HashMap::remove! (mut (.paths w)) wd)
+                                           0))
+                          (None [] 0)))
+                      (set! at (+ at 16 name-len))))))))))
+    0))
+
+(defn kqueue-wait! [(missed i64) (ms i64)] (-> void)
   (let [w (watch-state)
         wait (if (> missed 0) ms 1000)
         timeout (primitive/alloc-stack (array u8 16))
