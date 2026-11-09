@@ -508,7 +508,7 @@ footprint; Linux resident set, from build 20 to build 101):
 | App | Before: first build → 200 edits (macOS) | With regions, macOS | With regions, Linux |
 |---|---|---|---|
 | zod | 82 MB → 1,054 MB | 116 → 117 MB (200 edits) | 106.4 → 106.5 MB |
-| three | 88 MB → 4,822 MB | 170 → 170 MB | 191.5 → 191.7 MB |
+| three | 88 MB → 4,822 MB | 181 → 170 MB | 191.5 → 191.7 MB |
 | 12 copies of zod | 888 MB → 11,264 MB | | 1,156.6 → 1,156.6 MB (60 edits) |
 
 What it costs, on Linux (`tools/bench.py`, median of 7): a rebuild takes what it took (zod 4.2 ms,
