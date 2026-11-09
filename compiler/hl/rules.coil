@@ -6979,6 +6979,51 @@
       (when (= w s) (set! hit true)))
     hit))
 
+;;; Built with HL_AUDIT_ALL set, every plain function that could be kept (its arguments make a key,
+;;; none is mut, it answers something) counts its calls by their arguments while HL_MEMO_AUDIT is
+;;; set (see the memo audit in hl.rt): which functions no strategy keeps a build asks the same of
+;;; again and again. Built without it, nothing changes.
+(defn auditable? [(k (mut Comp)) (d g/Node)] (-> bool)
+  (and (!= (primitive/cast i64 (getenv c"HL_AUDIT_ALL")) 0)
+       (match (find-func (self-mod (mut k)) (.text (kid d 0)))
+         (None [] false)
+         (Some [f]
+               (and (> (len (.params f)) 0)
+                    (!= (.ret f) "Void")
+                    (let [(mut ok) true]
+                      (for p (.params f)
+                        (when (or (.by-ref p) (not (keyable? (mut k) (.ty p)))) (set! ok false)))
+                      ok))))))
+
+(defn compile-audited! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
+  (let [name (.text (kid d 0))
+        f (match (find-func (self-mod (mut k)) name) (Some [x] x) (None [] (die (mut k) d "this function was not collected")))
+        inner (sym (cat "audited--" name))
+        (mut params) (primitive/code-list-new)
+        (mut args) (primitive/code-list-new)]
+    (for i (range 0 (len (.params f)))
+      (push! (mut params) `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
+      (push! (mut args) (memo-arg i)))
+    (emit! (mut out) (compile-fn-as (mut k) d (cat "audited--" name)))
+    (emit! (mut out)
+           `(defn ~(sym name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
+              (if (rt/auditing?)
+                  ;; Its own time: from its start to its end, less what the audit of the calls it
+                  ;; made took; the audit's own work, before and after, added to that.
+                  (let [entered (rt/now-ns)
+                        key ~(memo-key-code (mut k) f)
+                        text ~(if (= (memo-key-type f) "Int") `(rt/num-text key) `key)
+                        before (rt/audit-overhead-now)
+                        started (rt/now-ns)
+                        v (~inner ~@args)
+                        ended (rt/now-ns)
+                        nested (- (rt/audit-overhead-now) before)]
+                    (rt/audit-call-ns! ~(cat3 (.self k) "/" name) text (- (- ended started) nested))
+                    (rt/audit-overhead-add! (+ (- started entered) (- (rt/now-ns) ended)))
+                    v)
+                  (~inner ~@args))))
+    0))
+
 (defn compile-fn [(k (mut Comp)) (d g/Node)] (-> Code)
   (compile-fn-as (mut k) d (.text (kid d 0))))
 
@@ -9498,7 +9543,9 @@
                         (rules-task-init! (rules-task))))))))
       (for d decls
         (when (= (.kind d) (g/KFn))
-          (emit! (mut out) (compile-fn (mut k) d)))
+          (if (auditable? (mut k) d)
+              (compile-audited! (mut k) d (mut out))
+              (emit! (mut out) (compile-fn (mut k) d))))
         (when (= (.kind d) (g/KMemoFn))
           (compile-memo! (mut k) d (mut out))))
       (emit! (mut out) (compile-persist (mut k) decls))

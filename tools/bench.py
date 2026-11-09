@@ -318,6 +318,15 @@ def bench_turbopack(r, name, tp, extra, root, entry, module, original):
     r["one-shot"][name] = [once(plain) for _ in range(runs)]
     r["one-shot --minify"][name] = [once(base) for _ in range(runs)]
     r["watch, first build"][name] = [tp_dev_first(tp, root, entry, []) for _ in range(runs)]
+    # An edit Turbopack leaves out of its output (a package that says it has no side effects lets it
+    # drop a statement made only for its effect) can be waited for for ever: looked for once first.
+    marker = edit(root, module, original)
+    once(plain)
+    seen = any(marker in open(os.path.join(root, "dist", f), errors="replace").read()
+               for f in os.listdir(os.path.join(root, "dist")) if f.endswith(".js"))
+    write(root, module, original)
+    if not seen:
+        return "rebuild not measured: its output leaves out the edit (the package says it has no side effects)"
     r["watch, rebuild, one edit"][name] = tp_dev_edits(tp, root, entry, module, original, runs)
     return "done"
 

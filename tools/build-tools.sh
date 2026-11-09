@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Build the command-line bundler and the parser driver, each its own entry.
-S="$(cd "$(dirname $0)/.." && pwd)/out/bin"; mkdir -p $S/mt
+# HL_TOOLS_OUT: another directory for the binaries (the audit build's, say).
+S="${HL_TOOLS_OUT:-$(cd "$(dirname $0)/.." && pwd)/out/bin}"; mkdir -p $S/mt
 READERS=$("$(dirname $0)/readers.sh") || exit 1
 cd "$(dirname $0)/.."
 cp Coil.toml $S/Coil.tools.bak

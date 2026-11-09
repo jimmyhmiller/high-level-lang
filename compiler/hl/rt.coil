@@ -2227,21 +2227,54 @@
     (Ok [i] (+ (* (.sec i) 1000000) (/ (.nsec i) 1000)))
     (Err [_] 0)))
 
-;;; A lap of a timed run: how long since the last lap, under its label, and how much memory the
-;;; process has held at most. The first lap only starts the clock.
-(defstruct Laps [(last i64)])
+(defn now-ns [] (-> i64)
+  (match (monotonic-now)
+    (Ok [i] (+ (* (.sec i) 1000000000) (.nsec i)))
+    (Err [_] 0)))
+
+;;; The time each worker has spent auditing (see the memo audit), in nanoseconds: what a call's own
+;;; time leaves out, of the audited calls it made.
+(defstruct AuditOverhead [(ns (array i64 64))])
+
+(defn audit-overhead [] (-> (ptr AuditOverhead))
+  (primitive/alloc-static AuditOverhead))
+
+(defn audit-overhead-now [] (-> i64)
+  (load (primitive/cast (ptr i64) (primitive/index (primitive/cast (ptr i8) (audit-overhead)) (* 8 (worker-slot))))))
+
+(defn audit-overhead-add! [(ns i64)] (-> void)
+  (let [at (primitive/cast (ptr i64) (primitive/index (primitive/cast (ptr i8) (audit-overhead)) (* 8 (worker-slot))))]
+    (store! at (+ (load at) ns))
+    0))
+
+;;; A lap of a timed run: how long since the last lap, under its label, how much memory the process
+;;; has held at most, and where the system counts them, the instructions retired in the lap. The
+;;; first lap only starts the clock, and says how many instructions came before it.
+(defstruct Laps [(last i64) (instr i64)])
 
 (defn lap! [(label (slice u8))] (-> void)
   (let [l (primitive/alloc-static Laps)
-        now (now-us)]
-    (when (> (.last l) 0)
-      (let [us (- now (.last l))]
-        (println "{:>4}.{} ms  {}  ({} MB)"
-                 (/ us 1000)
-                 (/ (% us 1000) 100)
-                 label
-                 (/ (max-rss) 1048576))))
+        now (now-us)
+        instr (instructions-retired)]
+    (if (> (.last l) 0)
+        (let [us (- now (.last l))]
+          (if (>= instr 0)
+              (println "{:>4}.{} ms  {}  ({} MB, {}.{} M instructions)"
+                       (/ us 1000)
+                       (/ (% us 1000) 100)
+                       label
+                       (/ (max-rss) 1048576)
+                       (/ (- instr (.instr l)) 1000000)
+                       (/ (% (- instr (.instr l)) 1000000) 100000))
+              (println "{:>4}.{} ms  {}  ({} MB)"
+                       (/ us 1000)
+                       (/ (% us 1000) 100)
+                       label
+                       (/ (max-rss) 1048576))))
+        (when (>= instr 0)
+          (println "         start  ({}.{} M instructions before the first lap)" (/ instr 1000000) (/ (% instr 1000000) 100000))))
     (set! (.last l) now)
+    (set! (.instr l) instr)
     0))
 
 ;;; Trees can be as deep as a merged statement list is long, so builds run on a thread
@@ -5257,6 +5290,7 @@
 ;;; same arguments, at a cost, is one this run's strategy should keep. Reported at the end
 ;;; (`memo-audit-report!`).
 (defstruct AuditRow [(calls i64) (repeats i64) (us i64) (repeat-us i64) (keys (HashMap (slice u8) i64))])
+;; (`us` and `repeat-us` are nanoseconds for an audited plain function's calls; see `audit-call-ns!`.)
 
 (defstruct Audit [(lock i64) (known i64) (on i64) (names (ArrayList (slice u8))) (rows (HashMap (slice u8) AuditRow))])
 
@@ -5274,6 +5308,12 @@
 
 (defn auditing? [] (-> bool)
   (= (.on (audit-state)) 1))
+
+;;; A call of an audited plain function: its own time in nanoseconds, the audit's left out; kept
+;;; in the row as microseconds' worth, to the nearest.
+(defn audit-call-ns! [(name (slice u8)) (key (slice u8)) (ns i64)] (-> void)
+  (audit-call! name key (/ (+ ns 500) 1000))
+  0)
 
 (defn audit-call! [(name (slice u8)) (key (slice u8)) (us i64)] (-> void)
   (let [a (audit-state)]
