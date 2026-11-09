@@ -49,6 +49,8 @@
 
 (defstruct Mutator [(key (slice u8)) (calls (ArrayList g/Node))])
 
+(defstruct CheckHooks [(key (slice u8)) (fns (ArrayList (slice u8)))])
+
 (defstruct Func
   [(name (slice u8))
    (coil (slice u8))
@@ -132,6 +134,9 @@
    ;; Foreign functions that change their first argument in place, as `module/function`, and the
    ;; calls of the module's functions that say what may change (`changes` in a foreign block).
    (mutators (ArrayList Mutator))
+   ;; Each kept function's `check by` functions, as `module/function`, in the order the pipeline
+   ;; numbers them (see `pl/check-hooks`).
+   (check-hooks (ArrayList CheckHooks))
    (staged (ArrayList (slice u8)))  ; every stage's own functions
    (checker pl/Checker)])
 
@@ -468,7 +473,11 @@
               (dsl/fail-at path 1 1 "a second pipeline with strategies: one program has one numbering of what it keeps"))
             (set! seen true)
             (set! (.keeps k) (.kept all))
-            (set! (.default-keeps k) (pl/strategy-keeps all (.default all) made)))
+            (set! (.default-keeps k) (pl/strategy-keeps all (.default all) made))
+            (for x (.kept all)
+              (let [hooks (pl/check-hooks all made x)]
+                (when (> (len hooks) 0)
+                  (push! (mut (.check-hooks k)) (CheckHooks :key x :fns hooks))))))
           (for m made (push! (mut (.made k)) m))
           (for d (.kids (get (.kids tree) 4))
             (let [fns (if (= (.kind d) (gpl/KPerStage)) (get (.kids d) 2) (get (.kids d) 1))]
@@ -8693,7 +8702,7 @@
         ;; Whether this run's mechanism for it saves its answers (`store memory disk`).
         disk (if (>= number 0) `(rt/kept-disk? ~number) `true)
         ;; One kept while no input changes is marked by any change, as it is read back too.
-        any-change (if (>= number 0) `(= (rt/kept-check ~number) 1) `false)
+        any-change (if (>= number 0) `(let [c (rt/kept-check ~number)] (or (= c 1) (>= c 3))) `false)
         (mut puts) (primitive/code-list-new)
         (mut binds) (primitive/code-list-new)
         (mut inits) (primitive/code-list-new)]
@@ -8721,9 +8730,11 @@
                (Some [a]
                      (do ~(if tree `0 (if int-key `(rt/put-int! x key) `(rt/put-text! x key)))
                          (match (get (.node-ids s) key)
-                           (Some [id] (rt/put-int! x id))
+                           (Some [id] (do (rt/put-int! x id)
+                                          (rt/put-varint! x (rt/writer-at w))
+                                          ;; Its `check by` version, read back with the index.
+                                          (rt/put-text! x (rt/version-of id))))
                            (None [] (panic "memo fn {} kept arguments with no node" ~name)))
-                         (rt/put-varint! x (rt/writer-at w))
                          ~@puts
                          (match (get (.table s) key)
                            (Some [answer] ~(enc-code (mut k) (.ret f) `answer))
@@ -8740,6 +8751,7 @@
                    (for _ (range 0 n)
                      (let [id (rt/take-int r)
                            at (rt/take-varint r)]
+                       (rt/version-set! id (rt/take-text r))
                        (when ~any-change (rt/dep-any-change-node! id))
                        (push! (mut (.pending s)) id)
                        (push! (mut (.pending s)) at))))
@@ -8747,6 +8759,7 @@
                    (let [key ~(if int-key `(rt/take-int r) `(rt/take-text r))
                          id (rt/take-int r)
                          at (rt/take-varint r)]
+                     (rt/version-set! id (rt/take-text r))
                      (when ~any-change (rt/dep-any-change-node! id))
                      (set! (mut (.lazy s)) key at)
                      (set! (mut (.node-ids s)) key id)
@@ -8969,6 +8982,38 @@
       `0))
 
 ;;; The shared table, its lock and generation; the function; the computation under another name.
+;;; A kept function's version, as the run's `check by` function for it gives it (see `check by` in the
+;;; pipeline language): the i-th of its check functions when its check is 3 + i, else "". Each is a
+;;; function of its module that takes what the kept function takes and answers Text.
+(defn check-version-code [(k (mut Comp)) (d g/Node) (f Func) (name (slice u8))] (-> Code)
+  (let [full (cat3 (.self k) "/" name)
+        (mut fns) (text-list)
+        (mut arms) (primitive/code-list-new)
+        (mut args) (primitive/code-list-new)]
+    (for h (.check-hooks k) (when (= (.key h) full) (set! fns (.fns h))))
+    (for i (range 0 (len (.params f))) (push! (mut args) (memo-arg i)))
+    (for i (range 0 (len fns))
+      (let [hook (get fns i)
+            slash (rt/name-end-at hook 47)
+            module (subslice hook 0 slash)
+            fname (subslice hook (+ slash 1) (len hook))]
+        (unless (= module (.self k))
+          (die (mut k) d (cat4 "check by " hook ": a check function is one of the module of what it checks, " (.self k))))
+        (let [g (match (find-func (self-mod (mut k)) fname)
+                  (Some [g] g)
+                  (None [] (die (mut k) d (cat "check by: no function named " hook))))]
+          (unless (= (.ret g) "Text")
+            (die (mut k) d (cat3 "check by " hook ": a check function answers Text")))
+          (unless (and (= (len (.params g)) (len (.params f)))
+                       (let [(mut same) true]
+                         (for j (range 0 (len (.params f)))
+                           (unless (= (.ty (get (.params g) j)) (.ty (get (.params f) j))) (set! same false)))
+                         same))
+            (die (mut k) d (cat4 "check by " hook ": a check function takes what " (cat name " takes"))))
+          (push! (mut arms) `(= check ~(+ 3 i)))
+          (push! (mut arms) `(~(sym (.coil g)) ~@args)))))
+    (if (= (len fns) 0) `"" `(cond ~@arms :else ""))))
+
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
   (let [f (memo-check! (mut k) d)
         name (.text (kid d 0))
@@ -8981,6 +9026,7 @@
         ;; kept one, and `name` asks which (see `rt/kept?`).
         number (kept-number (mut k) name)
         entry (if (>= number 0) (sym (cat "memo-kept--" name)) (sym name))
+        version-code (check-version-code (mut k) d f name)
         near (primitive/code-symbol "." (memo-near name))
         near-gen (primitive/code-symbol "." (memo-near-gen name))
         near-rev (primitive/code-symbol "." (memo-near-rev name))
@@ -9038,8 +9084,11 @@
                                  (rt/spin-unlock! word)
                                  l))]
                 ;; Checking an answer asks only whether it is current: one the cache holds and this
-                ;; run has not read, all of whose inputs are unchanged, is, and stays unread.
-                (if (and unread (or (rt/dep-current-id? id) (rt/dep-still-id? id)))
+                ;; run has not read, all of whose inputs are unchanged, is, and stays unread. Only
+                ;; an answer checked by its reads has them noted; any other the entry checks.
+                (if (and unread (or (rt/dep-current-id? id)
+                                    (and ~(if (>= (kept-number (mut k) name) 0) `(= (rt/kept-check ~(kept-number (mut k) name)) 0) `true)
+                                         (rt/dep-still-id? id))))
                     0
                     (do
                       (~(sym (cat "memo-fault--" name)) s key)
@@ -9193,22 +9242,30 @@
                                                                   (do
                                                                     ~(made-check (mut k) name)
                                                                     (rt/dep-begin!)
-                                                                    (let [fresh (~(sym compute) ~@args)
-                                                                          same (and cutoff ~(same-code (mut k) (.ret f) `old `fresh))]
-                                                                      (if (= check 0)
-                                                                          (rt/dep-end-id! node same)
-                                                                          (rt/dep-end-ignoring-reads! node same (= check 1)))
-                                                                      (unless same (set! new-answer true))
-                                                                      (if same old fresh)))))
+                                                                    ;; Checked by a function of its own: the same version, the
+                                                                    ;; same answer, not made again.
+                                                                    (let [version (if (>= check 3) ~version-code "")]
+                                                                      (if (and (>= check 3) (> (len version) 0) (= version (rt/version-of node)))
+                                                                          (do (rt/dep-end-same-version! node) old)
+                                                                          (let [fresh (~(sym compute) ~@args)
+                                                                                same (and cutoff ~(same-code (mut k) (.ret f) `old `fresh))]
+                                                                            (if (= check 0)
+                                                                                (rt/dep-end-id! node same)
+                                                                                (rt/dep-end-ignoring-reads! node same (or (= check 1) (>= check 3))))
+                                                                            (when (>= check 3) (rt/version-set! node version))
+                                                                            (unless same (set! new-answer true))
+                                                                            (if same old fresh)))))))
                                                         (None []
                                                               (do
                                                                 ~(made-check (mut k) name)
                                                                 (when tracking (rt/dep-begin!))
-                                                                (let [fresh (~(sym compute) ~@args)]
+                                                                (let [version (if (and tracking (>= check 3)) ~version-code "")
+                                                                      fresh (~(sym compute) ~@args)]
                                                                   (when tracking
                                                                     (if (= check 0)
                                                                         (rt/dep-end-id! node false)
-                                                                        (rt/dep-end-ignoring-reads! node false (= check 1))))
+                                                                        (rt/dep-end-ignoring-reads! node false (or (= check 1) (>= check 3))))
+                                                                    (when (>= check 3) (rt/version-set! node version)))
                                                                   (rt/dep-untracked!)
                                                                   (set! new-answer true)
                                                                   fresh))))]
@@ -9360,6 +9417,7 @@
             :default-keeps (text-list)
             :made (text-list)
             :mutators (ArrayList::new [Mutator] (malloc-allocator))
+            :check-hooks (ArrayList::new [CheckHooks] (malloc-allocator))
             :staged (text-list)
             :checker (pl/checker-new (dsl/manifest-entries (meta/read-context-manifest context))))
         manifest (meta/read-context-manifest context)]

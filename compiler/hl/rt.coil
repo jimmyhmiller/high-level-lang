@@ -3302,14 +3302,21 @@
 ;;; The memo this worker was computing is done, and is node `me`: it read what was noted, and is
 ;;; current in this revision; changed in it unless its answer is the one it had (`same`).
 (defn dep-end-id! [(me i64) (same bool)] (-> void)
-  (dep-end-with! me same true))
+  (dep-end-with! me same true true))
 
 ;;; The same for an answer checked otherwise than by what it read (see `check` in the pipeline
 ;;; language): it reads nothing, so nothing it read changes it; one kept while no input changes is
 ;;; noted, so any change marks it.
 (defn dep-end-ignoring-reads! [(me i64) (same bool) (any-change bool)] (-> void)
-  (dep-end-with! me same false)
+  (dep-end-with! me same false true)
   (when any-change (dep-any-change-node! me))
+  0)
+
+;;; An answer checked by a function of its own (`check by`), whose version is the one it was made
+;;; with: current again, not made again, and so not counted as computed.
+(defn dep-end-same-version! [(me i64)] (-> void)
+  (dep-end-with! me true false false)
+  (dep-any-change-node! me)
   0)
 
 (defstruct AnyChange [(lock i64) (ready bool) (ids (ArrayList i64)) (seen (HashMap i64 bool))])
@@ -3334,7 +3341,7 @@
     (spin-unlock! (cast (ptr i64) a))
     0))
 
-(defn dep-end-with! [(me i64) (same bool) (keep-reads bool)] (-> void)
+(defn dep-end-with! [(me i64) (same bool) (keep-reads bool) (made bool)] (-> void)
   (let [d (deps)
         slot (worker-slot)
         (mut frame) (match (pop! (mut (elem (mut (.stacks d)) slot)))
@@ -3372,10 +3379,10 @@
       ;; Only the worker holding this answer's key reads its list, and that is this one.
       (let [(mut old) before] (free! (mut old)))
       (set! (mut (.dirty d)) me false)
-      (when (dep-tracing?) (println "[deps] {} {}" (if same "same" "changed") (dep-node-text d me)))
+      (when (dep-tracing?) (println "[deps] {} {}" (if made (if same "same" "changed") "same version") (dep-node-text d me)))
       (set! (mut (.verified d)) me now)
       (unless same (set! (mut (.changed d)) me now))
-      (set! (.computed d) (+ (.computed d) 1)))
+      (when made (set! (.computed d) (+ (.computed d) 1))))
     (deps-unlock! d)
     0))
 
@@ -5564,3 +5571,35 @@
 (defn page-faults [] (-> i64) (let [u (usage-now)] (+ (.r8 u) (.r9 u))))
 (defn switches-waiting [] (-> i64) (.r16 (usage-now)))
 (defn switches-forced [] (-> i64) (.r17 (usage-now)))
+
+;; ---------------------------------------------------------------- versions of answers
+
+;;; What a `check by` function gave for an answer when it was made, by the answer's node (see
+;;; `check by` in the pipeline language): kept with the cache's index, so it is there to compare
+;;; with before the answer itself is read.
+(defstruct Versions [(lock i64) (ready bool) (by (HashMap i64 (slice u8)))])
+
+(defn versions [] (-> (ptr Versions))
+  (let [v (primitive/alloc-static Versions)]
+    (unless (.ready v)
+      (init-lock!)
+      (unless (.ready v)
+        (set! (.by v) (HashMap::new [i64 (slice u8)] (malloc-allocator) (i64-keyops)))
+        (set! (.ready v) true))
+      (init-unlock!))
+    v))
+
+(defn version-of [(id i64)] (-> (slice u8))
+  (let [v (versions)]
+    (spin-lock! (cast (ptr i64) v))
+    (let [out (match (get (.by v) id) (Some [t] t) (None [] ""))]
+      (spin-unlock! (cast (ptr i64) v))
+      out)))
+
+(defn version-set! [(id i64) (text (slice u8))] (-> void)
+  (when (> (len text) 0)
+    (let [v (versions)]
+      (spin-lock! (cast (ptr i64) v))
+      (set! (mut (.by v)) id text)
+      (spin-unlock! (cast (ptr i64) v))))
+  0)

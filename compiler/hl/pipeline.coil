@@ -909,6 +909,7 @@
 (defstruct MechanismDecl
   [(name (slice u8))
    (from (slice u8))
+   (check-by (slice u8))
    (disk i64)
    (check i64)
    (cutoff i64)
@@ -916,7 +917,7 @@
 
 ;;; How a function is kept: saved with the cache; checked by what it read (0), by no input changing
 ;;; (1), never (2); an answer made again the same changing nothing; at most so many answers (0: all).
-(defstruct Policy [(disk bool) (check i64) (cutoff bool) (evict i64)])
+(defstruct Policy [(disk bool) (check i64) (check-by (slice u8)) (cutoff bool) (evict i64)])
 
 ;;; Every strategy: what each keeps, what is kept by any (each function's place in that list is its
 ;;; number, the same for every compiler that reads the file), and which are used when a run does not
@@ -938,7 +939,7 @@
   (let [(mut out) (ArrayList::new [MechanismDecl] (malloc-allocator))]
     (for d (.kids (kid-of tree 2))
       (let [name (.text (kid-of d 0))
-            (mut m) (MechanismDecl :name name :from "" :disk -1 :check -1 :cutoff -1 :evict -1)]
+            (mut m) (MechanismDecl :name name :from "" :check-by "" :disk -1 :check -1 :cutoff -1 :evict -1)]
         (match (find-mechanism out name)
           (Some [_] (strategy-fail src path d (dsl/join2 "a second mechanism named " name)))
           (None [] 0))
@@ -956,10 +957,14 @@
                         (unless memory (strategy-fail src path item "answers are kept in memory, and on disk besides or not"))
                         (set! (.disk m) (if disk 1 0))))
             (g/KCheck []
-                      (set! (.check m) (match (.kind (kid-of item 0))
-                                         (g/KReads [] 0)
-                                         (g/KAnyChange [] 1)
-                                         (_ 2))))
+                      (let [how (kid-of item 0)]
+                        (set! (.check m) (match (.kind how)
+                                           (g/KReads [] 0)
+                                           (g/KAnyChange [] 1)
+                                           (g/KNever [] 2)
+                                           (_ 3)))
+                        (when (= (.kind how) (g/KCheckBy))
+                          (set! (.check-by m) (.text (kid-of how 0))))))
             (g/KCutoff [] (set! (.cutoff m) (if (= (.kind (kid-of item 0)) (g/KEqual)) 1 0)))
             (g/KEvict []
                       (let [how (kid-of item 0)]
@@ -977,7 +982,7 @@
 (defn mechanism-policy [(ms (ArrayList MechanismDecl)) (name (slice u8))] (-> Policy)
   (let [(mut chain) (ArrayList::new [MechanismDecl] (malloc-allocator))
         (mut at) name
-        (mut p) (Policy :disk true :check 0 :cutoff true :evict 0)]
+        (mut p) (Policy :disk true :check 0 :check-by "" :cutoff true :evict 0)]
     (while (> (len at) 0)
       (match (find-mechanism ms at)
         (Some [m] (do (push! (mut chain) m) (set! at (.from m))))
@@ -985,7 +990,7 @@
     (for i (range 0 (len chain))
       (let [m (get chain (- (- (len chain) 1) i))]
         (when (>= (.disk m) 0) (set! (.disk p) (= (.disk m) 1)))
-        (when (>= (.check m) 0) (set! (.check p) (.check m)))
+        (when (>= (.check m) 0) (set! (.check p) (.check m)) (set! (.check-by p) (.check-by m)))
         (when (>= (.cutoff m) 0) (set! (.cutoff p) (= (.cutoff m) 1)))
         (when (>= (.evict m) 0) (set! (.evict p) (.evict m)))))
     p))
@@ -1010,8 +1015,28 @@
 (defn strategy-policy [(all Strategies) (name (slice u8)) (f (slice u8))] (-> Policy)
   (let [m (strategy-mechanism all name f)]
     (if (= (len m) 0)
-        (Policy :disk true :check 0 :cutoff true :evict 0)
+        (Policy :disk true :check 0 :check-by "" :cutoff true :evict 0)
         (mechanism-policy (.mechanisms all) m))))
+
+;;; The check functions any strategy gives kept function `f` (`check by`), in order: a strategy's
+;;; choice among them is its number, past the three checks of its own (see `policy-check`).
+(defn check-hooks [(all Strategies) (made (ArrayList (slice u8))) (f (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (texts)]
+    (for d (.decls all)
+      (when (has? (strategy-keeps all (.name d) made) f)
+        (let [p (strategy-policy all (.name d) f)]
+          (when (= (.check p) 3) (add-unique! (mut out) (.check-by p))))))
+    out))
+
+;;; A policy's check as the runtime has it: 0 reads, 1 any-change, 2 never, and 3 + i for the i-th
+;;; of the function's check functions.
+(defn policy-check [(all Strategies) (made (ArrayList (slice u8))) (f (slice u8)) (p Policy)] (-> i64)
+  (if (= (.check p) 3)
+      (let [hooks (check-hooks all made f)
+            (mut at) -1]
+        (for i (range 0 (len hooks)) (when (= (get hooks i) (.check-by p)) (set! at i)))
+        (+ 3 at))
+      (.check p)))
 
 ;;; The paths strategy `name` trusts, or rechecks, with those of every strategy it is `from`.
 (defn strategy-paths [(all Strategies) (name (slice u8)) (trusting bool)] (-> (ArrayList (slice u8)))
@@ -1357,7 +1382,7 @@
             (for x (strategy-keeps all (.name d) (made-of tree))
               (let [p (strategy-policy all (.name d) x)]
                 (push! (mut policies)
-                       `(rt/keep-policy! ~(kept-index all x) ~(if (.disk p) `true `false) ~(.check p)
+                       `(rt/keep-policy! ~(kept-index all x) ~(if (.disk p) `true `false) ~(policy-check all (made-of tree) x p)
                                          ~(if (.cutoff p) `true `false) ~(.evict p)))))
             (for x (strategy-paths all (.name d) true) (push! (mut trusts) `(push! (mut trust) ~x)))
             (for x (strategy-paths all (.name d) false) (push! (mut rechecks) `(push! (mut recheck) ~x)))
