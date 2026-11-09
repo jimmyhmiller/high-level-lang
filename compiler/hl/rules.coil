@@ -120,10 +120,14 @@
    (sames (ArrayList (slice u8)))  ; the types `same-code` has made a comparison of, in this module
    (quiet i64)  ; inside a read of part of a setting, which notes that part and not the whole
    (attrs-from (slice u8))  ; the attribute grammar whose blocks are being read; "" for this one
-   ;; The functions the program's pipelines keep, and those a stage makes, as `module/function`
-   ;; (see `read-keeps!`); and what reads what, to know what a setting given again changes.
+   ;; The functions some strategy of the program's pipeline keeps, and those a stage makes, as
+   ;; `module/function` (see `read-keeps!`): each one's place in `keeps` is its number, by which a
+   ;; run's strategy turns it on; `default-keeps`, those the default strategy keeps. And what reads
+   ;; what, to know what a setting given again changes.
    (keeps (ArrayList (slice u8)))
+   (default-keeps (ArrayList (slice u8)))
    (made (ArrayList (slice u8)))
+   (staged (ArrayList (slice u8)))  ; every stage's own functions
    (checker pl/Checker)])
 
 ;;; A name a rewrite's pattern binds to a child, or to its node, and that one's rewritten form.
@@ -443,24 +447,39 @@
 ;;; are kept by their arguments (see `compile-memo!`), as `memo fn` would be. Every `.pipeline` file
 ;;; of the program's manifest says what it keeps, and a module is compiled again when one changes.
 (defn read-keeps! [(k (mut Comp))] (-> void)
-  (for a (.table k)
-    (when (rt/ends-with (.module a) ".pipeline")
-      (let [path (cat3 (.base k) "/" (.module a))
-            tree (pipeline-tree path)]
-        (push! (mut (.depends k)) path)
-        (for d (.kids (get (.kids tree) 2))
-          (for n (.kids (get (.kids d) 0))
-            (push! (mut (.keeps k)) (.text n))))
-        ;; A stage's `makes`, after its functions: what the stages after it only read, and so what is
-        ;; kept whatever else is.
-        (for d (.kids (get (.kids tree) 3))
-          (let [makes (if (= (.kind d) (gpl/KPerStage)) (get (.kids d) 3) (get (.kids d) 2))]
-            (unless (= (.kind makes) (gpl/KNone))
-              (for n (.kids (get (.kids makes) 0))
-                (push! (mut (.made k)) (.text n))
-                (unless (has-text? (.keeps k) (.text n))
-                  (push! (mut (.keeps k)) (.text n))))))))))
+  (let [(mut seen) false]
+    (for a (.table k)
+      (when (rt/ends-with (.module a) ".pipeline")
+        (let [path (cat3 (.base k) "/" (.module a))
+              src (rt/read-all path)
+              tree (pipeline-tree path)
+              made (pl/made-of tree)
+              all (pl/strategies-of src path tree made)]
+          (push! (mut (.depends k)) path)
+          (when (> (len (.decls all)) 0)
+            (when seen
+              (dsl/fail-at path 1 1 "a second pipeline with strategies: one program has one numbering of what it keeps"))
+            (set! seen true)
+            (set! (.keeps k) (.kept all))
+            (set! (.default-keeps k) (pl/strategy-keeps all (.default all) made)))
+          (for m made (push! (mut (.made k)) m))
+          (for d (.kids (get (.kids tree) 3))
+            (let [fns (if (= (.kind d) (gpl/KPerStage)) (get (.kids d) 2) (get (.kids d) 1))]
+              (for n (.kids fns) (push! (mut (.staged k)) (.text n)))))
+          (for m made
+            (unless (has-text? (.keeps k) m)
+              (push! (mut (.keeps k)) m)
+              (push! (mut (.default-keeps k)) m)))))))
   0)
+
+;;; A kept function's number, and whether the default strategy keeps it; -1 for a `memo fn` the
+;;; source declares, which is always kept.
+(defn kept-number [(k (mut Comp)) (name (slice u8))] (-> i64)
+  (let [(mut at) -1
+        full (cat3 (.self k) "/" name)]
+    (for i (range 0 (len (.keeps k)))
+      (when (= (get (.keeps k) i) full) (set! at i)))
+    at))
 
 ;;; A module's tree with each function a pipeline keeps a kept one. A kept name it has no function of
 ;;; is an error.
@@ -1214,7 +1233,17 @@
         (let [(mut f) (func-of "plan" record)]
           (param (mut f) "name" "Text" false)
           (push! (mut (.funcs m)) f))
-        (push! (mut (.funcs m)) (func-of "plan-names" "[Text]"))))
+        (push! (mut (.funcs m)) (func-of "plan-names" "[Text]"))
+        ;; Its strategies: which a run uses (see `strategy` in the pipeline language).
+        (let [(mut f) (func-of "use-strategy!" "Void")]
+          (param (mut f) "name" "Text" false)
+          (push! (mut (.funcs m)) f))
+        (let [(mut f) (func-of "strategy-tracks?" "Bool")]
+          (param (mut f) "name" "Text" false)
+          (push! (mut (.funcs m)) f))
+        (push! (mut (.funcs m)) (func-of "default-strategy" "Text"))
+        (push! (mut (.funcs m)) (func-of "watching-strategy" "Text"))
+        (push! (mut (.funcs m)) (func-of "strategy-names" "[Text]"))))
     m))
 
 (defn scopes-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
@@ -8763,9 +8792,11 @@
 
 ;;; A function a stage makes is made there, and read after: asked for at once by many threads, its
 ;;; answer is there already, or the pipeline is wrong (see `makes`), which this says rather than make
-;;; it, there, with what making it may do.
+;;; it, there, with what making it may do. One of a stage's own functions is made by many threads at
+;;; once, in that stage.
 (defn made-check [(k (mut Comp)) (name (slice u8))] (-> Code)
-  (if (has-text? (.made k) (cat3 (.self k) "/" name))
+  (if (and (has-text? (.made k) (cat3 (.self k) "/" name))
+           (not (has-text? (.staged k) (cat3 (.self k) "/" name))))
       `(when (rt/in-parallel?)
          (panic "{}: a stage makes this, and many threads at once asked for it before it was made" ~(cat3 (.self k) "/" name)))
       `0))
@@ -8779,6 +8810,10 @@
         store-fn (sym (cat "memo-store--" name))
         compute (cat "memo-compute--" name)
         ensure (sym (cat "memo-ensure--" name))
+        ;; A function a strategy keeps is kept only in a run whose strategy does: `entry` is the
+        ;; kept one, and `name` asks which (see `rt/kept?`).
+        number (kept-number (mut k) name)
+        entry (if (>= number 0) (sym (cat "memo-kept--" name)) (sym name))
         near (primitive/code-symbol "." (memo-near name))
         near-gen (primitive/code-symbol "." (memo-near-gen name))
         near-rev (primitive/code-symbol "." (memo-near-rev name))
@@ -8833,7 +8868,7 @@
                 (let [found (get (.args s) key)]
                   (rt/spin-unlock! word)
                   (match found
-                    (Some [a] (do (~(sym name) ~@stored) 0))
+                    (Some [a] (do (~entry ~@stored) 0))
                     (None [] (panic "memo fn {} has no arguments for {}" ~name text)))))))
     ;; Its answers forgotten, when a setting it reads is given again while nothing is tracked.
     (emit! (mut out)
@@ -8877,7 +8912,7 @@
     ;; thing it read is shown unchanged, and an answer computed again that is the same as the one
     ;; it replaces is kept, and does not count as changed.
     (emit! (mut out)
-           `(defn ~(sym name) [~@params] (-> ~rt)
+           `(defn ~entry [~@params] (-> ~rt)
               (let [key ~(memo-key-code (mut k) f)
                     t (rules-task)
                     s (~store-fn)
@@ -8979,7 +9014,20 @@
                                                 (set! go false))))))))
                           (match answer
                             (Some [v] (do (set! (mut (~near t)) key v) v))
-                            (None [] (panic "memo fn {} lost its answer" ~name)))))))))))
+                            (None [] (panic "memo fn {} lost its answer" ~name)))))))))
+    (when (>= number 0)
+      (emit! (mut out)
+             `(defn ~(sym name) [~@params] (-> ~rt)
+                (if (rt/kept? ~number ~(if (has-text? (.default-keeps k) (cat3 (.self k) "/" name)) `true `false))
+                    (~entry ~@args)
+                    ;; Not kept: counted, while auditing, by its arguments (see `rt/audit-call!`).
+                    (if (rt/auditing?)
+                        (let [key ~(memo-key-code (mut k) f)
+                              started (rt/now-us)
+                              v (~(sym compute) ~@args)]
+                          (rt/audit-call! ~(cat3 (.self k) "/" name) ~key-text (- (rt/now-us) started))
+                          v)
+                        (~(sym compute) ~@args))))))))
 
 ;;; Every memo of the module starts over, when dependencies are not tracked. Only while no other
 ;;; worker runs.
@@ -9090,7 +9138,9 @@
             :quiet 0
             :attrs-from ""
             :keeps (text-list)
+            :default-keeps (text-list)
             :made (text-list)
+            :staged (text-list)
             :checker (pl/checker-new (dsl/manifest-entries (meta/read-context-manifest context))))
         manifest (meta/read-context-manifest context)]
     (read-manifest! (mut k) manifest)

@@ -885,6 +885,117 @@
          (unless (label? n i)
            (uses! (mut c) (mut w) info f p (mut out) (kid n i)))))))
 
+;; ---------------------------------------------------------------- strategies
+
+;;; A strategy as the file declares it.
+(defstruct StrategyDecl
+  [(name (slice u8))
+   (from (slice u8))
+   (tracks bool)
+   (default bool)
+   (watching bool)
+   (own (ArrayList (slice u8)))])
+
+;;; Every strategy: what each keeps, what is kept by any (each function's place in that list is its
+;;; number, the same for every compiler that reads the file), and which are used when a run does not
+;;; say.
+(defstruct Strategies
+  [(decls (ArrayList StrategyDecl))
+   (kept (ArrayList (slice u8)))
+   (default (slice u8))
+   (watching (slice u8))])
+
+(defn strategy-fail [(src (slice u8)) (path (slice u8)) (n g/Node) (msg (slice u8))] (-> never)
+  (let [at (rt/line-col src (.lo n))]
+    (dsl/fail-at path (.line at) (.col at) msg)))
+
+(defn find-strategy [(decls (ArrayList StrategyDecl)) (name (slice u8))] (-> (Option StrategyDecl))
+  (let [(mut out) (None [StrategyDecl])]
+    (for d decls (when (= (.name d) name) (set! out (Some d))))
+    out))
+
+;;; What `name` keeps: its own, and through `from`, what those keep. `made`, what stages make, is
+;;; kept by every strategy.
+(defn strategy-keeps [(all Strategies) (name (slice u8)) (made (ArrayList (slice u8)))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (texts)
+        (mut at) name]
+    (for m made (add-unique! (mut out) m))
+    (while (> (len at) 0)
+      (match (find-strategy (.decls all) at)
+        (Some [d] (do (for x (.own d) (add-unique! (mut out) x)) (set! at (.from d))))
+        (None [] (panic "no strategy named {}" at))))
+    out))
+
+(defn texts-sorted [(xs (ArrayList (slice u8)))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (texts)]
+    (for i (rt/sort-order-text xs false) (push! (mut out) (get xs i)))
+    out))
+
+;;; The strategies of a pipeline file's tree, checked: each named once, `from` one before it, one
+;;; marked `default`, one marked `watching`, and that one tracks.
+(defn strategies-of [(src (slice u8)) (path (slice u8)) (tree g/Node) (made (ArrayList (slice u8)))] (-> Strategies)
+  (let [(mut decls) (ArrayList::new [StrategyDecl] (malloc-allocator))
+        (mut default) ""
+        (mut watching) ""
+        (mut union) (texts)]
+    (for d (.kids (kid-of tree 2))
+      (let [name (.text (kid-of d 0))
+            (mut from) ""
+            (mut tracks) false
+            (mut is-default) false
+            (mut is-watching) false
+            (mut own) (texts)]
+        (match (find-strategy decls name)
+          (Some [_] (strategy-fail src path d (dsl/join2 "a second strategy named " name)))
+          (None [] 0))
+        (for item (.kids (kid-of d 1))
+          (match (.kind item)
+            (g/KFrom []
+                     (let [f (.text (kid-of item 0))]
+                       (match (find-strategy decls f)
+                         (Some [_] (set! from f))
+                         (None [] (strategy-fail src path item (dsl/join3 "no strategy named " f " before this one"))))))
+            (g/KTracks [] (set! tracks true))
+            (g/KDefault [] (set! is-default true))
+            (g/KWatching [] (set! is-watching true))
+            (g/KKeep [] (for t (.kids (kid-of item 0)) (add-unique! (mut own) (.text t))))
+            (_ (strategy-fail src path item "not a strategy's item"))))
+        (when is-default
+          (when (> (len default) 0) (strategy-fail src path d "a second strategy marked default"))
+          (set! default name))
+        (when is-watching
+          (when (> (len watching) 0) (strategy-fail src path d "a second strategy marked watching"))
+          (unless (or tracks (match (find-strategy decls from) (Some [p] (.tracks p)) (None [] false)))
+            (strategy-fail src path d "the strategy used while watching must track: answers kept from one build to the next are checked by what they were made from"))
+          (set! watching name))
+        (when (and (> (len from) 0) (match (find-strategy decls from) (Some [p] (.tracks p)) (None [] false)))
+          (set! tracks true))
+        (for x own (add-unique! (mut union) x))
+        (push! (mut decls)
+               (StrategyDecl :name name :from from :tracks tracks :default is-default :watching is-watching :own own))))
+    (when (and (> (len decls) 0) (= (len default) 0))
+      (strategy-fail src path tree "no strategy is marked default"))
+    (when (and (> (len decls) 0) (= (len watching) 0))
+      (strategy-fail src path tree "no strategy is marked watching"))
+    (for m made (add-unique! (mut union) m))
+    (Strategies :decls decls :kept (texts-sorted union) :default default :watching watching)))
+
+;;; Each function's number among those any strategy keeps; -1 for one none does.
+(defn kept-index [(all Strategies) (name (slice u8))] (-> i64)
+  (let [(mut at) -1]
+    (for i (range 0 (len (.kept all)))
+      (when (= (get (.kept all) i) name) (set! at i)))
+    at))
+
+;;; The functions stages make, which every strategy keeps.
+(defn made-of [(tree g/Node)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (texts)]
+    (for d (.kids (kid-of tree 3))
+      (let [makes (if (= (.kind d) (g/KPerStage)) (kid-of d 3) (kid-of d 2))]
+        (unless (= (.kind makes) (g/KNone))
+          (for t (.kids (kid-of makes 0)) (add-unique! (mut out) (.text t))))))
+    out))
+
 ;; ---------------------------------------------------------------- the pipeline
 
 (defstruct Stage
@@ -979,10 +1090,12 @@
         (mut arms) (primitive/code-list-new)
         (mut names) (primitive/code-list-new)]
     ;; What is kept is the rules compiler's to apply (see `keep` in the rules compiler): here each is
-    ;; only a function's name.
+    ;; only a function's name, and a run's choice of strategy is a switch for each.
     (for d (.kids (kid-of tree 2))
-      (for t (.kids (kid-of d 0))
-        (split-fn (mut c) (tok-of src t))))
+      (for item (.kids (kid-of d 1))
+        (when (= (.kind item) (g/KKeep))
+          (for t (.kids (kid-of item 0))
+            (split-fn (mut c) (tok-of src t))))))
     (for d (.kids (kid-of tree 3))
       (let [(mut fns) (texts)
             (mut makes) (texts)
@@ -1069,12 +1182,31 @@
                `(~(primitive/code-symbol "plan-module/" record-name) :name
                    ~plan-name
                    ~@fields))))
-    (let [(mut deps) (primitive/code-list-new)]
+    (let [(mut deps) (primitive/code-list-new)
+          all (strategies-of src path tree (made-of tree))
+          (mut uses) (primitive/code-list-new)
+          (mut tracking) (primitive/code-list-new)
+          (mut strategy-names) (primitive/code-list-new)]
+      (for d (.decls all)
+        (let [(mut ons) (primitive/code-list-new)]
+          (for x (strategy-keeps all (.name d) (made-of tree))
+            (push! (mut ons) `(push! (mut on) ~(kept-index all x))))
+          (push! (mut uses) `(= name ~(.name d)))
+          (push! (mut uses)
+                 `(let [(mut on) (ArrayList::new [i64] (malloc-allocator))]
+                    ~@ons
+                    (rt/keep-only! ~(len (.kept all)) on)
+                    ~(if (.tracks d) `(rt/dep-track!) `0)
+                    0))
+          (push! (mut tracking) `(= name ~(.name d)))
+          (push! (mut tracking) (if (.tracks d) `true `false))
+          (push! (mut strategy-names) `(push! (mut out) ~(.name d)))))
       (for d (.depends chk) (push! (mut deps) `~d))
       (dsl/render `(do
                      (import ~record-module :as plan-module)
                      (import "hl.rt" :as rt)
                      (import "coil.arraylist" :use [ArrayList])
+                     (import "coil.alloc" :use [malloc-allocator])
                      ~(if (> (len (.depends chk)) 0) `(depends-on ~@deps) `(do))
                      (defn plan [(name (slice u8))]
                        (-> ~(primitive/code-symbol "plan-module/" record-name))
@@ -1083,6 +1215,18 @@
                        (let [(mut out)
                                (ArrayList::new [(slice u8)] (rt/tree-allocator))]
                          ~@names
+                         out))
+                     ;; The run keeps what this strategy keeps, and tracks dependencies if it does.
+                     (defn use-strategy! [(name (slice u8))] (-> void)
+                       (cond ~@uses :else (panic "no strategy named {}: the pipeline has {}" name (rt/joined (strategy-names) ", "))))
+                     (defn strategy-tracks? [(name (slice u8))] (-> bool)
+                       (cond ~@tracking :else (panic "no strategy named {}" name)))
+                     (defn default-strategy [] (-> (slice u8)) ~(.default all))
+                     (defn watching-strategy [] (-> (slice u8)) ~(.watching all))
+                     (defn strategy-names [] (-> (ArrayList (slice u8)))
+                       (let [(mut out)
+                               (ArrayList::new [(slice u8)] (rt/tree-allocator))]
+                         ~@strategy-names
                          out)))))))
 
 (defn kid-of [(n g/Node) (i i64)] (-> g/Node)

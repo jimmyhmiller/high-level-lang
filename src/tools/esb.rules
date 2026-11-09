@@ -96,7 +96,10 @@ record Run {
   cache: Bool,
   no-cache: Bool,
   cache-dir: Text,
-  cache-key: Text
+  cache-key: Text,
+  # `--strategy=NAME`: which of the pipeline's strategies says what is kept (see build.pipeline);
+  # none named, the one marked `watching` while watching or with the cache, else the default.
+  strategy: Text
 }
 
 fn with-run-flag(r: Run, a: Text) -> Run = match a {
@@ -107,6 +110,7 @@ fn with-run-flag(r: Run, a: Text) -> Run = match a {
   "--hmr" => r with { watch: true, hmr: true }
   "--serve=" ++ port => r with { serve-port: parse-int(port) }
   "--watch-interval=" ++ ms => r with { interval: parse-int(ms) }
+  "--strategy=" ++ name => r with { strategy: name }
   _ => r
 }
 
@@ -115,7 +119,7 @@ fn options() -> api.Options = fold o = api.options-new(arg-at(1), "") for i in 2
 
 fn run-options() -> Run =
   fold r = Run(watch: false, interval: 100, hmr: false, serve-port: -1, cache: false, no-cache: false,
-               cache-dir: "node_modules/.cache/esb", cache-key: cache-key())
+               cache-dir: "node_modules/.cache/esb", cache-key: cache-key(), strategy: "")
   for i in 2..arg-count(): with-run-flag(r, arg-at(i))
 
 # What tells one command line's cache from another's: the directory it runs in and its arguments,
@@ -125,7 +129,7 @@ fn cache-key() -> Text = join([working-dir()] ++ [a for i in 1..arg-count() for 
 
 fn run-only?(a: Text) -> Bool = match a {
   "--watch" | "--timing" | "--cache" | "--no-cache" => true
-  "--serve=" ++ _ | "--cache-dir=" ++ _ | "--repeat=" ++ _ | "--watch-interval=" ++ _ => true
+  "--serve=" ++ _ | "--cache-dir=" ++ _ | "--repeat=" ++ _ | "--watch-interval=" ++ _ | "--strategy=" ++ _ => true
   _ => false
 }
 
@@ -145,6 +149,7 @@ fn build(o: api.Options, r: Run) -> Void {
     true => dev-rebuilding(api.dev-given(o), r)
     false => builds(o, r)
   }
+  memo-audit-report!()
 }
 
 fn builds(o: api.Options, r: Run) -> Void {
@@ -178,15 +183,26 @@ fn builds(o: api.Options, r: Run) -> Void {
 # Whether builds keep what they compute on disk, and start from what an earlier run kept.
 fn cached?(r: Run) -> Bool = not r.no-cache and (r.cache or r.watch)
 
-fn cache-path(r: Run) -> Text = r.cache-dir ++ "/" ++ hash-text(r.cache-key) ++ ".cache"
+# A cache is the command line's and its strategy's: another strategy keeps other answers.
+fn cache-path(r: Run) -> Text = r.cache-dir ++ "/" ++ hash-text(r.cache-key ++ "\n" ++ strategy-of(r)) ++ ".cache"
 
-# Builds that watch, or start from the cache, track what each answer was made from, and the first
-# starts from what an earlier run kept, loaded before anything is computed.
+fn strategy-of(r: Run) -> Text = match r.strategy {
+  "" if r.watch or cached?(r) => plans.watching-strategy()
+  "" => plans.default-strategy()
+  name => name
+}
+
+# The run's strategy chosen, before anything is computed; builds that watch, or start from the
+# cache, track what each answer was made from, and the first starts from what an earlier run kept.
 fn started(o: api.Options, r: Run) -> Void {
+  let strategy = strategy-of(r)
   if r.watch or cached?(r) {
     one-entry(o)
-    track-dependencies!()
+    if not plans.strategy-tracks?(strategy) {
+      panic "--watch and --cache keep answers from one build to the next, which strategy {} does not track", strategy
+    }
   }
+  plans.use-strategy!(strategy)
   if cached?(r) {
     # There before anything is built: made later, it would change a listing a build read.
     make-dirs!(r.cache-dir)

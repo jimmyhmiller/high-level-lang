@@ -4992,3 +4992,102 @@
 ;;; Whether threads are running work at once now (`run-workers`).
 (defn in-parallel? [] (-> bool)
   (.running (pool)))
+
+;; ---------------------------------------------------------------- which functions a run keeps
+
+;;; The strategy a run uses (see `strategy` in the pipeline language): for each function some
+;;; strategy keeps, by its number, whether this run keeps it. Until a run chooses, each function
+;;; is kept as the default strategy says, which its code knows.
+(defstruct Kept [(chosen bool) (on (ArrayList bool))])
+
+(defn kept-state [] (-> (ptr Kept))
+  (primitive/alloc-static Kept))
+
+(defn keep-only! [(count i64) (on (ArrayList i64))] (-> void)
+  (let [s (kept-state)
+        (mut flags) (ArrayList::new [bool] (malloc-allocator))]
+    (when (.running (pool))
+      (panic "a run's strategy is chosen before any work runs on many threads"))
+    (for _ (range 0 count) (push! (mut flags) false))
+    (for i on (set! (mut flags) i true))
+    (set! (.on s) flags)
+    (set! (.chosen s) true)
+    0))
+
+(defn kept? [(index i64) (default bool)] (-> bool)
+  (let [s (kept-state)]
+    (if (.chosen s) (get (.on s) index) default)))
+
+;; ---------------------------------------------------------------- the memo audit
+
+;;; With HL_MEMO_AUDIT set, each function some strategy keeps but this run does not counts its
+;;; calls by their arguments, and the time they took: a function called again and again with the
+;;; same arguments, at a cost, is one this run's strategy should keep. Reported at the end
+;;; (`memo-audit-report!`).
+(defstruct AuditRow [(calls i64) (repeats i64) (us i64) (repeat-us i64) (keys (HashMap (slice u8) i64))])
+
+(defstruct Audit [(lock i64) (known i64) (on i64) (names (ArrayList (slice u8))) (rows (HashMap (slice u8) AuditRow))])
+
+(defn audit-state [] (-> (ptr Audit))
+  (let [a (primitive/alloc-static Audit)]
+    (when (= (.known a) 0)
+      (init-lock!)
+      (when (= (.known a) 0)
+        (set! (.on a) (if (= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) "HL_MEMO_AUDIT"))) 0) 0 1))
+        (set! (.names a) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (set! (.rows a) (HashMap::new [(slice u8) AuditRow] (malloc-allocator) (str/keyops)))
+        (set! (.known a) 1))
+      (init-unlock!))
+    a))
+
+(defn auditing? [] (-> bool)
+  (= (.on (audit-state)) 1))
+
+(defn audit-call! [(name (slice u8)) (key (slice u8)) (us i64)] (-> void)
+  (let [a (audit-state)]
+    (spin-lock! (cast (ptr i64) a))
+    (let [(mut row) (match (get (.rows a) name)
+                      (Some [r] r)
+                      (None []
+                            (do (push! (mut (.names a)) name)
+                                (AuditRow :calls 0 :repeats 0 :us 0 :repeat-us 0
+                                          :keys (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))))
+          seen (match (get (.keys row) key) (Some [n] n) (None [] 0))]
+      (set! (.calls row) (+ (.calls row) 1))
+      (set! (.us row) (+ (.us row) us))
+      (when (> seen 0)
+        (set! (.repeats row) (+ (.repeats row) 1))
+        (set! (.repeat-us row) (+ (.repeat-us row) us)))
+      (set! (mut (.keys row)) key (+ seen 1))
+      (set! (mut (.rows a)) name row))
+    (spin-unlock! (cast (ptr i64) a)))
+  0)
+
+(defn audit-spent [(a (ptr Audit)) (i i64)] (-> i64)
+  (match (get (.rows a) (get (.names a) i)) (Some [r] (.repeat-us r)) (None [] 0)))
+
+;;; What the audit saw, most time spent on repeats first: each function, its calls, how many had
+;;; arguments seen before, and the time those took (counting what they called).
+(defn memo-audit-report! [] (-> void)
+  (when (auditing?)
+    (let [a (audit-state)
+          (mut order) (ArrayList::new [i64] (malloc-allocator))]
+      ;; Most time in repeats first.
+      (for i (range 0 (len (.names a)))
+        (push! (mut order) i)
+        (let [(mut j) i]
+          (while (and (> j 0) (> (audit-spent a (get order j)) (audit-spent a (get order (- j 1)))))
+            (let [t (get order j)]
+              (set! (mut order) j (get order (- j 1)))
+              (set! (mut order) (- j 1) t))
+            (set! j (- j 1)))))
+      (eprintln "[audit] function: calls, repeated (same arguments), time in repeats ms, time in all ms")
+      (for i order
+        (let [n (get (.names a) i)]
+          (match (get (.rows a) n)
+            (Some [r]
+                  (eprintln "[audit] {}: {}, {}, {}.{}, {}.{}" n (.calls r) (.repeats r)
+                            (/ (.repeat-us r) 1000) (/ (% (.repeat-us r) 1000) 100)
+                            (/ (.us r) 1000) (/ (% (.us r) 1000) 100)))
+            (None [] 0))))))
+  0)
