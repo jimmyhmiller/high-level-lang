@@ -502,6 +502,21 @@ program where it is read; the watch, HMR, cache and mechanism checks all pass un
 `HL_REGION_TRACE=1` prints what each build's end let go and what is held, and `HL_REGION_LABELS=1`
 which functions' answers hold the most.
 
+A watcher's memory after a hundred edits of one module, before regions and with them (macOS
+footprint; Linux resident set, from build 20 to build 101):
+
+| App | Before: first build → 200 edits (macOS) | With regions, macOS | With regions, Linux |
+|---|---|---|---|
+| zod | 82 MB → 1,054 MB | 116 → 117 MB (200 edits) | 106.4 → 106.5 MB |
+| three | 88 MB → 4,822 MB | 170 → 170 MB | 191.5 → 191.7 MB |
+| 12 copies of zod | 888 MB → 11,264 MB | | 1,156.6 → 1,156.6 MB (60 edits) |
+
+What it costs, on Linux (`tools/bench.py`, median of 7): a rebuild takes what it took (zod 4.2 ms,
+three 26.5 ms, twelve copies of zod 40.8 ms); a watcher's first build retires 5–17% more
+instructions and holds 11–16 MB more (twelve copies of zod: 126 MB), each answer's region having
+memory to spare at its end; one-shot builds keep everything as before, three holding 11 MB more
+(a list that grows is copied within a region where malloc grew it in place).
+
 `tools/watch-check.py` checks every rebuild byte for byte against a fresh process, across edits to
 a module, to the entry, a new file, a `package.json`, and a write that changes nothing.
 `tools/hmr-check.py` runs a served bundle in Node and checks updates, reloads, kept state and
