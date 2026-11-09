@@ -166,7 +166,9 @@
    (refs (ArrayList i64))
    (ref-seen IntTable)
    (last-ref i64)
-   (cursors (ArrayList i64))])
+   (cursors (ArrayList i64))
+   ;; A cursor any thread may allocate through, under `lock` (see `region-shared-allocator`).
+   (shared i64)])
 
 ;;; Where one thread allocates in one region: the free bytes of its current chunk, `at` up to
 ;;; `end`; the start of the last allocation, which can grow or be taken back in place; and the size
@@ -188,7 +190,8 @@
               :refs (ArrayList::new [i64] (malloc-allocator))
               :ref-seen (int-table 0)
               :last-ref 0
-              :cursors (ArrayList::new [i64] (malloc-allocator))))
+              :cursors (ArrayList::new [i64] (malloc-allocator))
+              :shared 0))
     r))
 
 (defn cursor-make [(r (ptr Region))] (-> (ptr Cursor))
@@ -271,18 +274,75 @@
                    (let [p (cursor-allocate self want (load (field new align)))]
                      (mem/copy [u8] (primitive/cast (ptr u8) p) (primitive/cast (ptr u8) memory) had)
                      (Some p)))))
-  ;; Memory goes back with its region; only the last allocation is taken back at once.
+  ;; Memory goes back with its region, never on its own: a place once given out is never given
+  ;; out again while the region lives, so what knows values by where they are (the cache's writer)
+  ;; is told only when regions are let go.
   (deallocate [(self (ptr Cursor))
                (memory (ptr i8))
                (request (ref AllocRequest))]
               (-> i64)
-              (when (and (= (primitive/cast i64 memory) (.last self))
-                         (= (+ (.last self) (load (field request bytes))) (.at self)))
-                (set! (.at self) (.last self)))
               0))
 
-;;; A thread's stack of regions: the cursor on top is where its values go.
-(defstruct ThreadRegions [(top (ptr Cursor)) (stack (ArrayList i64))])
+;;; A cursor any thread may use, one at a time: for a value that changes after it is made, from
+;;; whichever thread changes it (a relation, as it is indexed), whose memory is its region's.
+(defstruct SharedCursor [(lock i64) (cursor Cursor)])
+
+(impl Allocator SharedCursor
+  (allocate [(self (ptr SharedCursor)) (request (ref AllocRequest))]
+            (-> (Option (ptr i8)))
+            (spin-lock! (field self lock))
+            (let [p (cursor-allocate (field self cursor)
+                                     (load (field request bytes))
+                                     (load (field request align)))]
+              (spin-unlock! (field self lock))
+              (Some p)))
+  (resize [(self (ptr SharedCursor))
+           (memory (ptr i8))
+           (old (ref AllocRequest))
+           (new (ref AllocRequest))]
+          (-> bool)
+          (<= (load (field new bytes)) (load (field old bytes))))
+  (remap [(self (ptr SharedCursor))
+          (memory (ptr i8))
+          (old (ref AllocRequest))
+          (new (ref AllocRequest))]
+         (-> (Option (ptr i8)))
+         (let [want (load (field new bytes))
+               had (load (field old bytes))]
+           (if (<= want had)
+               (Some memory)
+               (do
+                 (spin-lock! (field self lock))
+                 (let [p (cursor-allocate (field self cursor) want (load (field new align)))]
+                   (spin-unlock! (field self lock))
+                   (mem/copy [u8] (primitive/cast (ptr u8) p) (primitive/cast (ptr u8) memory) had)
+                   (Some p))))))
+  (deallocate [(self (ptr SharedCursor))
+               (memory (ptr i8))
+               (request (ref AllocRequest))]
+              (-> i64)
+              0))
+
+(defn region-shared-allocator [(r (ptr Region))] (-> (dyn Allocator))
+  (spin-lock! (field r lock))
+  (when (= (.shared r) 0)
+    (let [c (unwrap-ptr (create [SharedCursor] (malloc-allocator)))]
+      (store! c (SharedCursor :lock 0 :cursor (Cursor :region r :at 0 :end 0 :last 0 :grow 1024)))
+      (set! (.shared r) (primitive/cast i64 c))))
+  (spin-unlock! (field r lock))
+  (primitive/make-dyn Allocator (primitive/cast (ptr SharedCursor) (.shared r))))
+
+;;; Where a value that keeps changing after it is made keeps its memory: its region's, through a
+;;; cursor any thread may use, while the run reclaims memory; else malloc, as long as the program.
+(defn owned-allocator [] (-> (dyn Allocator))
+  (let [r (region-current)]
+    (if (and (reclaiming?) (not (.lasting r)))
+        (region-shared-allocator r)
+        (malloc-allocator))))
+
+;;; A thread's stack of regions: where its values go is the allocator on top, into `region`. The
+;;; stack holds each entered region with its allocator's state and whether that is a shared cursor.
+(defstruct ThreadRegions [(top (dyn Allocator)) (region (ptr Region)) (stack (ArrayList i64))])
 
 ;;; The thread-specific key of the threads' region stacks, plus one, as each place that asks keeps
 ;;; it: the key never changes once made, so a place asks `workers` only the first time.
@@ -306,21 +366,39 @@
 ;;; build that keeps everything takes few of them.
 (defn thread-regions-new [] (-> (ptr ThreadRegions))
   (let [t (unwrap-ptr (create [ThreadRegions] (malloc-allocator)))
-        c (cursor-make (region-make true 4194304))]
-    (store! t (ThreadRegions :top c :stack (ArrayList::new [i64] (malloc-allocator))))
+        r (region-make true 4194304)
+        c (cursor-make r)]
+    (store! t (ThreadRegions :top (primitive/make-dyn Allocator c)
+                             :region r
+                             :stack (ArrayList::new [i64] (malloc-allocator))))
+    (push! (mut (.stack t)) (primitive/cast i64 r))
     (push! (mut (.stack t)) (primitive/cast i64 c))
+    (push! (mut (.stack t)) 0)
     (pthread_setspecific (.tree-key (workers)) (primitive/cast (ptr i8) t))
     t))
 
 ;;; Where values go on this thread: the region on top of its stack.
 (defn value-allocator :inline (Always) [] (-> (dyn Allocator))
-  (primitive/make-dyn Allocator (.top (thread-regions))))
+  (.top (thread-regions)))
 
 (defn tree-allocator :inline (Always) [] (-> (dyn Allocator))
   (value-allocator))
 
 (defn region-current [] (-> (ptr Region))
-  (.region (.top (thread-regions))))
+  (.region (thread-regions)))
+
+;;; The thread's allocator as the top of its stack says.
+(defn thread-regions-top! [(t (ptr ThreadRegions))] (-> void)
+  (let [n (len (.stack t))
+        r (primitive/cast (ptr Region) (get (.stack t) (- n 3)))
+        state (get (.stack t) (- n 2))
+        shared (get (.stack t) (- n 1))]
+    (set! (.region t) r)
+    (set! (.top t)
+          (if (= shared 1)
+              (primitive/make-dyn Allocator (primitive/cast (ptr SharedCursor) state))
+              (primitive/make-dyn Allocator (primitive/cast (ptr Cursor) state))))
+    0))
 
 ;;; A region for values that will be held: by whoever made it, until they let it go.
 (defn region-new [] (-> (ptr Region))
@@ -330,16 +408,46 @@
 (defn region-enter! [(r (ptr Region))] (-> void)
   (let [t (thread-regions)
         c (cursor-make r)]
+    (push! (mut (.stack t)) (primitive/cast i64 r))
     (push! (mut (.stack t)) (primitive/cast i64 c))
-    (set! (.top t) c)
+    (push! (mut (.stack t)) 0)
+    (thread-regions-top! t)
+    0))
+
+;;; Values made on this thread go to `r` through its shared cursor, until `region-leave!`: for what
+;;; any thread may grow later.
+(defn region-enter-shared! [(r (ptr Region))] (-> void)
+  (let [t (thread-regions)]
+    (region-shared-allocator r)
+    (push! (mut (.stack t)) (primitive/cast i64 r))
+    (push! (mut (.stack t)) (.shared r))
+    (push! (mut (.stack t)) 1)
+    (thread-regions-top! t)
     0))
 
 (defn region-leave! [] (-> void)
   (let [t (thread-regions)]
-    (when (<= (len (.stack t)) 1) (panic "a region was left that was never entered"))
+    (when (<= (len (.stack t)) 3) (panic "a region was left that was never entered"))
     (pop! (mut (.stack t)))
-    (set! (.top t) (primitive/cast (ptr Cursor) (get (.stack t) (- (len (.stack t)) 1))))
+    (pop! (mut (.stack t)))
+    (pop! (mut (.stack t)))
+    (thread-regions-top! t)
     0))
+
+;;; The program's state (its modules' defaults, what the runtime keeps of values), made while this
+;;; thread is in the program's own region: as long as the program, grown by any thread.
+(defstruct StateRegion [(region i64)])
+
+(defn state-region [] (-> (ptr Region))
+  (let [o (primitive/alloc-static StateRegion)]
+    (when (= (.region o) 0)
+      (init-lock!)
+      (when (= (.region o) 0) (set! (.region o) (primitive/cast i64 (region-make true 4194304))))
+      (init-unlock!))
+    (primitive/cast (ptr Region) (.region o))))
+
+(defn state-region-enter! [] (-> void)
+  (region-enter-shared! (state-region)))
 
 (defn region-hold! [(r (ptr Region))] (-> void)
   (unless (.lasting r) (atomic/add (field r count) 1))
@@ -393,10 +501,11 @@
     0))
 
 ;;; Every region nothing holds, let go, and so whatever only they held: at a safe point only, when
-;;; no build runs and no value on any stack is in one of them. Each chunk let go is first told to
-;;; `forget-range` (the cache's writer knows values by where they are).
-(defn regions-let-go! [(forget-range (fnptr (cc/C) [i64 i64] i64))] (-> i64)
+;;; no build runs and no value on any stack is in one of them. What was let go, as (start, end)
+;;; pairs of addresses, for what knows values by where they are (the cache's writer).
+(defn regions-let-go! [] (-> (ArrayList i64))
   (let [q (region-queue)
+        (mut ranges) (ArrayList::new [i64] (malloc-allocator))
         (mut n) 0]
     (spin-lock! (field q lock))
     (while (> (len (.waiting q)) 0)
@@ -409,11 +518,13 @@
           (while (!= at 0)
             (let [before (load (primitive/cast (ptr i64) at))
                   size (load (primitive/cast (ptr i64) (+ at 8)))]
-              (forget-range at (+ at size))
+              (push! (mut ranges) at)
+              (push! (mut ranges) (+ at size))
               (chunk-let-go! at size)
               (set! at before))))
         (set! (.bytes-let-go q) (+ (.bytes-let-go q) (.bytes r)))
         (for c (.cursors r) (primitive/free (primitive/cast (ptr i8) c)))
+        (when (!= (.shared r) 0) (primitive/free (primitive/cast (ptr i8) (.shared r))))
         (free! (mut (.refs r)))
         (free! (mut (.cursors r)))
         (free! (mut (.keys (.ref-seen r))))
@@ -423,7 +534,156 @@
         (spin-lock! (field q lock))))
     (set! (.let-go q) (+ (.let-go q) n))
     (spin-unlock! (field q lock))
-    n))
+    ranges))
+
+;;; Whether this run lets go of what it no longer needs: while watching, answers live in regions
+;;; of their own, and each build's end is a safe point. Else every value lives as long as the
+;;; program, which ends soon.
+(defstruct Reclaim [(on bool)])
+
+;;; Static storage is per call site: the switch has one place, found through this.
+(defn reclaim-cell [] (-> (ptr Reclaim))
+  (primitive/alloc-static Reclaim))
+
+(defn reclaiming? [] (-> bool)
+  (.on (reclaim-cell)))
+
+;;; With HL_RECLAIM_OFF set, a watcher keeps everything, as a run that builds once does: to tell
+;;; what reclaiming changes from what it does not.
+(defn reclaim! [] (-> void)
+  (unless (env-on? "HL_RECLAIM_OFF") (set! (.on (reclaim-cell)) true))
+  0)
+
+;;; A memo's answer is made in a region of its own, held by the memo's table from then on. 0 when
+;;; the run reclaims nothing.
+(defn answer-region-open! [] (-> i64)
+  (if (reclaiming?)
+      (let [r (region-new)]
+        (region-enter! r)
+        (primitive/cast i64 r))
+      0))
+
+(defn answer-region-close! [(r i64)] (-> i64)
+  (when (!= r 0) (region-leave!))
+  0)
+
+(defn region-release-id! [(r i64)] (-> void)
+  (when (!= r 0) (region-release! (primitive/cast (ptr Region) r)))
+  0)
+
+(defn region-uses-id! [(r i64)] (-> void)
+  (when (!= r 0) (region-uses! (primitive/cast (ptr Region) r)))
+  0)
+
+(defn region-ref-id! [(from i64) (to i64)] (-> void)
+  (when (and (!= from 0) (!= to 0))
+    (region-ref! (primitive/cast (ptr Region) from) (primitive/cast (ptr Region) to)))
+  0)
+
+(defn region-enter-id! [(r i64)] (-> void)
+  (region-enter! (primitive/cast (ptr Region) r))
+  0)
+
+;;; A text's own copy, in the region values go to now.
+(defn text-copy [(s (slice u8))] (-> (slice u8))
+  (if (= (len s) 0)
+      ""
+      (match (alloc [u8] (value-allocator) (len s))
+        (Some [m] (do (mem/copy [u8] (data m) (data s) (len s)) m))
+        (None [] (panic "no memory to copy a text")))))
+
+;;; A text's copy that the runtime keeps, for as long as it keeps it: on malloc.
+(defn own-text [(s (slice u8))] (-> (slice u8))
+  (if (= (len s) 0)
+      ""
+      (match (alloc [u8] (malloc-allocator) (len s))
+        (Some [m] (do (mem/copy [u8] (data m) (data s) (len s)) m))
+        (None [] (panic "no memory to keep a text")))))
+
+;;; A writer for copying one value: written, then read back where values go now (see `own-code` in
+;;; the rules compiler), so the copy points at nothing the original did.
+(defn copy-writer-new [] (-> (ptr Writer))
+  (let [w (unwrap-ptr (create [Writer] (malloc-allocator)))]
+    (store! w (copy-writer-value))
+    w))
+
+(defn copy-writer-value [] (-> Writer)
+  (Writer
+    :mem
+      (match (alloc [u8] (malloc-allocator) 256)
+        (Some [m] m)
+        (None [] (panic "no memory to copy a value")))
+    :pos 0
+    :base 0
+    :objects false
+    :keys (ArrayList::new [i64] (malloc-allocator))
+    :ids (ArrayList::new [i64] (malloc-allocator))
+    :mask -1
+    :filled 0
+    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :next-id 0
+    :defined (ArrayList::new [i64] (malloc-allocator))
+    :open (ArrayList::new [i64] (malloc-allocator))
+    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+
+;;; What a copy writer wrote, as a reader of its bytes copied where values go now; the writer let go.
+(defn copy-reader [(w (ptr Writer))] (-> (ptr Reader))
+  (let [bytes (text-copy (subslice (.mem w) 0 (.pos w)))
+        r (unwrap-ptr (create [Reader] (malloc-allocator)))]
+    (writer-free! w)
+    (primitive/free (primitive/cast (ptr i8) w))
+    (store! r (reader-new bytes false))
+    r))
+
+(defn copy-reader-done! [(r (ptr Reader))] (-> void)
+  (reader-free! r)
+  (primitive/free (primitive/cast (ptr i8) r))
+  0)
+
+;;; A memo's last key kept by its store: its own copy, the one it replaces let go.
+(defn last-key-set! [(at (ptr (slice u8))) (key (slice u8))] (-> void)
+  (let [old (load at)]
+    (unless (and (= (len old) (len key)) (= (primitive/cast i64 (data old)) (primitive/cast i64 (data key))))
+      (store! at (own-text key))
+      (when (> (len old) 0) (free [u8] (malloc-allocator) old))))
+  0)
+
+(defn writer-free! [(w (ptr Writer))] (-> void)
+  (free [u8] (malloc-allocator) (.mem w))
+  (free! (mut (.keys w)))
+  (free! (mut (.ids w)))
+  (free! (mut (.shared w)))
+  (free! (mut (.defined w)))
+  (free! (mut (.open w)))
+  (free! (mut (.modules w)))
+  0)
+
+(defn reader-free! [(r (ptr Reader))] (-> void)
+  (free! (mut (.returns r)))
+  (free! (mut (.offsets r)))
+  (free! (mut (.values r)))
+  (free! (mut (.arena r)))
+  (free! (mut (.frames r)))
+  (free! (mut (.modules r)))
+  0)
+
+;;; The end of a build, while watching: what nothing holds any more let go, once the cache's last
+;;; save is done (it reads what builds made), and the cache's writer told what went, since it knows
+;;; values by where they were.
+(defn regions-safe-point! [] (-> void)
+  (when (reclaiming?)
+    (cache-saved!)
+    (let [q (region-queue)
+          before (.let-go q)
+          bytes-before (.bytes-let-go q)
+          (mut ranges) (regions-let-go!)]
+      (when (> (len ranges) 0) (writer-forget-ranges! (the-writer) ranges))
+      (when (env-on? "HL_REGION_TRACE")
+        (println "[regions] let go {} regions, {} KB"
+                 (- (.let-go q) before)
+                 (/ (- (.bytes-let-go q) bytes-before) 1024)))
+      (free! (mut ranges))))
+  0)
 
 ;;; Chunks come from malloc and go back to it; with HL_REGION_CHECK set they are pages of their
 ;;; own that are never used again once let go, and can be read by nobody, so a value read after
@@ -504,7 +764,7 @@
   (-> (Result (ArrayList Tok) LexFail))
   (block
     :out
-      (let [(mut toks) (ArrayList::new [Tok] (malloc-allocator))
+      (let [(mut toks) (ArrayList::new [Tok] (value-allocator))
             n (len src)
             (mut i) 0
             (mut line) 1
@@ -963,14 +1223,14 @@
 
 (defn w-new [(pretty bool) (style PrintStyle)] (-> W)
   (W
-    :buf (ArrayList::new [u8] (malloc-allocator))
+    :buf (ArrayList::new [u8] (value-allocator))
     :pretty pretty
     :pending false
     :soft ""
     :keep 0
     :after-int false
     :tracking false
-    :marks (ArrayList::new [Mark] (malloc-allocator))
+    :marks (ArrayList::new [Mark] (value-allocator))
     :next-src 0
     :style style))
 
@@ -981,7 +1241,7 @@
                    (apart-digits (slice u8))
                    (soft-close (slice u8))
                    (breaks (ArrayList (slice u8)))] (-> PrintStyle)
-  (let [(mut word) (ArrayList::new [bool] (malloc-allocator))]
+  (let [(mut word) (ArrayList::new [bool] (value-allocator))]
     (for i (range 0 256) (push! (mut word) (and high (>= i 128))))
     (for c bytes (set! (mut word) (cast i64 c) true))
     (PrintStyle
@@ -1095,7 +1355,7 @@
   (-> void)
   (flush-semi! (mut w))
   (let [at (skip-printed-space (mut w) mark)
-        tail (ArrayList::new [u8] (malloc-allocator))
+        tail (ArrayList::new [u8] (value-allocator))
         (mut saved) tail]
     (for i (range at (len (.buf w))) (push! (mut saved) (get (.buf w) i)))
     (while (> (len (.buf w)) at) (pop! (mut (.buf w))))
@@ -1125,7 +1385,7 @@
 
 ;;; A double-quoted token holding this already-escaped content.
 (defn quote-str [(content (slice u8))] (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (push-str! (mut b) "\"")
     (push-str! (mut b) content)
     (push-str! (mut b) "\"")
@@ -1175,7 +1435,7 @@
     (if ok (Some v) (None [i64]))))
 
 (defn num-text [(v i64)] (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (push-i64! (mut b) v)
     (finish! (mut b))))
 
@@ -1188,12 +1448,16 @@
 ;;; addressing on the key. A value is kept plus one, so a slot of zeros is empty, and a table is
 ;;; made, or grown, by zeroing memory.
 (defstruct IntTable
-  [(keys (ArrayList i64)) (vals (ArrayList i64)) (count i64) (mask i64)])
+  [(keys (ArrayList i64)) (vals (ArrayList i64)) (count i64) (mask i64) (alc (dyn Allocator))])
 
 ;;; Capacity 0: nothing allocated until the first put.
 (defn int-table [(cap i64)] (-> IntTable)
-  (let [(mut keys) (ArrayList::new [i64] (malloc-allocator))
-        (mut vals) (ArrayList::new [i64] (malloc-allocator))]
+  (int-table-in cap (malloc-allocator)))
+
+;;; One whose memory comes from `a`, as it grows too.
+(defn int-table-in [(cap i64) (a (dyn Allocator))] (-> IntTable)
+  (let [(mut keys) (ArrayList::new [i64] a)
+        (mut vals) (ArrayList::new [i64] a)]
     (when (> cap 0)
       (ArrayList::extend-zeroed! (mut keys) cap)
       (ArrayList::extend-zeroed! (mut vals) cap))
@@ -1201,7 +1465,8 @@
       :keys keys
       :vals vals
       :count 0
-      :mask (- cap 1))))
+      :mask (- cap 1)
+      :alc a)))
 
 ;;; A capacity that holds `n` keys without growing.
 (defn int-capacity [(n i64)] (-> i64)
@@ -1225,7 +1490,7 @@
   (when (> (* (+ (.count t) 1) 2) (+ (.mask t) 1))
     (let [old t
           (mut bigger)
-            (int-table (if (< (.mask t) 31) 64 (* (+ (.mask t) 1) 2)))]
+            (int-table-in (if (< (.mask t) 31) 64 (* (+ (.mask t) 1) 2)) (.alc t))]
       (for i (range 0 (len (.vals old)))
         (let [v (get (.vals old) i)]
           (when (> v 0) (int-put! (mut bigger) (get (.keys old) i) (- v 1)))))
@@ -1248,18 +1513,19 @@
     0))
 
 ;;; An index from a key to the rows holding it: a table to the bucket's number, and the buckets.
-(defstruct Index [(table IntTable) (buckets (ArrayList (ArrayList i64)))])
+(defstruct Index [(table IntTable) (buckets (ArrayList (ArrayList i64))) (alc (dyn Allocator))])
 
-(defn index-new [] (-> Index)
+(defn index-new [(a (dyn Allocator))] (-> Index)
   (Index
-    :table (int-table 0)
-    :buckets (ArrayList::new [(ArrayList i64)] (malloc-allocator))))
+    :table (int-table-in 0 a)
+    :buckets (ArrayList::new [(ArrayList i64)] a)
+    :alc a))
 
 (defn index-push! [(x (mut Index)) (key i64) (row i64)] (-> void)
   (let [at (int-get (mut (.table x)) key)]
     (if (>= at 0)
         (push! (elem (mut (.buckets x)) at) row)
-        (let [(mut b) (ArrayList::new [i64] (tree-allocator))]
+        (let [(mut b) (ArrayList::new [i64] (.alc x))]
           (push! (mut b) row)
           (int-put! (mut (.table x)) key (len (.buckets x)))
           (push! (mut (.buckets x)) b)))
@@ -1293,35 +1559,40 @@
    ;; The rows the last round added, for evaluating only what they make possible.
    (seen i64)
    (delta-from i64)
-   (delta-to i64)])
+   (delta-to i64)
+   ;; Where all of its memory comes from, as it grows and is indexed: its region's (see
+   ;; `owned-allocator`), whichever thread asks.
+   (alc (dyn Allocator))])
 
 (defn rel-new [(arity i64)] (-> Rel)
-  (let [(mut index) (ArrayList::new [Index] (malloc-allocator))
-        (mut indexed) (ArrayList::new [i64] (malloc-allocator))
+  (let [a (owned-allocator)
+        (mut index) (ArrayList::new [Index] a)
+        (mut indexed) (ArrayList::new [i64] a)
         (mut dense)
-          (ArrayList::new [(ArrayList (ArrayList i64))] (malloc-allocator))
-        (mut pair-index) (ArrayList::new [Index] (malloc-allocator))
-        (mut pair-indexed) (ArrayList::new [i64] (malloc-allocator))]
+          (ArrayList::new [(ArrayList (ArrayList i64))] a)
+        (mut pair-index) (ArrayList::new [Index] a)
+        (mut pair-indexed) (ArrayList::new [i64] a)]
     (for _ (range 0 arity)
-      (push! (mut index) (index-new))
-      (push! (mut dense) (ArrayList::new [(ArrayList i64)] (malloc-allocator)))
+      (push! (mut index) (index-new a))
+      (push! (mut dense) (ArrayList::new [(ArrayList i64)] a))
       (push! (mut indexed) 0))
     (for _ (range 0 (* arity arity))
-      (push! (mut pair-index) (index-new))
+      (push! (mut pair-index) (index-new a))
       (push! (mut pair-indexed) 0))
     (Rel
+      :alc a
       :arity arity
-      :data (ArrayList::new [i64] (malloc-allocator))
+      :data (ArrayList::new [i64] a)
       :count 0
-      :heads (int-table 0)
-      :next (ArrayList::new [i64] (malloc-allocator))
+      :heads (int-table-in 0 a)
+      :next (ArrayList::new [i64] a)
       :index index
       :indexed indexed
       :dense dense
       :pair-index pair-index
       :pair-indexed pair-indexed
-      :queue (ArrayList::new [i64] (malloc-allocator))
-      :present (ArrayList::new [u8] (malloc-allocator))
+      :queue (ArrayList::new [i64] a)
+      :present (ArrayList::new [u8] a)
       :seen 0
       :delta-from 0
       :delta-to 0)))
@@ -1333,7 +1604,7 @@
   (when (> (.arity r) 1)
     (let [cap (int-capacity (+ (.count r) n))]
       (when (> cap (+ (.mask (.heads r)) 1))
-        (let [(mut bigger) (int-table cap)
+        (let [(mut bigger) (int-table-in cap (.alc r))
               old (.heads r)]
           (for i (range 0 (len (.vals old)))
             (let [v (get (.vals old) i)]
@@ -1384,9 +1655,9 @@
   (let [key (rel-at (mut r) row col)]
     (if (dense-key? key)
         (let [d (elem (mut (.dense r)) col)]
-          ;; Rows of a key come from the thread's arena: they last as long as the program.
+          ;; Rows of a key come from the relation's own memory, whichever thread indexes it.
           (while (<= (len (load d)) key)
-            (push! d (ArrayList::new [i64] (tree-allocator))))
+            (push! d (ArrayList::new [i64] (.alc r))))
           (push! (elem d key) row))
         (index-push! (elem (mut (.index r)) col) key row))))
 
@@ -1496,7 +1767,7 @@
       (init-lock!)
       (when (= (atomic/read flag) 0)
         (set! (.table (elem (mut (.pair-index r)) slot))
-              (int-table (int-capacity (.count r))))
+              (int-table-in (int-capacity (.count r)) (.alc r)))
         (for row (range 0 (.count r)) (pair-index-add! (mut r) slot c1 c2 row))
         (atomic/store flag 1))
       (init-unlock!))
@@ -1525,7 +1796,10 @@
 
 ;;; A list of its own with `xs`'s items.
 (defn ints-copy [(xs (ArrayList i64))] (-> (ArrayList i64))
-  (let [(mut out) (ArrayList::new [i64] (malloc-allocator))]
+  (ints-copy-in xs (value-allocator)))
+
+(defn ints-copy-in [(xs (ArrayList i64)) (a (dyn Allocator))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] a)]
     (reserve! (mut out) (len xs))
     (for x xs (push! (mut out) x))
     out))
@@ -1534,16 +1808,18 @@
 ;;; rows and their hashes are copied as they are; its indexes are made again as queries ask for them.
 (defn rel-clone [(r (mut Rel))] (-> Rel)
   (let [(mut out) (rel-new (.arity r))
-        (mut present) (ArrayList::new [u8] (malloc-allocator))]
+        a (.alc out)
+        (mut present) (ArrayList::new [u8] a)]
     (for x (.present r) (push! (mut present) x))
-    (set! (.data out) (ints-copy (.data r)))
-    (set! (.next out) (ints-copy (.next r)))
+    (set! (.data out) (ints-copy-in (.data r) a))
+    (set! (.next out) (ints-copy-in (.next r) a))
     (set! (.heads out)
           (IntTable
-            :keys (ints-copy (.keys (.heads r)))
-            :vals (ints-copy (.vals (.heads r)))
+            :keys (ints-copy-in (.keys (.heads r)) a)
+            :vals (ints-copy-in (.vals (.heads r)) a)
             :count (.count (.heads r))
-            :mask (.mask (.heads r))))
+            :mask (.mask (.heads r))
+            :alc a))
     (set! (.present out) present)
     (set! (.count out) (.count r))
     (set! (.seen out) (.count r))
@@ -1636,12 +1912,12 @@
             :parent (ArrayList::new [i64] (tree-allocator))
             :slot (ArrayList::new [i64] (tree-allocator)))
         (mut seen)
-          (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+          (HashMap::new [(slice u8) i64] (value-allocator) (str/keyops))
         (mut path)
           (WalkPath
-            :at (ArrayList::new [i64] (malloc-allocator))
-            :kids (ArrayList::new [(ArrayList (slice u8))] (malloc-allocator))
-            :next (ArrayList::new [i64] (malloc-allocator)))]
+            :at (ArrayList::new [i64] (value-allocator))
+            :kids (ArrayList::new [(ArrayList (slice u8))] (value-allocator))
+            :next (ArrayList::new [i64] (value-allocator)))]
     (for r roots
       (match (get seen r)
         (Some [_] 0)
@@ -1785,7 +2061,7 @@
     bytes))
 
 (defn read-all-raw [(path (slice u8))] (-> (slice u8))
-  (let [a (malloc-allocator)
+  (let [a (value-allocator)
         fd
           (os/open (str/to-cstr a path)
                    (primitive/cast i32 (| fs/O_RDONLY fs/O_CLOEXEC))
@@ -1815,7 +2091,7 @@
 
 (defn read-all-general [(path (slice u8))] (-> (slice u8))
   (try (let [bytes
-               (try-or! (fs/read-file (malloc-allocator) path)
+               (try-or! (fs/read-file (value-allocator) path)
                         (panic "cannot read {}" path))]
          bytes)))
 
@@ -1838,7 +2114,7 @@
 
 ;;; The directory the program runs in.
 (defn working-dir [] (-> (slice u8))
-  (cpath/cwd-slice (malloc-allocator)))
+  (cpath/cwd-slice (value-allocator)))
 
 ;;; A path with its links resolved, as the file system has it; the path itself when nothing is there.
 (defn real-path [(path (slice u8))] (-> (slice u8))
@@ -1848,7 +2124,7 @@
     p))
 
 (defn real-path-raw [(path (slice u8))] (-> (slice u8))
-  (match (cpath/realpath-opt (malloc-allocator) path)
+  (match (cpath/realpath-opt (value-allocator) path)
     (Some [p] p)
     (None [] path)))
 
@@ -1876,14 +2152,14 @@
     (Err [_] (panic "cannot write {}" path))))
 
 (defn join [(a (slice u8)) (b (slice u8))] (-> (slice u8))
-  (let [(mut sb) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut sb) (str/StrBuf::new (value-allocator))]
     (push-str! (mut sb) a)
     (push-str! (mut sb) b)
     (finish! (mut sb))))
 
 ;;; `s` in memory of its own, kept however long whatever made `s` keeps its own.
 (defn copy-text [(s (slice u8))] (-> (slice u8))
-  (let [(mut sb) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut sb) (str/StrBuf::new (value-allocator))]
     (push-str! (mut sb) s)
     (finish! (mut sb))))
 
@@ -1961,7 +2237,7 @@
                      (text (slice u8))
                      (kids i64)
                      (count i64)] (-> (slice u8))
-  (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+  (let [(mut b) (ArrayList::new [u8] (value-allocator))]
     (reserve! (mut b) (+ 40 (len text)))
     (for v [kind lo hi (if (= count 0) 0 kids) count]
       (for i (range 0 8)
@@ -1971,7 +2247,7 @@
 
 ;;; A key `memo-key-of` made, back into its parts.
 (defn memo-key-parts [(key (slice u8))] (-> (ArrayList (slice u8)))
-  (let [(mut out) (ArrayList::new [(slice u8)] (malloc-allocator))
+  (let [(mut out) (ArrayList::new [(slice u8)] (value-allocator))
         (mut at) 0]
     (while (< at (len key))
       (let [(mut colon) at]
@@ -1986,7 +2262,7 @@
 ;;; length, a colon and the text, a list's length and a hash before its elements, a record's
 ;;; fields in turn. No key is the start of another of the same function's.
 (defn key-buf-new [] (-> str/StrBuf)
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (reserve! (mut (.bytes b)) 48)
     b))
 
@@ -2010,7 +2286,7 @@
   (finish! (mut b)))
 
 (defn memo-key-of [(parts (ArrayList (slice u8)))] (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (for p parts
       (push-str! (mut b) (num-text (len p)))
       (push-str! (mut b) ":")
@@ -2028,7 +2304,7 @@
         (mut w1) 0
         (mut w2) 0
         (mut w3) 0
-        (mut b) (str/StrBuf::new (malloc-allocator))
+        (mut b) (str/StrBuf::new (value-allocator))
         (mut start) 0
         (mut i) 0
         (mut any) false]
@@ -2081,7 +2357,7 @@
 ;;; a 256-bit set.
 (defn occurrences-of-many [(s (slice u8)) (whats (ArrayList (slice u8)))]
   (-> (ArrayList i64))
-  (let [(mut firsts) (ArrayList::new [i64] (malloc-allocator))]
+  (let [(mut firsts) (ArrayList::new [i64] (value-allocator))]
     (for w whats
       (when (= (len w) 0) (panic "occurrences needs text to look for"))
       (let [b (cast i64 (get w 0))
@@ -2179,7 +2455,7 @@
     out))
 
 (defn joined [(xs (ArrayList (slice u8))) (sep (slice u8))] (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (for i (range 0 (len xs))
       (when (> i 0) (push-str! (mut b) sep))
       (push-str! (mut b) (get xs i)))
@@ -2239,7 +2515,7 @@
         (subslice s from (- (len s) (span-back-of s chars))))))
 
 (defn ascii-lower [(s (slice u8))] (-> (slice u8))
-  (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+  (let [(mut b) (ArrayList::new [u8] (value-allocator))]
     (for c s (push! (mut b) (if (and (>= c 65) (<= c 90)) (+ c 32) c)))
     (slice b)))
 
@@ -2298,8 +2574,8 @@
 ;;; Indices of `keys` in sorted order, equal keys keeping their order.
 (defn sort-order-int [(keys (ArrayList i64)) (desc bool)] (-> (ArrayList i64))
   (let [n (len keys)
-        (mut a) (ArrayList::new [i64] (malloc-allocator))
-        (mut b) (ArrayList::new [i64] (malloc-allocator))
+        (mut a) (ArrayList::new [i64] (value-allocator))
+        (mut b) (ArrayList::new [i64] (value-allocator))
         (mut width) 1]
     (for i (range 0 n) (push! (mut a) i) (push! (mut b) i))
     (while (< width n)
@@ -2327,7 +2603,7 @@
 ;;; The same over text, by bytes: a module sorts few names.
 (defn sort-order-text [(keys (ArrayList (slice u8))) (desc bool)]
   (-> (ArrayList i64))
-  (let [(mut order) (ArrayList::new [i64] (malloc-allocator))]
+  (let [(mut order) (ArrayList::new [i64] (value-allocator))]
     (for i (range 0 (len keys)) (push! (mut order) i))
     (for i (range 1 (len keys))
       (let [(mut j) i]
@@ -2346,7 +2622,7 @@
 (defstruct Buf [(bytes (ArrayList u8))])
 
 (defn buf-new [] (-> Buf)
-  (Buf :bytes (ArrayList::new [u8] (malloc-allocator))))
+  (Buf :bytes (ArrayList::new [u8] (value-allocator))))
 
 (defn buf-add! [(b (mut Buf)) (s (slice u8))] (-> void)
   (when (> (len s) 0)
@@ -2509,7 +2785,7 @@
     listing))
 
 (defn dir-listing-raw [(path (slice u8))] (-> (slice u8))
-  (let [(mut out) (ArrayList::new [u8] (malloc-allocator))]
+  (let [(mut out) (ArrayList::new [u8] (value-allocator))]
     (match (fs/Directory::open (malloc-allocator)
                                (if (= (len path) 0) "." path))
       (Ok [d]
@@ -2542,14 +2818,14 @@
 ;;; What a file says, as an input's print: "missing" when it cannot be read.
 (defn file-print [(path (slice u8))] (-> (slice u8))
   (if (file-exists-raw? path)
-      (match (fs/read-file (malloc-allocator) path)
+      (match (fs/read-file (value-allocator) path)
         (Ok [b] (print-of b))
         (Err [_] "missing"))
       "missing"))
 
 ;;; UTF-8 text as code points. A truncated sequence ends with a -1.
 (defn code-points-of [(s (slice u8))] (-> (ArrayList i64))
-  (let [(mut out) (ArrayList::new [i64] (malloc-allocator))
+  (let [(mut out) (ArrayList::new [i64] (value-allocator))
         (mut i) 0
         n (len s)]
     (while (< i n)
@@ -2580,7 +2856,7 @@
 
 ;;; Code points as UTF-8 text.
 (defn text-of-points [(points (ArrayList i64))] (-> (slice u8))
-  (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+  (let [(mut b) (ArrayList::new [u8] (value-allocator))]
     (for cp points
       (cond (< cp 128) (push! (mut b) (cast u8 cp))
             (< cp 2048)
@@ -2602,7 +2878,7 @@
 
 ;;; Bytes as text, each as it is: what iterating over a text gives back.
 (defn text-of-bytes [(bytes (ArrayList i64))] (-> (slice u8))
-  (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+  (let [(mut b) (ArrayList::new [u8] (value-allocator))]
     (for x bytes (push! (mut b) (cast u8 x)))
     (slice b)))
 
@@ -2771,7 +3047,10 @@
    (job (ptr i8))
    ;; When the run was started by a memo computing, what each worker read, for it.
    (inherit bool)
-   (read (ArrayList i64))])
+   (read (ArrayList i64))
+   ;; The region of whatever started the run: what the workers make is its, so each works in it
+   ;; (through a cursor of its own) and their values live as long as what they were made for.
+   (region i64)])
 
 (defn pool-fail [(what (slice u8))] (-> void)
   (panic "worker pool: {}" what))
@@ -2854,16 +3133,20 @@
       (when (< slot (.want p))
         (let [body (.body p)
               job (.job p)
-              inherit (.inherit p)]
+              inherit (.inherit p)
+              region (.region p)]
           (pool-unlock! p)
           (when inherit (dep-begin!))
+          (when (!= region 0) (region-enter-id! region))
           (body job)
-          (let [read
+          (when (!= region 0) (region-leave!))
+          (let [(mut read)
                   (if inherit
                       (dep-take-notes!)
                       (ArrayList::new [i64] (malloc-allocator)))]
             (pool-lock! p)
-            (for x read (push! (mut (.read p)) x)))
+            (for x read (push! (mut (.read p)) x))
+            (free! (mut read)))
           (atomic/store (field p left) (- (.left p) 1))
           (when (= (.left p) 0)
             (match (Condition::notify-all! (field p done))
@@ -2971,6 +3254,7 @@
           (set! (.job p) job)
           (set! (.inherit p) (dep-in-frame?))
           (set! (.read p) (ArrayList::new [i64] (malloc-allocator)))
+          (set! (.region p) (let [r (region-current)] (if (.lasting r) 0 (primitive/cast i64 r))))
           (set! (.want p) count)
           (atomic/store (field p left) (- count 1))
           (atomic/store (field p round) (+ (.round p) 1))
@@ -2986,10 +3270,11 @@
           (pool-lock! p)
           (while (> (.left p) 0) (pool-wait! p (field p done)))
           (set! (.running p) false)
-          (let [read (.read p)]
+          (let [(mut read) (.read p)]
             (pool-unlock! p)
             ;; What the workers read, this thread's memo read.
-            (for x read (dep-note-id! x)))))
+            (for x read (dep-note-id! x))
+            (free! (mut read)))))
     0))
 
 ;;; What a program answered, carried from the thread it ran on to `main`.
@@ -3217,9 +3502,11 @@
   (match (get (.ids d) node)
     (Some [id] id)
     (None []
-          (let [id (len (.texts d))]
-            (set! (mut (.ids d)) node id)
-            (push! (mut (.texts d)) node)
+          (let [id (len (.texts d))
+                kept (own-text node)]
+            ;; The graph keeps its own copy: `node` is a value, of whatever region made it.
+            (set! (mut (.ids d)) kept id)
+            (push! (mut (.texts d)) kept)
             (push! (mut (.changed d)) 0)
             (push! (mut (.verified d)) 0)
             (push! (mut (.reads d)) (ArrayList::new [i64] (malloc-allocator)))
@@ -3639,7 +3926,7 @@
 ;;; An accessor call's path: `@name(args)`, its arguments as `memo-key-of` joins them.
 (defn call-path-text [(name (slice u8)) (parts (ArrayList (slice u8)))]
   (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (push-str! (mut b) "@")
     (push-str! (mut b) name)
     (push-str! (mut b) "(")
@@ -3650,7 +3937,7 @@
 ;;; An accessor call's path when its arguments are numbers and truths: `@name(a,b)`.
 (defn call-path [(name (slice u8)) (parts (ArrayList (slice u8)))]
   (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (push-str! (mut b) "@")
     (push-str! (mut b) name)
     (push-str! (mut b) "(")
@@ -3663,7 +3950,7 @@
 ;;; A query's path: `.rel(c0,c1,…)`, each column a value or `_`.
 (defn query-path [(rel (slice u8)) (parts (ArrayList (slice u8)))]
   (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (push-str! (mut b) ".")
     (push-str! (mut b) rel)
     (push-str! (mut b) "(")
@@ -3700,7 +3987,7 @@
 
 (defn query-key [(setting (slice u8)) (rel (slice u8)) (col i64) (value i64)]
   (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (push-str! (mut b) setting)
     (push-str! (mut b) "|")
     (push-str! (mut b) rel)
@@ -3712,7 +3999,7 @@
 
 ;;; Rows of `a` that `b` has not: each one's columns, `arity` to a row.
 (defn rel-minus [(a (mut Rel)) (b (mut Rel))] (-> (ArrayList i64))
-  (let [(mut out) (ArrayList::new [i64] (malloc-allocator))
+  (let [(mut out) (ArrayList::new [i64] (value-allocator))
         n (.arity a)]
     (for row (range 0 (.count a))
       (let [x0 (rel-at (mut a) row 0)
@@ -3789,14 +4076,14 @@
 ;;; column of each, in the order the relation holds them.
 (defn rel-matching [(r (mut Rel)) (spec (slice u8))] (-> (ArrayList i64))
   (let [cols (split spec ",")
-        (mut out) (ArrayList::new [i64] (malloc-allocator))
+        (mut out) (ArrayList::new [i64] (value-allocator))
         (mut first) -1]
     (for i (range 0 (len cols))
       (when (and (< first 0) (!= (get cols i) "_")) (set! first i)))
     (let [rows
             (if (>= first 0)
                 (rel-bucket (mut r) first (parse-int (get cols first)))
-                (let [(mut all) (ArrayList::new [i64] (malloc-allocator))]
+                (let [(mut all) (ArrayList::new [i64] (value-allocator))]
                   (for row (range 0 (.count r)) (push! (mut all) row))
                   all))]
       (for row rows
@@ -3993,10 +4280,10 @@
       (let [id (dep-id! d node)]
         (when (= (len (get (.prints d) id)) 0)
           (set! (mut (.changed d)) id (atomic/read (field d revision))))
-        (set! (mut (.prints d)) id print)
+        (set! (mut (.prints d)) id (own-text print))
         (set! (mut (.stamps d))
               id
-              (if (rechecked-path? (subslice node 2 (len node))) "" stamp0)))
+              (if (rechecked-path? (subslice node 2 (len node))) "" (own-text stamp0))))
       (deps-unlock! d)))
   0)
 
@@ -4101,7 +4388,7 @@
 
 ;;; A memo answer's node: its function's name, a NUL, its key.
 (defn memo-node [(name (slice u8)) (key (slice u8))] (-> (slice u8))
-  (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
     (push-str! (mut b) name)
     (push-str! (mut b) "\0")
     (push-str! (mut b) key)
@@ -4182,13 +4469,13 @@
       ""
       (let [(mut buf) (primitive/zeroed StatBuf)
             at (cast (ptr u8) (mut buf))]
-        (if (!= (stat (str/to-cstr (malloc-allocator) path) at) (: 0 i32))
+        (if (!= (stat (str/to-cstr (value-allocator) path) at) (: 0 i32))
             "missing"
             (let [size (load (cast (ptr i64) (primitive/index at STAT-SIZE)))
                   sec (load (cast (ptr i64) (primitive/index at STAT-MTIME)))
                   nsec
                     (load (cast (ptr i64) (primitive/index at (+ STAT-MTIME 8))))]
-              (let [(mut b) (ArrayList::new [u8] (malloc-allocator))]
+              (let [(mut b) (ArrayList::new [u8] (value-allocator))]
                 (reserve! (mut b) 24)
                 (for v [size sec nsec]
                   (for i (range 0 8)
@@ -5023,6 +5310,76 @@
     (set! (.mask w) (- cap 1)))
   0)
 
+;;; Whether `x` is in one of `ranges`: (start, end) pairs sorted by start, none overlapping.
+(defn in-ranges? [(ranges (ArrayList i64)) (x i64)] (-> bool)
+  (let [(mut lo) 0
+        (mut hi) (/ (len ranges) 2)]
+    ;; The last range starting at or before `x`.
+    (while (< lo hi)
+      (let [mid (/ (+ lo hi) 2)]
+        (if (<= (get ranges (* mid 2)) x) (set! lo (+ mid 1)) (set! hi mid))))
+    (and (> lo 0) (< x (get ranges (+ (* (- lo 1) 2) 1))))))
+
+;;; Memory that was let go (`ranges`, as `regions-let-go!` gives them), forgotten by a writer that
+;;; knows objects by where they are: one there now is another object. Texts and lists it knew there
+;;; are written again whole when next written; opaque values whose bytes point there, likewise.
+(defn writer-forget-ranges! [(w (ptr Writer)) (ranges (ArrayList i64))] (-> void)
+  (let [order (sort-order-int (let [(mut starts) (ArrayList::new [i64] (malloc-allocator))]
+                                (for i (range 0 (/ (len ranges) 2)) (push! (mut starts) (get ranges (* i 2))))
+                                starts)
+                              false)
+        (mut sorted) (ArrayList::new [i64] (malloc-allocator))]
+    (for i order
+      (push! (mut sorted) (get ranges (* i 2)))
+      (push! (mut sorted) (get ranges (+ (* i 2) 1))))
+    (when (>= (.mask w) 0)
+      (let [cap (+ (.mask w) 1)
+            old-keys (.keys w)
+            old-ids (.ids w)
+            (mut keys) (ArrayList::new [i64] (malloc-allocator))
+            (mut ids) (ArrayList::new [i64] (malloc-allocator))
+            (mut filled) 0]
+        (ArrayList::extend-zeroed! (mut keys) (* cap 3))
+        (ArrayList::extend-zeroed! (mut ids) cap)
+        (for j (range 0 (len old-ids))
+          (let [v (get old-ids j)]
+            (when (and (> v 0) (not (in-ranges? sorted (get old-keys (+ (* j 3) 1)))))
+              (let [tag (get old-keys (* j 3))
+                    at (get old-keys (+ (* j 3) 1))
+                    n (get old-keys (+ (* j 3) 2))
+                    (mut i) (object-slot tag at n (- cap 1))]
+                (while (!= (get ids i) 0) (set! i (& (+ i 1) (- cap 1))))
+                (set! (mut keys) (* i 3) tag)
+                (set! (mut keys) (+ (* i 3) 1) at)
+                (set! (mut keys) (+ (* i 3) 2) n)
+                (set! (mut ids) i v)
+                (set! filled (+ filled 1))))))
+        (let [(mut ok) old-keys
+              (mut oi) old-ids]
+          (free! (mut ok))
+          (free! (mut oi)))
+        (set! (.keys w) keys)
+        (set! (.ids w) ids)
+        (set! (.filled w) filled)))
+    (let [(mut gone) (ArrayList::new [(slice u8)] (malloc-allocator))]
+      (for key (.shared w)
+        (let [(mut start) 0]
+          (while (and (< start (len key)) (!= (cast i64 (get key start)) 0)) (set! start (+ start 1)))
+          (let [(mut i) (+ start 1)
+                (mut hit) false]
+            (while (and (not hit) (<= (+ i 8) (len key)))
+              (let [(mut word) 0]
+                (for b (range 0 8)
+                  (set! word (| word (<< (cast i64 (get key (+ i b))) (* b 8)))))
+                (when (in-ranges? sorted word) (set! hit true)))
+              (set! i (+ i 8)))
+            (when hit (push! (mut gone) key)))))
+      (for key gone (HashMap::remove! (mut (.shared w)) key))
+      (free! (mut gone)))
+    (free! (mut sorted))
+    (let [(mut o) order] (free! (mut o))))
+  0)
+
 ;;; The object at (tag, at, n)'s number, or -1; with `new`, one made for it when it has none.
 (defn object-id! [(w (ptr Writer)) (tag i64) (at i64) (n i64) (new i64)]
   (-> i64)
@@ -5149,7 +5506,20 @@
     (when (>= end 0) (set! (.at r) end)))
   0)
 
+;;; Objects read from the log are shared by every value that holds them, so they live in a region
+;;; of the cache's own, as long as the program: no one answer's region could hold them.
+(defstruct ObjectsRegion [(region i64)])
+
+(defn objects-region [] (-> (ptr Region))
+  (let [o (primitive/alloc-static ObjectsRegion)]
+    (when (= (.region o) 0)
+      (init-lock!)
+      (when (= (.region o) 0) (set! (.region o) (primitive/cast i64 (region-make true 4194304))))
+      (init-unlock!))
+    (primitive/cast (ptr Region) (.region o))))
+
 (defn object-enter! [(r (ptr Reader))] (-> void)
+  (when (.objects r) (region-enter! (objects-region)))
   (let [n (len (.frames r))
         id (get (.frames r) (- n 3))
         inline (get (.frames r) (- n 2))]
@@ -5173,6 +5543,7 @@
     (if (= inline 1)
         (set! (.at r) end)
         (reader-return! r))
+    (when (.objects r) (region-leave!))
     id))
 
 ;; ---- texts and functions
@@ -6594,6 +6965,10 @@
   (when (> (len text) 0)
     (let [v (versions)]
       (spin-lock! (cast (ptr i64) v))
-      (set! (mut (.by v)) id text)
+      ;; Its own copy: the text is a value, of whatever region made it. The one it replaces let go.
+      (match (get (.by v) id)
+        (Some [old] (when (> (len old) 0) (free [u8] (malloc-allocator) old)))
+        (None [] 0))
+      (set! (mut (.by v)) id (own-text text))
       (spin-unlock! (cast (ptr i64) v))))
   0)
