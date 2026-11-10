@@ -1,0 +1,164 @@
+# Semantic placement units, independent of how they will be packed into output files.
+# Initialization islands retain observable evaluation and every dependency they execute.
+# Independent values and deferred code can separate around those islands. Opaque wrappers and
+# module cycles remain indivisible. No source is reparsed into virtual modules.
+rules bundle.fragments over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.analysis as an
+use bundle.emit as emit
+use hl.graph as graph
+use bundle.evaluation as ev
+
+record Unit {
+  id: Int, module: Int, modules: [Int], path: Text, parts: [Int], roots: [Int], bytes: Int, portable: Bool, evaluation: Bool
+}
+record Model { units: [Unit], edges: [[Int]] }
+
+context here: m.Module = m.blank-module(-1, "", m.External, -1)
+context body: m.Body = m.empty-body()
+
+fn module-binding?(n: Node) -> Bool = match n {
+  Ident(_) | BindName(_) => any s in m.symbol-in(body, here, n.lo): sym.symbol-at(m.table, s).scope == here.root
+  _ => any k in n.kids: module-binding?(k)
+}
+
+everywhere fn requires-module?(n: Node) -> Bool = match n { ImportMeta() => true }
+
+everywhere fn writes-module?(n: Node) -> Bool = match n {
+  ForIn(target, _, _) | ForOf(_, target, _, _) if module-binding?(target) => true
+  Assignment(target, _, _) | PreInc(target) | PostInc(target) | PreDec(target) | PostDec(target)
+    if module-binding?(target) => true
+}
+
+fn candidate(id: Int) -> Bool = with here = m.modules[id], body = m.body-of(id) {
+  here.kind == m.Esm and (not an.wrapped?(here) or an.scheduled?(here)) and not sym.scope-at(m.table, here.root).dynamic
+  and not m.db.dynamic(id)
+  and not requires-module?(body.tree)
+  and unique-declarations?(id)
+}
+
+fn unique-declarations?(id: Int) -> Bool = len(declared) == len([s for s in declared distinct s])
+  where declared = [s for sm in an.summaries-of(id) for s in sm.declares]
+
+# Modules arrive dependency-first. A cycle has an as-yet-unvisited dependency, so neither the
+# cycle nor code depending on opaque/complex evaluation is considered freely movable.
+fn eligibility() -> [Bool] {
+  var safe = [false for mo in m.modules]
+  for id in m.order {
+    if id != 0 and emit.included?(id) {
+      safe[id] = candidate(id) and all dep in static-deps(id): safe[dep]
+    }
+  }
+  safe
+}
+
+fn module-roots(id: Int) -> [Int] = sort r in [r for m.db.module-consumer(?r, id)] by r
+
+# Loading and evaluation are different graphs. A dynamic import (or a require inside a function)
+# must not become an eager chunk import merely because it appears in the module's dependencies.
+fn static-deps(id: Int) -> [Int] =
+  [target for s in m.body-of(id).tree.body.kids for spec in m.import-spec-of(s)
+          for target in m.modules[id].dep-ids[spec] distinct target]
+
+fn part-roots(part: Int, otherwise: [Int]) -> [Int] = match an.linking.tree-shaking {
+  false => otherwise
+  true => sort r in [r for m.db.fragment-export(?r, part)] by r
+}
+
+fn bytes-of(parts: [Int], id: Int) -> Int =
+  sum p in parts: node-bytes(an.stmt-of(id, p))
+
+fn node-bytes(n: Node) -> Int = max(1, n.hi - n.lo)
+
+fn movable(part: Int, id: Int) -> Bool = with here = m.modules[id], body = m.body-of(id) {
+  ev.inert-stmt(stmt) and not writes-module?(stmt)
+  and not (ev.static-import?(stmt) and (m.db.effect(part) or len([target for m.db.initializes(part, ?target)]) > 0))
+} where stmt = an.stmt-of(id, part)
+
+# All order-sensitive parts of one module form a single evaluation island. Deferred writers are
+# included too: the symbol edges pull their state and initialization into the same SCC. Every
+# other fragment depends on the island; anything it reads/calls therefore joins it in a cycle.
+# This preserves source-order initialization and effects without forcing unrelated exports together.
+fn groups(parts: [Int], moving: {Int:Bool}, split: Bool) -> [[Int]] = match split {
+  false => [parts]
+  true => [anchor for anchor in [[p for p in parts if not (moving[p] ?? false)]] if len(anchor) > 0]
+          ++ [[p] for p in parts if moving[p] ?? false]
+}
+
+fn raw-units(split: Bool, eligible: [Bool]) -> [Unit] =
+  [Unit(id: 0, module: id, modules: [id], path: m.modules[id].path, parts: group, roots: roots,
+        bytes: bytes-of(group, id), portable: eligible[id] and not evaluating, evaluation: evaluating)
+   for id in m.order if emit.included?(id)
+   for parts in [[p for p in emit.parts-of(id) if emit.live?(p)]] if len(parts) > 0
+   for moving in [{p: movable(p, id) for p in parts}]
+   for group in groups(parts, moving, split and eligible[id])
+   for evaluating in [any p in group: not (moving[p] ?? false) or (not eligible[id] and m.db.effect(p))]
+   for roots in [if split and eligible[id] and not evaluating then part-roots(group[0], module-roots(id)) else module-roots(id)]]
+
+# `uses` already contains resolved ES imports and namespace reads. Resolving those names again
+# for every mention would repeat export resolution in a large module. Only opaque CJS bindings
+# need translation to their generated import variable here.
+fn symbol-target(s: Int) -> Int = (first ci in an.linked.cjs-imports[s]: ci.import-var) ?? s
+
+fn reads(parts: [Int]) -> [Int] =
+  [symbol-target(s) for p in parts for s in [s for m.db.mentions(p, ?s)] ++ [s for m.db.uses(p, ?s)] distinct symbol-target(s)]
+
+fn dependencies(units: [Unit]) -> [[Int]] =
+  [[to for to in [to for symbol in reads(u.parts) for to in homes[symbol]]
+                 ++ [to for id in u.modules for targets in evaluation[id] for to in targets]
+       if to != u.id distinct to] for u in units]
+  where homes = {s: u.id for u in units for p in u.parts for m.db.declares(p, ?s)},
+        effects = effect-units(units),
+        evaluation = {id: [to for dep in [id] ++ static-deps(id) for targets in effects[dep] for to in targets distinct to]
+                      for id in m.order if emit.included?(id)}
+
+fn effect-units(units: [Unit]) -> {Int:[Int]} {
+  var found: {Int:[Int]} = {}
+  for u in units {
+    if u.evaluation {
+      for id in u.modules { found[id] = (found[id] ?? []) ++ [u.id] }
+    }
+  }
+  found
+}
+
+fn model(split: Bool) -> Model = collapsed(numbered, dependencies(numbered))
+  where raw = raw-units(split, eligibility()), numbered = [raw[i] with { id: i } for i in 0..len(raw)]
+
+# Dependency cycles form one semantic unit. Cycles cannot acquire different initializers or
+# separate instances merely because a packing policy wants smaller chunks.
+fn collapsed(units: [Unit], edges: [[Int]]) -> Model =
+  match any i in 0..len(units): components[i] != i {
+    false => closed-model(units, edges)
+    true => coalesced(units, edges, components)
+  } where components = graph.components(edges)
+
+# Contract the existing graph, rather than rediscovering evaluation from merged modules. A
+# component may contain a namespace and a runtime helper: inheriting that helper's evaluation
+# marker must not turn every fragment of the namespace's source module into an initializer.
+fn coalesced(units: [Unit], edges: [[Int]], components: [Int]) -> Model = closed-model(numbered, contracted)
+  where buckets = graph.buckets(components),
+        owner = {id: i for i in 0..len(buckets) for id in buckets[i]},
+        merged = [combined([units[id] for id in bucket]) for bucket in buckets],
+        numbered = [merged[i] with { id: i } for i in 0..len(merged)],
+        contracted = [[to for id in buckets[i] for dep in edges[id] for to in owner[dep] if to != i distinct to]
+                      for i in 0..len(buckets)]
+
+# Seed demand at entry exports and evaluation islands, then propagate through the semantic
+# graph. Inert allocations previously kept by conservative linker effect facts may be unneeded;
+# remove only vertices with no consumers after this closure. --tree-shaking=false seeds all parts.
+fn closed-model(units: [Unit], edges: [[Int]]) -> Model =
+  Model(units: [kept[i] with { portable: closed[i] } for i in 0..len(kept)], edges: kept-edges)
+  where demand = graph.propagated(edges, [u.roots for u in units]),
+        active = [i for i in 0..len(units) if len(demand[i]) > 0],
+        owner = {active[i]: i for i in 0..len(active)},
+        kept = [units[active[i]] with { id: i, roots: demand[active[i]] } for i in 0..len(active)],
+        kept-edges = [[to for dep in edges[id] for to in owner[dep]] for id in active],
+        closed = graph.closed-safe(kept-edges, [u.portable for u in kept])
+
+fn combined(units: [Unit]) -> Unit =
+  Unit(id: 0, module: units[0].module, modules: [id for u in units for id in u.modules distinct id], path: units[0].path,
+       parts: [p for u in units for p in u.parts],
+       roots: sort r in [r for u in units for r in u.roots distinct r] by r,
+       bytes: sum u in units: u.bytes, portable: all u in units: u.portable, evaluation: any u in units: u.evaluation)

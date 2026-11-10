@@ -356,6 +356,16 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and out.strip().endswith("all checks passed"), "paired builds: "
       + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} checks" if code == 0 else out[-1800:]))
 
+print("== configurable chunks and fragments")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "chunking-check.py"), ESB, SPEC], 300)
+check(code == 0 and out.strip().endswith("all chunk policies check out"), "chunk policies and fragments: "
+      + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} checks" if code == 0 else out[-1800:]))
+
+print("== ESM evaluation across split chunks")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
+check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "
+      + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} fixture groups across all policies, fragment modes, minification and entry orders" if code == 0 else out[-1800:]))
+
 print("== watching")
 # Rebuilds after edits, byte for byte what a fresh process builds, and none for a write that changes nothing.
 code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch-check.py"), ESB, "datefns"],

@@ -58,6 +58,129 @@ var __esmMin = (fn, res, err) => () => {
     throw err = [e], e;
   }
 };
+// Async evaluation records model pending dependencies and async parents. Synchronous parents
+// execute in DFS completion order in the same completion job, before their queued microtasks.
+var __esmAsyncOrder = 0;
+var __esmAsyncRoot = (record) => {
+  while (record.cycle !== record) record = record.cycle;
+  return record;
+};
+var __esmAsyncPush = (queue, record) => {
+  var at = queue.length;
+  queue.push(record);
+  while (at > 0) {
+    var parent = (at - 1) >> 1;
+    if (queue[parent].order < record.order) break;
+    queue[at] = queue[parent];
+    at = parent;
+  }
+  queue[at] = record;
+};
+var __esmAsyncPop = (queue) => {
+  var first = queue[0], last = queue.pop();
+  if (queue.length) {
+    var at = 0;
+    while (2 * at + 1 < queue.length) {
+      var child = 2 * at + 1;
+      if (child + 1 < queue.length && queue[child + 1].order < queue[child].order) child++;
+      if (last.order < queue[child].order) break;
+      queue[at] = queue[child];
+      at = child;
+    }
+    queue[at] = last;
+  }
+  return first;
+};
+var __esmAsyncFail = (record, reason) => {
+  var queue = [record];
+  while (queue.length) {
+    var current = queue.pop();
+    if (current.state === 3 || current.state === 2) continue;
+    current.state = 3;
+    current.error = [reason];
+    if (current.reject) current.reject(reason);
+    current.resolve = current.reject = current.promise = current.body = 0;
+    for (var parent of current.parents) queue.push(parent);
+    current.parents = [];
+  }
+};
+var __esmAsyncDone = (record, queue) => {
+  if (record.state === 3) return;
+  record.state = 2;
+  if (record.resolve) record.resolve();
+  record.resolve = record.reject = record.promise = 0;
+  var parents = record.parents;
+  record.parents = [];
+  for (var parent of parents) {
+    if (parent.state === 1 && --parent.pending === 0) __esmAsyncPush(queue, parent);
+  }
+};
+var __esmAsyncDrain = (queue) => {
+  while (queue.length) {
+    let record = __esmAsyncPop(queue);
+    if (record.state !== 1) continue;
+    try {
+      var body = record.body;
+      record.body = 0;
+      var result = body();
+      if (result && typeof result.then === "function")
+        result.then(() => __esmAsyncComplete(record), (reason) => __esmAsyncFail(record, reason));
+      else __esmAsyncDone(record, queue);
+    } catch (reason) { __esmAsyncFail(record, reason); }
+  }
+};
+var __esmAsyncComplete = (record) => {
+  var queue = [];
+  __esmAsyncDone(record, queue);
+  __esmAsyncDrain(queue);
+};
+var __esmAsyncResult = (record, path) => {
+  var root = __esmAsyncRoot(record);
+  if (root.error) throw root.error[0];
+  if (root !== record && root.state !== 2 && !(path && path.includes(root))) record = root;
+  if (record.error) throw record.error[0];
+  if (record.state === 2) return;
+  if (path) return record;
+  return record.promise || (record.promise = new Promise((resolve, reject) => {
+    record.resolve = resolve;
+    record.reject = reject;
+  }));
+};
+var __esmAsync = (dependencies, body, record) => function init(path) {
+  if (!record) {
+    record = { state: 0, parents: [], pending: 0, body };
+    body = 0;
+  }
+  record.cycle || (record.cycle = record);
+  if (record.state === 1 && path && path.includes(record)) {
+    var root = __esmAsyncRoot(record);
+    var start = path.indexOf(root);
+    if (start < 0) start = path.indexOf(record);
+    for (var member of path.slice(start)) member.cycle = root;
+    return;
+  }
+  if (record.state === 0) {
+    record.state = 1;
+    try {
+      var start = dependencies;
+      dependencies = 0;
+      var pending = start((path || []).concat(record));
+      record.order = __esmAsyncOrder++;
+      for (var dependency of pending) {
+        if (dependency) {
+          record.pending++;
+          dependency.parents.push(record);
+        }
+      }
+      if (!record.pending) {
+        var queue = [];
+        __esmAsyncPush(queue, record);
+        __esmAsyncDrain(queue);
+      }
+    } catch (reason) { __esmAsyncFail(record, reason); }
+  }
+  return __esmAsyncResult(record, path);
+};
 var __commonJS = (cb, mod) => function __require() {
   try {
     return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;

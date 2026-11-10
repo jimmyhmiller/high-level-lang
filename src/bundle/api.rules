@@ -22,6 +22,7 @@ use bundle.tsconfig as tsc
 use bundle.ascii as ascii
 use bundle.finish as fin
 use bundle.hmr as hmr
+use bundle.chunking as packing
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -72,6 +73,7 @@ record Options {
   splitting: Bool,
   entry-names: Text,
   chunk-names: Text,
+  chunking: packing.Options,
   format: Format,
   global-name: Text,
   minify-identifiers: Bool,
@@ -116,7 +118,7 @@ fn default-optimize(n: Node) -> Node = fin.finished(minify.run(n), false)
 
 fn options-new(entry: Text, outfile: Text) -> Options =
   Options(entry: entry, entries: [entry], outfile: outfile, outdir: "", outbase: "", splitting: false,
-          entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]",
+          entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]", chunking: packing.options(),
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
           defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
@@ -389,7 +391,7 @@ fn delivered(o: Options, ws: [Written]) -> Void = match printing?(o) {
 fn files(options: Options) -> [Written] =
   with res.options = resolve-options(options), tsc.forced = options.tsconfig, ascii.braces = options.target >= 2015,
        cssb.loaders = loader-map(options) {
-    built(printable(options))
+    built(printable(options with { chunking: packing.checked(options.chunking) }))
   }
 
 fn written(ws: [Written]) -> Void = write-files!([w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
@@ -651,6 +653,7 @@ fn in-output?(chunk: chunks.Chunk?, id: Int) -> Bool = match chunk {
 # What running this chunk's entry looks like at its end.
 fn root-statements(root: Int) -> [Node] = match m.modules[root] {
   m.Module(kind: m.Cjs, ...) as mo => [stmt`export default $call_me();`] where call-me = e.final-of(an.require-sym(mo))
+  mo if an.wrapped?(mo) and an.asynchronous?(mo) => [ExprStmt(Await(exp`$call_me()`))] ++ exports-of-root(root) where call-me = e.final-of(an.init-sym(mo))
   mo if an.wrapped?(mo) => [stmt`$call_me();`] ++ exports-of-root(root) where call-me = e.final-of(an.init-sym(mo))
   _ => exports-of-root(root)
 }
@@ -663,7 +666,7 @@ fn chunk-root-statements(c: chunks.Chunk) -> [Node] = match c.root {
 # The body of one chunk, as text with placeholders in it.
 fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk]) -> Printed =
   Printed(text: r.text ++ "\n", base: 0, marks: r.marks)
-  where emission = with e.chunk-parts = some(c.parts) { e.program() },
+  where emission = with e.chunk-parts = some(c.parts), e.initializer-parts = c.initializers { e.program() },
         p = for-target(o, match o.minify-syntax {
           true => o.optimize(emission.tree)
           false => fold.run(emission.tree)
@@ -707,7 +710,7 @@ fn named-split(o: Options) -> [Written] =
   with e.chunk-paths = {root: chunks.placeholder(ids[root] ?? (panic "{} has no chunk", m.modules[root].path)) for root in roots} {
     chunks-written(o, all)
   } where roots = m.entries ++ an.linked.dynamic-roots,
-          all = chunks.chunks-of(roots),
+          all = timed(o.timing, "chunk: policy and fragments", chunks.configured(roots, o.chunking)),
           ids = {c.root: c.id for c in all if c.root >= 0}
 
 # Each chunk printed, its placeholders filled once every chunk's name is known.

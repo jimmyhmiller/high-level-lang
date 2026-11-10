@@ -6,6 +6,9 @@ use bundle.modules as m
 use bundle.analysis as an
 use bundle.emit as e
 use bundle.minhost as host
+use bundle.fragments as fragments
+use bundle.chunking as packing
+use hl.graph as graph
 
 record Chunk {
   id: Int,
@@ -13,40 +16,84 @@ record Chunk {
   root: Int,          # the module this chunk is the entry for, or -1 for a shared chunk
   roots: [Int],       # every root that needs it
   parts: {Int:Bool},
+  initializers: {Int:Bool},
   needs: {Int:[Text]} # from which other chunk, which names
 }
 
 fn key-of(roots: [Int]) -> Text = join([int-text(r) ++ "," for r in roots], "")
 
-# A file stays whole, as in esbuild: its live statements go where any of its roots can load them.
-fn roots-of(module: Int) -> [Int] = sort r in [r for m.db.entered(?r, module)] by r
-
-fn reaching(module: Int) -> [Int] = match roots-of(module) {
-  [] => panic "{}: a live statement no entry reaches", m.modules[module].path
-  found => found
-}
-
-# A live statement, and the roots that reach its file.
-record Live { part: Int, roots: [Int], key: Text }
-
-# Every root's own chunk first, even an empty one: it is still a file someone asked for. Then one for
-# each other set of roots that reaches live statements, in the order the statements come. A set
-# named twice has its statements in the last chunk of that set. Each chunk knows which names it
-# reads from which other.
-fn chunks-of(roots: [Int]) -> [Chunk] = [c with { needs: needs-of(c, homes) } for c in placed]
-  where live = [Live(part: p, roots: reaching(id), key: key-of(reaching(id)))
-                for id in m.order if e.included?(id) for p in e.parts-of(id) if e.live?(p)],
-        own-keys = {key-of([r]): true for r in roots},
-        groups = [[r] for r in roots] ++ [l.roots for l in live if not (l.key in own-keys) distinct l.key],
-        owner = {key-of(groups[i]): i for i in 0..len(groups)},
-        placed = [Chunk(id: i, key: key-of(groups[i]), root: root-at(roots, i), roots: groups[i],
-                        parts: {l.part: true for l in live if (owner[l.key] ?? -1) == i}, needs: {})
-                  for i in 0..len(groups)],
-        homes = {p: c.id for c in placed for p in keys(c.parts)}
-
 fn root-at(roots: [Int], i: Int) -> Int = match i {
   _ if i < len(roots) => roots[i]
   _ => -1
+}
+
+# All policies use the same placement engine. Whole modules and semantic fragments differ only
+# in the units supplied to the selected function; policy names have no semantic role here.
+fn configured(roots: [Int], options: packing.Options) -> [Chunk] =
+  planned(roots, fragments.model(options.fragments), options)
+
+fn planned(roots: [Int], model: fragments.Model, options: packing.Options) -> [Chunk] =
+  finalized(roots, model, stable-groups(checked-groups(model.units, proposed), model))
+  where pack = options.pack, proposed = pack(model.units, options.limits)
+
+# A policy proposes ownership, not new semantics. Every unit has exactly one home and an
+# effectful unit cannot gain consumers (which would execute it before the program requested it).
+fn checked-groups(units: [fragments.Unit], groups: [packing.Group]) -> [packing.Group] {
+  var assigned = [false for u in units]
+  var names: {Text:Bool} = {}
+  for g in groups {
+    if len(g.units) == 0 { panic "chunk policy returned an empty group {}", g.key }
+    if g.key in names { panic "chunk policy returned duplicate group key {}", g.key }
+    names[g.key] = true
+    for id in g.units {
+      if id < 0 or id >= len(units) { panic "chunk policy returned unknown unit {}", id }
+      if assigned[id] { panic "chunk policy placed unit {} more than once", id }
+      assigned[id] = true
+    }
+    let consumers = packing.consumers(packing.roots(g, units))
+    for id in g.units {
+      if not units[id].portable and packing.consumers(units[id].roots) != consumers {
+        panic "chunk policy would eagerly evaluate {} for a new consumer", units[id].path
+      }
+    }
+  }
+  if not (all found in assigned: found) { panic "chunk policy left a unit without a home" }
+  groups
+}
+
+# Regrouping can introduce cycles even when the original unit graph is acyclic. Collapse those
+# groups, preserve original statement order, and check the resulting evaluation demand again.
+fn stable-groups(groups: [packing.Group], model: fragments.Model) -> [packing.Group] =
+  checked-groups(model.units, [merged-group([groups[i] for i in bucket], model.units)
+                              for bucket in graph.buckets(graph.components(edges))])
+  where owner = {id: i for i in 0..len(groups) for id in groups[i].units},
+        edges = [[to for id in groups[i].units for dep in model.edges[id] for to in owner[dep]
+                     if to != i distinct to] for i in 0..len(groups)]
+
+fn merged-group(groups: [packing.Group], units: [fragments.Unit]) -> packing.Group =
+  packing.Group(key: key, units: sort id in [id for g in groups for id in g.units] by id)
+  where combined = packing.Group(key: "", units: [id for g in groups for id in g.units]),
+        own = packing.consumers(packing.roots(combined, units)),
+        key = if any g in groups: g.key == own then own else groups[0].key
+
+fn finalized(roots: [Int], model: fragments.Model, groups: [packing.Group]) -> [Chunk] =
+  [c with { needs: evaluation-needs(c.id, by-key[c.key], model.edges, unit-homes) ++ needs-of(c, homes) } for c in placed]
+  where own = {key-of([r]): true for r in roots},
+        group-keys = [key-of([r]) for r in roots] ++ [g.key for g in groups if not (g.key in own)],
+        by-key = {g.key: g for g in groups},
+        placed = [placed-group(i, group-keys[i], root-at(roots, i), model.units, by-key[group-keys[i]]) for i in 0..len(group-keys)],
+        homes = {p: c.id for c in placed for p in keys(c.parts)},
+        chunk-ids = {c.key: c.id for c in placed},
+        unit-homes = {id: chunk-ids[g.key] ?? -1 for g in groups for id in g.units}
+
+fn evaluation-needs(self: Int, group: packing.Group?, edges: [[Int]], homes: {Int:Int}) -> {Int:[Text]} =
+  {home: [] for g in group for id in g.units for dep in edges[id] for home in homes[dep] if home != self}
+
+fn placed-group(id: Int, key: Text, root: Int, units: [fragments.Unit], group: packing.Group?) -> Chunk = match group {
+  none => Chunk(id: id, key: key, root: root, roots: [root], parts: {}, initializers: {}, needs: {})
+  some(g) => Chunk(id: id, key: key, root: root, roots: packing.roots(g, units),
+                   parts: {p: true for at in g.units for p in units[at].parts},
+                   initializers: {p: true for at in g.units if units[at].evaluation for p in units[at].parts}, needs: {})
 }
 
 # A name a chunk reads, and the chunk it lives in.
@@ -61,6 +108,7 @@ fn needs-of(c: Chunk, homes: {Int:Int}) -> {Int:[Text]} =
 
 fn read-symbols(c: Chunk) -> [Int] =
   [s for p in keys(c.parts) for s in [x for m.db.mentions(p, ?x)] ++ [x for m.db.uses(p, ?x)]]
+  ++ [an.init-sym(m.modules[r]) for r in [c.root] if r >= 0 and an.wrapped?(m.modules[r])]
   ++ [best for r in [c.root] if r >= 0 for m.db.resolved(r, ?n, ?x) if let some(best) = e.resolved-export(r, n)]
 
 # A symbol as a chunk reads it: what an import resolves to, and the variable of a CommonJS import.

@@ -1,0 +1,81 @@
+# Evaluation-time purity shared by linking and fragment placement. Deferred bodies do not run
+# when their enclosing function, object or class is defined. No annotations override this proof.
+rules bundle.evaluation over bundle.js
+use bundle.js as js
+
+fn inert(n: Node) -> Bool = inert-value(n, {})
+
+fn inert-value(n: Node, hoisted: {Text:Bool}) -> Bool = match n {
+  None() | Num(_) | Str(_) | True() | False() | Null() => true
+  Regex(_) | TemplateFull(_) | Hole() => true
+  Ident(name) => name in hoisted
+  Neg(Num(_)) | Pos(Num(_)) => true
+  Paren(x) | Not(x) | Void(x) | Elem(x) | ElemLast(x) => inert-value(x, hoisted)
+  ArrayLit(List(xs...)) => all x in xs: inert-value(x, hoisted)
+  ObjectLit(List(xs...)) => all x in xs: inert-property(x, hoisted)
+  ClassExpr(_, heritage, members) => inert-class(heritage, members, hoisted)
+  FuncExpr(...) | GenExpr(...) | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) => true
+  _ => false
+}
+
+fn plain-key(n: Node) -> Bool = not (n is Computed(_))
+
+fn inert-property(n: Node, hoisted: {Text:Bool}) -> Bool = match n {
+  Prop(key, value) => plain-key(key) and inert-value(value, hoisted)
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...)
+    | AsyncMethod(key, ...) | AsyncGenMethod(key, ...) => plain-key(key)
+  _ => false
+}
+
+fn inert-class(heritage: Node, body: Node, hoisted: {Text:Bool}) -> Bool =
+  heritage is None() and all member in body.members.kids: inert-member(member, hoisted)
+
+fn inert-member(n: Node, hoisted: {Text:Bool}) -> Bool = match n {
+  ClassEmpty() => true
+  StaticMethod(method) => inert-property(method, hoisted)
+  StaticField(key, init) => plain-key(key) and inert-value(init, hoisted)
+  Field(key, _) => plain-key(key)
+  _ => inert-property(n, hoisted)
+}
+
+fn inert-stmt(n: Node) -> Bool = inert-statement(n, {})
+
+fn inert-statement(n: Node, hoisted: {Text:Bool}) -> Bool = match n {
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | Empty() | None() => true
+  VarDecl(List(ds...)) | LetDecl(List(ds...)) | ConstDecl(List(ds...)) | ExportVar(List(ds...)) =>
+    all d in ds: d.target is BindName(_) and inert-value(d.init, hoisted)
+  ClassDecl(_, heritage, members) => inert-class(heritage, members, hoisted)
+  ExportFunction(d) | ExportLexical(d) | ExportClass(d) => inert-statement(d, hoisted)
+  Import(...) | ImportBare(_) | ExportNamed(_) | ExportAll(_) | ExportAllAs(...) | ExportFrom(...) => true
+  ExprStmt(Str(_)) => true
+  _ => false
+}
+
+# Hoisted function bindings are initialized before whole-module evaluation. Reading one does
+# not itself require a module guard. This proof is deliberately NOT used by inert-stmt():
+# relocating an individual alias past a write to that function would still be incorrect.
+fn module-inert?(program: Node) -> Bool = all s in program.body.kids: inert-statement(s, hoisted)
+  where hoisted = {name: true for s in program.body.kids for name in function-names(s)}
+
+fn function-names(n: Node) -> [Text] = match n {
+  FuncDecl(name, ...) | GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) => [name.text]
+  ExportFunction(d) => function-names(d)
+  _ => []
+}
+
+fn static-import?(n: Node) -> Bool = match n {
+  Import(...) | ImportBare(_) | ExportAll(_) | ExportAllAs(...) | ExportFrom(...) => true
+  _ => false
+}
+
+# Await in a deferred function or an instance field is not module evaluation. Computed class
+# keys, heritage and static initialization still participate in module evaluation.
+fn top-await?(n: Node) -> Bool = match n {
+  Await(_) => true
+  ForOf(wait, ...) if not (wait is None()) => true
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncExpr(...) | GenExpr(...)
+    | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) => false
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...)
+    | AsyncMethod(key, ...) | AsyncGenMethod(key, ...) | Field(key, _) => top-await?(key)
+  _ => any k in n.kids: top-await?(k)
+}

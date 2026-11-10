@@ -7,6 +7,7 @@ use bundle.modules as m
 use bundle.analysis as an
 use bundle.minhost as host
 use bundle.naming as nm
+use bundle.evaluation as ev
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -20,6 +21,7 @@ setting emitting: Emitting
 # Code splitting: the statements of the chunk being printed, none when it is the whole program; and
 # what to write for the path of the chunk each root module starts.
 setting chunk-parts: {Int:Bool}?
+setting initializer-parts: {Int:Bool}
 setting chunk-paths: {Int:Text}
 
 fn chunk-path(root: Int) -> Text =
@@ -634,10 +636,50 @@ fn unit-namespace(u: Unit) -> [Node] = match included?(u.module) and any-part-he
 # it goes before it, where it still loads first.
 fn module-body(u: Unit) -> [Node] = match here.kind {
   Cjs => [cjs-part()]
+  _ if an.scheduled?(here) => scheduled-body(u)
   _ => match an.wrapped?(here) {
     true => [s for s in outputs if import-statement?(s)] ++ wrapped-module([s for s in outputs if not import-statement?(s)])
     false => outputs
   } where outputs = [s for p in u.parts if live?(p) and in-this-chunk?(p) for s in part-body(p)]
+}
+
+# Only the island's home defines the initializer. Other fragments are ordinary inert
+# declarations, even when the packer happens to put them beside the initialization island.
+fn scheduled-body(u: Unit) -> [Node] =
+  [s for p in parts if not (p in initializer-parts) for s in part-body(p)]
+  ++ [s for s in imports if import-statement?(s)]
+  ++ (if init-part in parts then match an.asynchronous?(here) {
+        true => async-module(import-parts, statements)
+        false => wrapped-module([s for s in imports if not import-statement?(s)] ++ statements)
+      } else [])
+  where parts = [p for p in u.parts if live?(p) and in-this-chunk?(p)],
+        init-part = (an.linked.part-starts[here.id] ?? -2) + 1,
+        import-parts = [p for p in parts if p in initializer-parts if ev.static-import?(an.stmt-in(body, here, p))],
+        imports = [s for p in import-parts for s in part-body(p)],
+        statements = [s for p in parts if p in initializer-parts if not ev.static-import?(an.stmt-in(body, here, p)) for s in part-body(p)]
+
+# Callback locals are fresh relative to the emitted dependency code. Module-body bindings
+# remain outside these callbacks, so dependency temporaries cannot shadow user bindings.
+everywhere fn identifier-names(n: Node) -> [Text] = match n { Ident(x) | BindName(x) => [x] }
+
+fn fresh-local(base: Text, used: {Text:Bool}) -> Text = if base in used then fresh-local(base ++ "_", used) else base
+
+fn async-module(parts: [Int], statements: [Node]) -> [Node] =
+  [VarDecl(List(hoisted...)) for h in [hoisted] if len(h) > 0]
+  ++ [s for s in statements if function-decl?(s)]
+  ++ [stmt`var $name = $wrap(($path) => { var $waits = []; $$dependencies; return $waits; }, $callback);`]
+  where outputs = [s for p in parts for s in part-body(p) if not import-statement?(s)],
+        used = {x: true for s in outputs for x in identifier-names(s)},
+        path = fresh-local("__evaluation_path", used), waits = fresh-local("__evaluation_waits", used),
+        hoisted = [declared-names(d)... for VarDecl(List(ds...)) in outputs ++ statements for d in ds],
+        dependencies = [s for p in parts for s in async-dependency(p, path, waits)],
+        body = [initializing(s)... for s in statements if not function-decl?(s)],
+        callback = if an.own-await?(here) then exp`async () => { $$body }` else exp`() => { $$body }`,
+        name = final-of(an.init-sym(here)), wrap = helper-name("__esmAsync")
+
+fn async-dependency(p: Int, path: Text, waits: Text) -> [Node] = match imported-module(here, p) {
+  id if an.asynchronous?(m.modules[id]) => [stmt`$waits.push($init($path));`] where init = final-of(an.init-sym(m.modules[id]))
+  _ => [initializing(s)... for s in part-body(p) if not import-statement?(s)]
 }
 
 # What the module adds to the namespace objects: an ES module's own, made by its first part, when

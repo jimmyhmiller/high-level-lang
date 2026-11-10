@@ -1,0 +1,145 @@
+# Packing policies over semantic units. These are ordinary language functions, selected by the
+# build; neither the compiler nor the emitter knows the names or decisions of these policies.
+rules bundle.chunking
+use bundle.fragments as f
+
+record Limits { min-size: Int, max-size: Int, max-requests: Int, request-cost: Int }
+record Group { key: Text, units: [Int] }
+record Options {
+  name: Text, fragments: Bool, limits: Limits,
+  pack: Fn([f.Unit],Limits)->[Group]
+}
+
+fn options() -> Options = Options(name: "exact", fragments: false,
+  limits: Limits(min-size: 20000, max-size: 200000, max-requests: 0, request-cost: 2000), pack: exact)
+
+fn policies() -> {Text:Fn([f.Unit],Limits)->[Group]} = {"exact": exact, "package": packages, "balanced": balanced}
+
+fn selected(o: Options, name: Text) -> Options =
+  o with { name: name, pack: policies()[name] ?? panic "unknown chunk policy {}; available: exact, package, balanced", name }
+
+fn consumers(roots: [Int]) -> Text = join([int-text(r) ++ "," for r in roots], "")
+fn exact-key(u: f.Unit) -> Text = consumers(u.roots)
+
+fn package-name(path: Text) -> Text = match last-index-of(path, "node_modules/") {
+  none => dir-of(path)
+  some(at) => match split(path[at + 13..len(path)], "/") {
+    [scope, name, ...] if starts-with(scope, "@") => scope ++ "/" ++ name
+    [name, ...] => name
+    _ => path
+  }
+}
+
+fn package-key(u: f.Unit) -> Text = match len(u.roots) {
+  1 => exact-key(u)
+  _ => exact-key(u) ++ "package:" ++ package-name(u.path)
+}
+
+# Hash buckets preserve first appearance and avoid comparing each unit with every other unit.
+fn group-by(units: [f.Unit], key: Fn(f.Unit)->Text) -> [Group] {
+  var ids: {Text:Int} = {}
+  var names: [Text] = []
+  var members: [[Int]] = []
+  for u in units {
+    let name = key(u)
+    let index = ids[name] ?? len(names)
+    if index == len(names) {
+      ids[name] = index
+      names ++= [name]
+      members ++= [[]]
+    }
+    members[index] ++= [u.id]
+  }
+  [Group(key: names[i], units: members[i]) for i in 0..len(names)]
+}
+
+fn exact(units: [f.Unit], limits: Limits) -> [Group] = group-by(units, exact-key)
+fn packages(units: [f.Unit], limits: Limits) -> [Group] = group-by(units, package-key)
+
+fn roots(g: Group, units: [f.Unit]) -> [Int] =
+  sort r in [r for id in g.units for r in units[id].roots distinct r] by r
+
+fn size(g: Group, units: [f.Unit]) -> Int = sum id in g.units: units[id].bytes
+
+fn combined(a: Group, b: Group, units: [f.Unit]) -> Group =
+  Group(key: key, units: a.units ++ b.units)
+  where consumers-set = sort r in [r for r in roots(a, units) ++ roots(b, units) distinct r] by r,
+        own = consumers(consumers-set), key = if a.key == own or b.key == own then own else a.key
+
+fn can-merge(a: Group, b: Group, units: [f.Unit]) -> Bool =
+  consumers(roots(a, units)) == consumers(roots(b, units))
+  or (all id in a.units ++ b.units: units[id].portable)
+
+# Approximate bytes saved by removing requests, less the extra code each consumer would load.
+# This is a policy cost model, not a semantic permission: can-merge supplies that separately.
+fn benefit(a: Group, b: Group, units: [f.Unit], limits: Limits) -> Int =
+  common * limits.request-cost - (sa * (len(rb) - common) + sb * (len(ra) - common))
+  where ra = roots(a, units), rb = roots(b, units), common = len([r for r in ra if r in rb]),
+        sa = size(a, units), sb = size(b, units)
+
+fn split-large(groups: [Group], units: [f.Unit], limit: Int) -> [Group] {
+  var answer: [Group] = []
+  for group in groups {
+    var bucket: [Int] = []
+    var bytes = 0
+    var number = 0
+    for id in group.units {
+      if limit > 0 and bytes + units[id].bytes > limit and len(bucket) > 0 {
+        answer ++= [Group(key: numbered-key(group.key, number), units: bucket)]
+        bucket = []
+        bytes = 0
+        number = number + 1
+      }
+      bucket ++= [id]
+      bytes = bytes + units[id].bytes
+    }
+    if len(bucket) > 0 { answer ++= [Group(key: numbered-key(group.key, number), units: bucket)] }
+  }
+  answer
+}
+
+fn numbered-key(key: Text, n: Int) -> Text = if n == 0 then key else key ++ "~" ++ int-text(n)
+
+fn requests(groups: [Group], units: [f.Unit]) -> {Int:Int} {
+  var counts: {Int:Int} = {}
+  for g in groups { for r in roots(g, units) { counts[r] = (counts[r] ?? 0) + 1 } }
+  counts
+}
+
+fn should-merge(a: Group, b: Group, units: [f.Unit], limits: Limits, counts: {Int:Int}) -> Bool =
+  can-merge(a, b, units)
+  and (limits.max-size == 0 or size(a, units) + size(b, units) <= limits.max-size)
+  and ((size(a, units) < limits.min-size or size(b, units) < limits.min-size) and benefit(a, b, units, limits) >= 0
+       or (limits.max-requests > 0 and (any r in roots(a, units) if r in roots(b, units): (counts[r] ?? 0) > limits.max-requests)))
+
+# Bounded adjacent greedy passes: no all-pairs candidate search. Each successful pass removes
+# at least one group; pairing disjoint neighbors lets common cases converge in logarithmic passes.
+fn merge-pass(groups: [Group], units: [f.Unit], limits: Limits) -> [Group] {
+  let counts = requests(groups, units)
+  var answer: [Group] = []
+  var i = 0
+  while i < len(groups) {
+    if i + 1 < len(groups) and should-merge(groups[i], groups[i + 1], units, limits, counts) {
+      answer ++= [combined(groups[i], groups[i + 1], units)]
+      i = i + 2
+    } else {
+      answer ++= [groups[i]]
+      i = i + 1
+    }
+  }
+  answer
+}
+
+fn merged(groups: [Group], units: [f.Unit], limits: Limits) -> [Group] = match merge-pass(groups, units, limits) {
+  next if len(next) == len(groups) => next
+  next => merged(next, units, limits)
+}
+
+fn balanced(units: [f.Unit], limits: Limits) -> [Group] =
+  merged(split-large(packages(units, limits), units, limits.max-size), units, limits)
+
+fn checked(o: Options) -> Options = match o.limits {
+  Limits(min-size: a, max-size: b, max-requests: c, request-cost: d) if min(min(a, b), min(c, d)) < 0 =>
+    panic "chunk size, request limit and request cost must be non-negative"
+  _ => o
+}

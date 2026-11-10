@@ -5,6 +5,8 @@ use bundle.link as link
 use bundle.scopes as sc
 use bundle.resolve as res
 use bundle.modules as m
+use bundle.evaluation as ev
+use hl.graph as graph
 
 # An import from a CommonJS module, which turns into a property read.
 record CjsImport { importer: Int, import-var: Int, name: Text, namespace: Bool }
@@ -45,6 +47,9 @@ record Made { purpose: Purpose, owner: Int, exported: Text, scope: Int, name: Te
 # re-exports from CommonJS. A part's statement is its module's (`stmt-of`).
 record Linked {
   wrapped: {Int:Bool},
+  scheduled: {Int:Bool},
+  asynchronous: {Int:Bool},
+  awaiting: {Int:Bool},
   dynamic-roots: [Int],
   made: [Made],
   first-made: Int,
@@ -110,6 +115,10 @@ fn reexport-sym(mo: m.Module, exported: Text) -> Int = reexport-in(linked.reexpo
 fn reexport-in(reexports: {Text:Int}, mo: m.Module, exported: Text) -> Int =
   reexports[reexport-key(mo.id, exported)] ?? panic "linking made no symbol for {}'s re-export {}", mo.path, exported
 fn wrapped?(mo: m.Module) -> Bool = mo.id in linked.wrapped
+fn scheduled?(mo: m.Module) -> Bool = mo.id in linked.scheduled
+fn asynchronous?(mo: m.Module) -> Bool = mo.id in linked.asynchronous
+fn own-await?(mo: m.Module) -> Bool = mo.id in linked.awaiting
+fn init-helper(mo: m.Module) -> Text = if asynchronous?(mo) then "__esmAsync" else wrapper-helper("__esm")
 
 # ---------------------------------------------------------------- what statements say
 
@@ -581,18 +590,22 @@ fn kept-star?(mo: m.Module, t: m.Module) -> Bool = kept?(t) and mo.id in m.entri
 # What linking needs of one module, kept while what it is made of stays the same: what it loads on
 # demand, the names its imports bind, what it re-exports from CommonJS, the symbols its statements
 # need made, whether it re-exports names only known at run time, and how many statements it has.
-record ModuleLink { loads: [Load], bindings: [Bound], reexports: [Reexport], made: [Made], dynamic: Bool, statements: Int }
+record ModuleLink { loads: [Load], bindings: [Bound], reexports: [Reexport], made: [Made], dynamic: Bool, statements: Int, initializes: Bool, imports: [Int], awaits: Bool }
 
 fn module-link(id: Int) -> ModuleLink = with here = m.modules[id], body = m.body-of(id) {
   ModuleLink(loads: [loads-of(here, n)... for n in on-demand-calls(id)], bindings: import-bindings(here),
              reexports: [r for s in linked-statements(here) for r in statement-reexports(here, s)],
              made: [x for s in linked-statements(here) for x in statement-made(here, s)],
              dynamic: any s in linked-statements(here): dynamic-star?(here, s),
-             statements: len(body.tree.body.kids))
+             statements: len(body.tree.body.kids),
+             awaits: linking.splitting and ev.top-await?(body.tree),
+             initializes: linking.splitting and not ev.module-inert?(body.tree),
+             imports: [target for s in body.tree.body.kids if linking.splitting for spec in m.import-spec-of(s) for target in here.dep-ids[spec] distinct target])
 }
 
 fn linked-of(links: [ModuleLink], first: Int) -> Linked =
-  Linked(wrapped: wrapped, dynamic-roots: roots, made: made, first-made: first, made-ids: ids, requires: made-for(made, ids, Require),
+  Linked(wrapped: wrapped, scheduled: scheduled, asynchronous: asynchronous,
+         awaiting: {m.order[i]: true for i in 0..len(links) if links[i].awaits}, dynamic-roots: roots, made: made, first-made: first, made-ids: ids, requires: made-for(made, ids, Require),
          namespaces: made-for(made, ids, Exports), inits: made-for(made, ids, Init), import-vars: import-vars,
          reexports: reexports,
          cjs-imports: {b.symbol: CjsImport(importer: id, import-var: symbol-in(import-vars, import-key(m.modules[id], b.target)),
@@ -610,7 +623,10 @@ fn linked-of(links: [ModuleLink], first: Int) -> Linked =
   where loads = [x for l in links for x in l.loads],
         roots = [l.target for l in loads if linking.splitting and l.by-import and m.modules[l.target].kind != External distinct l.target],
         seeds = [l.target for l in loads if not (linking.splitting and l.by-import)],
-        wrapped = fold w = none-wrapped() for t in seeds: wrapping(t, w),
+        delayed = fold w = none-wrapped() for t in seeds: wrapping(t, w),
+        asynchronous = if linking.splitting then checked-async(links, async-modules(links)) else {},
+        scheduled = if linking.splitting then scheduling(links, roots, asynchronous) else {},
+        wrapped = delayed ++ scheduled,
         bindings = [l.bindings for l in links],
         made = [x for x in [x for id in m.order for x in module-made(m.modules[id], wrapped)]
                            ++ [import-made(m.modules[m.order[i]], b.target) for i in 0..len(m.order) for b in bindings[i]
@@ -622,6 +638,43 @@ fn linked-of(links: [ModuleLink], first: Int) -> Linked =
         reexports = {reexport-key(made[i].owner, made[i].exported): ids[i] for i in 0..len(made) if made[i].purpose == ReexportName},
         starts = m.part-starts([m.modules[id].path for id in m.order],
                                 [part-count(m.modules[m.order[k]], wrapped, links[k].statements) for k in 0..len(m.order)])
+
+# A module with observable evaluation, or a static dependency with such evaluation, receives
+# a once-only initializer. Loading chunk definitions cannot execute it; importers call it in
+# source import order. Pure leaves remain ordinary declarations with no wrapper overhead.
+# Unimported entry/lazy roots with synchronous dependencies use host ESM evaluation directly;
+# no other bundled module can bypass that host boundary to read their definitions early.
+fn scheduling(links: [ModuleLink], dynamic-roots: [Int], asynchronous: {Int:Bool}) -> {Int:Bool} =
+  {mo.id: true for mo in m.modules if mo.kind == Esm and not safe[mo.id]
+    if not (mo.id in roots and not (mo.id in imported) and not (mo.id in required)
+            and not (any dep in edges[mo.id]: dep in asynchronous))}
+  where roots = {r: true for r in m.entries ++ dynamic-roots},
+        imported = {dep: true for l in links for dep in l.imports},
+        required = {load.target: true for l in links for load in l.loads if not load.by-import},
+        by-id = {m.order[i]: links[i] for i in 0..len(m.order)},
+        edges = [(first l in by-id[mo.id]: l.imports) ?? [] for mo in m.modules],
+        inert = [mo.kind == Runtime or (mo.kind == Esm and not ((first l in by-id[mo.id]: l.initializes) ?? true)) for mo in m.modules],
+        safe = graph.closed-safe(edges, inert)
+
+fn async-modules(links: [ModuleLink]) -> {Int:Bool} =
+  {mo.id: true for mo in m.modules if mo.kind == Esm and not safe[mo.id]}
+  where by-id = {m.order[i]: links[i] for i in 0..len(m.order)},
+        edges = [(first l in by-id[mo.id]: l.imports) ?? [] for mo in m.modules],
+        synchronous = [not ((first l in by-id[mo.id]: l.awaits) ?? false) for mo in m.modules],
+        safe = graph.closed-safe(edges, synchronous)
+
+# A synchronous require cannot wait for an async module graph. Reject that unsupported
+# interoperation explicitly instead of exposing uninitialized bindings or emitting invalid JS.
+fn checked-async(links: [ModuleLink], asynchronous: {Int:Bool}) -> {Int:Bool} {
+  for l in links {
+    for load in l.loads {
+      if not load.by-import and load.target in asynchronous {
+        panic "cannot require async ES module {}; use import() instead", m.modules[load.target].path
+      }
+    }
+  }
+  asynchronous
+}
 
 # ---------------------------------------------------------------- the facts
 
@@ -681,7 +734,8 @@ fn facts-of(id: Int, summaries: [Summary], start: Int) -> [link.Fact] = module-f
 # Facts for one module, its parts numbered from `start`. CommonJS is one opaque part with effects,
 # whose only symbol is its `require_x`; its dependencies are whatever it `require`s.
 fn module-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] =
-  [link.fact-module-effects(id) for id in [mo.id] if mo.side-effects] ++ parts-facts(mo, summaries, start)
+  [link.fact-module-effects(id) for id in [mo.id] if mo.side-effects]
+  ++ [link.fact-wrapped(mo.id) for id in [mo.id] if wrapped?(mo)] ++ parts-facts(mo, summaries, start)
 
 fn parts-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] = match mo.kind {
   Cjs => [link.fact-part-of(start, mo.id), link.fact-effect(start), link.fact-declares(start, require-sym(mo)),
@@ -711,7 +765,8 @@ fn cjs-statement-facts(mo: m.Module, sm: Summary, part: Int, directive: Bool) ->
 # object keeps; and the wrapper's `init_x`.
 fn synthetic-facts(mo: m.Module, start: Int) -> [link.Fact] = match mo.kind, wrapped?(mo) {
   Esm, true => namespace-part(mo, start) ++ [link.fact-part-of(start + 1, mo.id), link.fact-declares(start + 1, init-sym(mo)),
-                                         link.fact-mentions(start + 1, helper(wrapper-helper("__esm")))]
+                                         link.fact-mentions(start + 1, helper(init-helper(mo)))]
+                      ++ [link.fact-init-part(start + 1, mo.id) for id in [mo.id] if linking.splitting]
   Esm, false => namespace-part(mo, start)
   _, _ => []
 }
@@ -779,7 +834,9 @@ fn exported-by(mo: m.Module, s: Node) -> [link.Fact] = match s {
 fn imported(mo: m.Module, part: Int, t: Int) -> [link.Fact] = [link.fact-imports(mo.id, t)] ++ initialised(part, m.modules[t])
 
 fn initialised(part: Int, mo: m.Module) -> [link.Fact] = match wrapped?(mo) {
+  true if scheduled?(mo) => [link.fact-mentions(part, init-sym(mo)), link.fact-initializes(part, mo.id)]
   true => [link.fact-mentions(part, init-sym(mo)), link.fact-effect(part)]
+          ++ [link.fact-initializes(part, mo.id) for id in [mo.id] if linking.splitting]
   false => []
 }
 
@@ -816,7 +873,7 @@ fn statement-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact]
   # The runtime's statements are only ever live through a mention, and every statement of a wrapped
   # module runs when its initialiser does.
   _ => summary-facts(mo, part, sm) ++ exported-by(mo, s)
-       ++ [link.fact-effect(part) for p in [part] if wrapped?(mo) or not (mo.kind == Runtime or sm.pure)]
+       ++ [link.fact-effect(part) for p in [part] if (wrapped?(mo) and not scheduled?(mo)) or not (mo.kind == Runtime or sm.pure)]
 }
 
 # An import of an opaque module holds it in a variable, made an ES module. A kept one declares its

@@ -204,6 +204,93 @@ how the code moved out of Coil without changing behaviour. It passes no `--targe
 the previous commit's build, and `tools/same-split.py NEW BASE` code splitting and stylesheet assets,
 hashed file names and maps included.
 
+## Configurable chunks and fragments
+
+Chunk packing and placement granularity are independent choices:
+
+```sh
+out/bin/esb home.js admin.js --splitting --format=esm --outdir=out/site \
+  --chunk-policy=balanced --fragments \
+  --chunk-min-size=20000 --chunk-max-size=200000 \
+  --chunk-max-requests=8 --chunk-request-cost=2000
+```
+
+The default is `exact` with whole modules. `exact` groups units by the entries/dynamic roots
+that consume them. `package` further divides shared groups by npm package (or source directory).
+`balanced` starts there, splits oversized groups between units, then merges adjacent groups using
+size and request budgets. Request cost estimates the bytes worth spending to save a request;
+only inert code may gain consumers. These are selectable policies, rather than replicas of any
+particular bundler's algorithm. Size estimates use source spans, not compressed output. Budgets
+are hints when a module, dependency cycle, or evaluation constraint is indivisible. A zero maximum
+disables that limit. Size/request settings apply to `balanced`.
+
+`--fragments` allows independent declarations in the same module to land in different chunks.
+It uses existing parsed statements and linker facts; it does not reparse synthetic modules.
+Functions, inert object/array literals, and classes without eager side effects can separate.
+Calls, writes, inheritance, computed keys and other order-sensitive initialization form one
+initialization island per module. Every fragment depends on that island; symbol cycles pull in
+anything initialization reads or calls, preserving source order and shared state. Unrelated
+exports can still separate even when the module initializes state or runs effects. Consumers
+propagate through the resulting graph before packing. Property reads, spreads and eager binding
+reads are conservatively grouped because getters, coercion and read-before-initialization matter.
+Dynamic scopes, `import.meta`, wrappers, duplicate declarations, module cycles and dependencies
+that cannot be analyzed retain a whole-module boundary. Dependency cycles are condensed and
+dynamic imports retain their lazy boundary. For bundled modules with observable evaluation,
+chunks load definitions and once-only initializers; each entry then initializes its static
+dependencies in source import order before running its body. This preserves different evaluation
+orders for different entries, caches initialization errors per module, and lets unrelated entries
+initialize after another entry fails. Top-level await propagates through static dependencies;
+async evaluation tracks pending dependencies, async parents and cycle roots so suspended siblings,
+parent microtasks and concurrent entry loads retain their evaluation constraints. A synchronous
+`require()` of an async module graph is rejected; use `import()` instead. Pure leaf modules avoid
+initializer wrappers.
+With a single output, fragments do not reorder emission. Turn them off with `--fragments=false`.
+
+The runtime build spec can choose both:
+
+```text
+bundler
+target site
+  entries "home.js" "admin.js"
+  outdir "out/site"
+  splitting
+  format esm
+  fragments on
+  chunk-policy balanced
+  chunk-min-size 20000
+  chunk-max-size 200000
+  chunk-max-requests 8
+  chunk-request-cost 2000
+end
+```
+
+Policies are ordinary `.rules` functions with type
+`Fn([bundle.fragments.Unit], bundle.chunking.Limits) -> [bundle.chunking.Group]`.
+A unit supplies its parts, source modules/path, consumers, byte estimate, portability and
+evaluation-island marker.
+A group supplies a unique key and unit IDs. Every unit must occur exactly once. The placement
+engine validates ownership, rejects new consumers of nonportable code, and collapses chunk cycles.
+A canonical consumer key puts a group in its entry facade; other keys create shared files.
+See `src/app/chunk-policies.rules` for the `directories` example and `Steps.chunkers` in
+`src/app/build.rules` for registration. Adding a policy needs no compiler or emitter changes.
+The generic graph algorithms, fragment eligibility and built-in policies all live in `.rules`.
+
+`python3 tools/chunking-check.py` checks policy/mode combinations and execution semantics.
+`python3 tools/evaluation-check.py` compares original ESM and split outputs in both entry orders,
+including conflicting import order, diamonds, cycles, lazy imports, cached errors, top-level
+await, async-parent microtasks, pending async cycles and concurrent entry loads. All policies and
+fragment modes are covered, with minification/source maps tested on the parallel pipeline.
+`python3 tools/chunking-bench.py --baseline PATH --runs 7` compares time, CPU, memory and instructions
+against a frozen binary on real libraries, many small modules, a large single module, and a
+mixed module with classes, object literals and initialization effects.
+The mixed-module fixture exercises classes, object configuration and an initialization effect.
+Compare initial dependency-closure bytes as well as total output: fragments primarily avoid
+loading declarations used by another entry. Ordered initialization adds runtime guards, so
+size/performance measurements must include those guards. Results are recorded in the project pad.
+Use `--baseline-fragments` when comparing against an older fragment-capable binary.
+Use `--iterations 5` to amortize launch overhead and CPU timer resolution. Multi-output watch
+and disk caching retain their existing CLI restriction; single-output caching accepts fragments.
+
 ## Paired client/server builds
 
 A target with `client-outfile` builds one server entry and discovers browser entries from its
