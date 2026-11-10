@@ -1,0 +1,195 @@
+# Paired builds: the policy is Datalog; parsing, resolution, linking and emission are the same
+# operations an ordinary build uses. The server sees references at each `use client` boundary.
+rules bundle.boundaries over bundle.js
+use bundle.js as js
+use bundle.api as api
+use bundle.modules as m
+use bundle.resolve as res
+use bundle.tsconfig as tsc
+use bundle.analysis as an
+use bundle.emit as emit
+use bundle.minhost as host
+use bundle.boundary-policy as policy
+
+record Source {
+  path: Text, tree: Node, specs: [Text], client: Bool, server-only: Bool, client-only: Bool
+}
+record Edge { from: Text, to: Text }
+record Walk { sources: [Source], edges: [Edge], parents: {Text:Text}, roots: [Text] }
+record Boundary { path: Text, id: Text, exports: [Text] }
+
+# Each scan has its own resolution conditions. Client dependencies are not resolved using the
+# server's package conditions, even when both environments import the same source file.
+setting stop-at-client: Bool
+setting browser: Bool
+setting generated: {Text:Text}
+
+fn marker?(spec: Text) -> Bool = spec == "server-only" or spec == "client-only"
+
+fn directive-names(stmts: [Node]) -> [Text] =
+  [unquote(s.expr.text) for s in stmts while s is ExprStmt(Str(_))]
+
+everywhere fn server-action?(n: Node) -> Bool = match n {
+  FuncBody(List(stmts...)) if "use server" in directive-names(stmts) => true
+}
+
+fn inspected(path: Text) -> Source = match path {
+  "external:" ++ spec => Source(path: path, tree: js.parse("", path), specs: [], client: false,
+                               server-only: res.node-builtin?(spec), client-only: false)
+  _ => Source(path: path, tree: p.tree, specs: p.specs, client: "use client" in ds,
+              server-only: "server-only" in p.specs, client-only: "client-only" in p.specs)
+    where p = m.parsed-file(m.Pending(path: path, text: m.as-module(m.source-of(path), path), ready: true)),
+          ds = checked-directives(p.parsed, path)
+}
+
+fn checked-directives(tree: Node, path: Text) -> [Text] = match directive-names(tree.body.kids) {
+  ds if "use server" in ds or server-action?(tree) => panic "{}: use server actions are not supported by paired builds yet; use server-only to restrict a module", path
+  ds => ds
+}
+
+fn edge-to(spec: Text, importer: Text) -> Text = match browser and res.node-builtin?(m.aliased(spec)) {
+  true => "external:" ++ m.aliased(spec)
+  false => m.lead(spec, importer).key
+}
+
+fn dependencies(s: Source) -> [Edge] =
+  [Edge(from: s.path, to: edge-to(spec, s.path)) for spec in s.specs if not marker?(spec)]
+
+fn children(path: Text) -> [Text] = match stop-at-client and s.client {
+  true => []
+  false => [e.to for e in dependencies(s)]
+} where s = inspected(path)
+
+fn walked(o: api.Options, roots: [Text], client: Bool) -> Walk =
+  with res.options = api.resolve-options(o), tsc.forced = o.tsconfig,
+       m.loading = api.loading-of(o, dir-of(o.outfile)), stop-at-client = not client, browser = client {
+    walked-now(roots)
+  }
+
+fn walked-now(roots: [Text]) -> Walk =
+  Walk(sources: sources, roots: roots,
+       edges: [dependencies(s)... for s in sources if not (stop-at-client and s.client)],
+       parents: {w.pre[i]: w.pre[w.parent[i]] for i in 0..len(w.pre) if w.parent[i] >= 0})
+  where w = depth-first(roots, children), sources = [inspected(path) for path in w.pre]
+
+fn import-chain(path: Text, parents: {Text:Text}) -> [Text] = match parents[path] {
+  none => [m.shown-path(path)]
+  some(parent) => import-chain(parent, parents) ++ [m.shown-path(path)]
+}
+
+fn module-facts(s: Source, ids: {Text:Int}) -> [policy.Fact] =
+  [policy.fact-client-entry(id) for id in [ids[s.path] ?? -1] if s.client]
+  ++ [policy.fact-server-only(id) for id in [ids[s.path] ?? -1] if s.server-only]
+  ++ [policy.fact-client-only(id) for id in [ids[s.path] ?? -1] if s.client-only]
+
+fn checked(server: Walk, client: Walk) -> [Text] = match bad-client, bad-server {
+  [id, ...], _ => panic "server-only module reached from the client: {}", join(import-chain(paths[id], client.parents), " -> ")
+  _, [id, ...] => panic "client-only module reached from the server: {}", join(import-chain(paths[id], server.parents), " -> ")
+  _, _ => [paths[id] for db.reference(?id)]
+} where paths = [s.path for s in server.sources ++ client.sources distinct s.path],
+        ids = {paths[i]: i for i in 0..len(paths)},
+        db = policy.solved([module-facts(s, ids)... for s in server.sources ++ client.sources]
+             ++ [policy.fact-server-root(ids[p] ?? -1) for p in server.roots]
+             ++ [policy.fact-client-root(ids[p] ?? -1) for p in client.roots]
+             ++ [policy.fact-server-edge(ids[e.from] ?? -1, ids[e.to] ?? -1) for e in server.edges]
+             ++ [policy.fact-client-edge(ids[e.from] ?? -1, ids[e.to] ?? -1) for e in client.edges]),
+        bad-client = [id for db.invalid-client(?id)], bad-server = [id for db.invalid-server(?id)]
+
+# Poison-package imports are declarations to the policy, not packages to execute. The empty
+# modules are supplied through ordinary hooks, without changing the resolver or compiler.
+fn marker-path(spec: Text, importer: Text) -> Text? =
+  first s in [spec] if marker?(s): "boundary:" ++ s
+
+fn marker-text(path: Text) -> Text? = match path {
+  "boundary:server-only" | "boundary:client-only" => some("export {};")
+  _ => none
+}
+
+fn with-markers(o: api.Options) -> api.Options =
+  o with { on-resolve: [marker-path] ++ o.on-resolve, on-load: [marker-text] ++ o.on-load }
+
+# Discover names with the existing linker, including aliases, namespace exports, export-star
+# cycles and ambiguity. No second JavaScript export-resolution algorithm is needed here.
+fn boundary-exports(o: api.Options, paths: [Text]) -> [Boundary] = match paths {
+  [] => []
+  _ => with res.options = api.resolve-options(o), tsc.forced = o.tsconfig,
+            m.loading = api.loading-of(o, dir-of(o.outfile)),
+            an.linking = api.linking-of(o, true, false, api.esm-format()) {
+    exports-in(m.graph(include-text("runtime.js"), paths), paths)
+  }
+}
+
+fn exports-in(g: m.Graph, paths: [Text]) -> [Boundary] =
+  with m.modules = g.modules, m.by-path = g.by-path, m.order = g.order, m.ranks = g.ranks,
+       m.blocks = g.module-blocks, m.entries = g.entries, m.entry = g.entries[0],
+       an.linked = an.link(0), m.table = an.linked-table(g), m.db = an.solved-facts() {
+    [exports-of(path, g.by-path[path] ?? -1) for path in paths]
+  }
+
+fn exports-of(path: Text, id: Int) -> Boundary = match m.modules[id].kind {
+  m.Esm if not m.modules[id].script and not m.db.dynamic(id) =>
+    Boundary(path: path, id: m.shown-path(path),
+             exports: sort name in [name-of(m.names, n) for m.db.resolved(id, ?n, _) distinct n
+                                   if is-some(emit.resolved-export(id, n))] by name)
+  _ => panic "{}: a use client boundary must be an ES module with statically known exports", path
+}
+
+fn boundary-stub(b: Boundary, runtime: Text) -> Text =
+  "import { clientReference } from " ++ host.js-string(runtime) ++ ";\n"
+  ++ join(["var ref" ++ int-text(i) ++ " = clientReference(" ++ host.js-string(b.id) ++ ", " ++ host.js-string(b.exports[i]) ++ ");\n"
+           ++ "export { ref" ++ int-text(i) ++ " as " ++ host.js-string(b.exports[i]) ++ " };\n"
+           for i in 0..len(b.exports)], "")
+
+fn client-entry(boundaries: [Boundary]) -> Text =
+  join(["import * as module" ++ int-text(i) ++ " from " ++ host.js-string(boundaries[i].path) ++ ";\n"
+        for i in 0..len(boundaries)], "")
+  ++ "export const modules = Object.freeze({" ++ join([host.js-string(boundaries[i].id) ++ ": module" ++ int-text(i)
+                                                       for i in 0..len(boundaries)], ",") ++ "});\n"
+  ++ include-text("client_references.js")
+
+fn generated-text(path: Text) -> Text? = generated[path]
+
+fn generated-path(spec: Text, importer: Text) -> Text? = first path in [spec] if path in generated: path
+
+fn with-generated(o: api.Options, texts: {Text:Text}) -> [api.Written] =
+  with generated = texts {
+    api.files(o with { on-load: [generated-text] ++ o.on-load, on-resolve: [generated-path] ++ o.on-resolve })
+  }
+
+fn manifest(boundaries: [Boundary], server: Text, client: Text) -> Text =
+  "{\"version\":1,\"server\":" ++ host.js-string(server) ++ ",\"client\":" ++ host.js-string(client)
+  ++ ",\"modules\":{" ++ join([host.js-string(b.id) ++ ":{\"file\":" ++ host.js-string(client)
+                              ++ ",\"exports\":[" ++ join([host.js-string(n) for n in b.exports], ",") ++ "]}"
+                              for b in boundaries], ",") ++ "}}\n"
+
+fn files(options: api.Options, client-out: Text, manifest-out: Text) -> [api.Written] = match options.splitting, len(options.entries) {
+  false, 1 => paired-files(options, client-out, manifest-out)
+  _, _ => panic "paired builds take one server entry and do not combine with splitting"
+}
+
+fn paired-files(options: api.Options, client-out: Text, manifest-out: Text) -> [api.Written] =
+  match outputs-distinct([options.outfile, client-out, manifest-out]) {
+    true => with-generated(server-options, {b.path: boundary-stub(b, runtime) for b in boundaries}
+                                               ++ {runtime: include-text("server_references.js")})
+               ++ with-generated(client-options with { entry: entry, entries: [entry] }, {entry: client-entry(boundaries)})
+               ++ [api.Written(path: manifest-out, text: manifest(boundaries, options.outfile, client-out), said: "")]
+  }
+  where server-options = with-markers(node-options(options) with { format: api.cjs-format(),
+                          entry: m.full-path(options.entry), entries: [m.full-path(options.entry)] }),
+        client-options = with-markers(options with { outfile: client-out, platform-node: false,
+                          format: api.esm-format(), main-fields: ["browser", "module", "main"], conditions: ["import", "browser"] }),
+        server = walked(server-options, [m.full-path(options.entry)], false),
+        roots = [s.path for s in server.sources if s.client],
+        client = walked(client-options, roots, true),
+        boundaries = boundary-exports(client-options, checked(server, client)),
+        entry = "boundary:client-entry", runtime = "boundary:reference-runtime"
+
+fn node-options(o: api.Options) -> api.Options = match o.platform-node {
+  true => o
+  false => api.on-node(o)
+}
+
+fn outputs-distinct(paths: [Text]) -> Bool = match len([m.from-root(p) for p in paths distinct m.from-root(p)]) == len(paths) {
+  true => true
+  false => panic "server output, client output and client manifest must have different paths"
+}

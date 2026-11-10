@@ -351,6 +351,11 @@ print("== the rules language")
 code, out = sh([os.path.join(os.path.dirname(ESB), "langtest")], 30)
 check(code == 0 and out.strip().endswith("all checks passed"), f"collection forms mean what they say: {out.strip().split(chr(10))[-1]}")
 
+print("== paired client/server builds")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "boundary-check.py"), SPEC], 300)
+check(code == 0 and out.strip().endswith("all checks passed"), "paired builds: "
+      + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} checks" if code == 0 else out[-1800:]))
+
 print("== watching")
 # Rebuilds after edits, byte for byte what a fresh process builds, and none for a write that changes nothing.
 code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch-check.py"), ESB, "datefns"],

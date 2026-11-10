@@ -204,6 +204,63 @@ how the code moved out of Coil without changing behaviour. It passes no `--targe
 the previous commit's build, and `tools/same-split.py NEW BASE` code splitting and stylesheet assets,
 hashed file names and maps included.
 
+## Paired client/server builds
+
+A target with `client-outfile` builds one server entry and discovers browser entries from its
+`"use client"` boundaries. The server gets callable-guarded references to those modules' exports;
+the browser gets their implementations and a `resolveClientReference` export. Dependencies below
+a client boundary belong to the browser graph without needing their own directive. Shared source
+can be compiled into both environments, each with its own package resolution conditions.
+
+```
+bundler
+target app
+  entry "src/server.js"
+  outfile "dist/server.cjs"
+  client-outfile "dist/client.mjs"
+  client-manifest "dist/manifest.json"
+end
+```
+
+The server output is CommonJS, the browser output ESM; `client-manifest` defaults to
+`client-outfile` plus `.manifest.json`. The manifest records module IDs (paths relative to the
+build's working directory), exported names and the browser output file. A server reference
+serializes as `{ "module": "src/Counter.jsx", "export": "default" }`; the browser's
+`resolveClientReference` returns the corresponding implementation. Calling that reference on
+the server throws. All exports of a boundary are retained in the browser registry, including
+named/default exports and static re-exports; opaque CommonJS boundaries and dynamic export-star
+boundaries are rejected.
+
+`import "server-only"` and `import "client-only"` declare environment restrictions. The build
+checks the source dependency graphs before writing either bundle, including unused imports,
+and reports the import chain for a violation. Node builtins are also server-only. A client-only
+module may be imported by the server through a `"use client"` boundary, where it is a reference.
+The marker imports do not require installed packages. External modules are not inspected.
+
+The policy is `src/bundle/boundaries.facts`; `boundaries.rules` uses the existing loader, linker,
+hooks and emitter to make the paired outputs. Client dependencies resolve with browser/import
+conditions; the server defaults to Node conditions, which explicit target settings can override.
+The generic compiler contains no execution-environment policy.
+
+Run the interactive React counter demo:
+
+```sh
+python3 tools/client-server-demo.py --serve
+# Open http://127.0.0.1:8000
+```
+
+Its server entry imports a database module and a client component. The database supplies the
+initial counter value; the server serializes client references into `model.json`; the browser
+resolves one and mounts the real React counter. `tools/boundary-check.py` checks the paired build,
+separation, reference handoff, conditions and invalid imports, and is part of `tools/verify.py`.
+The demo serves only its `public/` output directory; the server bundle stays outside that directory.
+
+This implements the module-graph boundary used by a Next-style split, with a small JSON reference
+handoff for the demo. It does not implement React Flight, server rendering/hydration, server
+actions (`"use server"` is an error), routing or paired-build watch/HMR. One browser bundle is
+emitted for all boundaries; paired builds do not combine with code splitting yet. It is a build
+graph check, not a sandbox for runtime filesystem/network access or nonliteral dynamic imports.
+
 ## Results
 
 `tools/verify.py` checks all of this in one run.
