@@ -34,11 +34,17 @@ def write(rel, text):
 
 def resident(pid):
     """The memory the process uses: on macOS its physical footprint (what it has written and not
-    given back), which leaves out pages malloc keeps for reuse; elsewhere its resident set."""
+    given back), including dirty pages retained by malloc; elsewhere its resident set."""
     if sys.platform == "darwin":
-        out = subprocess.run(["footprint", str(pid)], capture_output=True, text=True).stdout
-        m = re.search(r"Footprint:\s+([\d.]+)\s+(KB|MB|GB)", out)
-        if m: return int(float(m.group(1)) * {"KB": 2**10, "MB": 2**20, "GB": 2**30}[m.group(2)])
+        out = subprocess.run(["footprint", "-f", "bytes", str(pid)], capture_output=True, text=True).stdout
+        # Whole-MB formatted output is too coarse for a four-MB growth limit. Keep the same
+        # limit and sample schedule, but measure bytes. Optional snapshots help diagnose growth.
+        profile = os.environ.get("MEMORY_PROFILE")
+        if profile:
+            os.makedirs(profile, exist_ok=True)
+            with open(os.path.join(profile, f"{pid}-{time.time_ns()}.txt"), "w") as file: file.write(out)
+        m = re.search(r"Footprint:\s+(\d+)\s+B\b", out)
+        if m: return int(m.group(1))
     out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return int(out) * 1024 if out else None
 
