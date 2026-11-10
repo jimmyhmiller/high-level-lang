@@ -1734,6 +1734,26 @@
    (seen i64)
    (delta-from i64)
    (delta-to i64)
+   ;; Rows taken out, as a database is brought up to date in place (see `solved-from` in hl.facts):
+   ;; each row's mark (0 in, 2 taken out by this update, 1 by an earlier one) and how many are out.
+   ;; A row taken out stays where it is, in its chain and its indexes, until the relation is made
+   ;; again (`rel-settle!`), and what reads the relation passes it by.
+   (dead (ArrayList u8))
+   (gone i64)
+   ;; While an update runs, the rows below `start` are those it began with: what it reads of the
+   ;; relation as it was. The rows it took out (`killed`) and the small keys whose presence it
+   ;; changed (`touched`), to put right when it ends.
+   (start i64)
+   (updating bool)
+   (killed (ArrayList i64))
+   (touched (ArrayList i64))
+   ;; For a relation of given facts: how many of the facts state each row.
+   (counts (ArrayList i64))
+   ;; How many updates have changed it in place: kept in its memory (`stamp`), which every copy of it
+   ;; shares, and as this copy last saw it (`version`). A copy whose `version` is behind was made
+   ;; before an update changed what it reads.
+   (stamp (ArrayList i64))
+   (version i64)
    ;; Where all of its memory comes from, as it grows and is indexed, whichever thread asks: while
    ;; the run reclaims memory, a region of its own (`region`), which the region it is made in holds,
    ;; and anything else that holds the relation holds too (`rel-held!`); else malloc's.
@@ -1792,7 +1812,16 @@
       :present (ArrayList::new [u8] a)
       :seen 0
       :delta-from 0
-      :delta-to 0)))
+      :delta-to 0
+      :dead (ArrayList::new [u8] a)
+      :gone 0
+      :start 0
+      :updating false
+      :killed (ArrayList::new [i64] a)
+      :touched (ArrayList::new [i64] a)
+      :counts (ArrayList::new [i64] a)
+      :stamp (let [(mut s) (ArrayList::new [i64] a)] (push! (mut s) 0) s)
+      :version 0)))
 
 ;;; Room for `n` more rows, when about that many are known to be coming: no growing as they come.
 (defn rel-reserve! [(r (mut Rel)) (n i64)] (-> void)
@@ -1834,7 +1863,7 @@
   (let [(mut at) first
         (mut hit) false]
     (while (and (>= at 0) (not hit))
-      (if (row-equal? (mut r) at a b c d)
+      (if (and (rel-live-row? (mut r) at) (row-equal? (mut r) at a b c d))
           (set! hit true)
           (set! at (get (.next r) at))))
     hit))
@@ -1842,8 +1871,57 @@
 ;;; Unused columns are passed as 0.
 (defn rel-has? [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
   (if (and (= (.arity r) 1) (dense-key? a))
-      (and (< a (len (.present r))) (!= (get (.present r) a) (: 0 u8)))
+      (and (< a (len (.present r)))
+           (!= (& (cast i64 (get (.present r) a)) 1) 0))
       (chain-has? (mut r) (int-get (mut (.heads r)) (row-hash a b c d)) a b c d)))
+
+;;; A small key's mark in a one-column relation: 1 while the row is in; 2 once an update has changed
+;;; whether it is, with 4 when it was in as the update began.
+(defn present-mark [(r (mut Rel)) (a i64)] (-> i64)
+  (if (< a (len (.present r))) (cast i64 (get (.present r) a)) 0))
+
+(defn present-mark! [(r (mut Rel)) (a i64) (mark i64)] (-> void)
+  (while (<= (len (.present r)) a)
+    (push! (mut (.present r)) (: 0 u8)))
+  (set! (mut (.present r)) a (cast u8 mark))
+  0)
+
+;;; A small key's mark as an update changes whether it is in: the first change says whether it was
+;;; in as the update began, and files the key to be put right when the update ends.
+(defn rel-changed-mark [(r (mut Rel)) (a i64) (mark i64)] (-> i64)
+  (cond (not (.updating r)) (& mark 1)
+        (!= (& mark 2) 0) mark
+        :else
+          (do
+            (push! (mut (.touched r)) a)
+            (| 2 (if (!= (& mark 1) 0) 4 0)))))
+
+;;; Whether a row is in now: not taken out.
+(defn rel-live-row? :inline (Always) [(r (mut Rel)) (row i64)] (-> bool)
+  (or (= (.gone r) 0)
+      (>= row (len (.dead r)))
+      (= (get (.dead r) row) (: 0 u8))))
+
+;;; Whether a row was in as the update running began: one of those it began with, not taken out
+;;; before it.
+(defn rel-old-row? :inline (Always) [(r (mut Rel)) (row i64)] (-> bool)
+  (and (< row (.start r))
+       (or (= (.gone r) 0)
+           (>= row (len (.dead r)))
+           (!= (get (.dead r) row) (: 1 u8)))))
+
+;;; `rel-has?` of the relation as the update running began.
+(defn rel-has-old? [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
+  (if (and (= (.arity r) 1) (dense-key? a))
+      (let [mark (present-mark (mut r) a)]
+        (if (!= (& mark 2) 0) (!= (& mark 4) 0) (!= (& mark 1) 0)))
+      (let [(mut at) (int-get (mut (.heads r)) (row-hash a b c d))
+            (mut hit) false]
+        (while (and (>= at 0) (not hit))
+          (if (and (rel-old-row? (mut r) at) (row-equal? (mut r) at a b c d))
+              (set! hit true)
+              (set! at (get (.next r) at))))
+        hit)))
 
 (defn dense-key? :inline (Always) [(key i64)] (-> bool)
   (and (>= key 0) (< key 4194304)))
@@ -1875,10 +1953,8 @@
   (if (and (= (.arity r) 1) (dense-key? a))
       (if (rel-has? (mut r) a 0 0 0)
           false
-          (do
-            (while (<= (len (.present r)) a)
-              (push! (mut (.present r)) (: 0 u8)))
-            (set! (mut (.present r)) a (: 1 u8))
+          (let [mark (present-mark (mut r) a)]
+            (present-mark! (mut r) a (| (rel-changed-mark (mut r) a mark) 1))
             (rel-append! (mut r) a b c d -1)
             true))
       (rel-add-hashed! (mut r) a b c d)))
@@ -1991,6 +2067,269 @@
     (set! (.seen out) (.count out))
     out))
 
+;;; A database's id of its own, one more than the last: which a database made from it in place names.
+(defn db-id-next! [] (-> i64)
+  (let [cell (primitive/alloc-static DbIds)]
+    (+ (atomic/add (field cell next) 1) 1)))
+
+(defstruct DbIds [(next i64)])
+
+;;; ---------------------------------------------------------------- updated in place
+
+;;; An update in place begins (see `solved-from` in hl.facts): the rows there now are what it reads
+;;; as the relation as it was, whatever it adds or takes out.
+(defn rel-begin! [(r (mut Rel))] (-> void)
+  (unless (= (len (.queue r)) 0)
+    (panic "a relation with rows still queued cannot be brought up to date"))
+  (set! (.start r) (.count r))
+  (set! (.updating r) true)
+  (clear! (mut (.killed r)))
+  (clear! (mut (.touched r)))
+  (set! (mut (.stamp r)) 0 (+ (get (.stamp r) 0) 1))
+  (set! (.version r) (get (.stamp r) 0))
+  0)
+
+;;; Whether this copy of a relation is what its memory holds: no update has changed it in place since.
+(defn rel-current? [(r (mut Rel))] (-> bool)
+  (= (get (.stamp r) 0) (.version r)))
+
+;;; The row that holds these columns now, or -1.
+(defn rel-find [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> i64)
+  (if (and (= (.arity r) 1) (dense-key? a))
+      (if (!= (& (present-mark (mut r) a) 1) 0)
+          (let [rows (rel-bucket (mut r) 0 a)
+                (mut out) -1]
+            (for row rows
+              (when (and (< out 0) (rel-live-row? (mut r) row)) (set! out row)))
+            out)
+          -1)
+      (let [(mut at) (int-get (mut (.heads r)) (row-hash a b c d))
+            (mut out) -1]
+        (while (and (>= at 0) (< out 0))
+          (if (and (rel-live-row? (mut r) at) (row-equal? (mut r) at a b c d))
+              (set! out at)
+              (set! at (get (.next r) at))))
+        out)))
+
+;;; Take out the row that holds these columns. True when one did. It stays where it is, passed by,
+;;; until the relation is made again.
+(defn rel-kill! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
+  (let [row (rel-find (mut r) a b c d)]
+    (if (< row 0)
+        false
+        (do
+          (while (<= (len (.dead r)) row)
+            (push! (mut (.dead r)) (: 0 u8)))
+          (set! (mut (.dead r)) row (if (.updating r) (: 2 u8) (: 1 u8)))
+          (set! (.gone r) (+ (.gone r) 1))
+          (when (.updating r) (push! (mut (.killed r)) row))
+          (when (and (= (.arity r) 1) (dense-key? a))
+            (present-mark! (mut r)
+                           a
+                           (& (rel-changed-mark (mut r) a (present-mark (mut r) a)) 6)))
+          true))))
+
+;;; Take out each row `gone` holds; then every row there is counted seen, so what is added after is
+;;; what the next round starts from. Answers how many were taken out.
+(defn rel-kill-rows! [(r (mut Rel)) (gone (mut Rel))] (-> i64)
+  (let [(mut n) 0]
+    (for row (range 0 (.count gone))
+      (when (and (rel-live-row? (mut gone) row)
+                 (rel-kill! (mut r)
+                            (row-col (mut gone) row 0)
+                            (row-col (mut gone) row 1)
+                            (row-col (mut gone) row 2)
+                            (row-col (mut gone) row 3)))
+        (set! n (+ n 1))))
+    (set! (.seen r) (.count r))
+    n))
+
+;;; The update ends: what it took out is out as an earlier update's is, and the keys it changed are
+;;; marked plainly again. A relation more than half taken out is made again of what is in, in its
+;;; own memory, so what was taken out goes with the memory it was in.
+(defn rel-settle! [(r (mut Rel))] (-> void)
+  (for row (.killed r) (set! (mut (.dead r)) row (: 1 u8)))
+  (for a (.touched r) (present-mark! (mut r) a (& (present-mark (mut r) a) 1)))
+  (clear! (mut (.killed r)))
+  (clear! (mut (.touched r)))
+  (set! (.updating r) false)
+  (set! (.start r) (.count r))
+  (when (and (> (.gone r) 64) (> (* (.gone r) 2) (.count r)))
+    (set! r (rel-compacted (mut r))))
+  0)
+
+;;; A relation of its own with the rows of `r` that are in, in their order, and how many facts state
+;;; each; every row counted seen.
+(defn rel-compacted [(r (mut Rel))] (-> Rel)
+  (let [(mut out) (rel-new (.arity r))
+        counted (> (len (.counts r)) 0)]
+    (rel-reserve! (mut out) (- (.count r) (.gone r)))
+    (for row (range 0 (.count r))
+      (when (rel-live-row? (mut r) row)
+        (rel-add! (mut out)
+                  (row-col (mut r) row 0)
+                  (row-col (mut r) row 1)
+                  (row-col (mut r) row 2)
+                  (row-col (mut r) row 3))
+        (when counted (push! (mut (.counts out)) (rel-count-at (mut r) row)))))
+    (set! (.seen out) (.count out))
+    (set! (.start out) (.count out))
+    out))
+
+;;; Every row that is in, taken out: what solving a stratum afresh in place starts from. Every row
+;;; counted seen.
+(defn rel-kill-all! [(r (mut Rel))] (-> void)
+  (for row (range 0 (.count r))
+    (when (rel-live-row? (mut r) row)
+      (rel-kill! (mut r)
+                 (row-col (mut r) row 0)
+                 (row-col (mut r) row 1)
+                 (row-col (mut r) row 2)
+                 (row-col (mut r) row 3))))
+  (set! (.seen r) (.count r))
+  0)
+
+;;; What an update that solved the relation afresh changed: the rows in now that were not as it began
+;;; (to `plus`), and those in as it began that are not now (to `minus`).
+(defn rel-whole-diff! [(r (mut Rel)) (plus (mut Rel)) (minus (mut Rel))] (-> void)
+  (for row (range 0 (.count r))
+    (let [a (row-col (mut r) row 0)
+          b (row-col (mut r) row 1)
+          c (row-col (mut r) row 2)
+          d (row-col (mut r) row 3)]
+      (when (and (rel-live-row? (mut r) row) (not (rel-has-old? (mut r) a b c d)))
+        (rel-add! (mut plus) a b c d))
+      (when (and (rel-old-row? (mut r) row) (not (rel-has? (mut r) a b c d)))
+        (rel-add! (mut minus) a b c d))))
+  0)
+
+;;; How many rows are in.
+(defn rel-live-count [(r (mut Rel))] (-> i64)
+  (- (.count r) (.gone r)))
+
+;;; How many of the given facts state row `row`.
+(defn rel-count-at [(r (mut Rel)) (row i64)] (-> i64)
+  (if (< row (len (.counts r))) (get (.counts r) row) 0))
+
+(defn rel-count-set! [(r (mut Rel)) (row i64) (n i64)] (-> void)
+  (while (<= (len (.counts r)) row)
+    (push! (mut (.counts r)) 0))
+  (set! (mut (.counts r)) row n)
+  0)
+
+;;; One more fact states this row (`by` more, or fewer when negative): the row added when it is new.
+(defn rel-tally! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64) (by i64)] (-> void)
+  (if (rel-add! (mut r) a b c d)
+      (rel-count-set! (mut r) (- (.count r) 1) by)
+      (let [row (rel-find (mut r) a b c d)]
+        (rel-count-set! (mut r) row (+ (rel-count-at (mut r) row) by))))
+  0)
+
+;;; How many rows of `tally` say a change: an upper bound on how many rows of the relation they
+;;; tally will be added or taken out.
+(defn rel-tally-changes [(tally (mut Rel))] (-> i64)
+  (let [(mut n) 0]
+    (for row (range 0 (.count tally))
+      (unless (= (rel-count-at (mut tally) row) 0) (set! n (+ n 1))))
+    n))
+
+;;; Each row of `tally` by how many more (or fewer) facts state it: a row no fact stated before is
+;;; added to `r` and to `plus`; one no fact states now is taken out of `r` and added to `minus`.
+;;; Answers how many rows were added or taken out.
+(defn rel-apply-tally! [(r (mut Rel)) (tally (mut Rel)) (plus (mut Rel)) (minus (mut Rel))]
+  (-> i64)
+  (let [(mut n) 0]
+    (for row (range 0 (.count tally))
+      (let [by (rel-count-at (mut tally) row)]
+        (unless (= by 0)
+          (let [a (row-col (mut tally) row 0)
+                b (row-col (mut tally) row 1)
+                c (row-col (mut tally) row 2)
+                d (row-col (mut tally) row 3)
+                at (rel-find (mut r) a b c d)
+                was (if (< at 0) 0 (rel-count-at (mut r) at))
+                now (+ was by)]
+            (when (< now 0)
+              (panic "a fact is counted out of a relation more often than it was counted in"))
+            (cond (and (= was 0) (> now 0))
+                    (do
+                      (when (>= at 0)
+                        (panic "a relation of given facts holds a row no fact states"))
+                      (rel-add! (mut r) a b c d)
+                      (rel-count-set! (mut r) (- (.count r) 1) now)
+                      (rel-add! (mut plus) a b c d)
+                      (set! n (+ n 1)))
+                  (and (> was 0) (= now 0))
+                    (do
+                      (rel-kill! (mut r) a b c d)
+                      (rel-add! (mut minus) a b c d)
+                      (set! n (+ n 1)))
+                  :else (rel-count-set! (mut r) at now))))))
+    n))
+
+;;; How many rows would change were `r` to hold just what `tally` counts: those it holds that
+;;; `tally` has not, and those `tally` counts that it has not.
+(defn rel-reset-changes [(r (mut Rel)) (tally (mut Rel))] (-> i64)
+  (let [(mut n) 0]
+    (for row (range 0 (.count r))
+      (when (and (rel-live-row? (mut r) row)
+                 (< (rel-find (mut tally)
+                              (row-col (mut r) row 0)
+                              (row-col (mut r) row 1)
+                              (row-col (mut r) row 2)
+                              (row-col (mut r) row 3))
+                    0))
+        (set! n (+ n 1))))
+    (for row (range 0 (.count tally))
+      (when (< (rel-find (mut r)
+                         (row-col (mut tally) row 0)
+                         (row-col (mut tally) row 1)
+                         (row-col (mut tally) row 2)
+                         (row-col (mut tally) row 3))
+               0)
+        (set! n (+ n 1))))
+    n))
+
+;;; `r` made to hold just what `tally` counts, each row stated by as many facts as it says: what it
+;;; held that `tally` has not taken out (and added to `minus`), what `tally` has that it had not
+;;; added (and to `plus`). For a relation whose counts are not known: one read back from the cache.
+(defn rel-reset-tally! [(r (mut Rel)) (tally (mut Rel)) (plus (mut Rel)) (minus (mut Rel))]
+  (-> i64)
+  (let [(mut n) 0
+        before (.count r)]
+    (for row (range 0 before)
+      (when (rel-live-row? (mut r) row)
+        (let [a (row-col (mut r) row 0)
+              b (row-col (mut r) row 1)
+              c (row-col (mut r) row 2)
+              d (row-col (mut r) row 3)]
+          (when (< (rel-find (mut tally) a b c d) 0)
+            (rel-kill! (mut r) a b c d)
+            (rel-add! (mut minus) a b c d)
+            (set! n (+ n 1))))))
+    (for row (range 0 (.count tally))
+      (let [a (row-col (mut tally) row 0)
+            b (row-col (mut tally) row 1)
+            c (row-col (mut tally) row 2)
+            d (row-col (mut tally) row 3)
+            at (rel-find (mut r) a b c d)]
+        (if (< at 0)
+            (do
+              (rel-add! (mut r) a b c d)
+              (rel-count-set! (mut r) (- (.count r) 1) (rel-count-at (mut tally) row))
+              (rel-add! (mut plus) a b c d)
+              (set! n (+ n 1)))
+            (rel-count-set! (mut r) at (rel-count-at (mut tally) row)))))
+    n))
+
+;;; The rows that are in, every column of each, in order: what a database says it gained or lost.
+(defn rel-rows [(r (mut Rel))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (value-allocator))]
+    (for row (range 0 (.count r))
+      (when (rel-live-row? (mut r) row)
+        (for c (range 0 (.arity r)) (push! (mut out) (rel-at (mut r) row c)))))
+    out))
+
 ;;; A list of its own with `xs`'s items.
 (defn ints-copy [(xs (ArrayList i64))] (-> (ArrayList i64))
   (ints-copy-in xs (value-allocator)))
@@ -2030,12 +2369,13 @@
                             (out (mut Rel))] (-> i64)
   (let [(mut n) 0]
     (for row (range from to)
-      (let [x0 (row-col (mut a) row 0)
-            x1 (row-col (mut a) row 1)
-            x2 (row-col (mut a) row 2)
-            x3 (row-col (mut a) row 3)]
-        (unless (rel-has? (mut b) x0 x1 x2 x3)
-          (when (rel-add! (mut out) x0 x1 x2 x3) (set! n (+ n 1))))))
+      (when (rel-live-row? (mut a) row)
+        (let [x0 (row-col (mut a) row 0)
+              x1 (row-col (mut a) row 1)
+              x2 (row-col (mut a) row 2)
+              x3 (row-col (mut a) row 3)]
+          (unless (rel-has? (mut b) x0 x1 x2 x3)
+            (when (rel-add! (mut out) x0 x1 x2 x3) (set! n (+ n 1)))))))
     n))
 
 ;;; Rows of `a` that `b` has not, added to `out`. Answers how many.
@@ -2044,7 +2384,7 @@
 
 ;;; Whether `a` and `b` hold the same rows, whatever their order.
 (defn rel-same-rows? [(a (mut Rel)) (b (mut Rel))] (-> bool)
-  (and (= (.count a) (.count b))
+  (and (= (rel-live-count (mut a)) (rel-live-count (mut b)))
        (let [(mut none) (rel-new (.arity a))]
          (= (rel-diff-into! (mut a) (mut b) (mut none)) 0))))
 
@@ -4232,12 +4572,13 @@
   (let [(mut out) (ArrayList::new [i64] (value-allocator))
         n (.arity a)]
     (for row (range 0 (.count a))
-      (let [x0 (rel-at (mut a) row 0)
-            x1 (if (> n 1) (rel-at (mut a) row 1) 0)
-            x2 (if (> n 2) (rel-at (mut a) row 2) 0)
-            x3 (if (> n 3) (rel-at (mut a) row 3) 0)]
-        (unless (rel-has? (mut b) x0 x1 x2 x3)
-          (for c (range 0 n) (push! (mut out) (rel-at (mut a) row c))))))
+      (when (rel-live-row? (mut a) row)
+        (let [x0 (rel-at (mut a) row 0)
+              x1 (if (> n 1) (rel-at (mut a) row 1) 0)
+              x2 (if (> n 2) (rel-at (mut a) row 2) 0)
+              x3 (if (> n 3) (rel-at (mut a) row 3) 0)]
+          (unless (rel-has? (mut b) x0 x1 x2 x3)
+            (for c (range 0 n) (push! (mut out) (rel-at (mut a) row c)))))))
     out))
 
 ;;; Whether a query path's bound columns hold a row's values.
@@ -4259,47 +4600,61 @@
                         (rel (slice u8))
                         (a (mut Rel))
                         (b (mut Rel))] (-> void)
-  (unless (= (primitive/cast i64 (data (slice (.data a))))
-             (primitive/cast i64 (data (slice (.data b)))))
-    (let [d (deps)
-          gone (rel-minus (mut a) (mut b))
-          come (rel-minus (mut b) (mut a))
-          n (.arity a)
-          (mut hit) (ArrayList::new [i64] (malloc-allocator))]
-      (when (> (+ (len gone) (len come)) 0)
-        (deps-lock! d)
-        (match (get (.queries d) (query-key setting rel -1 0))
-          (Some [ids] (for id ids (push! (mut hit) id)))
-          (None [] 0))
-        ;; Queries by one column, numbered: the site and the row's value there name the node.
-        (match (get (.setting-sites d) setting)
-          (Some [sites]
-                (for site sites
-                  (when (= (get (.site-rels d) site) rel)
-                    (let [col (get (.site-cols d) site)]
-                      (for rows [gone come]
-                        (for at (range 0 (/ (len rows) n))
-                          (let [v (get rows (+ (* at n) col))]
-                            (when (and (>= v 0) (< v 4294967296))
-                              (let [id (dep-element-at d site v)]
-                                (when (>= id 0) (push! (mut hit) id)))))))))))
-          (None [] 0))
-        (for rows [gone come]
-          (for at (range 0 (/ (len rows) n))
-            (for c (range 0 n)
-              (match (get (.queries d)
-                          (query-key setting rel c (get rows (+ (* at n) c))))
-                (Some [ids]
-                      (for id ids
-                        (when (query-sees? (subslice (get (.texts d) id)
-                                                     (len setting)
-                                                     (len (get (.texts d) id)))
-                                           rows
-                                           (* at n))
-                          (push! (mut hit) id))))
-                (None [] 0)))))
-        (deps-unlock! d)
-        (for id hit (dep-changed-id! id)))))
+  (unless (and (rel-current? (mut a)) (rel-current? (mut b)))
+    (panic "the relation {} of {} was changed in place, and a value made before still reads it"
+           rel
+           setting))
+  (unless (and (= (primitive/cast i64 (data (slice (.data a))))
+                  (primitive/cast i64 (data (slice (.data b)))))
+               (= (.count a) (.count b))
+               (= (.gone a) (.gone b)))
+    (dep-rows-changed! setting rel (rel-minus (mut a) (mut b)) (rel-minus (mut b) (mut a)) (.arity a)))
+  0)
+
+;;; The same, given the rows the relation lost (`gone`) and gained (`come`), `n` columns to a row:
+;;; what a database brought up to date in place says changed. What it costs is what changed.
+(defn dep-rows-changed! [(setting (slice u8))
+                         (rel (slice u8))
+                         (gone (ArrayList i64))
+                         (come (ArrayList i64))
+                         (n i64)] (-> void)
+  (let [d (deps)
+        (mut hit) (ArrayList::new [i64] (malloc-allocator))]
+    (when (> (+ (len gone) (len come)) 0)
+      (deps-lock! d)
+      (match (get (.queries d) (query-key setting rel -1 0))
+        (Some [ids] (for id ids (push! (mut hit) id)))
+        (None [] 0))
+      ;; Queries by one column, numbered: the site and the row's value there name the node.
+      (match (get (.setting-sites d) setting)
+        (Some [sites]
+              (for site sites
+                (when (= (get (.site-rels d) site) rel)
+                  (let [col (get (.site-cols d) site)]
+                    (for rows [gone come]
+                      (for at (range 0 (/ (len rows) n))
+                        (let [v (get rows (+ (* at n) col))]
+                          (when (and (>= v 0) (< v 4294967296))
+                            (let [id (dep-element-at d site v)]
+                              (when (>= id 0) (push! (mut hit) id)))))))))))
+        (None [] 0))
+      (for rows [gone come]
+        (for at (range 0 (/ (len rows) n))
+          (for c (range 0 n)
+            (match (get (.queries d)
+                        (query-key setting rel c (get rows (+ (* at n) c))))
+              (Some [ids]
+                    (for id ids
+                      (when (query-sees? (subslice (get (.texts d) id)
+                                                   (len setting)
+                                                   (len (get (.texts d) id)))
+                                         rows
+                                         (* at n))
+                        (push! (mut hit) id))))
+              (None [] 0)))))
+      (deps-unlock! d)
+      (for id hit (dep-changed-id! id))
+      (free! (mut hit))))
   0)
 
 ;;; The rows of a relation a query sees, `spec` giving each column's value or `_` for any: every
@@ -4317,7 +4672,7 @@
                   (for row (range 0 (.count r)) (push! (mut all) row))
                   all))]
       (for row rows
-        (let [(mut fits) true]
+        (let [(mut fits) (rel-live-row? (mut r) row)]
           (for c (range 0 (len cols))
             (when (and fits
                        (!= (get cols c) "_")
@@ -5995,12 +6350,22 @@
 (defn rel-encode! [(w (ptr Writer)) (x Rel)] (-> void)
   (unless (= (len (.queue x)) 0)
     (panic "a relation with rows still queued cannot be kept"))
-  (put-varint! w (.arity x))
-  (put-varint! w (.count x))
-  (for v (.data x) (put-int! w v))
-  (put-int! w (.seen x))
-  (put-int! w (.delta-from x))
-  (put-int! w (.delta-to x))
+  (when (.updating x)
+    (panic "a relation an update is still changing cannot be kept"))
+  (let [(mut y) x
+        live (rel-live-count (mut y))]
+    (put-varint! w (.arity x))
+    (put-varint! w live)
+    ;; The rows that are in, numbered again from 0, so what was taken out is not kept.
+    (for row (range 0 (.count x))
+      (when (rel-live-row? (mut y) row)
+        (for c (range 0 (.arity x)) (put-int! w (rel-at (mut y) row c)))))
+    (if (= (.gone x) 0)
+        (do
+          (put-int! w (.seen x))
+          (put-int! w (.delta-from x))
+          (put-int! w (.delta-to x)))
+        (do (put-int! w live) (put-int! w live) (put-int! w live))))
   0)
 
 (defn rel-decode [(r (ptr Reader))] (-> Rel)
@@ -6018,6 +6383,7 @@
     (set! (.seen x) (take-int r))
     (set! (.delta-from x) (take-int r))
     (set! (.delta-to x) (take-int r))
+    (set! (.start x) (.count x))
     x))
 
 ;;; The dependency graph, as `Deps` holds it. What is found by text is found again from the texts.

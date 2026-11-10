@@ -43,8 +43,20 @@
 ;;; (whether the head's row is derived, its columns bound beforehand: see `rederive-code`).
 (defstruct Clause [(head Atom) (body (ArrayList Atom)) (sink (slice u8))])
 
+;;; The database an atom reads. The relation as it was (`old`) is the one being brought up to date,
+;;; read as it began (see `row-seen`): it changes in place, and nothing is copied for what it was.
 (defn src-sym [(a Atom)] (-> Code)
-  (primitive/code-symbol (.src a)))
+  (primitive/code-symbol (if (old? a) "db" (.src a))))
+
+(defn old? [(a Atom)] (-> bool)
+  (= (.src a) "old"))
+
+;;; Whether atom `i`'s row is one the atom sees: as the relation was when it reads it as it was,
+;;; else one that is in now.
+(defn row-seen [(a Atom) (i i64)] (-> Code)
+  (if (old? a)
+      `(rt/rel-old-row? (mut (~(field-sym (.rel a)) ~(src-sym a))) ~(row-sym i))
+      `(rt/rel-live-row? (mut (~(field-sym (.rel a)) ~(src-sym a))) ~(row-sym i))))
 
 (defn field-sym [(n (slice u8))] (-> Code)
   (primitive/code-symbol "." n))
@@ -174,8 +186,11 @@
                            (dsl/join3 "the negated variable "
                                       (.text t)
                                       " must be bound earlier in the body"))))
-              `(unless (rt/rel-has? (mut (~rel ~db)) ~@(row-args a))
-                 ~(atoms-code (mut c) k (+ i 1) (mut bound))))
+              (if (old? a)
+                  `(unless (rt/rel-has-old? (mut (~rel ~db)) ~@(row-args a))
+                     ~(atoms-code (mut c) k (+ i 1) (mut bound)))
+                  `(unless (rt/rel-has? (mut (~rel ~db)) ~@(row-args a))
+                     ~(atoms-code (mut c) k (+ i 1) (mut bound)))))
             (let [(mut key-col) -1
                   (mut key-col2) -1]
               (for j (range 0 (len (.args a)))
@@ -204,7 +219,7 @@
                            (for ~(ix-sym i) (range 0 (len ~(bucket-sym i)))
                              (let [~(row-sym i)
                                      (get ~(bucket-sym i) ~(ix-sym i))]
-                               ~body))))
+                               (when ~(row-seen a i) ~body)))))
                     (>= key-col 0)
                       (let [key (var-sym (.text (get (.args a) key-col)))
                             body (columns-code (mut c) k i 0 (mut bound))]
@@ -213,11 +228,13 @@
                            (for ~(ix-sym i) (range 0 (len ~(bucket-sym i)))
                              (let [~(row-sym i)
                                      (get ~(bucket-sym i) ~(ix-sym i))]
-                               ~body))))
+                               (when ~(row-seen a i) ~body)))))
                     :else
                       (let [body (columns-code (mut c) k i 0 (mut bound))]
-                        `(for ~(row-sym i) (range 0 (.count (~rel ~db)))
-                           ~body))))))))
+                        `(for ~(row-sym i) (range 0 ~(if (old? a)
+                                                          `(.start (~rel ~db))
+                                                          `(.count (~rel ~db))))
+                           (when ~(row-seen a i) ~body)))))))))
 
 ;;; Does any rule add to this relation? One that none does never has a delta.
 (defn derived? [(clauses (ArrayList Clause)) (name (slice u8))] (-> bool)
@@ -667,12 +684,9 @@
         (push! (mut del-starts) `(rt/rel-advance! (mut (~f minus))))
         (push! (mut del-marks)
                `(when (rt/rel-advance! (mut (~f minus))) (set! changed true)))
-        ;; A relation of its own to change, `old`'s staying as it was: without what was taken out.
+        ;; What was taken out, out of the relation itself; what reads it as it was still sees it.
         (push! (mut removes)
-               `(set! (~f db)
-                      (if (> ~(count-of n "minus") 0)
-                          (rt/rel-without (mut (~f db)) (mut (~f minus)))
-                          (rt/rel-clone (mut (~f db))))))
+               `(rt/rel-kill-rows! (mut (~f db)) (mut (~f minus))))
         (push! (mut starts) (start-sym n))
         (push! (mut starts) (count-of n "db"))
         (for ci (range 0 (len clauses))
@@ -690,12 +704,12 @@
                `(when (rt/rel-advance! (mut (~f db))) (set! changed true)))
         (push! (mut sizes) (count-of n "old"))
         (push! (mut gone-counts) (count-of n "minus"))
-        (push! (mut empties) `(set! (~f db) (rt/rel-new ~(.arity r))))
+        ;; Solving the stratum afresh: everything in it taken out, and derived again after.
+        (push! (mut empties) `(rt/rel-kill-all! (mut (~f db))))
         (push! (mut whole-finals)
                `(let [(mut gained) (rt/rel-new ~(.arity r))
                       (mut lost) (rt/rel-new ~(.arity r))]
-                  (rt/rel-diff-into! (mut (~f db)) (mut (~f old)) (mut gained))
-                  (rt/rel-diff-into! (mut (~f old)) (mut (~f db)) (mut lost))
+                  (rt/rel-whole-diff! (mut (~f db)) (mut gained) (mut lost))
                   (set! (~f plus) gained)
                   (set! (~f minus) lost)))
         (push! (mut finals)
@@ -798,8 +812,14 @@
           (mut rederive-fns) (primitive/code-list-new)
           (mut updates) (primitive/code-list-new)
           (mut same-checks) (primitive/code-list-new)
-          (mut given-checks) (primitive/code-list-new)
-          (mut base-diffs) (primitive/code-list-new)
+          (mut tallies) (primitive/code-list-new)
+          (mut estimates) (primitive/code-list-new)
+          (mut applies) (primitive/code-list-new)
+          (mut begins) (primitive/code-list-new)
+          (mut settles) (primitive/code-list-new)
+          (mut deltas) (primitive/code-list-new)
+          (mut encodes) (primitive/code-list-new)
+          (mut decodes) (primitive/code-list-new)
           (mut holds) (primitive/code-list-new)
           (mut index) 0]
       (for r rels
@@ -845,6 +865,22 @@
                                  (cast i64 (.c f))
                                  (cast i64 (.d f)))
                     0))
+          (push! (mut tallies) `(= (.rel f) (: ~index i32)))
+          (push! (mut tallies)
+                 (if (derived? clauses (.name r))
+                     `(panic "facts are given for {}, which rules derive" ~(.name r))
+                     `(rt/rel-tally! (mut (~access db))
+                                     (cast i64 (.a f))
+                                     (cast i64 (.b f))
+                                     (cast i64 (.c f))
+                                     (cast i64 (.d f))
+                                     by)))
+          (push! (mut begins) `(rt/rel-begin! (mut (~access db))))
+          (push! (mut settles) `(rt/rel-settle! (mut (~access db))))
+          (push! (mut deltas) `(push! (mut gone) (rt/rel-rows (mut (~access minus)))))
+          (push! (mut deltas) `(push! (mut come) (rt/rel-rows (mut (~access plus)))))
+          (push! (mut encodes) `(rt/rel-encode! w (~access db)))
+          (push! (mut decodes) `(set! (~access db) (rt/rel-decode r)))
           (push! (mut room)
                  `(when (> (get counts ~index) 0)
                     (rt/rel-reserve! (mut (~access db)) (get counts ~index))))
@@ -861,24 +897,19 @@
                  `(unless (rt/rel-same-rows? (mut (~f db)) (mut (~f whole)))
                     (panic "solved-from: {} differs from solving afresh"
                            ~(.name r))))
-          (if (derived? clauses (.name r))
-              (push! (mut given-checks)
-                     `(when (> (.count (~f wanted)) 0)
-                        (panic "solved-from: facts are given for {}, which rules derive"
-                               ~(.name r))))
-              (push! (mut base-diffs)
-                     `(let [lost
-                              (rt/rel-diff-into! (mut (~f old))
-                                                 (mut (~f wanted))
-                                                 (mut (~f minus)))
-                            gained
-                              (rt/rel-diff-into! (mut (~f wanted))
-                                                 (mut (~f old))
-                                                 (mut (~f plus)))]
-                        (set! rows (+ rows (.count (~f wanted))))
-                        (when (> (+ lost gained) 0)
-                          (set! (~f db) (~f wanted))
-                          (set! changes (+ changes lost gained))))))))
+          (unless (derived? clauses (.name r))
+            (push! (mut estimates)
+                   `(do
+                      (set! rows (+ rows (rt/rel-live-count (mut (~f prev)))))
+                      (set! changes
+                            (+ changes
+                               (if known
+                                   (rt/rel-tally-changes (mut (~f tally)))
+                                   (rt/rel-reset-changes (mut (~f prev)) (mut (~f tally))))))))
+            (push! (mut applies)
+                   `(if known
+                        (rt/rel-apply-tally! (mut (~f db)) (mut (~f tally)) (mut (~f plus)) (mut (~f minus)))
+                        (rt/rel-reset-tally! (mut (~f db)) (mut (~f tally)) (mut (~f plus)) (mut (~f minus))))))))
       (for s (range 0 (+ top 1))
         (let [(mut group) (ArrayList::new [(slice u8)] (malloc-allocator))]
           (for r rels
@@ -887,20 +918,39 @@
           (push! (mut strata) (stratum-code (mut c) rels clauses group))))
       (dsl/render `(do
                      (import "hl.rt" :as rt)
+                     (import "coil.primitive" :as primitive)
                      (import "coil.arraylist" :use [ArrayList])
                      (import "coil.alloc" :use [malloc-allocator])
                      (import "coil.control" :use [return-from])
-                     (defstruct Db [~@fields])
                      ;; A row of a relation, numbered in the file's order. Every id a relation holds fits in 32
                      ;; bits, which keeps a program's many rows small.
                      (defstruct Fact
                        [(rel i32) (a i32) (b i32) (c i32) (d i32)])
+                     (defstruct Db
+                       [~@fields
+                        (known bool)
+                        (blocks (ArrayList (ArrayList Fact)))
+                        (id i64)
+                        (from i64)
+                        (gone (ArrayList (ArrayList i64)))
+                        (come (ArrayList (ArrayList i64)))])
                      (defn fact-column [(v i64)] (-> i32)
                        (when (or (< v -2147483648) (> v 2147483647))
                          (panic "{} is too big for a fact" v))
                        (cast i32 v))
+                     ;;; A database, its relations empty. One solved from blocks of facts (see `solved-blocks`)
+                     ;;; knows the blocks, and how many facts state each given row, so the next can be made
+                     ;;; from it by what the blocks that differ change (see `solved-from`). Each database has
+                     ;;; an id of its own, and one made from another in place says which (`from`) and what
+                     ;;; each relation, by its number, lost (`gone`) and gained (`come`).
                      (defn new-db [] (-> Db)
-                       (Db ~@inits))
+                       (Db ~@inits
+                           :known false
+                           :blocks (ArrayList::new [(ArrayList Fact)] (rt/value-allocator))
+                           :id (rt/db-id-next!)
+                           :from -1
+                           :gone (ArrayList::new [(ArrayList i64)] (rt/value-allocator))
+                           :come (ArrayList::new [(ArrayList i64)] (rt/value-allocator))))
                      ;;; What is being made holds `db`: each of its relations, whose memory is a region
                      ;;; of its own (see `rt/rel-new`), so a database made from another (`solved-from`)
                      ;;; holds the relations it shares with it, and not the other.
@@ -913,6 +963,58 @@
                          (add-facts! (mut db) facts)
                          (solve! (mut db))
                          db))
+                     ;;; The same from blocks of facts, one after another, knowing them and how many facts
+                     ;;; state each row: what `solved-from` makes the next from.
+                     (defn solved-blocks [(blocks (ArrayList (ArrayList Fact)))] (-> Db)
+                       (let [(mut db) (new-db)
+                             (mut counts) (ArrayList::new [i64] (malloc-allocator))]
+                         (for i (range 0 ~index) (push! (mut counts) 0))
+                         (for b blocks
+                           (for (ref f) b
+                             (let [r (cast i64 (.rel f))]
+                               (set! (mut counts) r (+ (get counts r) 1)))))
+                         ~@room
+                         (free! (mut counts))
+                         (for b blocks (tally! (mut db) b 1))
+                         (solve! (mut db))
+                         (set! (.known db) true)
+                         (set! (.blocks db) blocks)
+                         db))
+                     ;;; Each fact of `facts` counted `by` more (or fewer) times in `db`'s relation for it.
+                     (defn tally! [(db (mut Db)) (facts (ArrayList Fact)) (by i64)] (-> void)
+                       (for (ref f) facts
+                         (cond ~@tallies :else
+                               (panic "no relation numbered {}" (.rel f))))
+                       0)
+                     ;;; In `tally`, the facts of the blocks `now` has and `before` has not counted in, and
+                     ;;; those `before` has and `now` has not counted out. A block is the same as itself:
+                     ;;; one a build kept (a memo's answer) is not looked into.
+                     (defn blocks-tally! [(tally (mut Db))
+                                          (before (ArrayList (ArrayList Fact)))
+                                          (now (ArrayList (ArrayList Fact)))] (-> void)
+                       (let [(mut left) (rt/int-table 0)]
+                         (for b before
+                           (let [id (block-id b)]
+                             (rt/int-put! (mut left) id (+ (max0 (rt/int-get (mut left) id)) 1))))
+                         (for b now
+                           (let [id (block-id b)
+                                 n (rt/int-get (mut left) id)]
+                             (if (> n 0)
+                                 (rt/int-put! (mut left) id (- n 1))
+                                 (tally! (mut tally) b 1))))
+                         (for b before
+                           (let [id (block-id b)
+                                 n (rt/int-get (mut left) id)]
+                             (when (> n 0)
+                               (rt/int-put! (mut left) id (- n 1))
+                               (tally! (mut tally) b -1))))
+                         (free! (mut (.keys left)))
+                         (free! (mut (.vals left))))
+                       0)
+                     (defn block-id [(b (ArrayList Fact))] (-> i64)
+                       (if (= (len b) 0) 0 (primitive/cast i64 (data (slice b)))))
+                     (defn max0 [(n i64)] (-> i64)
+                       (if (< n 0) 0 n))
                      ;;; Rows added in the order given, each relation made big enough for its own first.
                      (defn add-facts! [(db (mut Db)) (facts (ArrayList Fact))]
                        (-> void)
@@ -941,34 +1043,83 @@
                          ~@strata
                          rounds))
                      ~@rederive-fns
-                     ;;; What `solved` makes of `facts`, made from `last`, what it made of other facts: only
+;;; What `solved-blocks` makes of `blocks`, made from `last`, what it made of others: only
                      ;;; what the facts that differ change is derived again or taken out (see
-                     ;;; `update-stratum`). Facts are given rows of relations no rule derives. When most
-                     ;;; of them differ, solving afresh costs less, and is what happens. `last` stays as
-                     ;;; it was. With HL_CHECK_DATALOG set, each relation is checked against solving afresh.
-                     (defn solved-from [(last Db) (facts (ArrayList Fact))]
+                     ;;; `update-stratum`), in place: `last`'s relations are changed, and `last` is not to be
+                     ;;; read after. The blocks `last` was made from that are the same in `blocks` are not
+                     ;;; looked into, so what this costs is what changed. When most rows would change,
+                     ;;; solving afresh costs less, and is what happens; and a database whose counts are not
+                     ;;; known (one read back from the cache) has every fact counted again, once. With
+                     ;;; HL_CHECK_DATALOG set, each relation is checked against solving afresh.
+                     (defn solved-from [(last Db) (blocks (ArrayList (ArrayList Fact)))]
                        (-> Db)
-                       (let [(mut wanted) (new-db)]
-                         (add-facts! (mut wanted) facts)
-                         ~@given-checks
-                         (let [(mut old) last
-                               (mut db) last
-                               (mut plus) (new-db)
-                               (mut minus) (new-db)
-                               (mut changes) 0
-                               (mut rows) 0
-                               (mut rounds) 0]
-                           ~@base-diffs
-                           (cond (= changes 0) last
-                                 (> (* changes 4) rows) (solved facts)
-                                 :else
-                                   (do
-                                     ~@updates
-                                     (when (rt/env-on? "HL_CHECK_DATALOG")
-                                       (let [(mut whole) (solved facts)]
-                                         ~@same-checks
-                                         0))
-                                     db))))))))))
+                       (let [(mut tally) (new-db)
+                             (mut prev) last
+                             known (.known last)]
+                         (if known
+                             (blocks-tally! (mut tally) (.blocks last) blocks)
+                             (for b blocks (tally! (mut tally) b 1)))
+                         (let [(mut changes) 0
+                               (mut rows) 0]
+                           ~@estimates
+                           (cond (and known (= changes 0))
+                                   (let [(mut db) last]
+                                     (set! (.blocks db) blocks)
+                                     (set! (.id db) (rt/db-id-next!))
+                                     (set! (.from db) (.id last))
+                                     (set! (.gone db) (ArrayList::new [(ArrayList i64)] (rt/value-allocator)))
+                                     (set! (.come db) (ArrayList::new [(ArrayList i64)] (rt/value-allocator)))
+                                     db)
+                                 (> (* changes 4) rows) (solved-blocks blocks)
+                                 :else (updated-in-place last tally known blocks)))))
+                     (defn updated-in-place [(last Db) (tally Db) (known bool) (blocks (ArrayList (ArrayList Fact)))]
+                       (-> Db)
+                       (let [(mut old) last
+                             (mut db) last
+                             (mut tally) tally
+                             (mut plus) (new-db)
+                             (mut minus) (new-db)
+                             (mut gone) (ArrayList::new [(ArrayList i64)] (rt/value-allocator))
+                             (mut come) (ArrayList::new [(ArrayList i64)] (rt/value-allocator))
+                             (mut rounds) 0]
+                         ~@begins
+                         ~@applies
+                         ~@updates
+                         ~@settles
+                         ~@deltas
+                         (set! (.known db) true)
+                         (set! (.blocks db) blocks)
+                         (set! (.id db) (rt/db-id-next!))
+                         (set! (.from db) (.id last))
+                         (set! (.gone db) gone)
+                         (set! (.come db) come)
+                         (when (rt/env-on? "HL_CHECK_DATALOG")
+                           (let [(mut whole) (solved-blocks blocks)]
+                             ~@same-checks
+                             0))
+                         db))
+                     ;;; Whether `after` was made from `before` in place, so what it says it lost and gained
+                     ;;; is what changed from one to the other.
+                     (defn made-from? [(before Db) (after Db)] (-> bool)
+                       (= (.from after) (.id before)))
+                     ;;; The rows relation `i` lost, or gained, as `after` was made from the one before.
+                     (defn rows-gone [(after Db) (i i64)] (-> (ArrayList i64))
+                       (if (< i (len (.gone after)))
+                           (get (.gone after) i)
+                           (ArrayList::new [i64] (rt/value-allocator))))
+                     (defn rows-come [(after Db) (i i64)] (-> (ArrayList i64))
+                       (if (< i (len (.come after)))
+                           (get (.come after) i)
+                           (ArrayList::new [i64] (rt/value-allocator))))
+                     ;;; A database, for the cache: the rows of its relations that are in. Read back, it
+                     ;;; knows no blocks and no counts.
+                     (defn db-encode! [(w (ptr rt/Writer)) (db Db)] (-> void)
+                       ~@encodes
+                       0)
+                     (defn db-decode [(r (ptr rt/Reader))] (-> Db)
+                       (let [(mut db) (new-db)]
+                         ~@decodes
+                         db)))))))
 
 (defn read-facts [(context Code)] (-> Code)
   (primitive/code-read (module-text context) `(reader-config)))
