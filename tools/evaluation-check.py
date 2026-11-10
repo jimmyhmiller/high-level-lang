@@ -35,7 +35,7 @@ catch (e) {{ records.push(["error",typeof e,e?.message ?? e,e === previous,globa
     return p.stdout.strip()
 
 
-def check(name, files, extra=''):
+def check(name, files, extra='', max_initializers=None):
     folder = fixture(name, files)
     expected = {order: observe(folder, order, extra) for order in [('a', 'b'), ('b', 'a')]}
     for policy, fragments, minify in MODES:
@@ -45,6 +45,19 @@ def check(name, files, extra=''):
                             f'--chunk-policy={policy}', f'--fragments={str(fragments).lower()}', *flags],
                            cwd=folder, capture_output=True, text=True, timeout=120)
         assert p.returncode == 0, (name, policy, fragments, minify, p.stdout + p.stderr)
+        if max_initializers is not None:
+            # These fixtures contain no user callback factories. Counting their initializer
+            # allocations verifies that forwarding chains disappear, in addition to running
+            # correctly; semantic comparisons alone would accept the old, larger output.
+            scan = 'import {parse} from '+json.dumps((ROOT/'tests/node_modules/acorn/dist/acorn.mjs').as_uri())+';'
+            scan += '''import {readFileSync} from "node:fs";let count=0;
+function visit(n){if(!n||typeof n!=="object")return;
+if(n.type==="VariableDeclarator"&&n.init?.type==="CallExpression"&&n.init.arguments.some(x=>x.type==="ArrowFunctionExpression"))count++;
+for(const v of Object.values(n)){if(Array.isArray(v))v.forEach(visit);else if(v&&typeof v==="object")visit(v);}}
+for(const file of process.argv.slice(1))visit(parse(readFileSync(file,"utf8"),{ecmaVersion:"latest",sourceType:"module"}));console.log(count);'''
+            counted = subprocess.run(['node', '--input-type=module', '-e', scan, *map(str, output.glob('*.js'))], capture_output=True, text=True, timeout=20)
+            assert counted.returncode == 0, counted.stderr
+            assert int(counted.stdout) <= max_initializers, (name, policy, fragments, minify, 'forwarding initializers were not eliminated', counted.stdout)
         for order, want in expected.items():
             got = observe(output, order, extra)
             assert got == want, (name, policy, fragments, minify, order, got, want)
@@ -61,14 +74,14 @@ check('inert-initializer-forwarders', {
     'other.js': B,
     'a.js': 'import {value as run} from "./diamond.js"; import {b} from "./other.js"; globalThis.__eval_trace.push("entry-a"); export const value=run()+b;',
     'b.js': 'import {b} from "./other.js"; import {right} from "./right.js"; globalThis.__eval_trace.push("entry-b"); export const value=right()+b;',
-})
+}, max_initializers=2)
 check('inert-forwarded-failure', {
     'effect.js': 'globalThis.__eval_trace=["failure"]; throw 0; export function run(){return 1;}',
     'left.js': 'import {run} from "./effect.js"; export function left(){return run();}',
     'right.js': 'import {run} from "./effect.js"; export function right(){return run();}',
     'a.js': 'import {left} from "./left.js"; export const value=left();',
     'b.js': 'import {right} from "./right.js"; export const value=right();',
-})
+}, max_initializers=1)
 check('sibling-shared', {
     'dep-a.js': A, 'dep-b.js': B,
     'a.js': 'import {a} from "./dep-a.js"; import {b} from "./dep-b.js"; globalThis.__eval_trace.push("first"); export const value = a+b;',
