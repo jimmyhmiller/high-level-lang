@@ -1,6 +1,12 @@
 # Node-style module resolution: a search over the filesystem, whose knobs come from the build.
 rules bundle.resolve
 use bundle.package as pkg
+use bundle.package-targets as targets
+
+enum Kind { Import, Require }
+
+fn conditions-for(kind: Kind) -> [Text] =
+  [c for c in options.conditions if c != "import" and c != "require"] ++ [match kind { Import => "import" Require => "require" }]
 
 record Options {
   main-fields: [Text],
@@ -46,24 +52,6 @@ fn text-member(object: pkg.Node, key: Text) -> Text? = match member(object, key)
   _ => none
 }
 
-# A package `exports` value: a path, or conditions tried in the file's order.
-fn exports-target(v: pkg.Node) -> Text? = match v {
-  pkg.Str(raw) => some(unquote(raw))
-  pkg.Object(List(ms...)) => first m in ms if condition?(unquote(m.key.text)): exports-target(m.value)
-  _ => none
-}
-
-fn condition?(key: Text) -> Bool = key == "default" or key in options.conditions
-
-# `exports` keyed by subpath, or one target for the package itself.
-fn package-exports(doc: pkg.Node, subpath: Text) -> Text? = match member(doc, "exports"), subpath {
-  some(e), _ if subpath-keyed?(e) => first v in member(e, subpath): exports-target(v)
-  some(e), "." => exports-target(e)
-  _, _ => none
-}
-
-fn subpath-keyed?(e: pkg.Node) -> Bool = e is pkg.Object(List(m, ...)) and unquote(m.key.text) is "." ++ _
-
 # A file: the name as written, with each extension the build tries, then what TypeScript meant.
 fn try-file(base: Text) -> Text? =
   first path in [base] ++ [base ++ ext for ext in options.extensions] ++ typescript-instead(base) if file?(path): path
@@ -85,7 +73,8 @@ fn try-dir(dir: Text) -> Text? =
 fn try-path(base: Text) -> Text? = try-file(base) ?? try-dir(base)
 
 # The package.json governing a directory: the nearest one at or above it.
-fn package-json-for(start: Text) -> Text? = first dir in path-ancestors(start): existing(in-dir(dir, "package.json"))
+fn package-json-for(start: Text) -> Text? = first dir in path-ancestors(start) while path-base(dir) != "node_modules"
+    for path in [in-dir(dir, "package.json")] if readable-file?(path): path
 
 fn in-dir(dir: Text, name: Text) -> Text = match dir {
   "." => name
@@ -136,19 +125,54 @@ fn segment-end(s: Text) -> Int = (first i in 0..len(s) if s[i] == '/': i) ?? len
 
 # A bare name: the package's own directory in the nearest node_modules that has one, and the part
 # of the name after the package's, `@scope/name` being two parts.
-fn resolve-bare(spec: Text, from-dir: Text) -> Text? =
-  first dir in path-ancestors(from-dir): package-target(in-dir(dir, "node_modules/" ++ join(parts[0..cut], "/")),
-                                                        join(["."] ++ parts[cut..len(parts)], "/"))
-  where parts = split(spec, "/"),
-        cut = min(len(parts), match spec { "@" ++ _ => 2  _ => 1 })
+fn resolve-bare(spec: Text, from-dir: Text) -> Text? = bare-target(spec, from-dir, Import, [])
 
-# What `sub` of the package in `pdir` names, if there is a package there that has it.
-fn package-target(pdir: Text, sub: Text) -> Text? =
-  first doc in package-doc(pdir): match package-exports(doc, sub), sub {
-    some(target), _ => some(path-normalize(pdir ++ "/" ++ target))
-    none, "." => try-dir(pdir)
-    none, _ => try-path(path-normalize(pdir ++ "/" ++ sub))
+fn package-name(spec: Text) -> Text = join(parts[0..cut], "/")
+  where parts = split(spec, "/"), cut = min(len(parts), match spec { "@" ++ _ => 2 _ => 1 })
+
+fn package-subpath(spec: Text) -> Text = "." ++ spec[len(package-name(spec))..len(spec)]
+
+fn bare-target(spec: Text, from-dir: Text, kind: Kind, seen: [Text]) -> Text? = match own-package(spec, from-dir) {
+  some(pdir) => package-target-kind(pdir, package-subpath(spec), kind, seen)
+  none => first dir in path-ancestors(from-dir)
+    for pdir in [in-dir(dir, "node_modules/" ++ package-name(spec))]
+    if is-some(package-doc(pdir)) or is-some(try-file(pdir ++ "/index")):
+      package-target-kind(pdir, package-subpath(spec), kind, seen)
+}
+
+fn own-package(spec: Text, from-dir: Text) -> Text? = first pj in package-json-for(from-dir)
+  for doc in [doc-of(pj)] if (text-member(doc, "name") ?? "") == package-name(spec) and is-some(member(doc, "exports")): dir-of(pj)
+
+fn package-target(pdir: Text, sub: Text) -> Text? = package-target-kind(pdir, sub, Import, [])
+
+fn package-target-kind(pdir: Text, sub: Text, kind: Kind, seen: [Text]) -> Text? = match package-doc(pdir) {
+  some(doc) => match member(doc, "exports") {
+    some(value) => resolved-target(targets.exports(value, sub, conditions-for(kind)), pdir, sub, kind, seen)
+    none => match sub { "." => try-dir(pdir) _ => try-path(path-normalize(pdir ++ "/" ++ sub)) }
   }
+  none => try-path(path-normalize(pdir ++ "/" ++ sub))
+}
+
+fn imports-target(spec: Text, from-dir: Text, kind: Kind, seen: [Text]) -> Text? = match spec {
+  "#" | "#/" ++ _ => panic "invalid package import {}", spec
+  _ => match package-json-for(from-dir) {
+    some(pj) => match member(doc-of(pj), "imports") {
+      some(value) => resolved-target(targets.imports(value, spec, conditions-for(kind)), dir-of(pj), spec, kind, seen)
+      none => panic "{}: package import {} is not defined", pj, spec
+    }
+    none => panic "package import {} has no package scope", spec
+  }
+}
+
+fn resolved-target(target: targets.Target, dir: Text, spec: Text, kind: Kind, seen: [Text]) -> Text? = match target {
+  targets.Target(kind: targets.Path, value: path) => first decoded in targets.decoded(path): existing(path-normalize(dir ++ "/" ++ decoded))
+  targets.Target(kind: targets.Redirect, value: name) => match dir ++ ":" ++ spec in seen {
+    true => panic "{}: cyclic package import {}", dir, spec
+    false => target-kind(name, dir, kind, seen ++ [dir ++ ":" ++ spec])
+  }
+  targets.Target(kind: targets.Bad, value: reason) => panic "{}: invalid package target for {}: {}", dir, spec, reason
+  targets.Target(kind: targets.Denied, ...) | targets.Target(kind: targets.Unmatched, ...) => panic "{}: package path {} is not exported or is blocked", dir, spec
+}
 
 const node-builtin-names: [Text] = ["assert", "async_hooks", "buffer", "child_process", "cluster",
   "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs",
@@ -177,17 +201,77 @@ fn relative?(spec: Text) -> Bool = match spec {
   _ => false
 }
 
-fn target-of(spec: Text, from-dir: Text) -> Text? = match spec {
-  "/" ++ _ => try-path(path-normalize(spec))
-  _ if relative?(spec) => try-path(path-normalize(from-dir ++ "/" ++ spec))
-  _ => resolve-bare(spec, from-dir)
+fn target-of(spec: Text, from-dir: Text) -> Text? = target-kind(spec, from-dir, Import, [])
+
+# Browser maps apply both to a package's dependency spellings and to files resolved inside it.
+# Disabled modules have an explicit virtual identity; they are not filesystem paths or externals.
+fn browser-entry(doc: pkg.Node, key: Text) -> pkg.Node? = match member(doc, "browser") {
+  some(pkg.Object(...) as map) => member(map, key)
+  _ => none
 }
 
-fn resolution(from-dir: Text, spec: Text) -> Text? = target-of(spec, from-dir)
+fn browser-specifier(spec: Text, from-dir: Text) -> Text? = first pj in package-json-for(from-dir)
+  for doc in [doc-of(pj)] for value in browser-entry(doc, spec): browser-value(value, dir-of(pj), spec)
 
-# The same, or nothing: for looking ahead at imports that may never be needed.
-fn resolve-opt(spec: Text, importer: Text) -> Resolved? =
-  first p in resolution(dir-of(importer), spec): Resolved(path: p, side-effects: side-effects-of(p))
+fn browser-file(path: Text) -> Text? = first pj in package-json-for(dir-of(path))
+  for doc in [doc-of(pj)] for key in ["./" ++ below-package(dir-of(pj), path)]
+  for value in browser-entry(doc, key): browser-value(value, dir-of(pj), key)
 
-fn resolve(spec: Text, importer: Text) -> Resolved = Resolved(path: path, side-effects: side-effects-of(path))
-  where path = resolution(dir-of(importer), spec) ?? panic "{}: could not resolve {}", importer, spec
+fn below-package(dir: Text, path: Text) -> Text = match dir {
+  "." => path
+  _ => path[len(dir) + 1..len(path)]
+}
+
+fn browser-value(value: pkg.Node, dir: Text, key: Text) -> Text = match value {
+  pkg.False() => "disabled:" ++ real-path(dir) ++ "/" ++ key
+  pkg.Str(raw) => match unquote(raw) {
+    "./" ++ path => path-normalize(real-path(dir) ++ "/" ++ path)
+    target => target
+  }
+  _ => panic "{}: browser mapping for {} must be a string or false", dir, key
+}
+
+fn mapped-browser-target(target: Text, from-dir: Text, kind: Kind, seen: [Text]) -> Text? = match target {
+  "disabled:" ++ _ => some(target)
+  _ => target-kind(target, from-dir, kind, seen)
+}
+
+fn target-kind(spec: Text, from-dir: Text, kind: Kind, seen: [Text]) -> Text? = match options.node-builtins {
+  true => basic-target(spec, from-dir, kind, seen)
+  false => browser-target(spec, from-dir, kind, seen)
+}
+
+fn browser-target(spec: Text, from-dir: Text, kind: Kind, seen: [Text]) -> Text? = match key in seen {
+  true => panic "cyclic browser mapping for {} from {}", spec, from-dir
+  false => match browser-specifier(spec, from-dir) {
+    some(target) if target != spec => mapped-browser-target(target, from-dir, kind, seen ++ [key])
+    _ => first path in basic-target(spec, from-dir, kind, seen) : match browser-file(path) {
+      some(target) if target != path => mapped-browser-target(target, from-dir, kind, seen ++ [key])
+      _ => some(path)
+    }
+  }
+} where key = "browser:" ++ from-dir ++ ":" ++ spec
+
+fn basic-target(spec: Text, from-dir: Text, kind: Kind, seen: [Text]) -> Text? = match spec {
+  _ if options.node-builtins and node-builtin?(spec) => some("external:" ++ spec)
+  "/" ++ _ => try-path(path-normalize(spec))
+  "#" ++ _ => imports-target(spec, from-dir, kind, seen)
+  _ if relative?(spec) => try-path(path-normalize(from-dir ++ "/" ++ spec))
+  _ => bare-target(spec, from-dir, kind, seen)
+}
+
+fn resolution(dir: Text, spec: Text) -> Text? = resolution-kind(dir, spec, Import)
+
+# Canonical identity follows symlinks, with real-path tracked as an input by the generic runtime.
+fn resolution-kind(dir: Text, spec: Text, kind: Kind) -> Text? =
+  first p in target-kind(spec, dir, kind, []): real-path(p)
+
+fn resolve-opt(spec: Text, importer: Text) -> Resolved? = resolve-opt-kind(spec, importer, Import)
+
+fn resolve-opt-kind(spec: Text, importer: Text, kind: Kind) -> Resolved? =
+  first path in resolution-kind(dir-of(importer), spec, kind): Resolved(path: path, side-effects: side-effects-of(path))
+
+fn resolve(spec: Text, importer: Text) -> Resolved = resolve-kind(spec, importer, Import)
+
+fn resolve-kind(spec: Text, importer: Text, kind: Kind) -> Resolved =
+  resolve-opt-kind(spec, importer, kind) ?? panic "{}: could not resolve {}", importer, spec

@@ -6,6 +6,8 @@ var __hmr = (() => {
   var spaces = Object.create(null);
   var datas = Object.create(null);
   var entry = null;
+  var display = (id) => id.startsWith(base) ? id.slice(base.length) : id;
+  var base = typeof __hmr_base === "string" ? __hmr_base : "";
   var log = (text) => typeof console !== "undefined" && console.log("[hmr] " + text);
 
   // A module's namespace: the same object every time it runs. Its own exports are getters on it;
@@ -45,7 +47,8 @@ var __hmr = (() => {
   // What a module's code is given: its namespace's getters, imports, require, and import.meta.
   var context = (id, rec) => {
     var deps = defined[id].deps;
-    var target = (spec) => {
+    var target = (kind, spec) => {
+      spec = kind + ":" + spec;
       if (!(spec in deps)) throw new Error("[hmr] " + id + " imports " + spec + ", which the build did not resolve");
       return deps[spec];
     };
@@ -61,13 +64,13 @@ var __hmr = (() => {
         (stars[id] || (stars[id] = [])).push(ns);
       },
       import(spec) {
-        var t = target(spec);
+        var t = target("import", spec);
         if (t === null) return __toESM(outside(spec));
         var r = load(t);
         return r.esm ? r.ns : __toESM(r.module.exports);
       },
       require(spec) {
-        var t = target(spec);
+        var t = target("require", spec);
         if (t === null) return outside(spec);
         var r = load(t);
         return r.esm ? __toCommonJS(r.ns) : r.module.exports;
@@ -132,7 +135,7 @@ var __hmr = (() => {
       var rec = load(id);
       if (rec.accepted) rec.accepted(rec.ns);
     }
-    log("updated " + boundaries.join(", "));
+    log("updated " + boundaries.map(display).join(", "));
   };
 
   // Each update is a script, run by `apply`, which the bundle gives from its own top level: where

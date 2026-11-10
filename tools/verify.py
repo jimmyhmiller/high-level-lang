@@ -180,10 +180,11 @@ for name, files in [("sources", source), ("declarations", declarations)]:
     listfile = f"{SCRATCH}/ts-{name}.list"; open(listfile, "w").write("\n".join(files) + "\n")
     code, out = sh([PARSE, "check", listfile], 300)
     tail = out.strip().split("\n")[-1]
-    # Esbuild rejects these too. Three say `export const x: T;`, and four are `export =       function
+    # Esbuild rejects these too. Several say `export const x: T;`, and four are `export =       function
     # f(): T;`, a find-and-replace on `export default` in the package's own build.
     rejected = set() if name == "sources" else {f"node_modules/{f}" for f in [
         "acorn/dist/acorn.d.ts", "acorn/dist/acorn.d.mts", "preact/src/index.d.ts",
+        "playwright-core/types/types.d.ts",
         "@jridgewell/trace-mapping/types/by-source.d.cts", "@jridgewell/trace-mapping/types/resolve.d.cts",
         "@jridgewell/trace-mapping/types/strip-filename.d.cts", "@jridgewell/trace-mapping/types/sort.d.cts"]}
     failed = set(re.findall(r"^FAIL (\S+?):\d+:\d+", out, re.M))
@@ -365,6 +366,19 @@ print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "
       + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} fixture groups across all policies, fragment modes, minification and entry orders" if code == 0 else out[-1800:]))
+
+print("== package resolution and application assets")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "resolution-check.py"), ESB], 180)
+check(code == 0 and "resolution checks passed" in out, "package maps, request kinds, workspace identity and browser mappings: " + out.strip().split("\n")[-1])
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "multi-output-check.py"), ESB], 180)
+check(code == 0 and out.strip().endswith("ALL multi-output cache/watch checks passed"), "split JS/CSS/assets cache and watch: " + out.strip().split("\n")[-1])
+code, out = sh(["node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets-check.mjs"), ESB], 180)
+check(code == 0 and out.strip().endswith("ALL split asset browser checks passed"), "split assets in Chrome: " + out.strip().split("\n")[-1])
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "workbench.py"), "--spec=" + SPEC], 180)
+check(code == 0, "Workbench application builds from its declarative spec")
+if code == 0:
+    code, out = sh(["node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "workbench-check.mjs")], 180)
+    check(code == 0 and out.strip().endswith("ALL Workbench browser and API checks passed"), "Workbench browser, assets, CRUD and persistence: " + out.strip().split("\n")[-1])
 
 print("== watching")
 # Rebuilds after edits, byte for byte what a fresh process builds, and none for a write that changes nothing.

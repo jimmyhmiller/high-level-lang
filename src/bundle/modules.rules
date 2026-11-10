@@ -16,6 +16,26 @@ use bundle.cssbundle as cssb
 use bundle.legal as legal
 use bundle.tsconfig as tsc
 
+# Resolution requests preserve their kind, including when one module imports and requires the
+# same spelling. Keys are a serialization for maps and work items, never module identities.
+record Request { spec: Text, kind: res.Kind }
+
+fn import-request(spec: Text) -> Request = Request(spec: spec, kind: res.Import)
+fn require-request(spec: Text) -> Request = Request(spec: spec, kind: res.Require)
+fn request-key(r: Request) -> Text = match r.kind { res.Import => "import:" res.Require => "require:" } ++ r.spec
+fn request-of(key: Text) -> Request = match key {
+  "import:" ++ spec => import-request(spec)
+  "require:" ++ spec => require-request(spec)
+  _ => panic "invalid resolution request {}", key
+}
+fn requests-in(tree: Node, required: [Text], dynamic: [Text]) -> [Request] =
+  [import-request(s) for s in imported-specs(tree)] ++ [require-request(s) for s in required]
+  ++ [import-request(s) for s in dynamic]
+fn requests-of(p: Parsed) -> [Request] = match p.analysed {
+  true => requests-in(p.tree, p.required, p.imports)
+  false => requests-in(p.tree, p.requires, p.imports)
+}
+
 # `External` is an import left for the runtime: it has no source and no statements.
 enum ModuleKind { Esm, Cjs, Runtime, External }
 
@@ -29,7 +49,8 @@ record Module {
   root: Int,
   side-effects: Bool,
   deps: [Int],
-  dep-ids: {Text:Int},  # the module each specifier it imports or requires led to
+  dep-ids: {Text:Int},  # imports and import() by specifier
+  require-ids: {Text:Int}, # require() has its own conditions and may resolve the same name differently
   symbol-shift: Int,    # how far those symbols moved when its table joined the shared one
   base: Text,
   free: [Text],
@@ -316,7 +337,7 @@ fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-
 
 fn blank-module(id: Int, path: Text, kind: ModuleKind, root: Int) -> Module =
   Module(id: id, path: path, kind: kind, root: root, side-effects: true,
-         deps: [], dep-ids: {}, symbol-shift: 0, base: base-name(path), free: [],
+         deps: [], dep-ids: {}, require-ids: {}, symbol-shift: 0, base: base-name(path), free: [],
          legal: [], helpers: [], calls: true, script: false)
 
 # What a module is made of: its tree; the symbol each name leaf is, by where it starts, as its own
@@ -377,19 +398,19 @@ fn configured-path(spec: Text, importer: Text) -> Text? = match spec {
 
 # Where an import leads: resolve hooks first, then the project's paths, then the search. A worker
 # that parsed the importer ahead may have found the answer already.
-fn resolve-import(spec: Text, importer: Text) -> res.Resolved = resolved-now(spec, importer)
+fn resolve-import(spec: Text, importer: Text) -> res.Resolved = resolved-now(import-request(spec), importer)
 
-fn resolved-now(spec: Text, importer: Text) -> res.Resolved = match hook-path(wanted, importer) {
+fn resolved-now(request: Request, importer: Text) -> res.Resolved = match hook-path(wanted, importer) {
   some(p) => res.Resolved(path: p, side-effects: true)
   none => match configured-path(wanted, importer) {
     some(p) => res.Resolved(path: p, side-effects: res.side-effects-of(p))
     # A relative alias is relative to where the build runs, not to the importing file.
-    none => res.resolve(wanted, match wanted != spec and res.relative?(wanted) {
+    none => res.resolve-kind(wanted, match wanted != spec and res.relative?(wanted) {
       true => "alias"
       false => importer
-    })
+    }, request.kind)
   }
-} where wanted = aliased(spec)
+} where spec = request.spec, wanted = aliased(spec)
 
 fn loader-of(path: Text) -> Text = (first l in loading.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
 
@@ -404,12 +425,17 @@ fn default-loader(path: Text) -> Text = match path {
 
 # A file's text as a module, by what its loader says it is.
 fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
-  "file" => "export default " ++ host.js-string(public-url(cssb.file-url(path))) ++ ";"
+  "file" => "export default " ++ host.js-string(cssb.file-url(path)) ++ ";"
   _ => module-text(text, path)
 }
 
 # A load hook may supply a file's text, or the file does.
-fn source-of(path: Text) -> Text = (first hook in loading.on-load: hook(path)) ?? read-file(path)
+fn source-of(path: Text) -> Text = (first hook in loading.on-load: hook(path)) ?? unhooked-source(path)
+
+fn unhooked-source(path: Text) -> Text = match path {
+  "disabled:" ++ _ => "module.exports = {};"
+  _ => read-file(path)
+}
 
 # The specifier a statement imports from, or nothing.
 fn import-spec-of(s: Node) -> Text? = match s {
@@ -548,7 +574,7 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
 fn parsed-file(item: Pending) -> Parsed = parsed-with(item.path, src, checked.tree, none, some(checked))
   where src = match item.ready {
           true => item.text
-          false => module-text(read-file(item.path), item.path)
+          false => module-text(unhooked-source(item.path), item.path)
         },
         checked = parse-file(src, item.path)
 
@@ -587,7 +613,7 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
 # has to see the tree first.
 fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
   true => p
-  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, required: found.requires, specs: specs }
+  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, required: found.requires, imports: found.imports, specs: specs }
     where a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers),
           # The calls are the parsed tree's unless a define changed it, and those were found already.
           found = match p.found and not a.analysis.defined {
@@ -630,7 +656,7 @@ fn part-visited(path: Text, item: Text, what: Text) -> Parsed = match what {
   "early" => worked(item) where problem = early-of(path)
   "from" => worked(item) where p = from-of(path)
   "w" ++ _ => worked(item) where w = walked-of(item)
-  "?" ++ spec => blank-parsed(path) with { role: Resolved, targets: {spec: t for t in unhooked-target(spec, path)} }
+  "?" ++ spec => blank-parsed(path) with { role: Resolved, targets: {spec: t for t in unhooked-target(request-of(spec), path)} }
   _ => worked(item) with { targets: piece-of(item).targets }
 }
 
@@ -647,7 +673,7 @@ fn prepared-file(path: Text, pr: Prepared) -> Parsed = match pr.whole {
 const resolve-alone: Int = 16
 
 fn targets-of(p: Parsed) -> Parsed =
-  p with { targets: {spec: t for spec in p.specs if let some(t) = unhooked-target(spec, p.path)} }
+  p with { targets: {request-key(r): t for r in requests-of(p) if let some(t) = unhooked-target(r, p.path)} }
 
 # The files what a result imports lead to, visited after what waits already.
 # What the walk ahead needs of a visit: where it goes next, what carries on first, and what comes
@@ -674,7 +700,7 @@ fn first-files(p: Parsed) -> [Text] = match p.role {
   # Then its parts' walks, its early errors and the rest, at once.
   Prepare => [p.path ++ "\nw" ++ int-text(k) for k in 0..p.pieces] ++ [p.path ++ "\nearly", p.path ++ "\nfrom"]
   Whole => if len(p.specs) > resolve-alone and len(keys(p.targets)) == 0
-           then [p.path ++ "\n?" ++ s for s in p.specs] else []
+           then [p.path ++ "\n?" ++ request-key(r) for r in requests-of(p)] else []
   _ => []
 }
 
@@ -708,7 +734,7 @@ record Parts { src: Text, starts: [Int], open: Int, close: Int }
 fn split-source(path: Text) -> Parts = match src {
   _ if loading.has-transform or loader-of(path) != "js" or len(src) < 2 * piece-bytes => Parts(src: src, starts: [0], open: -1, close: -1)
   _ => parts-of-source(src)
-} where src = module-text(read-file(path), path)
+} where src = module-text(unhooked-source(path), path)
 
 fn parts-of-source(src: Text) -> Parts = match top-cuts {
   [_, ...] => whole with { starts: [0] ++ top-cuts }
@@ -828,7 +854,7 @@ record PieceTree { tree: Node?, specs: [Text], targets: {Text:Text} }
 fn piece-of(item: Text) -> PieceTree = match item {
   path ++ "\n" ++ number => match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
     none => PieceTree(tree: none, specs: [], targets: {})
-    some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {spec: t for spec in specs if let some(t) = unhooked-target(spec, path)})
+    some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {request-key(r): t for r in requests-in(tree, found.requires, found.imports) if let some(t) = unhooked-target(r, path)})
       where found = calls.run(tree),
             specs = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)] ++ found.requires ++ found.imports
   } where k = parse-int(number),
@@ -927,8 +953,8 @@ fn finished-file(path: Text) -> Parsed = match prepared-of(path) {
 fn joined-file(path: Text, pr: Prepared) -> Parsed =
   match early-of(path) ?? (first w in walks: w.problem), (cjs and pr.wrapper < 0) or p.jsx-imports or (any w in walks: w.defined) {
     some(at), _ => panic "{}:{}:{}: {}", path, line-of(sp.src, at.at), col-of(sp.src, at.at), at.message
-    none, true => q with { targets: {spec: t for spec in q.specs if let some(t) = targets[spec]} } where q = analysed-file(p)
-    none, false => p with { analysed: true, scopes: own, analysis: a, calls: calls, required: [r for w in walks for r in w.requires],
+    none, true => targets-of(analysed-file(p))
+    none, false => p with { analysed: true, scopes: own, analysis: a, calls: calls, required: [r for w in walks for r in w.requires], imports: [r for w in walks for r in w.imports],
                             targets: targets }
   }
   where sp = split-source(path),
@@ -980,25 +1006,25 @@ fn piece-starts(src: Text) -> [Int] = match co.parse-opt(src, "<coarse>", 0) {
 fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
 
 # `ahead-target` without hooks, which only the thread that owns them may call.
-fn unhooked-target(spec: Text, importer: Text) -> Text? = match wanted {
+fn unhooked-target(request: Request, importer: Text) -> Text? = match wanted {
   _ if res.external?(wanted) or (loading.packages-external and package-spec?(wanted, importer)) => none
-  _ => configured-path(wanted, importer) ?? searched(spec, wanted, importer)
-} where wanted = aliased(spec)
+  _ => configured-path(wanted, importer) ?? searched(request, wanted, importer)
+} where spec = request.spec, wanted = aliased(spec)
 
 # Where the search finds it. A relative alias is relative to where the build runs.
-fn searched(spec: Text, wanted: Text, importer: Text) -> Text? =
-  first r in res.resolve-opt(wanted, match wanted != spec and res.relative?(wanted) {
+fn searched(request: Request, wanted: Text, importer: Text) -> Text? =
+  first r in res.resolve-opt-kind(wanted, match wanted != request.spec and res.relative?(wanted) {
     true => "alias"
     false => importer
-  }): r.path
+  }, request.kind): r.path
 
 fn ahead?(path: Text) -> Bool = loader-of(path) != "file"
 
 # Where an import would lead, or nothing if it leads nowhere or stays outside the bundle.
-fn ahead-target(spec: Text, importer: Text) -> Text? = match spec {
-  _ if stays-external?(spec, importer) => none
-  _ => hook-path(wanted, importer) ?? configured-path(wanted, importer) ?? searched(spec, wanted, importer)
-    where wanted = aliased(spec)
+fn ahead-target(request: Request, importer: Text) -> Text? = match request.spec {
+  _ if stays-external?(request.spec, importer) => none
+  _ => hook-path(wanted, importer) ?? configured-path(wanted, importer) ?? searched(request, wanted, importer)
+    where spec = request.spec, wanted = aliased(spec)
 }
 
 # Every file the entries can reach, parsed on many threads before the graph is made, into memos the
@@ -1010,7 +1036,7 @@ fn parsed-ahead(paths: [Text]) -> Int = match loading.load-threads > 1, hooked?(
   false, _ => 0
   true, false => len(parallel-walk(roots, visit-step, step-next, step-first, step-after, loading.load-threads))
   true, true => len(parsed-waves(roots, {p: true for p in roots}))
-} where roots = [p for p in paths if ahead?(p) distinct p]
+} where roots = [real-path(p) for p in paths if ahead?(p) distinct real-path(p)]
 
 # With hooks, which only this thread may call: a wave's texts are asked for here, its files parsed
 # at once, and the files their imports lead to that none has led to before are the next wave.
@@ -1019,7 +1045,7 @@ fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] = match wave {
   _ => done ++ parsed-waves(next, {p: true for ps in [keys(seen), next] for p in ps})
     where texts = [hooked-text(p) for p in wave],
           done = match len(texts) { _ => parallel-map(wave, parsed-hooked, loading.load-threads) },
-          next = [t for d in done for spec in d.specs if let some(t) = ahead-target(spec, d.path) if ahead?(t) and not (t in seen) distinct t]
+          next = [t for d in done for request in requests-of(d) if let some(t) = ahead-target(request, d.path) if ahead?(t) and not (t in seen) distinct t]
 }
 
 # ---------------------------------------------------------------- the graph
@@ -1073,12 +1099,13 @@ record Lead { key: Text, effects: Bool }
 # defines, its scopes in a table of its own, what it imports and loads at run time, and where each
 # leads, in the order it names them.
 record Loaded { path: Text, parsed: Parsed, tree0: Node, analysis: Analysis, scopes: sym.Table, specs: [Text], calls: [Text],
-                leads: [Lead], whole: [Text] }
+                requests: [Request], leads: [Lead], whole: [Text] }
 
 fn loaded(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: tree0, analysis: a.analysis, scopes: a.scopes, specs: specs, calls: calls,
-         leads: [lead(spec, path) for spec in specs],
-         whole: [lead(spec, path).key for spec in required ++ [x for st in tree0.body.kids for x in wholly-imported(st)]])
+         requests: requests, leads: [lead-request(request, path) for request in requests],
+         whole: [lead-request(r, path).key for r in [require-request(s) for s in required]
+                   ++ [import-request(x) for st in tree0.body.kids for x in wholly-imported(st)]])
   where p = parsed-for-graph(path),
         tree0 = match p.analysed {
           true => p.tree
@@ -1098,7 +1125,8 @@ fn loaded(path: Text) -> Loaded =
           false => found.requires ++ found.imports
         },
         required = found.requires,
-        specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls
+        specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls,
+        requests = requests-in(tree0, required, [s for s in calls[len(required)..len(calls)]])
 
 # What loading made of a file, before the graph joins it to the others: on many threads, what the
 # walk ahead made of it, found again in the memos it filled (a big file put together from its
@@ -1148,9 +1176,11 @@ fn whole-clause?(c: Node) -> Bool = match c {
   _ => false
 }
 
-fn lead(spec: Text, importer: Text) -> Lead = match stays-external?(spec, importer) {
-  true => Lead(key: "external:" ++ aliased(spec), effects: false)
-  false => Lead(key: r.path, effects: r.side-effects) where r = resolve-import(spec, importer)
+fn lead(spec: Text, importer: Text) -> Lead = lead-request(import-request(spec), importer)
+
+fn lead-request(request: Request, importer: Text) -> Lead = match stays-external?(request.spec, importer) {
+  true => Lead(key: "external:" ++ aliased(request.spec), effects: false)
+  false => Lead(key: r.path, effects: r.side-effects) where r = resolved-now(request, importer)
 }
 
 # What a node of the graph leads to: an outside import, nothing.
@@ -1173,12 +1203,14 @@ fn graph(runtime: Text, paths: [Text]) -> Graph =
         blocks: blocks, module-blocks: {0: blocks[0]} ++ {ids[files[k]] ?? (panic "{} has no id", files[k]): blocks[k + 1] for k in 0..len(files)},
         symbols: lay.symbols,
         scopes: lay.scopes, scope-shifts: lay.scope-shifts, symbol-shifts: lay.symbol-shifts)
-  where w = depth-first(paths, led-to),
+  where roots = [real-path(p) for p in paths],
+        w = depth-first(roots, led-to),
         numbers = module-ids(w.pre),
         post = [i for i in w.post if not external?(w.pre[i])],
         order-ids = [0] ++ [numbers[i] for i in post],
         ranked = rank!(order-ranks, ["<runtime>"] ++ [w.pre[i] for i in post]),
-        ids = {w.pre[i]: numbers[i] for i in 0..len(w.pre)},
+        canonical-ids = {w.pre[i]: numbers[i] for i in 0..len(w.pre)},
+        ids = canonical-ids ++ {paths[i]: canonical-ids[roots[i]] ?? -1 for i in 0..len(paths)},
         top = (fold t = 1 for n in numbers: max(t, n + 1)),
         files = [key for key in w.pre if not external?(key)],
         # The files something requires, or imports the default or namespace of.
@@ -1248,7 +1280,8 @@ fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift
     symbol-shift: symbol-shift, side-effects: effects,
     free: l.analysis.free,
     legal: l.parsed.legal, helpers: l.parsed.helpers, deps: deps,
-    dep-ids: {l.specs[k]: deps[k] for k in 0..len(l.specs)}, calls: len(l.calls) > 0,
+    dep-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].kind == res.Import},
+    require-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].kind == res.Require}, calls: len(l.calls) > 0,
     script: l.analysis.script and kind == Esm
   } where kind = match l.analysis.cjs, l.analysis.script and whole {
     true, _ => Cjs
@@ -1293,3 +1326,15 @@ fn public-url(local: Text) -> Text = match loading.public-path {
 
 # Stylesheets the program imports, in the order its modules run.
 fn css-imports() -> [Text] = [modules[id].path for id in order if loader-of(modules[id].path) == "css"]
+
+# CSS belongs to an evaluation root's static import closure. Dynamic imports start a separate
+# closure. The shared graph walk supplies cycle-safe postorder; no chunk policy decides cascade.
+fn static-dependencies(id: Int) -> [Text] = [int-text(target)
+  for statement in body-of(id).tree.body.kids for spec in import-spec-of(statement)
+  for target in modules[id].dep-ids[spec] if modules[target].kind != External distinct int-text(target)]
+
+fn static-style-children(key: Text) -> [Text] = static-dependencies(parse-int(key))
+
+fn stylesheets(root: Int) -> [Text] = [modules[parse-int(w.pre[i])].path for i in w.post
+  if loader-of(modules[parse-int(w.pre[i])].path) == "css"]
+  where w = depth-first([int-text(root)], static-style-children)

@@ -1,0 +1,105 @@
+# Package maps are an ordered choice over declarative targets. Selecting a target is separate
+# from finding a file: an explicit null or an unexported path never enables a filesystem fallback.
+rules bundle.package-targets
+use bundle.package as pkg
+
+enum Kind { Unmatched, Denied, Bad, Path, Redirect }
+record Target { kind: Kind, value: Text }
+fn missing() -> Target = Target(kind: Unmatched, value: "")
+fn blocked() -> Target = Target(kind: Denied, value: "")
+fn invalid(reason: Text) -> Target = Target(kind: Bad, value: reason)
+fn local(path: Text) -> Target = Target(kind: Path, value: path)
+fn package(name: Text) -> Target = Target(kind: Redirect, value: name)
+
+fn member(object: pkg.Node, key: Text) -> pkg.Node? = match object {
+  pkg.Object(List(ms...)) => last m in ms if unquote(m.key.text) == key: m.value
+  _ => none
+}
+
+fn numeric?(s: Text) -> Bool = len(s) > 0 and len(s) <= 10 and (s == "0" or s[0] != '0')
+  and (all c in s: c >= '0' and c <= '9') and is-some(digits-number(s, 10, 4294967294))
+
+fn path-key?(s: Text) -> Bool = starts-with(s, ".")
+
+fn subpaths?(value: pkg.Node) -> Bool = match value {
+  pkg.Object(List(ms...)) => any m in ms: path-key?(unquote(m.key.text))
+  _ => false
+}
+
+fn exports(value: pkg.Node, subpath: Text, conditions: [Text]) -> Target = match value {
+  pkg.Object(List(ms...)) if subpaths?(value) => match all m in ms: path-key?(unquote(m.key.text)) {
+    true => mapped(value, subpath, conditions, false)
+    false => invalid("exports mixes condition names and subpaths")
+  }
+  _ if subpath == "." => selected(value, conditions, false, none)
+  _ => missing()
+}
+
+fn imports(value: pkg.Node, spec: Text, conditions: [Text]) -> Target = match value {
+  pkg.Object(...) => mapped(value, spec, conditions, true)
+  _ => invalid("imports must be an object")
+}
+
+fn mapped(value: pkg.Node, key: Text, conditions: [Text], internal: Bool) -> Target = match member(value, key) {
+  some(v) if not has-byte?(key, '*') => selected(v, conditions, internal, none)
+  _ => matched-pattern(value, key, conditions, internal)
+}
+
+record Pattern { key: Text, value: pkg.Node, prefix: Int }
+
+# Longest prefix wins, then longest pattern. Declaration order is only for conditions.
+fn matched-pattern(value: pkg.Node, key: Text, conditions: [Text], internal: Bool) -> Target = match patterns {
+  [p, ...] => selected(p.value, conditions, internal, some(key[p.prefix..len(key) - (len(p.key) - p.prefix - 1)]))
+  _ => missing()
+} where patterns = sort p in [Pattern(key: name, value: m.value, prefix: at)
+          for m in value.members.kids for name in [unquote(m.key.text)] for at in index-of(name, "*")
+          if not has-byte?(name[at + 1..len(name)], '*') and starts-with(key, name[0..at])
+          and ends-with(key, name[at + 1..len(name)]) and len(key) > len(name) - 1]
+        by (0 - (p.prefix * (len(key) + 1) + len(p.key)))
+
+fn selected(value: pkg.Node, conditions: [Text], internal: Bool, capture: Text?) -> Target = match value {
+  pkg.Str(raw) => string-target(unquote(raw), internal, capture)
+  pkg.Null() => blocked()
+  pkg.Array(List(items...)) => array-target(items, conditions, internal, capture)
+  pkg.Object(List(ms...)) => match any m in ms: numeric?(unquote(m.key.text)) or path-key?(unquote(m.key.text)) {
+    true => invalid("invalid condition name in package target")
+    false => (first m in ms if unquote(m.key.text) == "default" or unquote(m.key.text) in conditions
+              for t in [selected(m.value, conditions, internal, capture)] if t.kind != Unmatched: t) ?? missing()
+  }
+  _ => invalid("package target must be a string, object, array or null")
+}
+
+# Arrays skip invalid targets, nulls and unmatched conditions, but never missing files. The
+# selected path is resolved only after this choice, so a missing file cannot change the choice.
+fn array-target(items: [pkg.Node], conditions: [Text], internal: Bool, capture: Text?) -> Target =
+  fold chosen = blocked() for item in items: array-choice(chosen, selected(item, conditions, internal, capture))
+
+fn array-choice(chosen: Target, next: Target) -> Target = match chosen, next {
+  Target(kind: Path, ...) | Target(kind: Redirect, ...), _ => chosen
+  _, Target(kind: Unmatched, ...) => chosen
+  _, _ => next
+}
+
+# Decode percent escapes once, including encoded package-segment names. Preserve UTF-8 bytes.
+fn decoded(s: Text) -> Text? = match s {
+  "" => some("")
+  "%" ++ rest if len(rest) >= 2 => first byte in digits-number(rest[0..2], 16, 255)
+    for tail in decoded(rest[2..len(rest)]): byte-text(byte) ++ tail
+  "%" ++ _ => none
+  _ => first tail in decoded(s[1..len(s)]): s[0..1] ++ tail
+}
+
+fn invalid-path?(s: Text) -> Bool =
+  has-byte?(s, '\\') or contains-text?(ascii-lower(s), "%2f") or contains-text?(ascii-lower(s), "%5c")
+  or any part in split(s, "/"): (decoded(ascii-lower(part)) ?? "..") in [".", "..", "node_modules"]
+
+fn string-target(target: Text, internal: Bool, capture: Text?) -> Target = match target {
+  "./" ++ rest if invalid-path?(rest) => invalid("package target escapes its package or has an invalid segment")
+  "./" ++ _ => match capture {
+    some(c) if invalid-path?(c) => invalid("invalid package pattern capture")
+    _ => local(replace-all(target, "*", capture ?? "*"))
+  }
+  _ if internal and not starts-with(target, "../") and not starts-with(target, "/") and not contains-text?(target, ":") =>
+    package(replace-all(target, "*", capture ?? "*"))
+  _ => invalid("export targets must start with ./")
+}

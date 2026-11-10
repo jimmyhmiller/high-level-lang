@@ -124,7 +124,7 @@ for p in (esb, client):
 # The development format runs as the bundle does: every app, built both ways, says the same in Node.
 print("== the development format runs as the bundle does")
 APPS = {"named": [], "all": [], "cjs": [], "features": [], "three": [], "zod": [], "rx": [], "datefns": [], "preact": [],
-        "immer": [], "react": [], "d3": [], "lib": [], "excjs": [], "nodey": ["--platform=node"]}
+        "immer": [], "react": [], "d3": [], "lib": [], "excjs": [], "nodey": ["--platform=node"], "hmrdual": []}
 OUT = os.path.join(WORK, "apps-out")
 os.makedirs(OUT)
 def run_node(path):

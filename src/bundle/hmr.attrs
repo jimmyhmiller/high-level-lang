@@ -8,6 +8,7 @@ attrs bundle.hmr over bundle.js
 use bundle.js as js
 use bundle.modules as m
 use bundle.early as early
+use bundle.analysis as an
 use bundle.hmr-plan as plan
 
 quote stmt at 1 0 ;
@@ -34,12 +35,15 @@ rewrite Shorthand(old) => Prop(PropName(old.text), old.out)
 rewrite CallExpr(callee, _) as n => call-read(n, callee, n.out)
 rewrite ImportMeta() => Member(Ident(ctx), PropName("meta"))
 # `import("x")` of a module the build resolved: its namespace, once it has run.
-rewrite ImportCall(Str(raw), ...) if is-some(leads[unquote(raw)]) => import-later(raw)
+rewrite ImportCall(Str(raw), ...) if is-some(leads[m.request-key(m.import-request(unquote(raw)))]) => import-later(raw)
 
-fn call-read(n: Node, callee: Node, out: Node) -> Node = match callee {
-  Ident(_) if is-some(import-read(callee)) and not (out.callee is Ident(_)) =>
-    CallExpr(exp`(0, $f)`, out.args) with { lo: n.lo, hi: n.hi } where f = out.callee
-  _ => out
+fn call-read(n: Node, callee: Node, out: Node) -> Node = match an.required-str(body, n) {
+  some(from) => exp`$c.require($spec)` where c = Ident(ctx), spec = from
+  none => match callee {
+    Ident(_) if is-some(import-read(callee)) and not (out.callee is Ident(_)) =>
+      CallExpr(exp`(0, $f)`, out.args) with { lo: n.lo, hi: n.hi } where f = out.callee
+    _ => out
+  }
 }
 
 fn import-later(raw: Text) -> Node = exp`Promise.resolve().then(() => $c.import($spec))` where c = Ident(ctx), spec = Str(raw)
@@ -68,10 +72,10 @@ fn dev-accepts(path: Text) -> Bool = accepts?(m.loaded(path).analysis.tree)
 fn dev-module(l: m.Loaded, cjs: Bool) -> m.Module =
   m.blank-module(-1, l.path, match cjs { true => m.Cjs  false => m.Esm }, l.analysis.root)
 
-fn leads-of(l: m.Loaded) -> {Text:Text} = {l.specs[k]: match l.leads[k].key {
+fn leads-of(l: m.Loaded) -> {Text:Text} = {m.request-key(l.requests[k]): match l.leads[k].key {
   "external:" ++ _ => ""
   path => path
-} for k in 0..len(l.specs)}
+} for k in 0..len(l.requests)}
 
 fn define-args(mo: m.Module) -> Text = match mo.kind {
   m.Cjs => deps-text(mo) ++ ", function (module, exports, require, " ++ p ++ ") {\n"
@@ -221,7 +225,7 @@ fn files(mods: [m.Module]) -> [m.Module] = [mo for mo in mods if mo.kind == m.Es
 # The bundle: the runtime's helpers and the development runtime, every module's function, a
 # connection to `events` when there is one, and the entry run.
 fn dev-build(entry: Int, events: Text) -> Dev =
-  Dev(text: "(() => {\n" ++ include-text("runtime.js") ++ include-text("hmr_runtime.js")
+  Dev(text: "(() => {\n" ++ include-text("runtime.js") ++ "var __hmr_base = " ++ quote-text(real-path(working-dir()) ++ "/") ++ ";\n" ++ include-text("hmr_runtime.js")
             ++ "var __hmr_apply = (text) => eval(text);\n"
             ++ join(["__hmr.define(" ++ id-text(mo) ++ ", " ++ (functions[mo.path] ?? "") ++ ");\n" for mo in files(m.modules)], "")
             ++ match events { "" => ""  url => "__hmr.connect(" ++ quote-text(url) ++ ", __hmr_apply);\n" }
@@ -242,7 +246,7 @@ fn update(before: Dev, now: Dev, entries: [Int]) -> Sent? = match changed {
                                                    for i in changed], ", ")
                           ++ "}, " ++ id-list([x for db.dirty(?x)]) ++ ", " ++ id-list([x for db.boundary(?x)]) ++ ");"))
     xs => some(Sent(event: "reload", changed: [m.modules[i].path for i in changed],
-                    text: join([m.modules[x].path for x in xs], ", ") ++ " changed, and does not accept updates"))
+                    text: join([m.shown-path(m.modules[x].path) for x in xs], ", ") ++ " changed, and does not accept updates"))
   } where db = plan.solved([plan.fact-changed(i) for i in changed]
                            ++ [plan.fact-imports(mo.id, d) for mo in files(m.modules) for d in mo.deps]
                            ++ [plan.fact-accepts(mo.id) for mo in files(m.modules) if dev-accepts(mo.path)]

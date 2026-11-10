@@ -703,7 +703,59 @@ memory to spare at its end; one-shot builds keep everything as before, three hol
 a module, to the entry, a new file, a `package.json`, and a write that changes nothing.
 `tools/hmr-check.py` runs a served bundle in Node and checks updates, reloads, kept state and
 dispose data, and that all 15 test apps run the same in the development format as bundled.
-A build error in `--watch` still ends the process.
+A build error in `--watch` still ends the process. Split builds can be watched and cached;
+HMR remains a single-entry development format.
+
+## Application acceptance and larger graphs
+
+`examples/workbench.bundler` builds a React project-management application and its Node API.
+Overview, projects and D3 reports are lazy routes, with separate stylesheets. The application
+uses shared Zod schemas, date-fns, package self-references and `#imports`, JSON data, text, SVG
+images and CSS background assets. Create and complete projects, filter/search them, switch
+between routes and change the theme. The API serializes mutations and saves JSON through an
+atomic rename. It is an acceptance application: authentication, authorization and a multi-user
+database service are outside this fixture.
+
+```sh
+python3 tools/workbench.py --serve       # builds the spec, serves at http://127.0.0.1:8000
+node tools/workbench-check.mjs           # actual Chrome: routes, CRUD, assets, persisted restart
+node tools/assets-check.mjs              # policies × modules/fragments, lazy CSS failure/retry
+python3 tools/resolution-check.py        # Node/esbuild resolution differential checks
+python3 tools/multi-output-check.py      # split JS/CSS/assets: cold/warm cache and watched edits
+python3 tools/scale-check.py             # 10,160 source modules, 32 entries, native-output oracle
+```
+
+Browser checks use the installed macOS Chrome, or the executable in `CHROME`. They require
+`npm ci` in `tests/` for playwright-core; no browser download is needed. Build the native tools
+first as described above. The full verification suite includes browser and API acceptance;
+the larger generated graph is a separate stress test, with measurements in
+`out/application-scale/results.json`. Generated scale and real-application behavior are
+separate evidence; neither alone establishes performance for every large application.
+
+Package-map selection is in `bundle.package-targets`: explicit missing, blocked, invalid,
+local and redirected targets; ordered conditions; exact and wildcard subpaths; array fallback
+and path validation. `bundle.resolve` handles package scope, `#imports`, self-references,
+request-specific import/require conditions, browser file/dependency replacements (including
+`false`), and canonical symlink identity. Unexported/private paths do not fall back to disk.
+Resolution requests retain their kind even when one file both imports and requires a package.
+This is a larger supported subset, not a claim of complete Node/package-manager parity.
+
+Split stylesheets follow each root's static import closure, independent of JavaScript packing
+policy. Static entries receive a matching `.css` file for the HTML to link. A dynamic import
+waits for its root's CSS before evaluating any of that root's JavaScript. Concurrent requests
+share a stylesheet load; a failed stylesheet rejects the import and can be retried. CSS import
+cycles terminate, and imports of one sheet under different media conditions remain distinct.
+Assets are copied for split builds too; `public-path` is available in the spec as well as the CLI.
+
+An entry may contain implementation definitions only when other implementation chunks do not
+import them. Otherwise it becomes a facade, avoiding initialization cycles caused by splitting
+a large entry. Chunk hashes include their own content before their dependency closure. Different
+contents targeting the same normalized output path fail before any file is written.
+
+`--watch` and `--cache` accept split and multiple-output builds; their checks compare every current
+JS/CSS/asset/source-map byte with a fresh build. Old hashed files are retained for existing clients.
+HMR still supports a single JavaScript entry. Recovering from build errors and publishing a whole
+output generation atomically remain follow-up work; file output is not a deployment transaction.
 
 ## What it does
 
@@ -735,17 +787,22 @@ Being explicit, because "everything esbuild does" is a lot:
   (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
   and inlining enum values across files.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside
-  another, stylesheets with `--splitting`, `--legal-comments=inline`, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`
+  another, `--legal-comments=inline`, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`
   class, and decorators on members with computed names.
 - **Hard errors when lowering:** `super` inside an async function, object rest nested inside another
   pattern or in an assignment, a computed key in an object rest, and calling a parenthesized optional
   chain, all below the version that has them; browser names in `--target`.
 - **Simplifications:** CSS minification is whitespace and number spelling only, so minified
   stylesheets are a few percent larger than esbuild's. Content hashes in file names differ from
-  esbuild's. A computed class field name is evaluated before the class's computed method
-  names when lowered, not in source order. Data URLs are spelled out or base64, without esbuild's percent escaping. Source maps have no
+  esbuild's. Data URLs are spelled out or base64, without esbuild's percent escaping. Source maps have no
   `names`. Regex patterns are not validated. Labels are not renamed. Single-use `const` inlining is
   missing.
+
+Known semantic gaps remain outside the Workbench acceptance target: scope hoisting does not
+preserve imported aliases accessed only through direct `eval`, and class-field lowering can
+reorder computed field and method keys. Local declarations read only by direct `eval` now retain
+both their liveness and spelling, but complete lexical-environment preservation needs further work.
+These are correctness bugs, not completed production guarantees.
 
 ## Layout
 

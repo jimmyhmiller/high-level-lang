@@ -82,6 +82,9 @@ fn helper(name: Text) -> Int = root-sym(m.modules[0], name) ?? panic "the runtim
 fn known-dep(mo: m.Module, from: Node) -> Int =
   mo.dep-ids[m.module-of-str(from)] ?? panic "{}: {} was not loaded", mo.path, from.text
 
+fn known-required(mo: m.Module, from: Node) -> Int =
+  mo.require-ids[m.module-of-str(from)] ?? panic "{}: require {} was not loaded", mo.path, from.text
+
 # Imported as an opaque object at run time, rather than linked by name.
 fn opaque?(t: m.Module) -> Bool = t.kind == Cjs or t.kind == External
 
@@ -166,8 +169,13 @@ on ImportCall(...) as n if counting and imported-str(n) is some(from) and m.modu
                         }, known-dep(here, from))
   kids.counting = false
 }
+# A direct eval in a retained declaration can read any visible module binding. Scope analysis
+# already preserves their spellings; liveness must retain their declarations as well.
+on CallExpr(Ident("eval"), _) if counting and sym.scope-at(m.table, here.root).dynamic {
+  mentions ++= [mentioned(Symbol, s) for s in sym.scope-at(m.table, here.root).symbols]
+}
 on CallExpr(...) as n if counting and required-str(body, n) is some(from) {
-  mentions += mentioned(Required, known-dep(here, from))
+  mentions += mentioned(Required, known-required(here, from))
   kids.counting = false
 }
 
@@ -235,7 +243,7 @@ fn required-str(b: m.Body, n: Node) -> Node? = match n {
 # The modules those name, once everything is resolved: these only look up, so many threads may ask.
 fn known-import-call-target(mo: m.Module, n: Node) -> Int? = first from in imported-str(n): known-dep(mo, from)
 
-fn known-require-target(b: m.Body, mo: m.Module, n: Node) -> Int? = first from in required-str(b, n): known-dep(mo, from)
+fn known-require-target(b: m.Body, mo: m.Module, n: Node) -> Int? = first from in required-str(b, n): known-required(mo, from)
 
 # ---------------------------------------------------------------- what can be removed
 
@@ -413,7 +421,7 @@ record Load { target: Int, by-import: Bool }
 
 fn loads-of(mo: m.Module, n: Node) -> [Load] = match n {
   ImportCall(...) => [Load(target: known-dep(mo, from), by-import: true) for from in imported-str(n)]
-  CallExpr(...) => [Load(target: known-dep(mo, from), by-import: false) for from in required-str(body, n)]
+  CallExpr(...) => [Load(target: known-required(mo, from), by-import: false) for from in required-str(body, n)]
   _ => []
 }
 
@@ -693,7 +701,7 @@ fn module-reserved(id: Int) -> [Text] = m.modules[id].free ++ eval-kept(m.module
 # take them, as esbuild has it.
 fn eval-kept(mo: m.Module) -> [Text] = match mo.kind {
   m.Cjs => kept-below(root.parent)
-  _ => [n for child in root.children for n in kept-below(child)]
+  _ => kept-below(mo.root)
 } where root = sym.scope-at(m.table, mo.root)
 
 fn kept-below(scope: Int) -> [Text] = match now.dynamic {
@@ -796,6 +804,7 @@ fn mention-facts(mo: m.Module, part: Int, x: Mention) -> [link.Fact] = match x.r
   Whole => whole-module(mo, part, m.modules[x.id])
   # What `import()` of a chunk needs here: only the helper that makes CommonJS look like a module.
   Chunk => [link.fact-mentions(part, helper("__toESM")) for t in [m.modules[x.id]] if t.kind == Cjs]
+    ++ [link.fact-mentions(part, helper("__loadCSS")) for id in [x.id] if len(m.stylesheets(id)) > 0]
 }
 
 # What `require` of a module needs: its wrapper, and an ES module made CommonJS.

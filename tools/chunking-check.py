@@ -484,4 +484,50 @@ for flag in ("--chunk-policy=missing", "--chunk-min-size=-1"):
     result = subprocess.run([str(ESB), "main.js", flag, "--outfile=out.js"], cwd=root, capture_output=True, text=True)
     assert result.returncode != 0 and not (root / "out.js").exists(), result.stdout + result.stderr
 print("ok   unknown policies and invalid limits are errors")
+
+
+root = fixture("entry-facade-initialization", {
+    "scheduler.cjs": 'module.exports = () => "scheduled";',
+    "engine.cjs": 'const schedule=require("./scheduler.cjs");module.exports = () => schedule()+":engine";',
+    "a.js": 'import engine from "./engine.cjs";export const value=engine();',
+    "b.js": 'export const value="other";',
+})
+for fragments in (False, True):
+    output = build(root, ["a.js", "b.js"], "balanced", fragments,
+                   ["--chunk-min-size=0", "--chunk-max-size=1", "--minify"])
+    assert execute(root, output, ["a.js", "b.js"], "[m0.value,m1.value]") == '["scheduled:engine","other"]'
+    assert len([p.name for p in output.glob('*.js')]) == len(set(p.name for p in output.glob('*.js')))
+print("ok   entry facade does not create a cycle through var-based implementation definitions")
+
+root = fixture("direct-eval-bindings", {
+    "library.js": 'var hidden=7;export function one(){return eval("hidden")}export function two(){return eval("hidden")}',
+    "a.js": 'import {one} from "./library.js";export const value=one();',
+    "b.js": 'import {two} from "./library.js";export const value=two();',
+})
+for policy, fragments in MODES:
+    output = build(root, ["a.js", "b.js"], policy, fragments, ["--minify"])
+    assert execute(root, output, ["a.js", "b.js"], "[m0.value,m1.value]") == '[7,7]'
+print("ok   direct eval retains visible declarations and names without an explicit identifier read")
+
+root = fixture("opaque-direct-entry-export", {
+    "legacy.cjs": 'module.exports={value:3};',
+    "bridge.js": 'export * from "./legacy.cjs";',
+    "a.js": 'import {value} from "./bridge.js";export {value};',
+    "b.js": 'export const other=4;',
+})
+for policy, fragments in MODES:
+    output = build(root, ["a.js", "b.js"], policy, fragments, ["--minify"])
+    assert execute(root, output, ["a.js", "b.js"], "[m0.value,m1.other]") == '[3,4]'
+print("ok   an entry directly exporting a CommonJS star-reexport gets a declared export binding")
+
+root = fixture("output-collision", {
+    "one/a.js": 'export const value=1;',
+    "two/a.js": 'export const value=2;',
+})
+result = subprocess.run([str(ESB), 'one/a.js', 'two/a.js', '--splitting', '--format=esm',
+                         '--entry-names=[name]', '--outdir=built'], cwd=root, capture_output=True, text=True, timeout=30)
+assert result.returncode != 0 and 'outputs collide' in result.stderr, result.stdout+result.stderr
+assert not (root/'built/a.js').exists()
+print('ok   conflicting entry paths fail before publishing any output')
+
 print("all chunk policies check out")

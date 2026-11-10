@@ -15,6 +15,8 @@ record Asset { from: Text, to: Text }
 
 # How each kind of file a stylesheet names is loaded, by extension.
 setting loaders: {Text:Text}
+setting public-path: Text = ""
+setting asset-directory: Text = ""
 
 fn tree-of(path: Text) -> Node = css.parse(read-file(path), path)
 
@@ -77,12 +79,16 @@ fn css-spec(spec: Text) -> Text = match spec {
 }
 
 # Every file in the order its rules apply: a stylesheet after what it imports, those after theirs.
-fn visit(path: Text, media: [Node]) -> [Placed] =
-  [imported(path, media, imp)... for item in leading-imports(tree-of(path)) if let some(imp) = import-of(item)
-   if not external-url?(imp.spec)] ++ [Placed(path: path, media: media)]
+fn visit(path: Text, media: [Node]) -> [Placed] = visit-in(real-path(path), media, [])
 
-fn imported(path: Text, media: [Node], imp: Import) -> [Placed] =
-  visit(res.resolve(css-spec(imp.spec), path).path, inner-media(path, media, imp.media))
+fn visit-in(path: Text, media: [Node], ancestors: [Text]) -> [Placed] = match path in ancestors {
+  true => []
+  false => [imported(path, media, imp, ancestors ++ [path])... for item in leading-imports(tree-of(path))
+            if let some(imp) = import-of(item) if not external-url?(imp.spec)] ++ [Placed(path: path, media: media)]
+}
+
+fn imported(path: Text, media: [Node], imp: Import, ancestors: [Text]) -> [Placed] =
+  visit-in(res.resolve(css-spec(imp.spec), path).path, inner-media(path, media, imp.media), ancestors)
 
 fn inner-media(path: Text, outer: [Node], inner: [Node]) -> [Node] = match inner, outer {
   [], _ => outer
@@ -90,10 +96,16 @@ fn inner-media(path: Text, outer: [Node], inner: [Node]) -> [Node] = match inner
   _, _ => panic "{}: an import with a media query inside another is not implemented yet", path
 }
 
-# Each stylesheet once, where it last appears, which is where its rules would win.
+# Keep each stylesheet/media pair at its last occurrence. A later unconditional copy also
+# subsumes earlier conditional copies; different media conditions do not subsume one another.
+fn placement-key(p: Placed) -> Text = quote-text(p.path) ++ quote-text(css.render(AtRule(AtName("@media"), List(p.media...), AtSemi()), false))
+
 fn order-of(entries: [Text]) -> [Placed] =
-  [all[i] for i in 0..len(all) if not (any j in i + 1..len(all): all[j].path == all[i].path)]
-  where all = [visit(e, [])... for e in entries]
+  [placements[i] for i in 0..len(placements) if (last-at[placement-key(placements[i])] ?? -1) == i
+          and (unconditional[placements[i].path] ?? i) <= i]
+  where placements = [visit(e, [])... for e in entries],
+        last-at = {placement-key(placements[i]): i for i in 0..len(placements)},
+        unconditional = {placements[i].path: i for i in 0..len(placements) if len(placements[i].media) == 0}
 
 fn external-url?(s: Text) -> Bool = match s {
   "data:" ++ _ | "http:" ++ _ | "https:" ++ _ | "//" ++ _ | "#" ++ _ => true
@@ -115,9 +127,15 @@ fn asset-url(path: Text, out-dir: Text, from-file: Text) -> Text = match loader-
 # A file copied beside the output, named for what is in it.
 fn asset-name(path: Text) -> Text = path-stem(path) ++ "-" ++ host.content-hash(read-file(path)) ++ path-ext(path)
 
-fn file-url(path: Text) -> Text = "./" ++ asset-name(path)
+fn file-url(path: Text) -> Text = asset-prefix() ++ asset-name(path)
 
-fn asset-of(path: Text, out-dir: Text) -> Asset = Asset(from: path, to: out-dir ++ "/" ++ asset-name(path))
+fn asset-prefix() -> Text = match public-path {
+  "" => "./"
+  p if ends-with(p, "/") => p
+  p => p ++ "/"
+}
+
+fn asset-of(path: Text, out-dir: Text) -> Asset = Asset(from: path, to: (if public-path != "" and asset-directory != "" then asset-directory else out-dir) ++ "/" ++ asset-name(path))
 
 everywhere fn rewritten-urls(n: Node, file: Text, out-dir: Text) -> Node = match n {
   Url(raw) => url-rewritten(n, url-text(raw), file, out-dir)

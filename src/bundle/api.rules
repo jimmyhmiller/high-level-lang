@@ -121,7 +121,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]", chunking: packing.options(),
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
-          defines: [], main-fields: ["module", "main"], conditions: ["import", "browser"],
+          defines: [], main-fields: ["browser", "module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
           packages-external: false, public-path: "", tsconfig: "", plan: serial-plan(), legal-comments: "eof", jsx: jsx.options-new(), target: lower.no-lowering,
@@ -242,17 +242,19 @@ fn esm-exports() -> [Node] = exports-of-root(m.entry)
 # has it.
 fn exports-of-root(root: Int) -> [Node] =
   [h for x in found for h in x.hoisted] ++ [ExportNamed(List([x.spec for x in found]...)) for f in [found] if len(f) > 0]
-  where found = [exported(name-of(m.names, n), s)
+  where found = [exported(name-of(m.names, n), s, prefix)
                  for n in sort n in [n for m.db.resolved(root, ?n, _) distinct n] by name-of(m.names, n)
-                 if let some(s) = e.resolved-export(root, n)]
+                 if let some(s) = e.resolved-export(root, n)],
+        prefix = first i in 0.. for p in ["__entry_export_" ++ int-text(i) ++ "_"]
+                 if all name in names-in-use(): not starts-with(name, p): p
 
 # An export of the entry: its specifier, after a variable holding it when what it reads is no name.
 record Exported { hoisted: [Node], spec: Node }
 
-fn exported(name: Text, s: Int) -> Exported = match e.symbol-read(s) {
+fn exported(name: Text, s: Int, prefix: Text) -> Exported = match e.symbol-read(s) {
   Ident(local) => Exported(hoisted: [], spec: ExportAs(PropName(local), PropName(name)))
   read => Exported(hoisted: [stmt`var $hoisted = $read;`], spec: ExportAs(PropName(hoisted), PropName(name)))
-    where hoisted = "export_" ++ name
+    where hoisted = prefix ++ int-text(m.name-id(name))
 }
 
 # The output text: `prefix`, the printed program, `suffix`. `base` is where the program starts, for
@@ -390,9 +392,18 @@ fn delivered(o: Options, ws: [Written]) -> Void = match printing?(o) {
 # else (a `with` compares what it gives with what the last gave).
 fn files(options: Options) -> [Written] =
   with res.options = resolve-options(options), tsc.forced = options.tsconfig, ascii.braces = options.target >= 2015,
-       cssb.loaders = loader-map(options) {
-    built(printable(options with { chunking: packing.checked(options.chunking) }))
+       cssb.loaders = loader-map(options), cssb.public-path = options.public-path,
+       cssb.asset-directory = (if options.outdir != "" then options.outdir else dir-of(options.outfile)) {
+    checked-files(built(printable(options with { chunking: packing.checked(options.chunking) })))
   }
+
+# All artifacts are validated together before the first write. Equal shared assets are emitted
+# once; two different contents may never silently occupy the same normalized output path.
+fn checked-files(files: [Written]) -> [Written] = match first w in files
+  if (contents[m.from-root(w.path)] ?? "") != w.text: w.path {
+  some(path) => panic "different outputs collide at {}; use distinct entry and chunk names", path
+  none => [w for w in files distinct m.from-root(w.path)]
+} where contents = {m.from-root(w.path): w.text for w in files}
 
 fn written(ws: [Written]) -> Void = write-files!([w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
 
@@ -497,12 +508,11 @@ setting building: Building
 fn bundle() -> [Written] = loaded-built(building.options, building.format)
 
 # One development build, as hot module replacement makes them, given what it reads (as `files` and
-# `bundled` give it), with names of its own.
+# `bundled` give it), with the session's persistent name interner.
 fn dev-step-of(o: Options, before: hmr.Dev, events: Text) -> DevStep =
   with res.options = resolve-options(o), tsc.forced = o.tsconfig, ascii.braces = o.target >= 2015, cssb.loaders = loader-map(o),
        m.loading = loading-of(o, dir-of(o.outfile)), an.linking = linking-of(o, len(f.exports) > 0, false, f),
-       e.emitting = emitting-of(o, f), e.chunk-parts = none, printing = printing-of(o), building = Building(options: o, format: f),
-       m.names = names-new() {
+       e.emitting = emitting-of(o, f), e.chunk-parts = none, printing = printing-of(o), building = Building(options: o, format: f) {
     dev-built(o, before, events)
   } where f = format-of(o)
 
@@ -664,9 +674,9 @@ fn chunk-root-statements(c: chunks.Chunk) -> [Node] = match c.root {
 }
 
 # The body of one chunk, as text with placeholders in it.
-fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk]) -> Printed =
+fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.Unit]) -> Printed =
   Printed(text: r.text ++ "\n", base: 0, marks: r.marks)
-  where emission = with e.chunk-parts = some(c.parts), e.initializer-parts = c.initializers { e.program() },
+  where emission = with e.units = selected, e.chunk-parts = some(c.parts), e.initializer-parts = c.initializers { e.program() },
         p = for-target(o, match o.minify-syntax {
           true => o.optimize(emission.tree)
           false => fold.run(emission.tree)
@@ -676,7 +686,7 @@ fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk]) -> Printed =
 
 fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text = match c.root {
   r if r < 0 => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"
-  r if r in static-roots => entry-output(o, m.modules[r].path, base)
+  r if r in static-roots => entry-output(o, (first entry in o.entries if real-path(entry) == m.modules[r].path: entry) ?? m.modules[r].path, base)
   r => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(m.modules[r].path), hash) ++ ".js"
 }
 
@@ -684,8 +694,9 @@ fn split-built(options: Options) -> [Written] = match options.outdir, options.fo
   "", _ => panic "code splitting needs --outdir"
   _, false => panic "code splitting needs --format=esm"
   _, true => with m.loading = loading-of(o, o.outdir), an.linking = linking-of(o, false, true, esm-format()), e.emitting = emitting-of(o, esm-format()),
-                  printing = printing-of(o), m.names = names-new() {
-      match m.parsed-ahead(o.entries) { _ => split-graph(o, m.graph(include-text("runtime.js"), o.entries)) }
+                  printing = printing-of(o) {
+      match timed(o.timing, "load: parse files ahead", m.parsed-ahead(o.entries)) { _ =>
+        split-graph(o, timed(o.timing, "load: resolve, scopes, the graph", m.graph(include-text("runtime.js"), o.entries))) }
     } where o = with-node-env(options)
 }
 
@@ -695,32 +706,55 @@ fn split-graph(o: Options, g: m.Graph) -> [Written] =
     linked-split(o, g)
   }
 
-fn linked-split(o: Options, g: m.Graph) -> [Written] = match m.css-imports() {
-  [] => with an.linked = an.link(g.symbols), m.table = an.linked-table(g), m.db = an.solved-facts() {
-          with e.units = e.units-of-order() {
-            with nm.finals = final-names(o) { named-split(o) }
-          }
-        }
-  _ => panic "stylesheets with --splitting are not implemented yet"
-}
+fn linked-split(o: Options, g: m.Graph) -> [Written] =
+  with an.linked = timed(o.timing, "link: modules", an.link(g.symbols)),
+       m.table = timed(o.timing, "link: table", an.linked-table(g)),
+       m.db = timed(o.timing, "link: facts and Datalog", an.solved-facts()) {
+    with e.units = e.units-of-order() {
+      with nm.finals = timed(o.timing, "naming", final-names(o)) { named-split(o) }
+    }
+  }
 
 # The rest of a split build, once every symbol has its name: a chunk for each root, which an import
 # of it names by a placeholder until every chunk's name is known.
 fn named-split(o: Options) -> [Written] =
-  with e.chunk-paths = {root: chunks.placeholder(ids[root] ?? (panic "{} has no chunk", m.modules[root].path)) for root in roots} {
-    chunks-written(o, all)
+  with e.chunk-paths = {root: chunks.placeholder(ids[root] ?? (panic "{} has no chunk", m.modules[root].path)) for root in roots},
+       e.chunk-styles = {styles[i].root: chunks.placeholder(len(all) + i) for i in 0..len(styles)} {
+    chunks-written(o, all, styles)
   } where roots = m.entries ++ an.linked.dynamic-roots,
           all = timed(o.timing, "chunk: policy and fragments", chunks.configured(roots, o.chunking)),
-          ids = {c.root: c.id for c in all if c.root >= 0}
+          ids = {c.root: c.id for c in all if c.root >= 0},
+          styles = [root-stylesheet(o, r, sheets) for r in roots for sheets in [m.stylesheets(r)] if len(sheets) > 0]
 
 # Each chunk printed, its placeholders filled once every chunk's name is known.
-fn chunks-written(o: Options, all: [chunks.Chunk]) -> [Written] =
+record RootStylesheet { root: Int, path: Text, bundle: cssb.Bundled }
+
+fn root-stylesheet(o: Options, root: Int, sheets: [Text]) -> RootStylesheet =
+  RootStylesheet(root: root, path: path, bundle: cssb.bundle(sheets, path, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments))
+  where bundled = cssb.bundle(sheets, o.outdir ++ "/style.css", o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments),
+        path = match root in m.entries {
+          true => with-extension(entry-output(o, (first entry in o.entries if real-path(entry) == m.modules[root].path: entry)
+                                                  ?? m.modules[root].path, base-dir(o)), ".css")
+          false => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(m.modules[root].path), host.content-hash(bundled.text)) ++ ".css"
+        }
+
+fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> [Written] =
   [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths)... for i in 0..len(all)]
-  where printed = [chunk-program(o, c, all) for c in all],
-        texts = [p.text for p in printed],
+  ++ [sheet-written(s.path, s.bundle)... for s in styles]
+  ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
+  where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
+        printed = [chunk-program(o, c, all, chunk-units(c, unit-index)) for c in all],
+        texts = [p.text for p in printed] ++ [s.bundle.text for s in styles],
         holes = [chunks.holes-in(t) for t in texts],
         base = base-dir(o),
         paths = [chunk-path-of(o, c, chunks.content-hash(c.id, texts, holes), base, m.entries) for c in all]
+                ++ [s.path for s in styles]
+
+# Join a chunk's part ids through an inverted index, then restore the original emission order.
+# Asking every module about every chunk creates mostly-empty memo answers and graph-sized
+# dependency frames. Only units actually owned by a chunk participate in that chunk's emission.
+fn chunk-units(c: chunks.Chunk, index: {Int:Int}) -> [e.Unit] =
+  [e.units[i] for i in sort i in [id for p in keys(c.parts) for id in index[p] distinct id] by i]
 
 fn chunk-written(o: Options, c: chunks.Chunk, pr: Printed, holes: [chunks.Hole], path: Text, paths: [Text]) -> [Written] =
   beside(path ++ ".LEGAL.txt", notes.file) ++ with-map(o, path, done.text ++ notes.tail, done.text, pr.base, done.marks)

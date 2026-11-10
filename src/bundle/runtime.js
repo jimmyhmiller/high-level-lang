@@ -292,3 +292,26 @@ var __yieldStar = (value) => {
   return it[__knownSymbol("iterator")] = () => it, method("next"), "throw" in obj ? method("throw") : it.throw = (x) => { throw x; }, "return" in obj && method("return"), it;
 };
 var __forAwait = (obj, it, method) => (it = obj[__knownSymbol("asyncIterator")]) ? it.call(obj) : (obj = obj[__knownSymbol("iterator")](), it = {}, method = (key, fn) => (fn = obj[key]) && (it[key] = (arg) => new Promise((yes, no, done) => (arg = fn.call(obj, arg), done = arg.done, Promise.resolve(arg.value).then((value) => yes({ value, done }), no)))), method("next"), method("return"), it);
+
+// A dynamic boundary waits for its stylesheet before evaluating any of its JavaScript. Failed
+// loads are removed so a later navigation can retry; overlapping imports share one request.
+var __cssLoads = new Map();
+var __loadCSS = (url) => {
+  if (typeof document === "undefined") return Promise.resolve();
+  var pending = __cssLoads.get(url);
+  if (pending) return pending;
+  pending = new Promise((resolve, reject) => {
+    var link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = url;
+    link.onload = () => { link.onload = link.onerror = null; resolve(); };
+    link.onerror = () => {
+      link.remove();
+      __cssLoads.delete(url);
+      reject(new Error("Could not load stylesheet " + url));
+    };
+    document.head.appendChild(link);
+  });
+  __cssLoads.set(url, pending);
+  return pending;
+};
