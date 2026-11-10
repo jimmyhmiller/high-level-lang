@@ -1,14 +1,16 @@
 #!/bin/zsh
-# Build the command-line bundler and the parser driver, each its own entry.
+# Build each entry explicitly. A failed compiler or output filter fails the script; the project
+# manifest is never edited, so an interrupted build cannot leave its entry changed.
 # HL_TOOLS_OUT: another directory for the binaries (the audit build's, say).
-S="${HL_TOOLS_OUT:-$(cd "$(dirname $0)/.." && pwd)/out/bin}"; mkdir -p $S/mt
-READERS=$("$(dirname $0)/readers.sh") || exit 1
-cd "$(dirname $0)/.."
-cp Coil.toml $S/Coil.tools.bak
+set -euo pipefail
+TOOLS_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+TOOLS_OUTPUT="${HL_TOOLS_OUT:-$TOOLS_ROOT/out/bin}"
+mkdir -p "$TOOLS_OUTPUT"
+READERS=$("$TOOLS_ROOT/tools/readers.sh")
+cd "$TOOLS_ROOT"
 for pair in esb:compiler/boot/esb.coil jsparse:compiler/boot/jsparse.coil spec:compiler/boot/app.coil langtest:compiler/boot/langtest.coil; do
-  name=${pair%%:*}; file=${pair#*:}
-  # -i.sed-bak: an in-place edit both BSD and GNU sed take.
-  sed -i.sed-bak "s#^entry = .*#entry = \"$file\"#" Coil.toml && rm -f Coil.toml.sed-bak
-  coil build ${1:--O1} --meta-opt=2 --reader-artifact $READERS -o $S/$name 2>&1 | grep -v '^wrote' | sed -E "s#$PWD/##g" | cut -c1-260
+  name=${pair%%:*}
+  file=${pair#*:}
+  coil build "$file" "${1:--O1}" --meta-opt=2 --reader-artifact "$READERS" -o "$TOOLS_OUTPUT/$name" 2>&1 |
+    sed -E "/^wrote /d; s#$TOOLS_ROOT/##g" | cut -c1-260
 done
-cp $S/Coil.tools.bak Coil.toml
