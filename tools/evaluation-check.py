@@ -53,6 +53,22 @@ def check(name, files, extra=''):
 
 A = 'globalThis.__eval_trace ??= []; globalThis.__eval_trace.push("A"); export const a = 1;'
 B = 'globalThis.__eval_trace ??= []; globalThis.__eval_trace.push("B"); export const b = 2;'
+check('inert-initializer-forwarders', {
+    'effect.js': 'globalThis.__eval_trace ??= []; globalThis.__eval_trace.push("core"); export function core(){return 7;}',
+    'left.js': 'import {core} from "./effect.js"; export function left(){return core();}',
+    'right.js': 'import {core} from "./effect.js"; export function right(){return core()+1;}',
+    'diamond.js': 'import {left} from "./left.js"; import {right} from "./right.js"; export function value(){return left()+right();}',
+    'other.js': B,
+    'a.js': 'import {value as run} from "./diamond.js"; import {b} from "./other.js"; globalThis.__eval_trace.push("entry-a"); export const value=run()+b;',
+    'b.js': 'import {b} from "./other.js"; import {right} from "./right.js"; globalThis.__eval_trace.push("entry-b"); export const value=right()+b;',
+})
+check('inert-forwarded-failure', {
+    'effect.js': 'globalThis.__eval_trace=["failure"]; throw 0; export function run(){return 1;}',
+    'left.js': 'import {run} from "./effect.js"; export function left(){return run();}',
+    'right.js': 'import {run} from "./effect.js"; export function right(){return run();}',
+    'a.js': 'import {left} from "./left.js"; export const value=left();',
+    'b.js': 'import {right} from "./right.js"; export const value=right();',
+})
 check('sibling-shared', {
     'dep-a.js': A, 'dep-b.js': B,
     'a.js': 'import {a} from "./dep-a.js"; import {b} from "./dep-b.js"; globalThis.__eval_trace.push("first"); export const value = a+b;',
