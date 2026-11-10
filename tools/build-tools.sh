@@ -8,7 +8,7 @@ TOOLS_OUTPUT="${HL_TOOLS_OUT:-$TOOLS_ROOT/out/bin}"
 mkdir -p "$TOOLS_OUTPUT"
 READERS=$("$TOOLS_ROOT/tools/readers.sh")
 cd "$TOOLS_ROOT"
-for pair in esb:compiler/boot/esb.coil jsparse:compiler/boot/jsparse.coil spec:compiler/boot/app.coil langtest:compiler/boot/langtest.coil; do
+for pair in esb:compiler/boot/esb.coil jsparse:compiler/boot/jsparse.coil spec:compiler/boot/app.coil langtest:compiler/boot/langtest.coil runtime-check:compiler/boot/runtime-check.coil; do
   name=${pair%%:*}
   file=${pair#*:}
   coil build "$file" "${1:--O1}" --meta-opt=2 --reader-artifact "$READERS" -o "$TOOLS_OUTPUT/$name" 2>&1 |

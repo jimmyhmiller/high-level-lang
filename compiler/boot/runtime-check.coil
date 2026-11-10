@@ -1,0 +1,92 @@
+;;; Generic runtime regressions: sparse page lookup and isolated scratch storage.
+(module boot.runtime-check)
+(import "hl.symtab" :as sym)
+(import "hl.rt" :as rt)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [alloc])
+(import "coil.primitive" :as primitive)
+(import "coil.hashmap" :use [i64-keyops])
+
+(defstruct Payload [(tag i64) (padding (array i64 128))])
+
+(defn memo-map-check [] (-> void)
+  (let [(mut values) (rt/MemoMap::new [i64 Payload] (i64-keyops))
+        (mut small) (rt/MemoMap::new [i64 bool] (i64-keyops))]
+    (for wave (range 0 10)
+      (for key (range 0 5000)
+        (set! (mut values) key (Payload :tag (+ key wave) :padding (primitive/zeroed (array i64 128))))
+        (set! (mut small) key true))
+      (when (!= (len values) 5000) (panic "memo map lost an insertion"))
+      (for key values
+        (match (get values key)
+          (Some [v] (when (!= (.tag v) (+ key wave)) (panic "memo map returned stale data")))
+          (None [] (panic "memo map iteration visited a missing key"))))
+      (for key (range 0 5000)
+        (when (!= (rt/MemoMap::remove! (mut values) key) 1) (panic "memo map removal failed"))
+        (when (!= (rt/MemoMap::remove! (mut values) key) 0) (panic "memo map removed a key twice"))
+        (rt/MemoMap::remove! (mut small) key))
+      (when (or (!= (len values) 0) (!= (len small) 0)) (panic "memo map retained removed keys"))
+      (when (!= (len (.values values)) 5000) (panic "memo map did not reuse vacant slots")))
+    (free! (mut values))
+    (free! (mut small)))
+  0)
+
+(defn lookup-check [] (-> void)
+  (let [(mut blocks) (ArrayList::new [sym/Block] (rt/value-allocator))]
+    (for i (range 0 2200)
+      ;; Equal starts, one empty block, one real block, then a gap.
+      (for width (range 0 2)
+        (let [(mut symbols) (ArrayList::new [sym/Symbol] (rt/value-allocator))]
+          (when (= width 1) (push! (mut symbols) (primitive/zeroed sym/Symbol)))
+          (push! (mut blocks)
+                 (sym/Block :scopes (ArrayList::new [sym/Scope] (rt/value-allocator))
+                            :symbols symbols :scope-start (* i 3) :symbol-start (* i 3)
+                            :roots (ArrayList::new [i64] (rt/value-allocator)) :dynamic false)))))
+    (let [order (sym/identity-order (len blocks))
+          pages (sym/pages-of blocks order false 6600)]
+      (for id (range -1 6700)
+        (let [want (if (and (>= id 0) (< id 6600) (= (% id 3) 0)) (+ (* (/ id 3) 2) 1) -1)
+              got (sym/block-at blocks order pages false id)]
+          (when (!= got want) (panic "sparse block lookup {}: {} expected {}" id got want)))))
+    ;; The same search with physical storage reversed and an explicit sorted index.
+    (let [(mut reverse) (ArrayList::new [sym/Block] (rt/value-allocator))
+          (mut order) (ArrayList::new [i64] (rt/value-allocator))]
+      (for i (range 0 (len blocks))
+        (push! (mut reverse) (get blocks (- (- (len blocks) 1) i)))
+        (push! (mut order) (- (- (len blocks) 1) i)))
+      (let [pages (sym/pages-of reverse order false 6600)]
+        (for id (range -1 6700)
+          (let [want (if (and (>= id 0) (< id 6600) (= (% id 3) 0))
+                         (- (- (len blocks) 1) (+ (* (/ id 3) 2) 1)) -1)
+                got (sym/block-at reverse order pages false id)]
+            (when (!= got want) (panic "indexed block lookup {}: {} expected {}" id got want)))))))
+  0)
+
+(defn scratch-check [] (-> void)
+  (for turn (range 0 100)
+    (let [scratch (rt/scratch-enter!)]
+      (for i (range 0 1000)
+        (let [(mut xs) (ArrayList::new [i64] (rt/value-allocator))]
+          (reserve! (mut xs) 40)
+          (for n (range 0 40) (push! (mut xs) (+ n i)))
+          (when (!= (get xs 39) (+ 39 i)) (panic "scratch storage corrupted"))))
+      (rt/region-leave!)
+      (rt/scratch-dispose! scratch)))
+  0)
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (when (> argc 1)
+    (let [scratch (rt/scratch-enter!)
+          bytes (match (alloc [u8] (rt/value-allocator) 1)
+                  (Some [xs] xs)
+                  (None [] (panic "scratch allocation failed")))]
+      (store! (data bytes) (: 7 u8))
+      (rt/region-leave!)
+      (rt/scratch-dispose! scratch)
+      ;; With HL_REGION_CHECK=1 this must fault, never print a stale value.
+      (println "released value: {}" (get bytes 0))))
+  (lookup-check)
+  (scratch-check)
+  (memo-map-check)
+  (println "generic runtime checks passed")
+  0)

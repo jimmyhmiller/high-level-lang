@@ -12,7 +12,7 @@
 (import "coil.mem" :as mem)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
-(import "coil.hashmap" :use [HashMap i64-keyops])
+(import "coil.hashmap" :use [HashMap MapIter KeyOps i64-keyops])
 (import "coil.str" :as str)
 (import "coil.fs" :as fs)
 (import "coil.io" :as io)
@@ -31,6 +31,76 @@
 (import "coil.cc" :as cc)
 (import "coil.socket" :use [TcpListener TcpConnection])
 (import "coil.args" :as args)
+
+;;; Memo values can be large records. Open-addressed slots should not reserve a
+;;; multi-kilobyte payload for every empty bucket, in both global and worker caches.
+;;; Large values live densely, indexed by the small hash table. Removed slots are
+;;; reused; iteration visits only live keys. Small values retain direct hashing.
+(defstruct MemoMap [K V]
+  [(direct (HashMap K V)) (index (HashMap K i64))
+   (values (ArrayList V)) (vacant (ArrayList i64))])
+
+(impl [K V] (MemoMap K V)
+  (new [(ops (ptr KeyOps))] (-> (MemoMap K V))
+    (MemoMap :direct (HashMap::new [K V] (malloc-allocator) ops)
+             :index (HashMap::new [K i64] (malloc-allocator) ops)
+             :values (ArrayList::new [V] (malloc-allocator))
+             :vacant (ArrayList::new [i64] (malloc-allocator))))
+  (remove! [(m (mut (MemoMap K V))) (key K)] (-> i64)
+    (if (> (primitive/sizeof V) 128)
+        (match (get (.index m) key)
+          (Some [at]
+                (HashMap::remove! (mut (.index m)) key)
+                (push! (mut (.vacant m)) at)
+                1)
+          (None [] 0))
+        (HashMap::remove! (mut (.direct m)) key)))
+  (free! [(m (mut (MemoMap K V)))] (-> i64)
+    (free! (mut (.direct m)))
+    (free! (mut (.index m)))
+    (free! (mut (.values m)))
+    (free! (mut (.vacant m)))
+    0))
+
+(impl [K V] Len (MemoMap K V)
+  (len [(m (MemoMap K V))] (-> i64)
+    (if (> (primitive/sizeof V) 128) (len (.index m)) (len (.direct m)))))
+
+(impl [K V] Get (MemoMap K V)
+  (get [(m (MemoMap K V)) (key K)] (-> (Option V))
+    (if (> (primitive/sizeof V) 128)
+        (match (get (.index m) key)
+          (Some [at] (Some (get (.values m) at)))
+          (None [] (None)))
+        (get (.direct m) key))))
+
+(impl [K V] Set (MemoMap K V)
+  (set! [(m (mut (MemoMap K V))) (key K) (value V)] (-> i64)
+    (if (> (primitive/sizeof V) 128)
+        (match (get (.index m) key)
+          (Some [at] (set! (mut (.values m)) at value) 0)
+          (None []
+                (let [at (match (pop! (mut (.vacant m)))
+                           (Some [slot] (set! (mut (.values m)) slot value) slot)
+                           (None []
+                                 (let [slot (len (.values m))]
+                                   (push! (mut (.values m)) value)
+                                   slot)))]
+                  (set! (mut (.index m)) key at)
+                  1)))
+        (set! (mut (.direct m)) key value))))
+
+(defstruct MemoIter [K V] [(direct (MapIter K V)) (index (MapIter K i64))])
+
+(impl [K V] Iterable (MemoMap K V)
+  (iter [(m (MemoMap K V))] (-> (MemoIter K V))
+    (MemoIter :direct (iter (.direct m)) :index (iter (.index m)))))
+
+(impl [K V] Iterator (MemoIter K V)
+  (next [(it (mut (MemoIter K V)))] (-> (Option K))
+    (if (> (primitive/sizeof V) 128)
+        (next (mut (.index it)))
+        (next (mut (.direct it))))))
 
 ;;; ---------------------------------------------------------------- workers
 ;;; A program may run work on several threads. Each thread has a slot: 0 for the thread that
@@ -233,17 +303,21 @@
 ;;; the cursor where it was; else the next chunk, each twice the last up to the region's limit.
 (defn cursor-allocate-slow [(c (ptr Cursor)) (bytes i64) (align i64)] (-> (ptr i8))
   (let [r (.region c)
-        grow (.grow c)]
-    (if (> (+ bytes align) (/ grow 2))
+        (mut grow) (.grow c)]
+    ;; Small requests must advance a new cursor's growth too. Otherwise a stream
+    ;; of 160-byte child arrays forever takes individual chunks at grow=256.
+    (if (and (> (+ bytes align) (/ grow 2)) (> (+ bytes align) 4096))
         (let [base (chunk-add! r (+ bytes align (chunk-header-bytes)))]
           (primitive/cast (ptr i8) (align-to base align)))
-        (let [base (chunk-add! r grow)
+        (do
+          (while (< grow (+ bytes align (chunk-header-bytes))) (set! grow (* grow 2)))
+          (let [base (chunk-add! r grow)
               p (align-to base align)]
           (set! (.end c) (+ base (- grow (chunk-header-bytes))))
           (set! (.at c) (+ p bytes))
           (set! (.last c) p)
           (when (< (* grow 2) (+ (.grow-limit r) 1)) (set! (.grow c) (* grow 2)))
-          (primitive/cast (ptr i8) p)))))
+          (primitive/cast (ptr i8) p))))))
 
 (impl Allocator Cursor
   (allocate [(self (ptr Cursor)) (request (ref AllocRequest))]
@@ -438,6 +512,32 @@
     (pop! (mut (.stack t)))
     (thread-regions-top! t)
     0))
+
+;;; An isolated computation's scratch arena. Nothing in it may escape: the caller
+;;; leaves it, copies its result into its parent's allocator, then disposes it.
+;;; Unlike retained answer regions it never enters the dependency/cache lifetime graph.
+(defn scratch-enter! [] (-> (ptr Region))
+  (let [r (region-make true 65536)]
+    (region-enter! r)
+    r))
+
+(defn scratch-dispose! [(r (ptr Region))] (-> void)
+  (when (or (= r (region-current)) (!= (len (.refs r)) 0))
+    (panic "scratch region is still entered or owns retained references"))
+  (let [(mut at) (.chunks r)]
+    (while (!= at 0)
+      (let [before (load (primitive/cast (ptr i64) at))
+            size (load (primitive/cast (ptr i64) (+ at 8)))]
+        (chunk-let-go! at size)
+        (set! at before))))
+  (for c (.cursors r) (primitive/free (primitive/cast (ptr i8) c)))
+  (when (!= (.shared r) 0) (primitive/free (primitive/cast (ptr i8) (.shared r))))
+  (free! (mut (.refs r)))
+  (free! (mut (.cursors r)))
+  (free! (mut (.keys (.ref-seen r))))
+  (free! (mut (.vals (.ref-seen r))))
+  (primitive/free (primitive/cast (ptr i8) r))
+  0)
 
 ;;; The program's state (its modules' defaults, what the runtime keeps of values), made while this
 ;;; thread is in the program's own region: as long as the program, grown by any thread.

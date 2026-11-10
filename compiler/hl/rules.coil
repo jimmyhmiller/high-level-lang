@@ -4760,6 +4760,7 @@
                            (cat " children, this gives it " (rt/num-text count)))))
               (te `(let [(mut ~(sym kids))
                            (~(primitive/code-symbol alias "/new-kids"))]
+                     (reserve! (mut ~(sym kids)) ~count)
                      ~@pushes
                      (~(primitive/code-symbol alias "/mk") (~kind)
                         ~(sym kids)
@@ -6259,11 +6260,16 @@
                       (list? (.ty b))
                         (let [o (fresh (mut k) "out")
                               s (fresh (mut k) "src")
+                              start (fresh (mut k) "start")
+                              stop (fresh (mut k) "stop")
                               i (fresh (mut k) "i")]
                           (te `(let [~(sym s) ~(.code b)
+                                     ~(sym start) ~(.code lo)
+                                     ~(sym stop) ~(.code hi)
                                      (mut ~(sym o))
                                        ~(new-list (mut k) (elem-of (.ty b)))]
-                                 (for ~(sym i) (range ~(.code lo) ~(.code hi))
+                                 (reserve! (mut ~(sym o)) (if (> ~(sym stop) ~(sym start)) (- ~(sym stop) ~(sym start)) 0))
+                                 (for ~(sym i) (range ~(sym start) ~(sym stop))
                                    (push! (mut ~(sym o))
                                           (get ~(sym s) ~(sym i))))
                                  ~(sym o))
@@ -6290,6 +6296,9 @@
                           (push! (mut pushes)
                                  `(push! (mut ~(sym o)) ~(.code x))))))
                   (te `(let [(mut ~(sym o)) ~(new-list (mut k) elem)]
+                         (reserve! (mut ~(sym o)) ~(let [(mut count) 0]
+                                                    (for a args (unless (spread-arg? a) (set! count (+ count 1))))
+                                                    count))
                          ~@pushes
                          ~(sym o))
                       (cat3 "[" elem "]"))))
@@ -9045,13 +9054,18 @@
   (cat "memo-near-gen--" name))
 
 ;;; The task struct's fields for a memo: its near table and the generation that table is of.
+(defn memo-storage-type [(k (mut Comp)) (f Func)] (-> Code)
+  `(rt/MemoMap ~(coil-type (mut k) (memo-key-type f)) ~(coil-type (mut k) (.ret f))))
+
+(defn memo-storage-new [(k (mut Comp)) (f Func)] (-> Code)
+  `(rt/MemoMap::new [~(coil-type (mut k) (memo-key-type f)) ~(coil-type (mut k) (.ret f))]
+                    ~(if (= (memo-key-type f) "Int") `(i64-keyops) `(str/keyops))))
+
 (defn memo-new-map [(k (mut Comp)) (d g/Node)] (-> Code)
-  (runtime-map (mut k) (memo-map-type (memo-check! (mut k) d))))
+  (memo-storage-new (mut k) (memo-check! (mut k) d)))
 
 (defn memo-near-field [(k (mut Comp)) (d g/Node)] (-> Code)
-  `(~(sym (memo-near (.text (kid d 0)))) ~(coil-type (mut k)
-                                                     (memo-map-type (memo-check! (mut k)
-                                                                                 d)))))
+  `(~(sym (memo-near (.text (kid d 0)))) ~(memo-storage-type (mut k) (memo-check! (mut k) d))))
 
 (defn memo-gen-field [(d g/Node)] (-> Code)
   `(~(sym (memo-near-gen (.text (kid d 0)))) i64))
@@ -10172,7 +10186,7 @@
               [(lock i64)
                (ready bool)
                (gen i64)
-               (table ~(coil-type (mut k) mt))
+               (table ~(memo-storage-type (mut k) f))
                (args (HashMap ~(coil-type (mut k) (memo-key-type f)) ~args-ty))
                (node-ids (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
                (busy ~(coil-type (mut k) (memo-busy-type f)))
@@ -10306,7 +10320,7 @@
                 (free! (mut (.regions s)))
                 (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type f)))
                 (free! (mut (.table s)))
-                (set! (.table s) ~(runtime-map (mut k) mt))
+                (set! (.table s) ~(memo-storage-new (mut k) f))
                 (free! (mut (.busy s)))
                 (set! (.busy s) ~(runtime-map (mut k) (memo-busy-type f)))
                 (set! (.gen s) (rt/next-pass!))
@@ -10318,7 +10332,7 @@
                 (unless (.ready s)
                   (rt/init-lock!)
                   (unless (.ready s)
-                    (set! (.table s) ~(runtime-map (mut k) mt))
+                    (set! (.table s) ~(memo-storage-new (mut k) f))
                     (set! (.args s)
                           ~(if (= (memo-key-type f) "Int")
                                `(HashMap::new [i64 ~args-ty]
@@ -10412,7 +10426,7 @@
                       (match (get (.regions s) key)
                         (Some [r] (do (rt/region-release-id! r) (HashMap::remove! (mut (.regions s)) key)))
                         (None [] 0))
-                      (HashMap::remove! (mut (.table s)) key)
+                      (rt/MemoMap::remove! (mut (.table s)) key)
                       (HashMap::remove! (mut (.uses s)) key)))
                   ;; Every worker's table in front of this one forgets what it had.
                   (set! (.gen s) (rt/next-pass!))
@@ -10466,7 +10480,7 @@
                             (match (get (.regions s) key)
                               (Some [r] (do (rt/region-release-id! r) (HashMap::remove! (mut (.regions s)) key)))
                               (None [] 0))
-                            (HashMap::remove! (mut (.table s)) key)
+                            (rt/MemoMap::remove! (mut (.table s)) key)
                             (HashMap::remove! (mut (.uses s)) key))
                           (when (> (len drop) 0)
                             (set! (.gen s) (rt/next-pass!))
@@ -10525,7 +10539,7 @@
                 (when (and tracking (rt/dep-in-frame?)) (rt/dep-note-id! node))
                 (when (!= (~near-gen t) (.gen s))
                   (free! (mut (~near t)))
-                  (set! (~near t) ~(runtime-map (mut k) mt))
+                  (set! (~near t) ~(memo-storage-new (mut k) f))
                   (free! (mut (~near-regions t)))
                   (set! (~near-regions t) ~(runtime-map (mut k) (memo-busy-type f)))
                   (set! (~near-gen t) (.gen s)))
@@ -10533,7 +10547,7 @@
                   (let [rev (rt/dep-revision)]
                     (when (!= (~near-rev t) rev)
                       (free! (mut (~near t)))
-                      (set! (~near t) ~(runtime-map (mut k) mt))
+                      (set! (~near t) ~(memo-storage-new (mut k) f))
                       (free! (mut (~near-regions t)))
                       (set! (~near-regions t) ~(runtime-map (mut k) (memo-busy-type f)))
                       (set! (~near-rev t) rev))))

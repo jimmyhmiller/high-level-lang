@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Everything the bundler claims, checked against esbuild and acorn. Run from anywhere; it works in tests/.
 #   usage: verify.py ESB-BINARY JSPARSE-BINARY
-import glob, gzip, json, os, re, subprocess, sys, tempfile, time
+import glob, gzip, json, os, re, signal, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guard
 ESB, PARSE = guard.in_tests(sys.argv[1:3])
@@ -21,6 +21,11 @@ def check(ok, label):
     if not ok: failures.append(label)
 
 print("== parser")
+runtime_check = os.path.join(os.path.dirname(ESB), "runtime-check")
+code, out = sh([runtime_check], 30)
+check(code == 0 and "generic runtime checks passed" in out, "generic sparse symbol lookup and scratch storage")
+poisoned = subprocess.run([runtime_check, "--poison-read"], env={**os.environ, "HL_REGION_CHECK": "1"}, capture_output=True, text=True, timeout=30)
+check(poisoned.returncode in (-signal.SIGSEGV, -signal.SIGBUS), "released scratch storage is unreadable")
 lists = {
     "lodash.js": ["node_modules/lodash/lodash.js"],
     "lodash-es": sorted(glob.glob("node_modules/lodash-es/*.js")),
@@ -551,8 +556,9 @@ mod("bare.js", 'module.exports = 1\nglobalThis.bare = 1\n')
 mod("s-bare.js", 'import "./bare.js"\nimport "node:os"\nconsole.log(globalThis.bare)\n')
 mod("s-pure.js", 'var a = typeof Foo === "function" ? Foo : null\nvar b = typeof Bar < "u" ? Bar : 0\nvar n = -90\n'
                  'var t = { Int8Array, Uint8Array }\nvar c = Object.create\nclass M extends Map {}\nvar k = Symbol.iterator\nconsole.log("pure")\n')
+mod("s-remainders.js", 'console.log(JSON.stringify([0%19,1%19,100%19,9007199254740991%97,9007199254740992%3,-0%3,-5%3,1%0,5.5%2,0x10%3].map(x=>[String(x),Object.is(x,-0)])))\n')
 for name in ["s-required", "s-imported", "s-entry", "s-esm-throws", "s-names", "s-names-alone", "s-external", "s-pure",
-             "s-cjs-shaken", "s-order", "s-mjs", "s-bare"]:
+             "s-cjs-shaken", "s-order", "s-mjs", "s-bare", "s-remainders"]:
     for flags in [[], ["--minify"]]:
         ours, theirs = f"{MOD}/{name}.o.js", f"{MOD}/{name}.e.js"
         code, out = sh([ESB, f"{MOD}/{name}.js", f"--outfile={ours}", "--external:node:os"] + flags)
