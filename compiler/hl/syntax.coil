@@ -2529,12 +2529,18 @@
                             (flags i64)
                             (from i64)
                             (careful bool)] (-> (Result Node rt/ParseError))
-         (let [scratch (rt/scratch-enter!)
-               result (parse-working src path flags from careful)]
-           (rt/region-leave!)
-           (let [out (parse-owned-result result)]
-             (rt/scratch-dispose! scratch)
-             out)))
+         ;; Asked by a computation working apart, the parse works in that computation's
+         ;; storage: what it leaves behind goes with it, and the tree is copied out once.
+         (if (rt/apart-open?)
+             (parse-working src path flags from careful)
+             (let [scratch (rt/scratch-enter!)
+                   result (parse-working src path flags from careful)]
+               (rt/region-leave!)
+               (rt/own-begin!)
+               (let [out (parse-owned-result scratch result)]
+                 (rt/own-end!)
+                 (rt/scratch-dispose! scratch)
+                 out))))
 
        (defn parse-working [(src (slice u8)) (path (slice u8)) (flags i64)
                             (from i64) (careful bool)] (-> (Result Node rt/ParseError))
@@ -2553,23 +2559,36 @@
            (rt/p-free! (mut p))
            result))
 
-       (defn parse-owned-result [(result (Result Node rt/ParseError))]
+       (defn parse-owned-result [(scratch (ptr rt/Region)) (result (Result Node rt/ParseError))]
          (-> (Result Node rt/ParseError))
          (match result
-           (Ok [n] (Ok (parse-owned-tree n)))
+           (Ok [n] (Ok (node-own-in scratch n)))
            (Err [e] (Err (rt/ParseError :path (rt/text-copy (.path e))
                                       :line (.line e) :col (.col e)
                                       :want (rt/text-copy (.want e))
                                       :found (rt/text-copy (.found e)))))))
 
-       ;;; Only the accepted tree survives parsing. Failed alternatives and packrat
-       ;;; results live in scratch, not in the build's long-lived value arena.
-       (defn parse-owned-tree [(n Node)] (-> Node)
-         (let [(mut kids) (new-kids)]
-           (reserve! (mut kids) (len (.kids n)))
-           (for child (.kids n) (push! (mut kids) (parse-owned-tree child)))
-           (Node :kind (.kind n) :text (rt/text-copy (.text n)) :kids kids
-                 :lo (.lo n) :hi (.hi n) :gen (.gen n))))
+       ;;; A tree out of scratch storage (see "values out of scratch storage" in hl.rt): its own
+       ;;; copy of each node made there, sharing every subtree and text made outside it. Only the
+       ;;; accepted tree survives parsing, and its texts are still the source's; failed
+       ;;; alternatives and packrat results go with the scratch storage.
+       (defn node-own-in [(from (ptr rt/Region)) (n Node)] (-> Node)
+         (if (rt/storage-in? from (primitive/cast i64 (data (slice (.kids n)))) (cap (.kids n)))
+             (let [storage (primitive/cast i64 (data (slice (.kids n))))
+                   seen (rt/own-seen storage)
+                   kids
+                     (if (and (!= (primitive/cast i64 seen) 0)
+                              (= (len (load (primitive/cast (ptr (ArrayList Node)) seen))) (len (.kids n))))
+                         (load (primitive/cast (ptr (ArrayList Node)) seen))
+                         (let [(mut made) (new-kids)]
+                           (reserve! (mut made) (len (.kids n)))
+                           (for child (.kids n) (push! (mut made) (node-own-in from child)))
+                           (rt/own-keep! storage (primitive/cast (ptr u8) (mut made)) (sizeof (ArrayList Node)))
+                           made))]
+               (Node :kind (.kind n) :text (rt/text-own-in from (.text n)) :kids kids
+                     :lo (.lo n) :hi (.hi n) :gen (.gen n)))
+             (Node :kind (.kind n) :text (rt/text-own-in from (.text n)) :kids (.kids n)
+                   :lo (.lo n) :hi (.hi n) :gen (.gen n))))
 
        ;;; Parse a whole file. Syntax errors stop the program with file:line:col.
        (defn parse [(src (slice u8)) (path (slice u8))] (-> Node)

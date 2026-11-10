@@ -3,11 +3,104 @@
 (import "hl.symtab" :as sym)
 (import "hl.rt" :as rt)
 (import "coil.arraylist" :use [ArrayList])
-(import "coil.alloc" :use [alloc])
+(import "coil.alloc" :use [alloc malloc-allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.hashmap" :use [i64-keyops])
 
 (defstruct Payload [(tag i64) (padding (array i64 128))])
+
+(defn tracking-a [] (-> bool) (rt/dep-tracking?))
+(defn tracking-b [] (-> bool) (rt/dep-tracking?))
+
+(defn relation-index-check [] (-> void)
+  (let [(mut r) (rt/rel-new 2)]
+    (rt/rel-add! (mut r) 100000 1 0 0)
+    (rt/rel-add! (mut r) -7 2 0 0)
+    (rt/rel-add! (mut r) 100000 3 0 0)
+    (let [rows (rt/rel-bucket (mut r) 0 100000)
+          (mut seen) (ArrayList::new [i64] (malloc-allocator))]
+      (for row rows (push! (mut seen) row))
+      (when (or (!= (len rows) 2) (!= (len seen) 2) (!= (get seen 0) 0) (!= (get seen 1) 2))
+        (panic "dense index changed insertion order")))
+    (when (!= (len (rt/rel-bucket (mut r) 0 99999)) 0) (panic "empty dense key has rows"))
+    (when (!= (len (rt/rel-bucket (mut r) 0 -7)) 1) (panic "sparse index lost a row"))
+    (rt/rel-add! (mut r) 100000 4 0 0)
+    (rt/rel-add! (mut r) -7 5 0 0)
+    (when (!= (len (rt/rel-bucket (mut r) 0 100000)) 3) (panic "dense index missed an appended row"))
+    (when (!= (len (rt/rel-bucket (mut r) 0 -7)) 2) (panic "sparse index missed an appended row"))
+    (let [dense (get (.dense r) 0) heads (.heads (get (.index r) 0))]
+      (when (or (!= (get dense 99999) (: 0 i32)) (!= (len heads) 2))
+        (panic "dense index made slots for absent keys")))
+    ;; A walk begun before a row joined its chain sees the rows there were.
+    (let [rows (rt/rel-bucket (mut r) 0 -7)
+          (mut walked) 0]
+      (rt/rel-add! (mut r) -7 6 0 0)
+      (for row rows (set! walked (+ walked 1)))
+      (when (!= walked 2) (panic "a walk saw a row that joined after it began"))
+      (when (!= (len (rt/rel-bucket (mut r) 0 -7)) 3) (panic "sparse index missed a third row"))))
+  0)
+
+;;; A relation's rows are found by what they hold through every growth of its table; a row taken
+;;; out is passed by, and the same row added again is a new one; a column must fit 32 bits.
+(defn relation-rows-check [] (-> void)
+  (let [(mut r) (rt/rel-new 3)]
+    (for i (range 0 20000)
+      (unless (rt/rel-add! (mut r) i (* i 7) -3 0) (panic "a new row was taken for an old one")))
+    (for i (range 0 20000)
+      (when (rt/rel-add! (mut r) i (* i 7) -3 0) (panic "a row was added twice"))
+      (when (!= (rt/rel-find (mut r) i (* i 7) -3 0) i) (panic "a row was not found where it is")))
+    (when (rt/rel-has? (mut r) 5 36 -3 0) (panic "a row that is not there was found"))
+    (unless (rt/rel-kill! (mut r) 5 35 -3 0) (panic "a row could not be taken out"))
+    (when (rt/rel-has? (mut r) 5 35 -3 0) (panic "a row taken out is still found"))
+    (unless (rt/rel-add! (mut r) 5 35 -3 0) (panic "a row taken out could not be added again"))
+    (when (!= (rt/rel-find (mut r) 5 35 -3 0) 20000) (panic "the row added again is not the one found"))
+    (when (!= (rt/rel-at (mut r) 7 2) -3) (panic "a negative column changed")))
+  0)
+
+;;; One text, kept once: the same bytes whoever asks, and from a copy elsewhere.
+(defn kept-text-check [] (-> void)
+  (let [a (rt/kept-text "features/one.js")
+        b (rt/kept-text (rt/text-copy "features/one.js"))
+        c (rt/kept-text "features/two.js")]
+    (when (!= (primitive/cast i64 (data a)) (primitive/cast i64 (data b)))
+      (panic "one text was kept twice"))
+    (when (= (primitive/cast i64 (data a)) (primitive/cast i64 (data c)))
+      (panic "two texts were kept as one"))
+    (when (!= b "features/one.js") (panic "a kept text changed")))
+  0)
+
+;;; What `distinct` lets by: each key once, the first few in place and the rest in a table.
+(defn int-seen-check [] (-> void)
+  (let [(mut s) (rt/int-seen)
+        (mut fresh) 0]
+    (for round (range 0 3)
+      (for key (range 0 100)
+        (when (rt/int-seen-add! (mut s) (* key 3)) (set! fresh (+ fresh 1)))))
+    (when (!= fresh 100) (panic "distinct keys were let by more than once, or not at all")))
+  0)
+
+;;; A value out of scratch storage: what was made there is copied, what was made outside is
+;;; shared, and a list reached twice is still one list.
+(defn scratch-copy-check [] (-> void)
+  (let [(mut outside) (ArrayList::new [i64] (rt/value-allocator))]
+    (for i (range 0 100) (push! (mut outside) i))
+    (let [scratch (rt/scratch-enter!)
+          (mut inside) (ArrayList::new [i64] (rt/value-allocator))]
+      (for i (range 0 100) (push! (mut inside) (* i 2)))
+      (rt/region-leave!)
+      (unless (rt/scratch-holds? scratch (rt/list-storage inside)) (panic "a list made in scratch storage is not in it"))
+      (when (rt/scratch-holds? scratch (rt/list-storage outside)) (panic "a list made outside scratch storage is in it"))
+      (rt/own-begin!)
+      (let [kept-outside (rt/ints-own-in scratch outside)
+            copy (rt/ints-own-in scratch inside)
+            again (rt/ints-own-in scratch inside)]
+        (rt/own-end!)
+        (rt/scratch-dispose! scratch)
+        (when (!= (rt/list-storage kept-outside) (rt/list-storage outside)) (panic "a list outside scratch storage was copied"))
+        (when (rt/scratch-space-holds? (rt/list-storage copy)) (panic "a copy out of scratch storage is still in it"))
+        (when (!= (rt/list-storage copy) (rt/list-storage again)) (panic "one list reached twice was copied twice"))
+        (when (or (!= (len copy) 100) (!= (get copy 99) 198)) (panic "a copy out of scratch storage lost its values")))))
+  0)
 
 (defn memo-map-check [] (-> void)
   (let [(mut values) (rt/MemoMap::new [i64 Payload] (i64-keyops))
@@ -88,5 +181,13 @@
   (lookup-check)
   (scratch-check)
   (memo-map-check)
+  (relation-index-check)
+  (relation-rows-check)
+  (kept-text-check)
+  (int-seen-check)
+  (scratch-copy-check)
+  (when (or (tracking-a) (tracking-b)) (panic "tracking started before it was enabled"))
+  (rt/dep-track!)
+  (when (not (and (tracking-a) (tracking-b))) (panic "tracking switch is not shared"))
   (println "generic runtime checks passed")
   0)

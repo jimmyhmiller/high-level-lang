@@ -62,7 +62,7 @@
 
 (defstruct FieldDef [(name (slice u8)) (ty (slice u8))])
 
-(defstruct RecDef [(name (slice u8)) (fields (ArrayList FieldDef))])
+(defstruct RecDef [(name (slice u8)) (fields (ArrayList FieldDef)) (boxed bool)])
 
 (defstruct EnumDef [(name (slice u8)) (variants (ArrayList (slice u8)))])
 
@@ -140,6 +140,9 @@
    (keeps (ArrayList (slice u8)))
    (default-keeps (ArrayList (slice u8)))
    (made (ArrayList (slice u8)))
+   ;; The functions some strategy has work apart (`apart` in the pipeline language), as
+   ;; `module/function`: each one's place is its number, by which a run's strategy turns it on.
+   (aparts (ArrayList (slice u8)))
    ;; Foreign functions that change their first argument in place, as `module/function`, and the
    ;; calls of the module's functions that say what may change (`changes` in a foreign block).
    (mutators (ArrayList Mutator))
@@ -309,7 +312,44 @@
           (let [(mut ps) (primitive/code-list-new)]
             (for p (fn-params t) (push! (mut ps) (coil-type (mut k) p)))
             `(fnptr (cc/C) [~@ps] ~(coil-type (mut k) (fn-ret t))))
-        :else (sym (qualified (mut k) (type-module t) (type-name t)))))
+        :else
+          (let [native (sym (qualified (mut k) (type-module t) (type-name t)))]
+            (if (boxed-record? (mut k) t) `(ptr ~native) native))))
+
+;;; Representation is a source-level declaration, independent of any client's types.
+(defn boxed-record? [(k (mut Comp)) (t (slice u8))] (-> bool)
+  (if (< (mod-index (mut k) (type-module t)) 0)
+      false
+      (match (find-rec (mod-at (mut k) (type-module t)) (type-name t))
+        (Some [r] (.boxed r))
+        (None [] false))))
+
+;;; An enclosing value must not expose a child's pointer representation in equality.
+(defn has-boxed-value? [(k (mut Comp)) (t (slice u8))] (-> bool)
+  (cond (list? t) (has-boxed-value? (mut k) (elem-of t))
+        (opt? t) (has-boxed-value? (mut k) (opt-of t))
+        (map? t) (or (has-boxed-value? (mut k) (map-key t)) (has-boxed-value? (mut k) (map-val t)))
+        (fn? t) false
+        (< (mod-index (mut k) (type-module t)) 0) false
+        :else
+          (match (find-rec (mod-at (mut k) (type-module t)) (type-name t))
+            (Some [r]
+                  (or (.boxed r)
+                      (let [(mut found) false]
+                        (for f (.fields r)
+                          (when (has-boxed-value? (mut k) (.ty f)) (set! found true)))
+                        found)))
+            (None [] false))))
+
+(defn record-value [(k (mut Comp)) (t (slice u8)) (value Code)] (-> Code)
+  (if (boxed-record? (mut k) t)
+      `(box! (rt/value-allocator) ~(sym (qualified (mut k) (type-module t) (type-name t))) ~value)
+      value))
+
+(defn record-copy [(k (mut Comp)) (t (slice u8)) (value Code)] (-> Code)
+  (if (boxed-record? (mut k) t)
+      (record-value (mut k) t `(load (: ~value ~(coil-type (mut k) t))))
+      value))
 
 ;; ---------------------------------------------------------------- finding things
 
@@ -491,6 +531,7 @@
                            "a second pipeline with strategies: one program has one numbering of what it keeps"))
             (set! seen true)
             (set! (.keeps k) (.kept all))
+            (set! (.aparts k) (.apart all))
             (set! (.default-keeps k)
                   (pl/strategy-keeps all (.default all) made))
             (for x (.kept all)
@@ -1413,6 +1454,7 @@
                                          (.text (kid item 0)))
                         (push! (mut (.recs (elem (mut (.mods k)) ix)))
                                (RecDef
+                                 :boxed false
                                  :name (.text (kid item 0))
                                  :fields
                                    (ArrayList::new [FieldDef]
@@ -1506,13 +1548,14 @@
              (func-of "reset-state!" "Void"))
       ;; Type names before anything that mentions them.
       (for d decls
-        (match (.kind d)
-          (g/KRecord []
+        (when (or (= (.kind d) (g/KRecord)) (= (.kind d) (g/KBoxedRecord)))
                      (push! (mut (.recs (elem (mut (.mods k)) ix)))
                             (RecDef
                               :name (.text (kid d 0))
+                              :boxed (= (.kind d) (g/KBoxedRecord))
                               :fields
                                 (ArrayList::new [FieldDef] (malloc-allocator)))))
+        (match (.kind d)
           (g/KEnum []
                    (let [(mut vs) (text-list)]
                      (for v (list-kids (kid d 1)) (push! (mut vs) (.text v)))
@@ -1534,7 +1577,7 @@
           (when (= (.kind d) (g/KEnum))
             (for v (list-kids (kid d 1)) (push! (mut names) (.text v)))))
         (for d decls
-          (when (= (.kind d) (g/KRecord))
+          (when (or (= (.kind d) (g/KRecord)) (= (.kind d) (g/KBoxedRecord)))
             (let [name (.text (kid d 0))]
               (for x names
                 (when (= x name)
@@ -1550,6 +1593,7 @@
         (push! (mut (.recs (elem (mut (.mods k)) ix)))
                (RecDef
                  :name "Attrs"
+                 :boxed false
                  :fields (ArrayList::new [FieldDef] (malloc-allocator)))))
       (for d decls
         (when (= (.kind d) (g/KForeign)) (add-foreign! (mut k) d name)))
@@ -1557,8 +1601,7 @@
       (let [ix2 (mod-index (mut k) name)
             (mut rec-index) 0]
         (for d decls
-          (match (.kind d)
-            (g/KRecord []
+          (when (or (= (.kind d) (g/KRecord)) (= (.kind d) (g/KBoxedRecord)))
                        (for f (list-kids (kid d 1))
                          (let [ty (resolve-type (mut k) name (kid f 1))]
                            (push! (mut (.fields (elem (mut (.recs (elem (mut (.mods k))
@@ -1566,6 +1609,7 @@
                                                       rec-index)))
                                   (FieldDef :name (.text (kid f 0)) :ty ty))))
                        (set! rec-index (+ rec-index 1)))
+          (match (.kind d)
             (g/KState [] (add-global! (mut k) ix2 name d true))
             (g/KTaskState [] (add-global! (mut k) ix2 name d true))
             (g/KContext [] (add-global! (mut k) ix2 name d true))
@@ -1805,14 +1849,21 @@
 
 ;;; A map the generated code keeps for itself (a memo's tables): on malloc, let go explicitly.
 (defn runtime-map [(k (mut Comp)) (t (slice u8))] (-> Code)
-  (map-in (mut k) t `(malloc-allocator)))
+  (map-with (mut k) t `(malloc-allocator) `(rt/memo-keyops)))
 
 (defn map-in [(k (mut Comp)) (t (slice u8)) (allocator Code)] (-> Code)
+  (map-with (mut k) t allocator `(str/keyops)))
+
+;;; A map whose Text keys are held as `text-keys` says: its own copies, or views of kept texts
+;;; for a table of kept answers (see `rt/memo-keyops`).
+(defn map-with [(k (mut Comp)) (t (slice u8)) (allocator Code) (text-keys Code)] (-> Code)
+  (when (boxed-record? (mut k) (map-key t))
+    (panic "rules: boxed records are values, not scalar map keys; use an Int or Text key"))
   (cond (= (map-key t) "Text")
           `(HashMap::new [~(coil-type (mut k) (map-key t))
                           ~(coil-type (mut k) (map-val t))]
                          ~allocator
-                         (str/keyops))
+                         ~text-keys)
         ;; An Int is its own hash, near enough: one multiply, not eight bytes of FNV.
         (= (map-key t) "Int")
           `(HashMap::new [i64 ~(coil-type (mut k) (map-val t))]
@@ -3155,11 +3206,14 @@
             (set! (mut stops) i (get labels j))))
         (when (= (.wrap-kind h) 10)
           (push! (mut seen) `(mut ~(sym (.var h))))
+          ;; Int keys are mostly few: kept in place, with no table (see `rt/int-seen`).
           (push! (mut seen)
-                 (new-map (mut k)
-                          (cat3 "{"
-                                (if (opt? (.row h)) (opt-of (.row h)) (.row h))
-                                ":Bool}"))))))
+                 (if (= (if (opt? (.row h)) (opt-of (.row h)) (.row h)) "Int")
+                     `(rt/int-seen)
+                     (new-map (mut k)
+                              (cat3 "{"
+                                    (if (opt? (.row h)) (opt-of (.row h)) (.row h))
+                                    ":Bool}")))))))
     (let [(mut body) inner
           (mut i) (- (len opened) 1)]
       (while (>= i 0)
@@ -3175,11 +3229,14 @@
                 (= (.wrap-kind h) 10)
                   (let [kv (fresh (mut k) "key")
                         once
-                          `(unless (match (get ~(sym (.var h)) ~(sym kv))
-                                     (Some [_] true)
-                                     (None [] false))
-                             (set! (mut ~(sym (.var h))) ~(sym kv) true)
-                             ~body)]
+                          (if (= (if (opt? (.row h)) (opt-of (.row h)) (.row h)) "Int")
+                              `(when (rt/int-seen-add! (mut ~(sym (.var h))) ~(sym kv))
+                                 ~body)
+                              `(unless (match (get ~(sym (.var h)) ~(sym kv))
+                                         (Some [_] true)
+                                         (None [] false))
+                                 (set! (mut ~(sym (.var h))) ~(sym kv) true)
+                                 ~body))]
                     (set! body
                           (if (opt? (.row h))
                               `(match ~(.seq h)
@@ -3256,6 +3313,8 @@
                                             "")))))
                    (None []
                          (let [b (place (mut k) base)]
+                           (when (boxed-record? (mut k) (.ty b))
+                             (die (mut k) e "boxed records are immutable; replace the value with `with { ... }`"))
                            (when (named-child? (mut k) (.ty b) field)
                              (die (mut k)
                                   e
@@ -4704,7 +4763,8 @@
           (die (mut k)
                a
                (cat4 (.name r) " has no field named " (.text (kid a 0)) "")))))
-    (te `(~(sym (qualified (mut k) module (.name r))) ~@inits)
+    (te (record-value (mut k) (cat3 module "." (.name r))
+                      `(~(sym (qualified (mut k) module (.name r))) ~@inits))
         (cat3 module "." (.name r)))))
 
 (defn build-node [(k (mut Comp))
@@ -4978,7 +5038,10 @@
             (die (mut k) n (cat4 "cannot compare " (.ty a) " with " (.ty b))))
           (when (or (list? (.ty a)) (map? (.ty a)) (opt? (.ty a)))
             (die (mut k) n (cat "cannot compare values of " (.ty a))))
-          (te (if negate `(!= ~(.code a) ~(.code b)) `(= ~(.code a) ~(.code b)))
+          (te (if (has-boxed-value? (mut k) (.ty a))
+                  (let [same (same-code (mut k) (.ty a) (.code a) (.code b))]
+                    (if negate `(not ~same) same))
+                  (if negate `(!= ~(.code a) ~(.code b)) `(= ~(.code a) ~(.code b))))
               "Bool")))))
 
 (defn in-test [(k (mut Comp)) (n g/Node)] (-> TE)
@@ -5520,6 +5583,7 @@
           (and (not scan)
                (not in-place)
                (record-type? (mut k) ty)
+               (not (boxed-record? (mut k) ty))
                (= (.kind with-node) (g/KWithE))
                (= (.kind (kid with-node 0)) (g/KName))
                (= (.text (kid with-node 0)) (.text (kid n 0))))
@@ -6664,7 +6728,7 @@
             (push! (mut sets)
                    `(set! (~(primitive/code-symbol "." name) ~(sym t))
                           ~(.code v))))))
-    (te `(let [(mut ~(sym t)) ~(.code base)] ~@sets ~(sym t)) (.ty base))))
+    (te `(let [(mut ~(sym t)) ~(record-copy (mut k) (.ty base) (.code base))] ~@sets ~(sym t)) (.ty base))))
 
 ;;; Whether `e` is `name.field`.
 (defn field-of? [(e g/Node) (name (slice u8)) (field (slice u8))] (-> bool)
@@ -6963,7 +7027,9 @@
                                       ;; reclaims memory), which the setting holds from now on.
                                       (push! (mut sets)
                                              `(let [~(sym made-in) (rt/answer-region-open! ~(cat "with " name))
-                                                    ~(sym given) ~(.code v)]
+                                                    ;; Given by a computation working apart, the
+                                                    ;; setting's own: the next is compared with it.
+                                                    ~(sym given) ~(lasting-code (mut k) (.ty x) (.code v))]
                                                 (rt/answer-region-close! ~(sym made-in))
                                                 (set! ~field ~(sym given))
                                                 (set! ~region-at ~(sym made-in))))
@@ -7461,7 +7527,7 @@
                                    ;; Made in a region of its own, which the setting holds from
                                    ;; now on in place of the one it held.
                                    made-in (rt/answer-region-open! ~(cat "set " (.name (.x sp))))
-                                   value ~(.code v)
+                                   value ~(lasting-code (mut k) (.ty (.x sp)) (.code v))
                                    closed (rt/answer-region-close! made-in)]
                                (set! ~(.code p) value)
                                (rt/region-release-id! (~(primitive/code-symbol "."
@@ -7722,6 +7788,90 @@
 (defn compile-fn [(k (mut Comp)) (d g/Node)] (-> Code)
   (compile-fn-as (mut k) d (.text (kid d 0))))
 
+;; ---------------------------------------------------------------- working apart
+
+;;; A function's number among those some strategy has work apart; -1 for one none does.
+(defn apart-number [(k (mut Comp)) (name (slice u8))] (-> i64)
+  (let [(mut at) -1
+        full (cat3 (.self k) "/" name)]
+    (for i (range 0 (len (.aparts k)))
+      (when (= (get (.aparts k) i) full) (set! at i)))
+    at))
+
+;;; Every function a pipeline has work apart is one of its module's.
+(defn check-aparts! [(k (mut Comp)) (path (slice u8)) (decls (ArrayList g/Node))] (-> void)
+  (let [prefix (cat (.self k) "/")]
+    (for name (.aparts k)
+      (when (rt/starts-with name prefix)
+        (let [(mut found) false]
+          (for d decls
+            (when (and (or (= (.kind d) (g/KFn)) (= (.kind d) (g/KMemoFn)))
+                       (= (.text (kid d 0)) (subslice name (len prefix) (len name))))
+              (set! found true)))
+          (unless found
+            (dsl/fail-at path
+                         1
+                         1
+                         (cat3 "a pipeline has "
+                               name
+                               (cat " work apart, which is no function of " (.self k)))))))))
+  0)
+
+;;; A function a strategy has work apart (see "working apart" in hl.rt), compiled as `coil-name`:
+;;; the function as written under another name, and this one, which a run whose strategy says so
+;;; has call it in storage of its own, copy the answer out to where values went before, and let
+;;; the rest go. Any other run calls it as it is.
+(defn compile-apart! [(k (mut Comp))
+                      (d g/Node)
+                      (coil-name (slice u8))
+                      (number i64)
+                      (out (mut str/StrBuf))] (-> void)
+  (let [name (.text (kid d 0))
+        f
+          (match (find-func (self-mod (mut k)) name)
+            (Some [x] x)
+            (None [] (die (mut k) d "this function was not collected")))
+        working (cat coil-name "--working")
+        (mut params) (primitive/code-list-new)
+        (mut args) (primitive/code-list-new)]
+    (when (= (.ret f) "Void")
+      (die (mut k) d "a function that works apart answers a value: its answer is all that is kept of its work"))
+    (for i (range 0 (len (.params f)))
+      (when (.by-ref (get (.params f) i))
+        (die (mut k) d "a function that works apart takes nothing by reference: what it changed would be let go"))
+      (push! (mut params)
+             `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
+      (push! (mut args) (memo-arg i)))
+    (emit! (mut out) (compile-fn-as (mut k) d working))
+    (emit! (mut out)
+           `(defn ~(sym coil-name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
+              (if (rt/apart? ~number)
+                  (let [apart-storage (rt/apart-enter!)
+                        apart-made (~(sym working) ~@args)]
+                    (rt/apart-leave!)
+                    (rt/own-begin!)
+                    (let [apart-answer ~(own-in-code (mut k) (.ret f) `apart-made `apart-storage)]
+                      (rt/own-end!)
+                      (rt/scratch-dispose! apart-storage)
+                      apart-answer))
+                  (~(sym working) ~@args))))
+    0))
+
+;;; A value that must outlive a computation working apart: while one is open on this thread, its
+;;; own copy in the thread's lasting storage; else the value itself.
+(defn lasting-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
+  (if (own-in-plain? t)
+      v
+      `(let [lasting-given ~v]
+         (if (rt/apart-open?)
+             (let [lasting-open (rt/lasting-enter!)
+                   lasting-began (rt/own-begin!)
+                   lasting-own ~(own-in-code (mut k) t `lasting-given `(rt/any-scratch))]
+               (rt/own-end!)
+               (rt/lasting-leave! lasting-open)
+               lasting-own)
+             lasting-given))))
+
 (defn compile-fn-as [(k (mut Comp)) (d g/Node) (coil-name (slice u8))] (-> Code)
   (let [name (.text (kid d 0))
         f
@@ -7889,7 +8039,7 @@
                         (push! (mut inits)
                                (primitive/code-symbol ":" (.name f)))
                         (push! (mut inits) (default-of (mut k) at (.ty f))))
-                      `(~(sym (qualified (mut k) (type-module ty) (.name r))) ~@inits)))
+                      (record-value (mut k) ty `(~(sym (qualified (mut k) (type-module ty) (.name r))) ~@inits))))
               (None []
                     (match (find-enum-named m (type-name ty))
                       (Some [e]
@@ -9059,7 +9209,7 @@
 
 (defn memo-storage-new [(k (mut Comp)) (f Func)] (-> Code)
   `(rt/MemoMap::new [~(coil-type (mut k) (memo-key-type f)) ~(coil-type (mut k) (.ret f))]
-                    ~(if (= (memo-key-type f) "Int") `(i64-keyops) `(str/keyops))))
+                    ~(if (= (memo-key-type f) "Int") `(i64-keyops) `(rt/memo-keyops))))
 
 (defn memo-new-map [(k (mut Comp)) (d g/Node)] (-> Code)
   (memo-storage-new (mut k) (memo-check! (mut k) d)))
@@ -9518,9 +9668,8 @@
                                                                     (.name f)))
                                       (push! (mut inits) (sym v))))
                                   `(let [~@binds]
-                                     (~(sym (qualified (mut k)
-                                                       module
-                                                       (type-name t))) ~@inits)))
+                                     ~(record-value (mut k) t
+                                        `(~(sym (qualified (mut k) module (type-name t))) ~@inits))))
                               :else
                                 (shared-dec (mut k)
                                             t
@@ -10138,6 +10287,105 @@
                (rt/copy-reader-done! r)
                copied))))
 
+;;; A value out of scratch storage (see "values out of scratch storage" in hl.rt): its own copy,
+;;; where values go now, of whatever part of it lies in scratch region `from` (in any, for
+;;; `(rt/any-scratch)`), sharing the rest. Numbers, truths and functions are as they are.
+(defn own-in-code [(k (mut Comp)) (t (slice u8)) (v Code) (from Code)] (-> Code)
+  (cond (or (= t "Int") (= t "Bool") (= t "Float") (fn? t)) v
+        (= t "Text") `(rt/text-own-in ~from ~v)
+        (opt? t)
+          (let [x (fresh (mut k) "x")]
+            `(match ~v
+               (Some [~(sym x)] (Some ~(own-in-code (mut k) (opt-of t) (sym x) from)))
+               (None [] (None [~(coil-type (mut k) (opt-of t))]))))
+        :else `(~(own-in-helper (mut k) t) ~from ~v)))
+
+;;; Whether a value of type `t` can hold anything in scratch storage at all.
+(defn own-in-plain? [(t (slice u8))] (-> bool)
+  (or (= t "Int") (= t "Bool") (= t "Float") (fn? t)))
+
+(defn own-in-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
+  (let [name (persist-name "ownin--" t)
+        ty (coil-type (mut k) t)]
+    (unless (has-text? (.sames k) name)
+      (push! (mut (.sames k)) name)
+      (let [body
+              (cond (list? t)
+                      `(if (rt/storage-in? from (rt/list-storage v) (cap v))
+                           ;; Reached before in this copy: the same list again. A short list
+                           ;; of numbers is as cheap to copy again as to look up.
+                           (let [noted ~(if (own-in-plain? (elem-of t)) `(>= (len v) 64) `true)
+                                 seen (if noted (rt/own-seen (rt/list-storage v)) (primitive/cast (ptr u8) 0))]
+                             (if (and (!= (primitive/cast i64 seen) 0)
+                                      (= (len (load (primitive/cast (ptr ~ty) seen))) (len v)))
+                                 (load (primitive/cast (ptr ~ty) seen))
+                                 (let [(mut out) ~(new-list (mut k) (elem-of t))]
+                                   (reserve! (mut out) (len v))
+                                   (for e v (push! (mut out) ~(own-in-code (mut k) (elem-of t) `e `from)))
+                                   (when noted
+                                     (rt/own-keep! (rt/list-storage v) (primitive/cast (ptr u8) (mut out)) (sizeof ~ty)))
+                                   out)))
+                           v)
+                    (map? t)
+                      `(if (rt/storage-in? from (rt/map-storage v) (rt/map-capacity v))
+                           (let [seen (rt/own-seen (rt/map-storage v))]
+                             (if (!= (primitive/cast i64 seen) 0)
+                                 (load (primitive/cast (ptr ~ty) seen))
+                                 (let [(mut out) ~(new-map (mut k) t)]
+                                   (for key v
+                                     (match (get v key)
+                                       ;; A Text key is copied by the map that takes it.
+                                       (Some [x] (set! (mut out) key ~(own-in-code (mut k) (map-val t) `x `from)))
+                                       (None [] (panic "a map lost a key while it was copied"))))
+                                   (rt/own-keep! (rt/map-storage v) (primitive/cast (ptr u8) (mut out)) (sizeof ~ty))
+                                   out)))
+                           v)
+                    :else
+                      (let [kind (persist-kind (mut k) t)
+                            module (type-module t)
+                            mo (mod-at (mut k) module)]
+                        (cond (= kind "node")
+                                `(~(sym (qualified (mut k) module "node-own-in")) from v)
+                              ;; A database's relations keep their own memory; a fact and an
+                              ;; enum's value are numbers.
+                              (or (= kind "db") (= kind "fact") (= kind "enum")) `v
+                              (= kind "record")
+                                (let [r
+                                        (match (find-rec mo (type-name t))
+                                          (Some [r] r)
+                                          (None [] (panic "rules: no record {}" t)))
+                                      (mut inits) (primitive/code-list-new)]
+                                  (for f (.fields r)
+                                    (push! (mut inits) (primitive/code-symbol ":" (.name f)))
+                                    (push! (mut inits)
+                                           (own-in-code (mut k)
+                                                        (.ty f)
+                                                        `(~(primitive/code-symbol "." (.name f)) v)
+                                                        `from)))
+                                  (let [made `(~(sym (qualified (mut k) module (type-name t))) ~@inits)]
+                                    (if (boxed-record? (mut k) t)
+                                        ;; A boxed record outside scratch storage holds nothing in it.
+                                        `(if (rt/scratch-holds? from (primitive/cast i64 v))
+                                             (let [seen (rt/own-seen (primitive/cast i64 v))]
+                                               (if (!= (primitive/cast i64 seen) 0)
+                                                   (load (primitive/cast (ptr ~ty) seen))
+                                                   (let [(mut boxed) ~(record-value (mut k) t made)]
+                                                     (rt/own-keep! (primitive/cast i64 v)
+                                                                   (primitive/cast (ptr u8) (mut boxed))
+                                                                   (sizeof ~ty))
+                                                     boxed)))
+                                             v)
+                                        made)))
+                              :else
+                                `(~(sym (qualified (mut k)
+                                                   module
+                                                   (cat "apart-own-" (type-name t)))) from
+                                    v))))]
+        (push! (mut (.aux k))
+               `(defn ~(sym name) [(from (ptr rt/Region)) (v ~ty)] (-> ~ty)
+                  ~body))))
+    (sym name)))
+
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
   (let [f (memo-check! (mut k) d)
         name (.text (kid d 0))
@@ -10177,7 +10425,9 @@
       (push! (mut arg-inits) (memo-arg i))
       (push! (mut stored)
              `(~(primitive/code-symbol "." (cat "memo-arg-" (rt/num-text i))) a)))
-    (emit! (mut out) (compile-fn-as (mut k) d compute))
+    (if (>= (apart-number (mut k) name) 0)
+        (compile-apart! (mut k) d compute (apart-number (mut k) name) (mut out))
+        (emit! (mut out) (compile-fn-as (mut k) d compute)))
     ;; The lock word comes first, so the store's address is the word's.
     (emit! (mut out)
            `(defstruct ~args-ty [~@arg-fields]))
@@ -10340,7 +10590,7 @@
                                               (i64-keyops))
                                `(HashMap::new [(slice u8) ~args-ty]
                                               (malloc-allocator)
-                                              (str/keyops))))
+                                              (rt/memo-keyops))))
                     (set! (.node-ids s)
                           ~(if (= (memo-key-type f) "Int")
                                `(HashMap::new [i64 i64]
@@ -10348,7 +10598,7 @@
                                               (i64-keyops))
                                `(HashMap::new [(slice u8) i64]
                                               (malloc-allocator)
-                                              (str/keyops))))
+                                              (rt/memo-keyops))))
                     (set! (.busy s) ~(runtime-map (mut k) (memo-busy-type f)))
                     (set! (.lazy s)
                           ~(runtime-map (mut k)
@@ -10605,14 +10855,35 @@
                                               (set! (mut (.busy s)) key me)
                                               (rt/spin-unlock! word)
                                               ;; Made from the store's own copy of the arguments, in a
-                                              ;; region of its own, when the run reclaims memory.
-                                              (let [owned
-                                                      (if reclaim
-                                                          (~(sym (cat "memo-own--" name)) s key ~@args)
-                                                          (~(sym (cat "MemoOwned--" name))
-                                                            :args ~(if (= (len (.params f)) 0)
-                                                                       `(zeroed ~args-ty)
-                                                                       `(~args-ty ~@arg-inits))))
+                                              ;; region of its own, when the run reclaims memory. Asked
+                                              ;; for by a computation working apart, made in lasting
+                                              ;; storage, from the store's own copy too: the answer
+                                              ;; outlives what asked.
+                                              (let [apart-open (rt/lasting-enter!)
+                                                    owned
+                                                      (cond reclaim (~(sym (cat "memo-own--" name)) s key ~@args)
+                                                            ;; Asked for by a computation working apart:
+                                                            ;; whatever of the arguments lies in scratch
+                                                            ;; storage, the answer's own copy of.
+                                                            (> apart-open 0)
+                                                              (~(sym (cat "MemoOwned--" name))
+                                                                :args ~(if (= (len (.params f)) 0)
+                                                                           `(zeroed ~args-ty)
+                                                                           `(~args-ty ~@(let [(mut owns) (primitive/code-list-new)]
+                                                                                          (for i (range 0 (len (.params f)))
+                                                                                            (push! (mut owns)
+                                                                                                   (primitive/code-symbol ":" (cat "memo-arg-" (rt/num-text i))))
+                                                                                            (push! (mut owns)
+                                                                                                   (own-in-code (mut k)
+                                                                                                                (.ty (get (.params f) i))
+                                                                                                                (memo-arg i)
+                                                                                                                `(rt/any-scratch))))
+                                                                                          owns))))
+                                                            :else
+                                                              (~(sym (cat "MemoOwned--" name))
+                                                                :args ~(if (= (len (.params f)) 0)
+                                                                           `(zeroed ~args-ty)
+                                                                           `(~args-ty ~@arg-inits))))
                                                     ~@(let [(mut rebinds) (primitive/code-list-new)]
                                                         (for i (range 0 (len (.params f)))
                                                           (push! (mut rebinds) (memo-arg i))
@@ -10712,7 +10983,8 @@
                                                                   (rt/dep-untracked!)
                                                                   (set! new-answer
                                                                         true)
-                                                                  fresh))))]
+                                                                  fresh))))
+                                                    apart-left (rt/lasting-leave! apart-open)]
                                                 (rt/spin-lock! word)
                                                 (when tracking
                                                   ;; Its arguments: the store's own copy already, while the run
@@ -10913,6 +11185,7 @@
             :keeps (text-list)
             :default-keeps (text-list)
             :made (text-list)
+            :aparts (text-list)
             :mutators (ArrayList::new [Mutator] (malloc-allocator))
             :hooks (ArrayList::new [Hooks] (malloc-allocator))
             :sig-only (text-list)
@@ -10958,7 +11231,7 @@
       (emit! (mut out)
              `(do
                 (import "coil.primitive" :as primitive)
-                (import "coil.alloc" :use [malloc-allocator])
+                (import "coil.alloc" :use [malloc-allocator box!])
                 (import "coil.arraylist" :use [ArrayList])
                 (import "coil.hashmap" :use [HashMap i64-keyops])
                 (import "coil.slice" :use [subslice])
@@ -11203,11 +11476,17 @@
                         ~@puts
                         (rules-task-init! (rules-task))
                         (rt/region-leave!)))))))
+      (check-aparts! (mut k) path decls)
       (for d decls
         (when (= (.kind d) (g/KFn))
-          (if (auditable? (mut k) d)
-              (compile-audited! (mut k) d (mut out))
-              (emit! (mut out) (compile-fn (mut k) d))))
+          (cond (>= (apart-number (mut k) (.text (kid d 0))) 0)
+                  (compile-apart! (mut k)
+                                  d
+                                  (.text (kid d 0))
+                                  (apart-number (mut k) (.text (kid d 0)))
+                                  (mut out))
+                (auditable? (mut k) d) (compile-audited! (mut k) d (mut out))
+                :else (emit! (mut out) (compile-fn (mut k) d))))
         (when (= (.kind d) (g/KMemoFn))
           (compile-memo! (mut k) d (mut out))))
       (emit! (mut out) (compile-persist (mut k) decls))

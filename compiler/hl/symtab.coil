@@ -52,7 +52,7 @@
    (extra (HashMap i64 (ArrayList i64)))
    (scopes i64)
    (symbols i64)
-   ;; Where to start looking for an id, a page of 1024 ids at a time: the block (by `blocks` for
+   ;; Where to start looking for an id, a page of 16 ids at a time: the block (by `blocks` for
    ;; scopes, by `by-symbol` for symbols) last to start at or before the page; and which blocks
    ;; hold scopes linking made symbols in.
    (scope-pages (ArrayList i64))
@@ -499,8 +499,8 @@
       :symbol-pages (pages-of blocks by-symbol false symbols)
       :extra-in extra-in)))
 
-(defn page-size [] (-> i64)
-  1024)
+(defn page-size :inline (Always) [] (-> i64)
+  16)
 
 ;;; For each page of ids up to `total`, the place in `order` of the last block that starts at or
 ;;; before it, or -1.
@@ -1091,3 +1091,145 @@
             :free free
             :outer outer
             :joined (None [Joined]))))))
+
+;; ---------------------------------------------------------------- tables out of scratch storage
+
+;;; A table's own copy of whatever part of it lies in scratch storage (see "values out of scratch
+;;; storage" in hl.rt): each list and map made there, and each name. What was made outside is
+;;; shared, as a joined table shares its blocks.
+
+(defn names-own-in [(from (ptr rt/Region)) (m (HashMap (slice u8) i64))]
+  (-> (HashMap (slice u8) i64))
+  (if (rt/storage-in? from (rt/map-storage m) (rt/map-capacity m))
+      (let [seen (rt/own-seen (rt/map-storage m))]
+        (if (!= (primitive/cast i64 seen) 0)
+            (load (primitive/cast (ptr (HashMap (slice u8) i64)) seen))
+            (let [(mut out) (names-map)
+                  (mut src) m]
+              (for-entries [k v (mut src)]
+                (set! (mut out) (rt/text-own-in from (load k)) (load v)))
+              (rt/own-keep! (rt/map-storage m) (primitive/cast (ptr u8) (mut out)) (sizeof (HashMap (slice u8) i64)))
+              out)))
+      m))
+
+(defn int-map-own-in [(from (ptr rt/Region)) (m (HashMap i64 i64))] (-> (HashMap i64 i64))
+  (if (rt/storage-in? from (rt/map-storage m) (rt/map-capacity m))
+      (let [(mut out) (HashMap::new-scalar [i64 i64] (rt/value-allocator))
+            (mut src) m]
+        (for-entries [k v (mut src)] (set! (mut out) (load k) (load v)))
+        out)
+      m))
+
+(defn symbol-own-in [(from (ptr rt/Region)) (s Symbol)] (-> Symbol)
+  (Symbol
+    :name (rt/text-own-in from (.name s))
+    :scope (.scope s)
+    :uses (.uses s)
+    :final (rt/text-own-in from (.final s))
+    :pinned (.pinned s)))
+
+(defn symbols-own-in [(from (ptr rt/Region)) (xs (ArrayList Symbol))] (-> (ArrayList Symbol))
+  (if (rt/storage-in? from (rt/list-storage xs) (cap xs))
+      (let [seen (rt/own-seen (rt/list-storage xs))]
+        (if (and (!= (primitive/cast i64 seen) 0)
+                 (= (len (load (primitive/cast (ptr (ArrayList Symbol)) seen))) (len xs)))
+            (load (primitive/cast (ptr (ArrayList Symbol)) seen))
+            (let [(mut out) (ArrayList::new [Symbol] (rt/value-allocator))]
+              (reserve! (mut out) (len xs))
+              (for x xs (push! (mut out) (symbol-own-in from x)))
+              (rt/own-keep! (rt/list-storage xs) (primitive/cast (ptr u8) (mut out)) (sizeof (ArrayList Symbol)))
+              out)))
+      xs))
+
+(defn scope-own-in [(from (ptr rt/Region)) (sc Scope)] (-> Scope)
+  (Scope
+    :parent (.parent sc)
+    :names (names-own-in from (.names sc))
+    :symbols (rt/ints-own-in from (.symbols sc))
+    :children (rt/ints-own-in from (.children sc))
+    :dynamic (.dynamic sc)))
+
+(defn scopes-own-in [(from (ptr rt/Region)) (xs (ArrayList Scope))] (-> (ArrayList Scope))
+  (if (rt/storage-in? from (rt/list-storage xs) (cap xs))
+      (let [seen (rt/own-seen (rt/list-storage xs))]
+        (if (and (!= (primitive/cast i64 seen) 0)
+                 (= (len (load (primitive/cast (ptr (ArrayList Scope)) seen))) (len xs)))
+            (load (primitive/cast (ptr (ArrayList Scope)) seen))
+            (let [(mut out) (ArrayList::new [Scope] (rt/value-allocator))]
+              (reserve! (mut out) (len xs))
+              (for x xs (push! (mut out) (scope-own-in from x)))
+              (rt/own-keep! (rt/list-storage xs) (primitive/cast (ptr u8) (mut out)) (sizeof (ArrayList Scope)))
+              out)))
+      xs))
+
+(defn apart-own-Block [(from (ptr rt/Region)) (b Block)] (-> Block)
+  (Block
+    :scopes (scopes-own-in from (.scopes b))
+    :symbols (symbols-own-in from (.symbols b))
+    :scope-start (.scope-start b)
+    :symbol-start (.symbol-start b)
+    :roots (rt/ints-own-in from (.roots b))
+    :dynamic (.dynamic b)))
+
+(defn blocks-own-in [(from (ptr rt/Region)) (xs (ArrayList Block))] (-> (ArrayList Block))
+  (if (rt/storage-in? from (rt/list-storage xs) (cap xs))
+      (let [seen (rt/own-seen (rt/list-storage xs))]
+        (if (and (!= (primitive/cast i64 seen) 0)
+                 (= (len (load (primitive/cast (ptr (ArrayList Block)) seen))) (len xs)))
+            (load (primitive/cast (ptr (ArrayList Block)) seen))
+            (let [(mut out) (ArrayList::new [Block] (rt/value-allocator))]
+              (reserve! (mut out) (len xs))
+              (for x xs (push! (mut out) (apart-own-Block from x)))
+              (rt/own-keep! (rt/list-storage xs) (primitive/cast (ptr u8) (mut out)) (sizeof (ArrayList Block)))
+              out)))
+      xs))
+
+(defn bools-own-in [(from (ptr rt/Region)) (xs (ArrayList bool))] (-> (ArrayList bool))
+  (if (rt/storage-in? from (rt/list-storage xs) (cap xs))
+      (let [seen (rt/own-seen (rt/list-storage xs))]
+        (if (and (!= (primitive/cast i64 seen) 0)
+                 (= (len (load (primitive/cast (ptr (ArrayList bool)) seen))) (len xs)))
+            (load (primitive/cast (ptr (ArrayList bool)) seen))
+            (let [(mut out) (ArrayList::new [bool] (rt/value-allocator))]
+              (reserve! (mut out) (len xs))
+              (for x xs (push! (mut out) x))
+              (rt/own-keep! (rt/list-storage xs) (primitive/cast (ptr u8) (mut out)) (sizeof (ArrayList bool)))
+              out)))
+      xs))
+
+(defn joined-own-in [(from (ptr rt/Region)) (j Joined)] (-> Joined)
+  (Joined
+    :blocks (blocks-own-in from (.blocks j))
+    :by-symbol (rt/ints-own-in from (.by-symbol j))
+    :made
+      (if (rt/storage-in? from (rt/map-storage (.made j)) (rt/map-capacity (.made j)))
+          (let [(mut out) (HashMap::new-scalar [i64 Symbol] (rt/value-allocator))
+                (mut src) (.made j)]
+            (for-entries [k v (mut src)]
+              (set! (mut out) (load k) (symbol-own-in from (load v))))
+            out)
+          (.made j))
+    :extra
+      (if (rt/storage-in? from (rt/map-storage (.extra j)) (rt/map-capacity (.extra j)))
+          (let [(mut out) (HashMap::new-scalar [i64 (ArrayList i64)] (rt/value-allocator))
+                (mut src) (.extra j)]
+            (for-entries [k v (mut src)]
+              (set! (mut out) (load k) (rt/ints-own-in from (load v))))
+            out)
+          (.extra j))
+    :scopes (.scopes j)
+    :symbols (.symbols j)
+    :scope-pages (rt/ints-own-in from (.scope-pages j))
+    :symbol-pages (rt/ints-own-in from (.symbol-pages j))
+    :extra-in (bools-own-in from (.extra-in j))))
+
+(defn apart-own-Table [(from (ptr rt/Region)) (t Table)] (-> Table)
+  (Table
+    :scopes (scopes-own-in from (.scopes t))
+    :symbols (symbols-own-in from (.symbols t))
+    :free (names-own-in from (.free t))
+    :outer (int-map-own-in from (.outer t))
+    :joined
+      (match (.joined t)
+        (Some [j] (Some (joined-own-in from j)))
+        (None [] (None [Joined])))))

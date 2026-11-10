@@ -12,7 +12,7 @@
 (import "coil.mem" :as mem)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
-(import "coil.hashmap" :use [HashMap MapIter KeyOps i64-keyops])
+(import "coil.hashmap" :use [HashMap MapIter KeyOps i64-keyops bytewise-hash])
 (import "coil.str" :as str)
 (import "coil.fs" :as fs)
 (import "coil.io" :as io)
@@ -205,6 +205,18 @@
   (atomic/store (init-lock-word) 0)
   0)
 
+;;; Something made once, by whichever thread asks first, with a word of its own to say so (0 not
+;;; made, 2 being made, 1 made): unlike the lock above, it may be asked for while that is held.
+;;; Whether the asker is the one to make it; it says `once-made!` when it has.
+(defn once-mine? [(word (ptr i64))] (-> bool)
+  (cond (= (atomic/read word) 1) false
+        (= (atomic/cas word 0 2) 0) true
+        :else (do (while (!= (atomic/read word) 1) 0) false)))
+
+(defn once-made! [(word (ptr i64))] (-> void)
+  (atomic/store word 1)
+  0)
+
 ;; ---------------------------------------------------------------- regions
 
 ;;; Values live in regions. A region is memory taken in chunks and given out by bumping a pointer,
@@ -240,7 +252,14 @@
    ;; A cursor any thread may allocate through, under `lock` (see `region-shared-allocator`).
    (shared i64)
    ;; What made it, for the trace (see `regions-labels`).
-   (label (slice u8))])
+   (label (slice u8))
+   ;; A scratch region's memory is stretches of the scratch space (see `scratch-space`), not
+   ;; chunks of its own from the system: each stretch's start and size, in turn, and the free
+   ;; bytes of the last, `space-at` up to `space-end`.
+   (space bool)
+   (stretches (ArrayList i64))
+   (space-at i64)
+   (space-end i64)])
 
 ;;; Where one thread allocates in one region: the free bytes of its current chunk, `at` up to
 ;;; `end`; the start of the last allocation, which can grow or be taken back in place; and the size
@@ -264,7 +283,11 @@
               :last-ref 0
               :cursors (ArrayList::new [i64] (malloc-allocator))
               :shared 0
-              :label ""))
+              :label ""
+              :space false
+              :stretches (ArrayList::new [i64] (malloc-allocator))
+              :space-at 0
+              :space-end 0))
     r))
 
 (defn cursor-make [(r (ptr Region))] (-> (ptr Cursor))
@@ -280,6 +303,30 @@
 
 ;;; A chunk of `size` bytes, its header filled, added to its region. Its first byte for values.
 (defn chunk-add! [(r (ptr Region)) (size i64)] (-> i64)
+  (if (.space r) (chunk-add-space! r size) (chunk-add-own! r size)))
+
+;;; A scratch region's chunk: the next bytes of its last stretch of the scratch space, or of a
+;;; new stretch when that has too few left.
+(defn chunk-add-space! [(r (ptr Region)) (size i64)] (-> i64)
+  (let [want (align-to size 16)]
+    (spin-lock! (field r lock))
+    (when (> (+ (.space-at r) want) (.space-end r))
+      (let [took (stretch-size want)
+            at (stretch-take! took)]
+        (push! (mut (.stretches r)) at)
+        (push! (mut (.stretches r)) took)
+        (set! (.space-at r) at)
+        (set! (.space-end r) (+ at took))))
+    (let [p (.space-at r)]
+      (set! (.space-at r) (+ p want))
+      (store! (primitive/cast (ptr i64) p) (.chunks r))
+      (store! (primitive/cast (ptr i64) (+ p 8)) want)
+      (set! (.chunks r) p)
+      (set! (.bytes r) (+ (.bytes r) want))
+      (spin-unlock! (field r lock))
+      (+ p (chunk-header-bytes)))))
+
+(defn chunk-add-own! [(r (ptr Region)) (size i64)] (-> i64)
   (let [p (primitive/cast i64 (chunk-memory size))]
     (when (= p 0) (oom-at c"a region's chunk" size))
     (spin-lock! (field r lock))
@@ -420,7 +467,13 @@
 
 ;;; A thread's stack of regions: where its values go is the allocator on top, into `region`. The
 ;;; stack holds each entered region with its allocator's state and whether that is a shared cursor.
-(defstruct ThreadRegions [(top (dyn Allocator)) (region (ptr Region)) (stack (ArrayList i64))])
+(defstruct ThreadRegions [(top (dyn Allocator)) (region (ptr Region)) (stack (ArrayList i64)) (scratch i64)
+                          ;; How many computations working apart (see `apart-enter!`) enclose what this
+                          ;; thread does now: what it is handed may be let go when they answer.
+                          (apart i64)
+                          ;; The text this thread last asked the kept texts for: a key goes
+                          ;; into several tables in a row.
+                          (kept-last (slice u8))])
 
 ;;; The thread-specific key of the threads' region stacks, plus one, as each place that asks keeps
 ;;; it: the key never changes once made, so a place asks `workers` only the first time.
@@ -448,7 +501,8 @@
         c (cursor-make r)]
     (store! t (ThreadRegions :top (primitive/make-dyn Allocator c)
                              :region r
-                             :stack (ArrayList::new [i64] (malloc-allocator))))
+                             :stack (ArrayList::new [i64] (malloc-allocator)) :scratch 0 :apart 0
+                             :kept-last ""))
     (push! (mut (.stack t)) (primitive/cast i64 r))
     (push! (mut (.stack t)) (primitive/cast i64 c))
     (push! (mut (.stack t)) 0)
@@ -516,28 +570,377 @@
 ;;; An isolated computation's scratch arena. Nothing in it may escape: the caller
 ;;; leaves it, copies its result into its parent's allocator, then disposes it.
 ;;; Unlike retained answer regions it never enters the dependency/cache lifetime graph.
+;;; Its memory is stretches of the scratch space, so whether a value lies in it is asked of
+;;; its address alone (`scratch-holds?`).
 (defn scratch-enter! [] (-> (ptr Region))
-  (let [r (region-make true 65536)]
+  (let [t (thread-regions)
+        saved (.scratch t)
+        r (if (= saved 0)
+              (let [made (region-make true 4194304)]
+                (set! (.space made) true)
+                made)
+              (primitive/cast (ptr Region) saved))]
+    ;; Remove it before entering: nested scratch computations need distinct storage.
+    (set! (.scratch t) 0)
     (region-enter! r)
+    (set! (.grow (primitive/cast (ptr Cursor) (get (.stack t) (- (len (.stack t)) 2)))) 65536)
     r))
 
 (defn scratch-dispose! [(r (ptr Region))] (-> void)
   (when (or (= r (region-current)) (!= (len (.refs r)) 0))
     (panic "scratch region is still entered or owns retained references"))
-  (let [(mut at) (.chunks r)]
-    (while (!= at 0)
-      (let [before (load (primitive/cast (ptr i64) at))
-            size (load (primitive/cast (ptr i64) (+ at 8)))]
-        (chunk-let-go! at size)
-        (set! at before))))
-  (for c (.cursors r) (primitive/free (primitive/cast (ptr i8) c)))
-  (when (!= (.shared r) 0) (primitive/free (primitive/cast (ptr i8) (.shared r))))
-  (free! (mut (.refs r)))
-  (free! (mut (.cursors r)))
-  (free! (mut (.keys (.ref-seen r))))
-  (free! (mut (.vals (.ref-seen r))))
-  (primitive/free (primitive/cast (ptr i8) r))
+  (let [t (thread-regions)
+        ;; A thread keeps one scratch region with its first stretch, for the next computation.
+        ;; Poisoning deliberately bypasses reuse to detect escapes.
+        reuse (and (not (region-check?)) (= (.scratch t) 0) (>= (len (.stretches r)) 2)
+                   (= (get (.stretches r) 1) (stretch-unit)))
+        count (/ (len (.stretches r)) 2)]
+    (for i (range 0 count)
+      (let [at (get (.stretches r) (* i 2))
+            size (get (.stretches r) (+ (* i 2) 1))
+            used (if (= i (- count 1)) (- (.space-at r) at) size)]
+        (if (and reuse (= i 0))
+            (stretch-trim! at used)
+            (stretch-give! at size used))))
+    (for c (.cursors r) (primitive/free (primitive/cast (ptr i8) c)))
+    (clear! (mut (.cursors r)))
+    (when (!= (.shared r) 0) (primitive/free (primitive/cast (ptr i8) (.shared r))))
+    (set! (.shared r) 0)
+    (set! (.chunks r) 0)
+    (set! (.bytes r) 0)
+    (if reuse
+        (let [at (get (.stretches r) 0)
+              size (get (.stretches r) 1)]
+          (clear! (mut (.stretches r)))
+          (push! (mut (.stretches r)) at)
+          (push! (mut (.stretches r)) size)
+          (set! (.space-at r) at)
+          (set! (.space-end r) (+ at size))
+          (set! (.scratch t) (primitive/cast i64 r)))
+        (do (free! (mut (.refs r)))
+            (free! (mut (.cursors r)))
+            (free! (mut (.stretches r)))
+            (free! (mut (.keys (.ref-seen r))))
+            (free! (mut (.vals (.ref-seen r))))
+            (primitive/free (primitive/cast (ptr i8) r)))))
   0)
+
+;;; Whether the byte at `p` is in scratch region `r`; in any scratch region at all, for `r` 0.
+(defn scratch-holds? [(r (ptr Region)) (p i64)] (-> bool)
+  (and (scratch-space-holds? p)
+       (or (= (primitive/cast i64 r) 0)
+           (let [(mut found) false
+                 n (len (.stretches r))
+                 (mut i) 0]
+             (while (and (not found) (< i n))
+               (let [at (get (.stretches r) i)]
+                 (when (and (>= p at) (< p (+ at (get (.stretches r) (+ i 1)))))
+                   (set! found true)))
+               (set! i (+ i 2)))
+             found))))
+
+;; ---------------------------------------------------------------- kept texts
+;;;
+;;; The tables that keep answers are keyed by texts, a file's path as often as not, and one path
+;;; keys many tables: each function kept for it, on each thread. A table that copied its keys had
+;;; a copy apiece. These tables take their keys from here instead: the program's one copy of each
+;;; text, never let go, so a key is a view of it and costs its table nothing.
+;;;
+;;; A run that reclaims memory makes keys without end (what it keeps changes from build to
+;;; build), and its tables copy and free their own (`memo-keyops`).
+
+(defstruct KeptTexts [(lock i64) (texts (HashMap (slice u8) (slice u8)))])
+
+(defstruct KeptTextsAll [(ready i64) (parts (ArrayList KeptTexts))])
+
+(defn kept-texts [] (-> (ptr KeptTextsAll))
+  (let [all (primitive/alloc-static KeptTextsAll)]
+    (when (once-mine? (field all ready))
+      (let [(mut parts) (ArrayList::new [KeptTexts] (malloc-allocator))]
+        ;; In parts, each with its lock: many threads keep texts at once.
+        (for _ (range 0 64)
+          (push! (mut parts)
+                 (KeptTexts :lock 0
+                            :texts (HashMap::new [(slice u8) (slice u8)]
+                                                 (malloc-allocator)
+                                                 (str/keyops-borrowed)))))
+        (set! (.parts all) parts))
+      (once-made! (field all ready)))
+    all))
+
+;;; A text's hash, eight bytes at a time: which part of the kept texts holds it.
+(defn text-hash [(s (slice u8))] (-> i64)
+  (let [n (len s)
+        p (data s)
+        (mut h) (^ n -7046029254386353131)
+        (mut i) 0]
+    (while (<= (+ i 8) n)
+      (set! h (memo-hash (^ h (load (primitive/cast (ptr i64) (primitive/index p i))))))
+      (set! i (+ i 8)))
+    (while (< i n)
+      (set! h (memo-hash (^ h (cast i64 (get s i)))))
+      (set! i (+ i 1)))
+    h))
+
+;;; The program's own copy of `s`: the same bytes for the same text, as long as it runs.
+(defn kept-text [(s (slice u8))] (-> (slice u8))
+  (let [t (thread-regions)]
+    (cond (= (len s) 0) ""
+          (= (.kept-last t) s) (.kept-last t)
+          :else
+            (let [all (kept-texts)
+                  part (elem (mut (.parts all)) (& (text-hash s) 63))]
+              (spin-lock! (field part lock))
+              (let [kept
+                      (match (get (.texts part) s)
+                        (Some [k] k)
+                        (None []
+                              (let [own (own-text s)]
+                                (set! (mut (.texts part)) own own)
+                                own)))]
+                (spin-unlock! (field part lock))
+                (set! (.kept-last t) kept)
+                kept)))))
+
+(defn kept-key-copy [(ap (ptr (dyn Allocator))) (slot (ptr i8))] (-> i64)
+  (let [at (primitive/cast (ptr (slice u8)) slot)]
+    (store! at (kept-text (load at)))
+    0))
+
+;;; A kept text is the program's, not the table's that is done with it.
+(defn kept-key-free [(ap (ptr (dyn Allocator))) (slot (ptr i8))] (-> i64)
+  0)
+
+(defstruct KeptKeyOps [(ready i64) (ops KeyOps)])
+
+;;; A text key's hash and equality as every table's, with these in place of copying and freeing.
+(defn kept-keyops [] (-> (ptr KeyOps))
+  (let [c (primitive/alloc-static KeptKeyOps)]
+    (when (once-mine? (field c ready))
+      (let [base (load (str/keyops))]
+        (set! (.ops c)
+              (KeyOps :hash (.hash base)
+                      :eq (.eq base)
+                      :size (.size base)
+                      :copy (primitive/fnptr-of kept-key-copy)
+                      :free (primitive/fnptr-of kept-key-free)
+                      :owns 1)))
+      (once-made! (field c ready)))
+    (field c ops)))
+
+;;; How a table of kept answers holds its Text keys: views of kept texts; or, in a run that
+;;; reclaims memory, copies of its own that go when it lets them go.
+(defn memo-keyops [] (-> (ptr KeyOps))
+  (if (reclaiming?) (str/keyops) (kept-keyops)))
+
+;; ---------------------------------------------------------------- values out of scratch storage
+;;;
+;;; A value leaves scratch storage by its own copy of whatever part of it lies there, and no
+;;; more: what it holds from outside (a tree some kept answer made, a file's text) it goes on
+;;; holding. A container outside scratch storage holds nothing inside it, since nothing made
+;;; before a computation can point at what the computation makes; so a copy stops at the first
+;;; container that is outside. `from` is the scratch region left, or 0 for every scratch
+;;; region there is.
+
+(defn any-scratch [] (-> (ptr Region))
+  (primitive/cast (ptr Region) 0))
+
+;;; One copy out, on one thread: a container reached twice is copied once, and the value still
+;;; holds one container in two places. `seen` has each copied container's old memory, and where
+;;; in `kept` its copy (the list's or map's own few words, or a boxed record's address) was put.
+(defstruct OwnCopies [(ready bool) (depth i64) (seen IntTable) (kept (ArrayList u8))])
+
+(defn own-copies [] (-> (ptr OwnCopies))
+  (let [slot (worker-slot)
+        all (own-copies-all)]
+    (elem (mut (.slots all)) slot)))
+
+(defstruct OwnCopiesAll [(ready i64) (slots (ArrayList OwnCopies))])
+
+(defn own-copies-all [] (-> (ptr OwnCopiesAll))
+  (let [all (primitive/alloc-static OwnCopiesAll)]
+    (when (once-mine? (field all ready))
+      (let [(mut slots) (ArrayList::new [OwnCopies] (malloc-allocator))]
+        (for _ (range 0 (max-workers))
+          (push! (mut slots)
+                 (OwnCopies :ready true
+                            :depth 0
+                            :seen (int-table 0)
+                            :kept (ArrayList::new [u8] (malloc-allocator)))))
+        (set! (.slots all) slots))
+      (once-made! (field all ready)))
+    all))
+
+;;; A copy out begins and ends; what it noted is forgotten when the outermost ends.
+(defn own-begin! [] (-> i64)
+  (let [c (own-copies)]
+    (set! (.depth c) (+ (.depth c) 1))
+    0))
+
+(defn own-end! [] (-> void)
+  (let [c (own-copies)]
+    (set! (.depth c) (- (.depth c) 1))
+    (when (and (= (.depth c) 0) (> (.count (.seen c)) 0))
+      (free! (mut (.keys (.seen c))))
+      (free! (mut (.vals (.seen c))))
+      (set! (.seen c) (int-table 0))
+      (if (> (cap (.kept c)) 65536)
+          (do (free! (mut (.kept c)))
+              (set! (.kept c) (ArrayList::new [u8] (malloc-allocator))))
+          (clear! (mut (.kept c)))))
+    0))
+
+;;; Where the copy of the container whose memory is at `storage` was kept, or nothing.
+(defn own-seen [(storage i64)] (-> (ptr u8))
+  (let [c (own-copies)
+        at (if (= storage 0) -1 (int-get (mut (.seen c)) storage))]
+    (if (< at 0)
+        (primitive/cast (ptr u8) 0)
+        (primitive/index (data (slice (.kept c))) at))))
+
+;;; The container whose memory was at `storage` has this copy, `size` bytes at `value`.
+(defn own-keep! [(storage i64) (value (ptr u8)) (size i64)] (-> void)
+  (when (!= storage 0)
+    (let [c (own-copies)
+          at (align-to (len (.kept c)) 8)]
+      (ArrayList::extend-zeroed! (mut (.kept c)) (- (+ at size) (len (.kept c))))
+      (mem/copy [u8] (primitive/index (data (slice (.kept c))) at) value size)
+      (int-put! (mut (.seen c)) storage at)))
+  0)
+
+;;; Whether a container whose memory is at `storage` is copied: its memory is in scratch
+;;; storage, or it has none yet, and would take its first from an allocator that may be gone.
+(defn storage-in? :inline (Always) [(from (ptr Region)) (storage i64) (capacity i64)] (-> bool)
+  (or (= capacity 0) (scratch-holds? from storage)))
+
+(defn list-storage [T] [(xs (ArrayList T))] (-> i64)
+  (primitive/cast i64 (data (slice xs))))
+
+(defn map-storage [K V] [(m (HashMap K V))] (-> i64)
+  (primitive/cast i64 (.slots m)))
+
+(defn map-capacity [K V] [(m (HashMap K V))] (-> i64)
+  (.cap m))
+
+(defn text-own-in [(from (ptr Region)) (s (slice u8))] (-> (slice u8))
+  (if (and (> (len s) 0) (scratch-holds? from (primitive/cast i64 (data s))))
+      (text-copy s)
+      s))
+
+(defn ints-own-in [(from (ptr Region)) (xs (ArrayList i64))] (-> (ArrayList i64))
+  (if (storage-in? from (list-storage xs) (cap xs))
+      (let [seen (if (< (len xs) 64) (primitive/cast (ptr u8) 0) (own-seen (list-storage xs)))]
+        (if (and (!= (primitive/cast i64 seen) 0)
+                 (= (len (load (primitive/cast (ptr (ArrayList i64)) seen))) (len xs)))
+            (load (primitive/cast (ptr (ArrayList i64)) seen))
+            (let [(mut out) (ArrayList::new [i64] (value-allocator))]
+              (reserve! (mut out) (len xs))
+              (for x xs (push! (mut out) x))
+              ;; A short list of numbers is as cheap to copy again as to look up.
+              (when (>= (len xs) 64)
+                (own-keep! (list-storage xs) (primitive/cast (ptr u8) (mut out)) (sizeof (ArrayList i64))))
+              out)))
+      xs))
+
+(defn texts-own-in [(from (ptr Region)) (xs (ArrayList (slice u8)))] (-> (ArrayList (slice u8)))
+  (if (storage-in? from (list-storage xs) (cap xs))
+      (let [(mut out) (ArrayList::new [(slice u8)] (value-allocator))]
+        (reserve! (mut out) (len xs))
+        (for x xs (push! (mut out) (text-own-in from x)))
+        out)
+      xs))
+
+;;; What the runtime keeps on its own memory is no part of any scratch storage.
+(defn apart-own-Names [(from (ptr Region)) (v Names)] (-> Names) v)
+(defn apart-own-Places [(from (ptr Region)) (v Places)] (-> Places) v)
+(defn apart-own-Ranks [(from (ptr Region)) (v Ranks)] (-> Ranks) v)
+
+;;; A printer and a buffer are written to in place: not values a computation answers with.
+(defn apart-own-W [(from (ptr Region)) (v W)] (-> W)
+  (panic "a printer is not a value: it cannot be an answer or an argument of a computation working apart"))
+
+(defn apart-own-Buf [(from (ptr Region)) (v Buf)] (-> Buf)
+  (panic "a buffer is not a value: it cannot be an answer or an argument of a computation working apart"))
+
+;; ---------------------------------------------------------------- working apart
+;;;
+;;; A function a run's strategy has work apart (`apart` in the pipeline language) makes what it
+;;; makes in storage of its own; its answer is copied out and the rest let go, at once. A build
+;;; that runs once keeps nothing else it made on the way.
+;;;
+;;; While such a computation is open on a thread, whatever is meant to outlive it is made in the
+;;; thread's own lasting storage instead (`lasting-enter!`): a kept function's answer, from the
+;;; store's own copy of its arguments, and a setting's value. So nothing that lasts points into
+;;; storage that is let go. Workers started meanwhile work in their own lasting storage, and are
+;;; told that what they are handed may not last (`apart-inherit!`).
+
+(defn apart-open? :inline (Always) [] (-> bool)
+  (> (.apart (thread-regions)) 0))
+
+(defn apart-enter! [] (-> (ptr Region))
+  (let [r (scratch-enter!)
+        t (thread-regions)]
+    (set! (.apart t) (+ (.apart t) 1))
+    r))
+
+;;; The computation is done: values go where they went before it. Its storage is still there,
+;;; for its answer to be copied from, until `scratch-dispose!`.
+(defn apart-leave! [] (-> void)
+  (let [t (thread-regions)]
+    (when (< (.apart t) 1) (panic "a computation apart was left that was never entered"))
+    (region-leave!)
+    (set! (.apart t) (- (.apart t) 1))
+    0))
+
+;;; What is made from here on, on this thread, lasts: until `lasting-leave!` values go to the
+;;; thread's first region, and nothing is apart. How many computations apart were open (0: none,
+;;; and nothing changed).
+(defn lasting-enter! [] (-> i64)
+  (let [t (thread-regions)
+        open (.apart t)]
+    (when (> open 0)
+      (let [region (get (.stack t) 0)
+            state (get (.stack t) 1)
+            shared (get (.stack t) 2)]
+        (push! (mut (.stack t)) region)
+        (push! (mut (.stack t)) state)
+        (push! (mut (.stack t)) shared)
+        (thread-regions-top! t)
+        (set! (.apart t) 0)))
+    open))
+
+(defn lasting-leave! [(open i64)] (-> i64)
+  (when (> open 0)
+    (region-leave!)
+    (set! (.apart (thread-regions)) open))
+  0)
+
+;;; A worker's job starts and ends: while whoever started the run works apart, so does the worker,
+;;; as far as what it is handed goes.
+(defn apart-inherit! [(open i64)] (-> void)
+  (set! (.apart (thread-regions)) (if (> open 0) 1 0))
+  0)
+
+;;; Which functions the run's strategy has work apart, by their numbers.
+(defstruct ApartState [(chosen bool) (on (ArrayList bool))])
+
+(defn apart-state [] (-> (ptr ApartState))
+  (primitive/alloc-static ApartState))
+
+(defn apart-only! [(count i64) (on (ArrayList i64))] (-> void)
+  (let [s (apart-state)
+        (mut flags) (ArrayList::new [bool] (malloc-allocator))]
+    (for _ (range 0 count) (push! (mut flags) false))
+    (for i on (set! (mut flags) i true))
+    (set! (.on s) flags)
+    (set! (.chosen s) true)
+    0))
+
+;;; Does this run have function `index` work apart? Never while the run reclaims memory or tracks
+;;; what answers were made from: there each answer has a region of its own already.
+(defn apart? [(index i64)] (-> bool)
+  (let [s (apart-state)]
+    (and (.chosen s) (get (.on s) index) (not (reclaiming?)) (not (dep-tracking?)))))
 
 ;;; The program's state (its modules' defaults, what the runtime keeps of values), made while this
 ;;; thread is in the program's own region: as long as the program, grown by any thread.
@@ -653,7 +1056,7 @@
 (defn reclaim-cell [] (-> (ptr Reclaim))
   (primitive/alloc-static Reclaim))
 
-(defn reclaiming? [] (-> bool)
+(defn reclaiming? :inline (Always) [] (-> bool)
   (.on (reclaim-cell)))
 
 ;;; With HL_RECLAIM_OFF set, a watcher keeps everything, as a run that builds once does: to tell
@@ -957,6 +1360,13 @@
 
 (gen-map-anon-private)
 
+;;; MAP_NORESERVE: address space no memory is set aside for until it is written.
+(defn gen-map-noreserve [] (-> Code)
+  `(const ~(primitive/syntax->datum `MAP-NORESERVE)
+          ~(match (target-os) (Linux [] 16384) (Darwin [] 64) (Wasm [] 16384) (BareMetal [] 16384))))
+
+(gen-map-noreserve)
+
 (extern mmap :cc (cc/C) [(ptr i8) isize i32 i32 i32 i64] (-> (ptr i8)))
 (extern munmap :cc (cc/C) [(ptr i8) isize] (-> i32))
 (extern mprotect :cc (cc/C) [(ptr i8) isize i32] (-> i32))
@@ -1001,6 +1411,99 @@
           (munmap (primitive/cast (ptr i8) at) (primitive/cast isize (chunk-pages size)))
         :else
           (primitive/free (primitive/cast (ptr i8) at)))
+  0)
+
+;; ---------------------------------------------------------------- the scratch space
+;;;
+;;; Scratch regions take their memory from one stretch of address space the program reserves
+;;; and never gives back, so "is this value in scratch storage" is two comparisons, whatever
+;;; the system's allocator hands out between times. The space is cut in units; a region takes a
+;;; unit at a time, and several in a row for one allocation bigger than a unit. A unit given
+;;; back keeps its address and loses its pages, for the next region to take. Reserved, the space
+;;; costs nothing: only pages written to are the program's.
+;;;
+;;; With HL_REGION_CHECK set, a unit given back is made unreadable and never taken again, so
+;;; whatever still points into it faults; units are small then, to last.
+
+(defstruct ScratchSpace
+  [(ready i64) (lock i64) (base i64) (end i64) (next i64) (unit i64) (free (ArrayList i64))])
+
+(defn scratch-space-cell [] (-> (ptr ScratchSpace))
+  (primitive/alloc-static ScratchSpace))
+
+(defn scratch-space [] (-> (ptr ScratchSpace))
+  (let [s (scratch-space-cell)]
+    (when (once-mine? (field s ready))
+      (do
+        (let [check (region-check?)
+              ;; 256 GB in 64 MB units; checking, 1 TB in 1 MB units.
+              size (if check 1099511627776 274877906944)
+              p (mmap (primitive/cast (ptr i8) 0) (primitive/cast isize size) (: 0 i32)
+                      (primitive/cast i32 (+ MAP-ANON-PRIVATE MAP-NORESERVE)) (: -1 i32) 0)]
+          (when (= (primitive/cast i64 p) -1)
+            (panic "cannot reserve address space for scratch storage"))
+          (set! (.base s) (primitive/cast i64 p))
+          (set! (.end s) (+ (primitive/cast i64 p) size))
+          (set! (.next s) (primitive/cast i64 p))
+          (set! (.unit s) (if check 1048576 67108864))
+          (set! (.free s) (ArrayList::new [i64] (malloc-allocator)))
+          (once-made! (field s ready)))))
+    s))
+
+;;; Whether `p` is in the scratch space: false before anything took any of it.
+(defn scratch-space-holds? :inline (Always) [(p i64)] (-> bool)
+  (let [s (scratch-space-cell)]
+    (and (>= p (.base s)) (< p (.end s)))))
+
+(defn stretch-unit [] (-> i64)
+  (.unit (scratch-space)))
+
+;;; The size of the stretch a region takes for `want` bytes: whole units.
+(defn stretch-size [(want i64)] (-> i64)
+  (align-to want (stretch-unit)))
+
+;;; A stretch of `size` bytes (whole units), readable and writable: a unit given back before,
+;;; or the next never taken.
+(defn stretch-take! [(size i64)] (-> i64)
+  (let [s (scratch-space)]
+    (spin-lock! (field s lock))
+    (if (and (= size (.unit s)) (> (len (.free s)) 0))
+        (let [at (match (pop! (mut (.free s))) (Some [a] a) (None [] 0))]
+          (spin-unlock! (field s lock))
+          at)
+        (let [at (.next s)]
+          (when (> (+ at size) (.end s))
+            (panic "the scratch space is used up: {} bytes more were asked for" size))
+          (set! (.next s) (+ at size))
+          (spin-unlock! (field s lock))
+          ;; PROT_READ|PROT_WRITE
+          (when (!= (mprotect (primitive/cast (ptr i8) at) (primitive/cast isize size) (: 3 i32)) (: 0 i32))
+            (panic "cannot make scratch storage writable"))
+          at))))
+
+;;; The pages written in a stretch that is kept, all but the first few, given back to the system.
+(defn stretch-trim! [(at i64) (used i64)] (-> void)
+  (when (> used 262144)
+    (let [from (+ at 262144)
+          size (- (align-to used 65536) 262144)
+          p (mmap (primitive/cast (ptr i8) from) (primitive/cast isize size) (: 3 i32)
+                  (primitive/cast i32 (+ MAP-ANON-PRIVATE MAP-NORESERVE 16)) (: -1 i32) 0)]
+      (when (!= (primitive/cast i64 p) from) (panic "cannot give back scratch pages"))))
+  0)
+
+;;; A stretch a region is done with, `used` bytes of it written. One unit goes to the next region
+;;; that takes one; a longer stretch is not taken again. Checking, it is made unreadable for good.
+(defn stretch-give! [(at i64) (size i64) (used i64)] (-> void)
+  (let [s (scratch-space)]
+    (if (or (region-check?) (!= size (.unit s)))
+        (let [p (mmap (primitive/cast (ptr i8) at) (primitive/cast isize size) (: 0 i32)
+                      (primitive/cast i32 (+ MAP-ANON-PRIVATE MAP-NORESERVE 16)) (: -1 i32) 0)]
+          (when (!= (primitive/cast i64 p) at) (panic "cannot poison released scratch storage")))
+        (do
+          (stretch-trim! at used)
+          (spin-lock! (field s lock))
+          (push! (mut (.free s)) at)
+          (spin-unlock! (field s lock)))))
   0)
 
 ;; ---------------------------------------------------------------- tokens
@@ -1792,43 +2295,138 @@
               :else (set! i (& (+ i 1) (.mask t))))))
     0))
 
+;;; The Int keys a `distinct` has let by: the first few in place, with nothing allocated, and
+;;; more than that in a table.
+(defstruct IntSeen [(n i64) (small (array i64 8)) (more IntTable)])
+
+(defn int-seen [] (-> IntSeen)
+  (primitive/zeroed IntSeen))
+
+;;; Whether `key` is new; it is not from now on.
+(defn int-seen-add! [(s (mut IntSeen)) (key i64)] (-> bool)
+  (let [n (.n s)
+        (mut found) false]
+    (for i (range 0 (if (< n 8) n 8))
+      (when (= (get (.small s) i) key) (set! found true)))
+    (cond found false
+          (< n 8)
+            (do
+              (set! (mut (.small s)) n key)
+              (set! (.n s) (+ n 1))
+              true)
+          :else
+            (do
+              (when (= n 8) (set! (.more s) (int-table-in 64 (value-allocator))))
+              (if (>= (int-get (mut (.more s)) key) 0)
+                  false
+                  (do
+                    (int-put! (mut (.more s)) key 0)
+                    (set! (.n s) (+ n 1))
+                    true))))))
+
 ;;; An index from a key to the rows holding it: a table to the bucket's number, and the buckets.
-(defstruct Index [(table IntTable) (buckets (ArrayList (ArrayList i64))) (alc (dyn Allocator))])
+;;; A column's rows by key. Every key that occurs has a slot; a slot's rows are a chain in the
+;;; order they came: its first, its last, how many, and for each row of the relation the next
+;;; with the same key (`links`, -1 at a chain's end). A key costs three numbers and a row one,
+;;; with no list of its own. Rows join in the relation's order, none passed over.
+(defstruct Index
+  [(table IntTable)
+   (heads (ArrayList i32))
+   (tails (ArrayList i32))
+   (counts (ArrayList i32))
+   (links (ArrayList i32))
+   (alc (dyn Allocator))])
 
 (defn index-new [(a (dyn Allocator))] (-> Index)
   (Index
     :table (int-table-in 0 a)
-    :buckets (ArrayList::new [(ArrayList i64)] a)
+    :heads (ArrayList::new [i32] a)
+    :tails (ArrayList::new [i32] a)
+    :counts (ArrayList::new [i32] a)
+    :links (ArrayList::new [i32] a)
     :alc a))
+
+;;; How many slots there are: the next new key's.
+(defn index-slots [(x (mut Index))] (-> i64)
+  (len (.heads x)))
+
+;;; `row` joins `slot`'s chain at its end; a slot one past the last is new.
+(defn index-link! [(x (mut Index)) (slot i64) (row i64)] (-> void)
+  (when (!= (len (.links x)) row)
+    (panic "a relation's index takes its rows in order: row {} after {}" row (len (.links x))))
+  (push! (mut (.links x)) (: -1 i32))
+  (if (< slot (len (.heads x)))
+      (do
+        (set! (mut (.links x)) (cast i64 (get (.tails x) slot)) (cast i32 row))
+        (set! (mut (.tails x)) slot (cast i32 row))
+        (set! (mut (.counts x)) slot (+ (get (.counts x) slot) (: 1 i32))))
+      (do
+        (push! (mut (.heads x)) (cast i32 row))
+        (push! (mut (.tails x)) (cast i32 row))
+        (push! (mut (.counts x)) (: 1 i32))))
+  0)
 
 (defn index-push! [(x (mut Index)) (key i64) (row i64)] (-> void)
   (let [at (int-get (mut (.table x)) key)]
     (if (>= at 0)
-        (push! (elem (mut (.buckets x)) at) row)
-        (let [(mut b) (ArrayList::new [i64] (.alc x))]
-          (push! (mut b) row)
-          (int-put! (mut (.table x)) key (len (.buckets x)))
-          (push! (mut (.buckets x)) b)))
+        (index-link! (mut x) at row)
+        (let [slot (index-slots (mut x))]
+          (int-put! (mut (.table x)) key slot)
+          (index-link! (mut x) slot row)))
     0))
 
-;;; No rows, made without allocating: what a query that matches nothing walks.
-(defn no-rows [] (-> (ArrayList i64))
-  (primitive/zeroed (ArrayList i64)))
+;;; The rows of one key, in the order they came: as many as there were when it was asked for,
+;;; whatever joins the chain meanwhile.
+(defstruct RelRows [(links (ptr (ArrayList i32))) (row i64) (left i64)])
 
-(defn index-rows [(x (mut Index)) (key i64)] (-> (ArrayList i64))
+(impl Iterable RelRows
+  (iter [(r RelRows)] (-> RelRows) r))
+
+(impl Iterator RelRows
+  (next [(r (mut RelRows))]
+        (-> (Option i64))
+        (if (> (.left r) 0)
+            (let [row (.row r)]
+              (set! (.left r) (- (.left r) 1))
+              (set! (.row r) (cast i64 (get (load (.links r)) row)))
+              (Some row))
+            (None))))
+
+(impl Len RelRows
+  (len [(r RelRows)] (-> i64) (.left r)))
+
+;;; No rows: what a query that matches nothing walks.
+(defn no-rows [] (-> RelRows)
+  (primitive/zeroed RelRows))
+
+(defn index-slot-rows [(x (mut Index)) (slot i64)] (-> RelRows)
+  (RelRows :links (primitive/cast (ptr (ArrayList i32)) (field x links))
+           :row (cast i64 (get (.heads x) slot))
+           :left (cast i64 (get (.counts x) slot))))
+
+(defn index-rows [(x (mut Index)) (key i64)] (-> RelRows)
   (let [at (int-get (mut (.table x)) key)]
-    (if (>= at 0) (get (.buckets x) at) (no-rows))))
+    (if (>= at 0) (index-slot-rows (mut x) at) (no-rows))))
 
+;;; A relation's rows by what they hold: row numbers (plus one, 0 for none) in an open table, a
+;;; row found by its hash and then by its columns. Four bytes a slot, and nothing else per row.
+(defstruct RowTable [(slots (ArrayList i32)) (mask i64) (count i64)])
+
+(defn row-table-in [(cap i64) (a (dyn Allocator))] (-> RowTable)
+  (let [(mut slots) (ArrayList::new [i32] a)]
+    (when (> cap 0) (ArrayList::extend-zeroed! (mut slots) cap))
+    (RowTable :slots slots :mask (- cap 1) :count 0)))
+
+;;; A fact's columns are numbers of 32 bits (names, symbols, parts, modules), and are kept so.
 (defstruct Rel
   [(arity i64)
-   (data (ArrayList i64))
+   (data (ArrayList i32))
    (count i64)
-   (heads IntTable)  ; a row's hash to the last row with it, chained through `next`
-   (next (ArrayList i64))
+   (heads RowTable)  ; the rows of a relation with more than one column, or keys too big to mark
    (index (ArrayList Index))
-   ;; Keys are interned ids, small and dense: their rows are found by position, with no hashing.
-   ;; A key out of that range goes to `index`.
-   (dense (ArrayList (ArrayList (ArrayList i64))))
+   ;; Numeric keys map to slots (plus one) of the column's index below, with no hashing. Only
+   ;; keys that occur have a slot, shared with the keys the index hashes.
+   (dense (ArrayList (ArrayList i32)))
    (indexed (ArrayList i64))
    ;; By two columns at once, for `(col1 * arity + col2)`.
    (pair-index (ArrayList Index))
@@ -1890,13 +2488,12 @@
               (region-shared-allocator (primitive/cast (ptr Region) region)))
         (mut index) (ArrayList::new [Index] a)
         (mut indexed) (ArrayList::new [i64] a)
-        (mut dense)
-          (ArrayList::new [(ArrayList (ArrayList i64))] a)
+        (mut dense) (ArrayList::new [(ArrayList i32)] a)
         (mut pair-index) (ArrayList::new [Index] a)
         (mut pair-indexed) (ArrayList::new [i64] a)]
     (for _ (range 0 arity)
       (push! (mut index) (index-new a))
-      (push! (mut dense) (ArrayList::new [(ArrayList i64)] a))
+      (push! (mut dense) (ArrayList::new [i32] a))
       (push! (mut indexed) 0))
     (for _ (range 0 (* arity arity))
       (push! (mut pair-index) (index-new a))
@@ -1905,10 +2502,9 @@
       :alc a
       :region region
       :arity arity
-      :data (ArrayList::new [i64] a)
+      :data (ArrayList::new [i32] a)
       :count 0
-      :heads (int-table-in 0 a)
-      :next (ArrayList::new [i64] a)
+      :heads (row-table-in 0 a)
       :index index
       :indexed indexed
       :dense dense
@@ -1932,20 +2528,64 @@
 ;;; Room for `n` more rows, when about that many are known to be coming: no growing as they come.
 (defn rel-reserve! [(r (mut Rel)) (n i64)] (-> void)
   (reserve! (mut (.data r)) (+ (len (.data r)) (* n (.arity r))))
-  (reserve! (mut (.next r)) (+ (len (.next r)) n))
   (when (> (.arity r) 1)
     (let [cap (int-capacity (+ (.count r) n))]
-      (when (> cap (+ (.mask (.heads r)) 1))
-        (let [(mut bigger) (int-table-in cap (.alc r))
-              old (.heads r)]
-          (for i (range 0 (len (.vals old)))
-            (let [v (get (.vals old) i)]
-              (when (> v 0) (int-put! (mut bigger) (get (.keys old) i) (- v 1)))))
-          (set! (.heads r) bigger)))))
+      (when (> cap (+ (.mask (.heads r)) 1)) (rows-grow! (mut r) cap))))
   0)
 
 (defn rel-at :inline (Always) [(r (mut Rel)) (row i64) (col i64)] (-> i64)
-  (get (.data r) (+ (* row (.arity r)) col)))
+  (cast i64 (get (.data r) (+ (* row (.arity r)) col))))
+
+;;; A row's hash, from its own columns: unused ones count as 0, as whoever asks passes them.
+(defn row-hash-of [(r (mut Rel)) (row i64)] (-> i64)
+  (let [n (.arity r)]
+    (row-hash (rel-at (mut r) row 0)
+              (if (>= n 2) (rel-at (mut r) row 1) 0)
+              (if (>= n 3) (rel-at (mut r) row 2) 0)
+              (if (>= n 4) (rel-at (mut r) row 3) 0))))
+
+;;; The row table with `cap` slots (a power of two), every row it had in it.
+(defn rows-grow! [(r (mut Rel)) (cap i64)] (-> void)
+  (let [old (.heads r)
+        (mut bigger) (row-table-in cap (.alc r))]
+    (for i (range 0 (len (.slots old)))
+      (let [s (cast i64 (get (.slots old) i))]
+        (when (> s 0)
+          (let [(mut at) (& (memo-hash (row-hash-of (mut r) (- s 1))) (.mask bigger))]
+            (while (!= (get (.slots bigger) at) (: 0 i32))
+              (set! at (& (+ at 1) (.mask bigger))))
+            (set! (mut (.slots bigger)) at (cast i32 s))
+            (set! (.count bigger) (+ (.count bigger) 1))))))
+    (let [(mut gone) (.slots old)] (free! (mut gone)))
+    (set! (.heads r) bigger)
+    0))
+
+;;; A row just appended goes in the table.
+(defn rows-put! [(r (mut Rel)) (hash i64) (row i64)] (-> void)
+  (when (> (* (+ (.count (.heads r)) 1) 2) (+ (.mask (.heads r)) 1))
+    (rows-grow! (mut r) (if (< (.mask (.heads r)) 31) 64 (* (+ (.mask (.heads r)) 1) 2))))
+  (let [(mut at) (& (memo-hash hash) (.mask (.heads r)))]
+    (while (!= (get (.slots (.heads r)) at) (: 0 i32))
+      (set! at (& (+ at 1) (.mask (.heads r)))))
+    (set! (mut (.slots (.heads r))) at (cast i32 (+ row 1)))
+    (set! (.count (.heads r)) (+ (.count (.heads r)) 1))
+    0))
+
+;;; The row that holds these columns and is in (`old`: was in as the update running began), or -1.
+(defn rows-find [(r (mut Rel)) (old bool) (a i64) (b i64) (c i64) (d i64)] (-> i64)
+  (if (= (.count (.heads r)) 0)
+      -1
+      (let [(mut at) (& (memo-hash (row-hash a b c d)) (.mask (.heads r)))
+            (mut out) -1
+            (mut go) true]
+        (while go
+          (let [s (cast i64 (get (.slots (.heads r)) at))]
+            (cond (= s 0) (set! go false)
+                  (and (if old (rel-old-row? (mut r) (- s 1)) (rel-live-row? (mut r) (- s 1)))
+                       (row-equal? (mut r) (- s 1) a b c d))
+                    (do (set! out (- s 1)) (set! go false))
+                  :else (set! at (& (+ at 1) (.mask (.heads r)))))))
+        out)))
 
 ;;; FNV-style mixing, which wraps on purpose.
 (defn row-hash [(a i64) (b i64) (c i64) (d i64)] (-> i64)
@@ -1963,23 +2603,12 @@
          (or (< n 3) (= (rel-at (mut r) row 2) c))
          (or (< n 4) (= (rel-at (mut r) row 3) d)))))
 
-;;; Whether a row with this hash is there, from the chain the hash starts.
-(defn chain-has? [(r (mut Rel)) (first i64) (a i64) (b i64) (c i64) (d i64)]
-  (-> bool)
-  (let [(mut at) first
-        (mut hit) false]
-    (while (and (>= at 0) (not hit))
-      (if (and (rel-live-row? (mut r) at) (row-equal? (mut r) at a b c d))
-          (set! hit true)
-          (set! at (get (.next r) at))))
-    hit))
-
 ;;; Unused columns are passed as 0.
 (defn rel-has? [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
   (if (and (= (.arity r) 1) (dense-key? a))
       (and (< a (len (.present r)))
            (!= (& (cast i64 (get (.present r) a)) 1) 0))
-      (chain-has? (mut r) (int-get (mut (.heads r)) (row-hash a b c d)) a b c d)))
+      (>= (rows-find (mut r) false a b c d) 0)))
 
 ;;; A small key's mark in a one-column relation: 1 while the row is in; 2 once an update has changed
 ;;; whether it is, with 4 when it was in as the update began.
@@ -2021,13 +2650,7 @@
   (if (and (= (.arity r) 1) (dense-key? a))
       (let [mark (present-mark (mut r) a)]
         (if (!= (& mark 2) 0) (!= (& mark 4) 0) (!= (& mark 1) 0)))
-      (let [(mut at) (int-get (mut (.heads r)) (row-hash a b c d))
-            (mut hit) false]
-        (while (and (>= at 0) (not hit))
-          (if (and (rel-old-row? (mut r) at) (row-equal? (mut r) at a b c d))
-              (set! hit true)
-              (set! at (get (.next r) at))))
-        hit)))
+      (>= (rows-find (mut r) true a b c d) 0)))
 
 (defn dense-key? :inline (Always) [(key i64)] (-> bool)
   (and (>= key 0) (< key 4194304)))
@@ -2035,11 +2658,13 @@
 (defn index-add! [(r (mut Rel)) (col i64) (row i64)] (-> void)
   (let [key (rel-at (mut r) row col)]
     (if (dense-key? key)
-        (let [d (elem (mut (.dense r)) col)]
-          ;; Rows of a key come from the relation's own memory, whichever thread indexes it.
-          (while (<= (len (load d)) key)
-            (push! d (ArrayList::new [i64] (.alc r))))
-          (push! (elem d key) row))
+        (let [d (elem (mut (.dense r)) col)
+              x (elem (mut (.index r)) col)]
+          (when (<= (len (load d)) key)
+            (ArrayList::extend-zeroed! d (+ (- key (len (load d))) 1)))
+          (when (= (get (load d) key) (: 0 i32))
+            (set! d key (cast i32 (+ (index-slots x) 1))))
+          (index-link! x (- (cast i64 (get (load d) key)) 1) row))
         (index-push! (elem (mut (.index r)) col) key row))))
 
 ;;; One key for two columns. Different pairs may share it, and a scan tests each column anyway.
@@ -2061,30 +2686,34 @@
           false
           (let [mark (present-mark (mut r) a)]
             (present-mark! (mut r) a (| (rel-changed-mark (mut r) a mark) 1))
-            (rel-append! (mut r) a b c d -1)
+            (rel-append! (mut r) a b c d)
             true))
       (rel-add-hashed! (mut r) a b c d)))
 
 (defn rel-add-hashed! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
-  (let [h (row-hash a b c d)
-        head (int-get (mut (.heads r)) h)]
-    (if (chain-has? (mut r) head a b c d)
-        false
-        (do
-          (rel-append! (mut r) a b c d head)
-          (int-put! (mut (.heads r)) h (- (.count r) 1))
-          true))))
+  (if (>= (rows-find (mut r) false a b c d) 0)
+      false
+      (do
+        (rel-append! (mut r) a b c d)
+        (rows-put! (mut r) (row-hash a b c d) (- (.count r) 1))
+        true)))
 
-;;; A new row at the end, in its indexes. `head`: the row it chains to, for a hashed relation.
-(defn rel-append! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64) (head i64)]
+;;; A column's value as a relation keeps it. One that does not fit is no fact's column.
+(defn rel-column [(x i64)] (-> i32)
+  (when (or (> x 2147483647) (< x -2147483648))
+    (panic "a relation's column holds {}, which is not a number of 32 bits" x))
+  (cast i32 x))
+
+;;; A new row at the end, in its indexes.
+(defn rel-append! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)]
   (-> void)
   (let [row (.count r)
         n (.arity r)]
-    (push! (mut (.data r)) a)
-    (when (>= n 2) (push! (mut (.data r)) b))
-    (when (>= n 3) (push! (mut (.data r)) c))
-    (when (>= n 4) (push! (mut (.data r)) d))
-    (push! (mut (.next r)) head)
+    (when (>= row 2147483646) (panic "a relation has more rows than it can number"))
+    (push! (mut (.data r)) (rel-column a))
+    (when (>= n 2) (push! (mut (.data r)) (rel-column b)))
+    (when (>= n 3) (push! (mut (.data r)) (rel-column c)))
+    (when (>= n 4) (push! (mut (.data r)) (rel-column d)))
     (set! (.count r) (+ row 1))
     (for col (range 0 n)
       (when (!= (get (.indexed r) col) 0)
@@ -2112,19 +2741,24 @@
                       (get (.queue r) (+ (* i 4) 2))
                       (get (.queue r) (+ (* i 4) 3)))
         (set! changed true)))
-    (clear! (mut (.queue r)))
+    ;; A long queue's memory goes back: a relation is flushed often, and filled like that once.
+    (if (> (cap (.queue r)) 4096)
+        (do (free! (mut (.queue r)))
+            (set! (.queue r) (ArrayList::new [i64] (.alc r))))
+        (clear! (mut (.queue r))))
     changed))
 
 ;;; The rows whose column equals `key`. Stable until the next flush.
 ;;; An index is made the first time a query needs it. Queries may run on many threads at once
 ;;; once nothing adds rows, so the first to need it makes it under a lock, and says so last.
 (defn rel-bucket :inline (Always) [(r (mut Rel)) (col i64) (key i64)]
-  (-> (ArrayList i64))
+  (-> RelRows)
   (when (= (atomic/read (elem (mut (.indexed r)) col)) 0)
     (rel-index-column! (mut r) col))
   (if (dense-key? key)
-      (let [d (get (.dense r) col)]
-        (if (< key (len d)) (get d key) (no-rows)))
+      (let [d (get (.dense r) col)
+            bucket (if (< key (len d)) (cast i64 (get d key)) 0)]
+        (if (> bucket 0) (index-slot-rows (elem (mut (.index r)) col) (- bucket 1)) (no-rows)))
       (index-rows (elem (mut (.index r)) col) key)))
 
 ;;; The rows whose two columns equal these keys, and perhaps a few others. Stable until the next flush.
@@ -2139,7 +2773,7 @@
     0))
 
 (defn rel-bucket2 [(r (mut Rel)) (c1 i64) (c2 i64) (k1 i64) (k2 i64)]
-  (-> (ArrayList i64))
+  (-> RelRows)
   (let [slot (+ (* c1 (.arity r)) c2)
         flag (elem (mut (.pair-indexed r)) slot)]
     (when (= (atomic/read flag) 0)
@@ -2194,13 +2828,7 @@
               (when (and (< out 0) (rel-live-row? (mut r) row)) (set! out row)))
             out)
           -1)
-      (let [(mut at) (int-get (mut (.heads r)) (row-hash a b c d))
-            (mut out) -1]
-        (while (and (>= at 0) (< out 0))
-          (if (and (rel-live-row? (mut r) at) (row-equal? (mut r) at a b c d))
-              (set! out at)
-              (set! at (get (.next r) at))))
-        out)))
+      (rows-find (mut r) false a b c d)))
 
 ;;; Take out the row that holds these columns. True when one did. It stays where it is, passed by,
 ;;; until the relation is made again.
@@ -2593,8 +3221,9 @@
 
 (defn places-new [] (-> Places)
   (Places
-    :at (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
-    :size (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    ;; Keyed by kept texts (see "kept texts"): a key is one text, here and in `keys`.
+    :at (HashMap::new [(slice u8) i64] (malloc-allocator) (kept-keyops))
+    :size (HashMap::new [(slice u8) i64] (malloc-allocator) (kept-keyops))
     :keys (ArrayList::new [(slice u8)] (malloc-allocator))
     :end 0))
 
@@ -2608,7 +3237,7 @@
         (let [a (.end p)]
           (match (get (.at p) key)
             (Some [_] 0)
-            (None [] (do (push! (mut (.keys p)) (own-text key)) 0)))
+            (None [] (do (push! (mut (.keys p)) (kept-text key)) 0)))
           (set! (mut (.at p)) key a)
           (set! (mut (.size p)) key size)
           (set! (.end p) (+ a size))
@@ -2646,7 +3275,7 @@
 
 (defn ranks-new [] (-> Ranks)
   (Ranks
-    :at (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :at (HashMap::new [(slice u8) i64] (malloc-allocator) (kept-keyops))
     :keys (ArrayList::new [(slice u8)] (malloc-allocator))
     :version 0))
 
@@ -2711,7 +3340,7 @@
         (let [key (get keys i)]
           (unless (= (get old i) (get out i))
             (set! changed true)
-            (when (< (get old i) 0) (push! (mut (.keys r)) (own-text key)))
+            (when (< (get old i) 0) (push! (mut (.keys r)) (kept-text key)))
             (set! (mut (.at r)) key (get out i)))))
       (when changed (set! (.version r) (+ (.version r) 1))))
     out))
@@ -3489,11 +4118,30 @@
 
 ;;; Exists and can be read: a directory exists, but is not a file.
 (defn readable-file? [(path (slice u8))] (-> bool)
-  (let [tracked (dep-in-frame?)
-        stamp (if tracked (file-stamp path) "")
-        print (file-print path)]
-    (when tracked (dep-input! (join "f:" path) print stamp))
-    (!= print "missing")))
+  (if (dep-in-frame?)
+      (let [stamp (file-stamp path)
+            print (file-print path)]
+        (dep-input! (join "f:" path) print stamp)
+        (!= print "missing"))
+      (readable-raw? path)))
+
+;;; The same question with nothing recorded: the file is opened and one byte asked of it, which a
+;;; directory refuses. What the file says is not read.
+(defn readable-raw? [(path (slice u8))] (-> bool)
+  (let [a (value-allocator)
+        fd
+          (os/open (str/to-cstr a path)
+                   (primitive/cast i32 (| fs/O_RDONLY fs/O_CLOEXEC))
+                   0)]
+    (if (< fd (: 0 i32))
+        false
+        (let [buf
+                (match (alloc [u8] a 1)
+                  (Some [b] b)
+                  (None [] (panic "no memory to read {}" path)))
+              n (read fd (primitive/cast (ptr i8) (data buf)) (primitive/cast isize 1))]
+          (os/close fd)
+          (>= (primitive/cast i64 n) 0)))))
 
 ;;; What a file says, as an input's print: "missing" when it cannot be read.
 (defn file-print [(path (slice u8))] (-> (slice u8))
@@ -3730,7 +4378,12 @@
    (read (ArrayList i64))
    ;; The region of whatever started the run: what the workers make is its, so each works in it
    ;; (through a cursor of its own) and their values live as long as what they were made for.
-   (region i64)])
+   (region i64)
+   ;; Whether whoever started the run works apart (see `apart-inherit!`), and the scratch
+   ;; region it works in: what the workers make is made there too, each through a cursor of
+   ;; its own, so the answer's copy out finds it and the rest goes with the region.
+   (apart i64)
+   (apart-region i64)])
 
 (defn pool-fail [(what (slice u8))] (-> void)
   (panic "worker pool: {}" what))
@@ -3814,11 +4467,17 @@
         (let [body (.body p)
               job (.job p)
               inherit (.inherit p)
-              region (.region p)]
+              region (.region p)
+              apart (.apart p)
+              apart-region (.apart-region p)]
           (pool-unlock! p)
           (when inherit (dep-begin!))
           (when (!= region 0) (region-enter-id! region))
+          (when (!= apart-region 0) (region-enter-id! apart-region))
+          (apart-inherit! apart)
           (body job)
+          (apart-inherit! 0)
+          (when (!= apart-region 0) (region-leave!))
           (when (!= region 0) (region-leave!))
           (let [(mut read)
                   (if inherit
@@ -3935,6 +4594,9 @@
           (set! (.inherit p) (dep-in-frame?))
           (set! (.read p) (ArrayList::new [i64] (malloc-allocator)))
           (set! (.region p) (let [r (region-current)] (if (.lasting r) 0 (primitive/cast i64 r))))
+          (set! (.apart p) (.apart (thread-regions)))
+          (set! (.apart-region p)
+                (if (> (.apart (thread-regions)) 0) (primitive/cast i64 (region-current)) 0))
           (set! (.want p) count)
           (atomic/store (field p left) (- count 1))
           (atomic/store (field p round) (+ (.round p) 1))
@@ -4249,15 +4911,20 @@
 
 ;;; Dependencies are tracked from here on, which only a program that builds more than once needs.
 ;;; Before any memo has computed anything, since what it computed untracked could never be checked.
+(defstruct TrackingSwitch [(on i64)])
+(defn tracking-switch :inline (Always) [] (-> (ptr TrackingSwitch))
+  (primitive/alloc-static TrackingSwitch))
+
 (defn dep-track! [] (-> void)
   (let [d (deps)]
     (when (> (atomic/read (field d untracked)) 0)
       (panic "dependencies are tracked only from before any memo computes"))
     (set! (.tracking d) true)
+    (atomic/store (field (tracking-switch) on) 1)
     0))
 
-(defn dep-tracking? [] (-> bool)
-  (.tracking (deps)))
+(defn dep-tracking? :inline (Always) [] (-> bool)
+  (= (atomic/read (field (tracking-switch) on)) 1))
 
 ;;; A memo computed an answer while dependencies were not tracked.
 (defn dep-untracked! [] (-> void)
@@ -4269,9 +4936,9 @@
   (atomic/read (field (deps) revision)))
 
 ;;; Whether this worker is computing a memo, so what it reads is noted.
-(defn dep-in-frame? [] (-> bool)
-  (let [d (deps)]
-    (and (.tracking d) (!= (primitive/cast i64 (key-get (.depth-key d))) 0))))
+(defn dep-in-frame? :inline (Always) [] (-> bool)
+  (and (dep-tracking?)
+       (!= (primitive/cast i64 (key-get (.depth-key (deps)))) 0)))
 
 (defn dep-top [(d (ptr Deps)) (slot i64)] (-> i64)
   (- (len (get (.stacks d) slot)) 1))
@@ -4802,23 +5469,28 @@
         (mut first) -1]
     (for i (range 0 (len cols))
       (when (and (< first 0) (!= (get cols i) "_")) (set! first i)))
-    (let [rows
-            (if (>= first 0)
-                (rel-bucket (mut r) first (parse-int (get cols first)))
-                (let [(mut all) (ArrayList::new [i64] (value-allocator))]
-                  (for row (range 0 (.count r)) (push! (mut all) row))
-                  all))]
-      (for row rows
-        (let [(mut fits) (rel-live-row? (mut r) row)]
-          (for c (range 0 (len cols))
-            (when (and fits
-                       (!= (get cols c) "_")
-                       (!= (rel-at (mut r) row c) (parse-int (get cols c))))
-              (set! fits false)))
-          (when fits
-            (for c (range 0 (.arity r))
-              (push! (mut out) (rel-at (mut r) row c)))))))
+    (if (>= first 0)
+        (for row (rel-bucket (mut r) first (parse-int (get cols first)))
+          (rel-matching-row! (mut r) cols row (mut out)))
+        (for row (range 0 (.count r))
+          (rel-matching-row! (mut r) cols row (mut out))))
     out))
+
+;;; One row's columns added to `out`, when the row is in and fits what `cols` asks.
+(defn rel-matching-row! [(r (mut Rel))
+                         (cols (ArrayList (slice u8)))
+                         (row i64)
+                         (out (mut (ArrayList i64)))] (-> void)
+  (let [(mut fits) (rel-live-row? (mut r) row)]
+    (for c (range 0 (len cols))
+      (when (and fits
+                 (!= (get cols c) "_")
+                 (!= (rel-at (mut r) row c) (parse-int (get cols c))))
+        (set! fits false)))
+    (when fits
+      (for c (range 0 (.arity r))
+        (push! (mut out) (rel-at (mut r) row c)))))
+  0)
 
 ;;; Whether a query sees the same rows of two relations.
 (defn rel-rows-same? [(a (mut Rel)) (b (mut Rel)) (spec (slice u8))] (-> bool)
