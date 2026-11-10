@@ -6,14 +6,15 @@
 #
 # The top level is named stem by stem (see `m.stem-of`): every name renaming tries for a claim has
 # the claim's stem, so one stem's names are decided by the claims and the reserved names of that
-# stem alone. Which modules may claim, or reserve, names of a stem, linking's database says
-# (`claims-stem`, `reserves-stem`), and it is brought up to date with the rest. Each module's part
+# stem alone. Which modules in the output may claim, or reserve, names of a stem, a database of its
+# own says (bundle.stems), brought up to date as linking's is. Each module's part
 # is its own: the names it reserves, the claims its statements make, and its nested scopes' names,
 # which read of the top level only whether each name they try is taken, stem by stem. So an edit
 # names again the stems its module's claims are of, and the modules those stems name, and no more.
 rules bundle.naming over bundle.js
 use bundle.modules as m
 use bundle.analysis as an
+use bundle.stems as st
 
 # Every symbol, named as the output names it: the build's table with each module's block named.
 setting finals: sym.Table
@@ -25,6 +26,9 @@ setting runtime-kept: Bool
 # What each module in the output claims, by stem, and the names each keeps from everything else:
 # what naming a stem reads of the modules. Given as settings, which are compared module by module,
 # so a module whose claims an edit left as they were changes nothing that names a stem.
+# Which modules in the output may claim, or reserve, names of each stem (see `stems-db`).
+setting stems: st.Db
+
 setting claims-of: {Int:{Text:[Claim]}}
 setting reserved-of: {Int:[Text]}
 
@@ -91,10 +95,10 @@ record Naming { taken: {Text:Int}, names: {Int:Text}, tries: {Text:Int} }
 fn stem-named(stem: Text) -> StemNames = StemNames(taken: done.taken, names: done.names)
   where sid = known-name(m.names, stem),
         # A stem no name of any module's has: nothing claims or reserves it.
-        reserving = [id for x in [sid] if x >= 0 for m.db.reserves-stem(?id, x) if id != 0 and included?(id)],
-        reserved = {w: -1 for w in keywords ++ globals() ++ [n for id in reserving for n in reserved-of[id] ?? []]
-                    if m.stem-of(w) == stem},
-        claimers = sort id in [id for x in [sid] if x >= 0 for m.db.claims-stem(?id, x) if included?(id)] by m.ranks[id] ?? -1,
+        reserving = [id for x in [sid] if x >= 0 for stems.reserves-stem(?id, x) if id != 0],
+        reserved = {w: -1 for w in (fixed-by-stem(runtime-kept)[stem] ?? []) ++ [n for id in reserving for n in reserved-of[id] ?? []
+                                                                                if m.stem-of(n) == stem]},
+        claimers = sort id in [id for x in [sid] if x >= 0 for stems.claims-stem(?id, x)] by m.ranks[id] ?? -1,
         claims = [c for id in claimers for c in (claims-of[id] ?? {})[stem] ?? []],
         done = fold t = Naming(taken: reserved, names: {}, tries: {}) for c in claims:
           (t with { taken: t.taken ++ {name: c.symbol}, names: t.names ++ {c.symbol: name}, tries: t.tries ++ {c.name: i} }
@@ -112,6 +116,11 @@ fn globals() -> [Text] = match runtime-kept {
   true => runtime-globals
   false => bundle-globals
 }
+
+# The reserved words and the globals kept, by stem.
+fn fixed-by-stem(runtime: Bool) -> {Text:[Text]} =
+  fold g = {} for w in keywords ++ (match runtime { true => runtime-globals  false => bundle-globals }):
+    g ++ {m.stem-of(w): (g[m.stem-of(w)] ?? []) ++ [w]}
 
 # `name`, or `name2`, `name3`… the first not taken: at the top level, in a scope around, or before
 # it in its own scope.
@@ -162,28 +171,56 @@ fn module-named(id: Int) -> [Named] = module-nested(m.modules[id])
 # nested scopes' names in it; and the names of the symbols linking made that its statements claim.
 record ModuleNames { block: sym.Block, made: [Named] }
 
-fn module-names(id: Int) -> ModuleNames = match included?(id) {
-  false => ModuleNames(block: sym.renamed(block, {}), made: [])
-  true => ModuleNames(block: sym.renamed(block, {x.symbol: x.name for x in top ++ module-named(id)}),
-                      made: [x for x in top if not sym.block-has?(block, x.symbol)])
-} where block = m.blocks[id] ?? (panic "module {} has no block", id),
-        top = [Named(symbol: c.symbol, name: (top-names[m.stem-of(c.name)] ?? (panic "no module claims names of {}", c.name)).names[c.symbol] ?? c.name)
-               for c in module-claims(id) if c.symbol >= 0]
+fn module-names(id: Int) -> ModuleNames =
+  ModuleNames(block: sym.renamed(block-of(id), {x.symbol: x.name for x in top ++ module-named(id)}),
+              made: [x for x in top if not sym.block-has?(block-of(id), x.symbol)])
+  where top = [Named(symbol: c.symbol, name: (top-names[m.stem-of(c.name)] ?? (panic "no module claims names of {}", c.name)).names[c.symbol] ?? c.name)
+               for g in [module-stem-claims(id)] for s in keys(g) if let some(cs) = g[s] for c in cs if c.symbol >= 0]
+
+fn block-of(id: Int) -> sym.Block = m.blocks[id] ?? (panic "module {} has no block", id)
+
+# A module's block as the output names it: one not in the output keeps every name its own, as its
+# block already says.
+fn output-block(id: Int) -> ModuleNames = match included?(id) {
+  true => module-names(id)
+  false => ModuleNames(block: block-of(id), made: [])
+}
 
 # esbuild's names for every symbol. `lowering`: whether lowering may add the runtime's helpers once
 # the names are given.
 fn esbuild-names(lowering: Bool) -> sym.Table =
-  with runtime-kept = lowering or included?(0), claims-of = claims-now(), reserved-of = reserved-now() {
+  with runtime-kept = lowering or included?(0), stems = stems-db(), claims-of = claims-now(), reserved-of = reserved-now() {
     with top-names = top-names-now() {
-      named(m.table, [module-names(id) for id in m.order])
+      named(m.table, [output-block(id) for id in m.order])
     }
   }
+
+# Where renaming will look for a module in the output: the stems of the top-level names its
+# statements claim, and of the names it keeps from everything else.
+fn stem-facts-at(id: Int) -> [st.Fact] =
+  [st.fact-claims-stem(id, m.name-id(s)) for s in keys(module-stem-claims(id))]
+  ++ [st.fact-reserves-stem(id, m.name-id(s)) for s in reserved distinct s]
+  ++ [st.fact-stem-bucket(sid, bucket-of(sid)) for s in keys(module-stem-claims(id)) ++ reserved distinct s for sid in [m.name-id(s)]]
+  where reserved = [m.stem-of(n) for n in an.module-reserved(id)]
+
+# The stem facts of the modules in the output, a block for each.
+fn stem-blocks() -> [[st.Fact]] = [stem-facts-at(id) for id in m.order if included?(id)]
+
+fn stems-db() -> st.Db = st.solved-blocks(stem-blocks())
 
 # The settings naming reads, each made by a function of its own: an edit that leaves every module's
 # claims as they were leaves each the answer it was, which the setting given it finds the same at once.
 fn claims-now() -> {Int:{Text:[Claim]}} = {id: module-stem-claims(id) for id in m.order if included?(id)}
 fn reserved-now() -> {Int:[Text]} = {id: an.module-reserved(id) for id in m.order if id != 0 and included?(id)}
-fn top-names-now() -> {Text:StemNames} = {s: stem-named(s) for sid in [x for m.db.stem(?x)] for s in [name-of(m.names, sid)]}
+fn top-names-now() -> {Text:StemNames} = {s: x for b in 0..buckets for g in [bucket-named(b)] for s in keys(g) if let some(x) = g[s]}
+
+# Stems are named a bucket at a time, by their names' ids: an answer for each bucket, not for each
+# stem, and an edit names again the buckets of the stems it changed.
+const buckets: Int = 64
+
+fn bucket-of(sid: Int) -> Int = bit-and(sid, buckets - 1)
+
+fn bucket-named(b: Int) -> {Text:StemNames} = {s: stem-named(s) for sid in [x for stems.stem-bucket(?x, b)] for s in [name-of(m.names, sid)]}
 
 fn named(t: sym.Table, all: [ModuleNames]) -> sym.Table =
   sym.named-from(t, [x.block for x in all], {n.symbol: n.name for x in all for n in x.made})

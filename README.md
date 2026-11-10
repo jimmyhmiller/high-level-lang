@@ -455,10 +455,12 @@ None of linking's three whole-program steps redoes the whole program after an ed
   rows change. A database read back from the cache counts every fact once, on its first update.
 - **Naming.** esbuild's renamer tries `x`, `x2`, `x3`… for a name, all of one stem (the name
   without the digits it ends in), so only names of one stem can take each other's, and the top
-  level is named stem by stem (`nm.stem-named`). Linking's database says which modules claim or
-  reserve names of each stem; modules keep ranks in the program's order while the order around them
-  does (`rt.Ranks`), so adding a module renumbers nothing. Each module's block is named on its own
-  (its claims' names, its nested scopes'), and the output's names are a table joined from those.
+  level is named stem by stem, the stems in 64 buckets (`nm.bucket-named`). A small database of
+  its own (`stems.facts`, of the modules in the output only) says which modules claim or reserve
+  names of each stem, brought up to date as linking's is; modules keep ranks in the program's order
+  while the order around them does (`rt.Ranks`), so adding a module renumbers nothing. Each module
+  in the output has its block named on its own (its claims' names, its nested scopes'); a module
+  left out keeps its block as placed. The output's names are a table joined from those.
 
 Dependencies here are marked dirty all the way up from what changed, and an answer that comes out
 the same stops nothing already marked. What naming reads of the modules (their claims, by stem)
@@ -476,17 +478,17 @@ module the app imports:
 
 | App | Rebuild (`--watch`) | esbuild `context().rebuild()` | Turbopack dev | One-shot, ours / esbuild |
 |---|---|---|---|---|
-| zod (96 modules) | 1.9 ms | 14.9 ms | 15.1 ms | 93 ms / 29 ms |
-| date-fns | 3.1 ms | 14.8 ms | 12.6 ms | 48 ms / 31 ms |
-| rx (225 modules) | 2.2 ms | 12.0 ms | 12.5 ms | 46 ms / 29 ms |
-| three | 25.3 ms | 54.6 ms | not observable (the package says it has no side effects, and dev never serves the edit) | 143 ms / 71 ms |
-| 12 copies of zod | 24.7 ms | 81.6 ms | 20.9 ms | 924 ms / 115 ms |
+| zod (96 modules) | 2.0 ms | 14.9 ms | 15.1 ms | 96 ms / 29 ms |
+| date-fns | 2.7 ms | 14.8 ms | 12.6 ms | 57 ms / 31 ms |
+| rx (225 modules) | 3.6 ms | 12.0 ms | 12.5 ms | 53 ms / 29 ms |
+| three | 26.5 ms | 54.6 ms | not observable (the package says it has no side effects, and dev never serves the edit) | 141 ms / 71 ms |
+| 12 copies of zod | 24.4 ms | 81.6 ms | 20.9 ms | 910 ms / 115 ms |
 
-Making the three steps incremental cost a little elsewhere: more answers kept (zod's first build
-makes 3,725 against 2,165), so first builds take 5–20% longer, the cache is about 10% bigger, and a
-watcher holds a few percent more memory. For twelve copies of zod, a rebuild went from 40.1 to 24.7
-ms and a run from a warm cache with one edit from 279 to 262 ms; what the rebuild spends now is
-mostly parsing the edited file again (about 10 ms) and printing (about 10 ms).
+What it costs elsewhere, against the build before (instructions, which load does not move): a
+one-shot build 1–5% more, a watcher's first build 3–8% more (zod's makes 2,618 answers against
+2,165), a cold cache 2–7% more; a run from a warm cache with one edit about the same or less
+(twelve copies of zod 2.53 → 2.37 G). For twelve copies of zod a rebuild went from 40.6 to 24.4 ms;
+what it spends now is mostly parsing the edited file again (about 10 ms) and printing (about 10 ms).
 
 `--hmr` watches too, writing a development format: no scope hoisting or renaming, each module a
 function registered with `hmr_runtime.js` by path, its imports read through live namespace objects

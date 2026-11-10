@@ -50,7 +50,13 @@
    (made (HashMap i64 Symbol))
    (extra (HashMap i64 (ArrayList i64)))
    (scopes i64)
-   (symbols i64)])
+   (symbols i64)
+   ;; Where to start looking for an id, a page of 1024 ids at a time: the block (by `blocks` for
+   ;; scopes, by `by-symbol` for symbols) last to start at or before the page; and which blocks
+   ;; hold scopes linking made symbols in.
+   (scope-pages (ArrayList i64))
+   (symbol-pages (ArrayList i64))
+   (extra-in (ArrayList bool))])
 
 (defstruct Table
   [(scopes (ArrayList Scope))
@@ -359,8 +365,9 @@
 ;;; ---------------------------------------------------------------- tables joined from blocks
 
 ;;; `part`, a module's own table, at its place among the build's: its scopes from `scope-shift` + 1
-;;; and its symbols from `symbol-shift`, as `joined-at` would put it, made once for as long as the
-;;; part and its place stay the same, and shared by every table joined from it after.
+;;; and its symbols from `symbol-shift`, each symbol named in the output as it is named here; made
+;;; once for as long as the part and its place stay the same, and shared by every table joined from
+;;; it after.
 (defn placed [(part Table) (scope-shift i64) (symbol-shift i64)] (-> Block)
   (own-table! part "placed")
   (when (> (len (.outer part)) 0)
@@ -392,7 +399,8 @@
                :name (.name sym)
                :scope (if (= (.scope sym) 0) 0 (+ (.scope sym) scope-shift))
                :uses (.uses sym)
-               :final (.final sym)
+               ;; Named as it is until the output names it otherwise (see `renamed`).
+               :final (.name sym)
                :pinned (.pinned sym))))
     (Block
       :scopes scopes
@@ -464,65 +472,90 @@
         :free (names-map)
         :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))
         :joined
-          (Some (Joined
-                  :blocks sorted
-                  :by-symbol (rt/sort-order-int starts false)
-                  :made made
-                  :extra extra
-                  :scopes (+ scopes 1)
-                  :symbols total))))))
+          (Some (joined-of sorted (rt/sort-order-int starts false) made extra (+ scopes 1) total))))))
 
-;;; Which of `blocks` (by where their scopes start) holds scope `s`, or -1.
-(defn block-of-scope [(blocks (ArrayList Block)) (s i64)] (-> i64)
-  (let [(mut lo) 0
-        (mut hi) (len blocks)]
-    ;; The last block that starts at or before `s`.
-    (while (< lo hi)
-      (let [mid (/ (+ lo hi) 2)]
-        (if (<= (.scope-start (get blocks mid)) s)
-            (set! lo (+ mid 1))
-            (set! hi mid))))
-    (if (and (> lo 0)
-             (< s (+ (.scope-start (get blocks (- lo 1)))
-                     (len (.scopes (get blocks (- lo 1)))))))
-        (- lo 1)
-        -1)))
+;;; A joined table's blocks and what is laid over them, with the pages that find a block for an id.
+(defn joined-of [(blocks (ArrayList Block))
+                 (by-symbol (ArrayList i64))
+                 (made (HashMap i64 Symbol))
+                 (extra (HashMap i64 (ArrayList i64)))
+                 (scopes i64)
+                 (symbols i64)] (-> Joined)
+  (let [scope-pages (pages-of blocks (identity-order (len blocks)) true scopes)
+        (mut extra-in) (ArrayList::new [bool] (rt/value-allocator))]
+    (for _ blocks (push! (mut extra-in) false))
+    (for s extra
+      (let [at (block-at blocks (identity-order-view) scope-pages true s)]
+        (when (>= at 0) (set! (mut extra-in) at true))))
+    (Joined
+      :blocks blocks
+      :by-symbol by-symbol
+      :made made
+      :extra extra
+      :scopes scopes
+      :symbols symbols
+      :scope-pages scope-pages
+      :symbol-pages (pages-of blocks by-symbol false symbols)
+      :extra-in extra-in)))
 
-;;; Which of `blocks` holds symbol `s`, `order` their indices by where their symbols start; or -1.
-(defn block-of-symbol [(blocks (ArrayList Block)) (order (ArrayList i64)) (s i64)]
+(defn page-size [] (-> i64)
+  1024)
+
+;;; For each page of ids up to `total`, the place in `order` of the last block that starts at or
+;;; before it, or -1.
+(defn pages-of [(blocks (ArrayList Block)) (order (ArrayList i64)) (scopes bool) (total i64)]
+  (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (rt/value-allocator))
+        (mut i) -1]
+    (for p (range 0 (+ (/ total (page-size)) 1))
+      (while (and (< (+ i 1) (len order))
+                  (<= (block-start (get blocks (get order (+ i 1))) scopes) (* p (page-size))))
+        (set! i (+ i 1)))
+      (push! (mut out) i))
+    out))
+
+;;; An empty order, which `block-at` reads as each block in turn.
+(defn identity-order-view [] (-> (ArrayList i64))
+  (primitive/zeroed (ArrayList i64)))
+
+;;; Which block holds id `s` (a scope's or a symbol's): its index in `blocks`, or -1. `order` gives
+;;; the blocks by where they start (empty: as they are).
+(defn block-at [(blocks (ArrayList Block)) (order (ArrayList i64)) (pages (ArrayList i64)) (scopes bool) (s i64)]
   (-> i64)
-  (let [(mut lo) 0
-        (mut hi) (len order)]
-    (while (< lo hi)
-      (let [mid (/ (+ lo hi) 2)]
-        (if (<= (.symbol-start (get blocks (get order mid))) s)
-            (set! lo (+ mid 1))
-            (set! hi mid))))
-    (if (> lo 0)
-        (let [b (get blocks (get order (- lo 1)))]
-          (if (< s (+ (.symbol-start b) (len (.symbols b))))
-              (get order (- lo 1))
-              -1))
-        -1)))
+  (if (< s 0)
+      -1
+      (let [p (/ s (page-size))
+            n (len blocks)
+            (mut i) (if (< p (len pages)) (get pages p) (- n 1))]
+        (when (< i 0) (set! i -1))
+        (while (and (< (+ i 1) n)
+                    (<= (block-start (get blocks (in-order order (+ i 1))) scopes) s))
+          (set! i (+ i 1)))
+        (if (and (>= i 0) (< s (block-end (get blocks (in-order order i)) scopes)))
+            (in-order order i)
+            -1))))
 
+(defn in-order [(order (ArrayList i64)) (i i64)] (-> i64)
+  (if (= (len order) 0) i (get order i)))
+
+;;; A block's symbol, or else one linking made: no made symbol is in a block's places.
 (defn joined-symbol-at [(j Joined) (s i64)] (-> Symbol)
-  (match (get (.made j) s)
-    (Some [x] x)
-    (None []
-          (let [at (block-of-symbol (.blocks j) (.by-symbol j) s)]
-            (if (< at 0)
-                (no-symbol)
-                (let [b (get (.blocks j) at)]
-                  (get (.symbols b) (- s (.symbol-start b)))))))))
+  (let [at (block-at (.blocks j) (.by-symbol j) (.symbol-pages j) false s)]
+    (if (>= at 0)
+        (let [b (get (.blocks j) at)]
+          (get (.symbols b) (- s (.symbol-start b))))
+        (match (get (.made j) s)
+          (Some [x] x)
+          (None [] (no-symbol))))))
 
 ;;; A block's scope, with the symbols linking made in it after its own.
 (defn joined-scope-at [(j Joined) (s i64)] (-> Scope)
-  (let [at (block-of-scope (.blocks j) s)]
+  (let [at (block-at (.blocks j) (identity-order-view) (.scope-pages j) true s)]
     (if (< at 0)
         (no-scope)
         (let [b (get (.blocks j) at)
               sc (get (.scopes b) (- s (.scope-start b)))]
-          (match (get (.extra j) s)
+          (match (if (get (.extra-in j) at) (get (.extra j) s) (None [(ArrayList i64)]))
             (None [] sc)
             (Some [more]
                   (let [(mut syms) (ArrayList::new [i64] (rt/value-allocator))]
@@ -698,8 +731,23 @@
     :dynamic false))
 
 ;;; `b` with each of its symbols named as it is in the output: `names[s]`, or else its own name. It
-;;; shares its scopes with `b`.
+;;; shares its scopes with `b`; when every name is its own, it is `b`.
 (defn renamed [(b Block) (names (HashMap i64 (slice u8)))] (-> Block)
+  (if (block-names-own? b names) b (renamed-copy b names)))
+
+;;; Whether `names` gives each symbol of `b` it names the name it has.
+(defn block-names-own? [(b Block) (names (HashMap i64 (slice u8)))] (-> bool)
+  (block :own
+    (for s names
+      (when (block-has? b s)
+        (match (get names s)
+          (Some [n]
+                (unless (= n (.final (get (.symbols b) (- s (.symbol-start b)))))
+                  (return-from :own false)))
+          (None [] 0))))
+    true))
+
+(defn renamed-copy [(b Block) (names (HashMap i64 (slice u8)))] (-> Block)
   (let [(mut symbols) (ArrayList::new [Symbol] (rt/value-allocator))]
     (reserve! (mut symbols) (len (.symbols b)))
     (for i (range 0 (len (.symbols b)))
@@ -766,13 +814,7 @@
                 :free (names-map)
                 :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))
                 :joined
-                  (Some (Joined
-                          :blocks sorted
-                          :by-symbol (rt/sort-order-int starts false)
-                          :made named
-                          :extra (.extra j)
-                          :scopes (.scopes j)
-                          :symbols (.symbols j)))))))))
+                  (Some (joined-of sorted (rt/sort-order-int starts false) named (.extra j) (.scopes j) (.symbols j)))))))))
 
 ;;; `t` with every symbol named `finals[s]`: names given the whole program at once.
 (defn renamed-all [(t Table) (finals (ArrayList (slice u8)))] (-> Table)
@@ -1026,13 +1068,7 @@
                   :free (names-map)
                   :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))
                   :joined
-                    (Some (Joined
-                            :blocks blocks
-                            :by-symbol by-symbol
-                            :made made
-                            :extra extra
-                            :scopes nscopes
-                            :symbols nsymbols)))))))
+                    (Some (joined-of blocks by-symbol made extra nscopes nsymbols)))))))
         (let [symbols (decode-symbols r)
               free (decode-names r)
               (mut outer) (HashMap::new-scalar [i64 i64] (rt/value-allocator))
