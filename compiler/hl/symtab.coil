@@ -5,6 +5,8 @@
 (import "coil.hashmap" :use [HashMap for-entries])
 (import "coil.str" :as str)
 (import "hl.rt" :as rt)
+(import "coil.primitive" :as primitive)
+(import "coil.control" :use [return-from])
 
 ;;; A map from names. Names are the program's own text, which is never changed, and lives in the
 ;;; region of the parse that read it, which any table made from it holds (see `rt/region-uses!`),
@@ -26,12 +28,37 @@
    (children (ArrayList i64))
    (dynamic bool)])
 
+;;; A module's own table at its place among the build's (see `placed`): scope i of the part as the
+;;; joined table numbers it, `scope-start` + i - 1, and its symbol s as `symbol-start` + s, each
+;;; already saying so. The part's scope 0 stands for the joined table's, which holds `roots`, the
+;;; part's top scopes; `dynamic` when code can reach the part's top level by name at run time.
+(defstruct Block
+  [(scopes (ArrayList Scope))
+   (symbols (ArrayList Symbol))
+   (scope-start i64)
+   (symbol-start i64)
+   (roots (ArrayList i64))
+   (dynamic bool)])
+
+;;; A table joined from blocks (see `joined-from`), which it shares and never copies: the blocks by
+;;; where their scopes start, and their indices by where their symbols start; the symbols linking
+;;; makes, laid over them, and which scopes each is in when that is a block's; and how many scopes
+;;; and symbols it numbers. Its own scope 0 is the one all the blocks' top scopes are in.
+(defstruct Joined
+  [(blocks (ArrayList Block))
+   (by-symbol (ArrayList i64))
+   (made (HashMap i64 Symbol))
+   (extra (HashMap i64 (ArrayList i64)))
+   (scopes i64)
+   (symbols i64)])
+
 (defstruct Table
   [(scopes (ArrayList Scope))
    (symbols (ArrayList Symbol))
    (free (HashMap (slice u8) i64))
    ;; In a table under another (see `table-under`): uses of that table's symbols, by symbol.
-   (outer (HashMap i64 i64))])
+   (outer (HashMap i64 i64))
+   (joined (Option Joined))])
 
 ;;; A tree's scope analysis as a value: the table it filled, its root scope, which symbol each
 ;;; name means by the name's offset, and the names no scope declares.
@@ -46,12 +73,14 @@
     :scopes (ArrayList::new [Scope] (rt/value-allocator))
     :symbols (ArrayList::new [Symbol] (rt/value-allocator))
     :free (names-map)
-    :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))))
+    :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))
+    :joined (None [Joined])))
 
 ;;; A table of its own for code inside `scope` of `t`: its scope 0 stands for that scope, and
 ;;; its names are the symbols of `t` that scope can see, its own and those of the scopes around it,
 ;;; as -(id + 1). Code in it can be analysed while other code is, and `graft!` puts it back.
 (defn table-under [(t Table) (scope i64)] (-> Table)
+  (own-table! t "table-under")
   (let [(mut out) (table-new)
         sc (get (.scopes t) scope)
         (mut names) (names-map)
@@ -75,6 +104,7 @@
 
 ;;; A copy that changes apart from `t`.
 (defn table-copy [(t Table)] (-> Table)
+  (own-table! t "table-copy")
   (let [(mut out) (table-new)]
     (for sc (.scopes t)
       (let [(mut names) (names-map)
@@ -99,6 +129,7 @@
     out))
 
 (defn new-scope! [(t (mut Table)) (parent i64)] (-> i64)
+  (own-table! t "new-scope!")
   (let [id (len (.scopes t))]
     (push! (mut (.scopes t))
            (Scope
@@ -113,6 +144,7 @@
 
 ;;; Declare `name` in `scope`, or answer the symbol it already has there.
 (defn declare! [(t (mut Table)) (scope i64) (name (slice u8))] (-> i64)
+  (own-table! t "declare!")
   (match (get (.names (get (.scopes t) scope)) name)
     (Some [s] s)
     (None []
@@ -130,6 +162,7 @@
 
 ;;; A symbol with no name in any scope's map: only the program refers to it.
 (defn generated-symbol! [(t (mut Table)) (scope i64) (name (slice u8))] (-> i64)
+  (own-table! t "generated-symbol!")
   (let [id (len (.symbols t))]
     (push! (mut (.symbols t))
            (Symbol
@@ -180,6 +213,7 @@
 ;;; for `parent`, and nothing was declared in it. Answers how far `from`'s scope ids moved; its
 ;;; symbol ids moved by `symbol-count` as it was before.
 (defn graft! [(t (mut Table)) (from Table) (parent i64)] (-> i64)
+  (own-table! t "graft!")
   (let [scope-shift (- (len (.scopes t)) 1)
         symbol-shift (len (.symbols t))]
     (for i (range 1 (len (.scopes from)))
@@ -235,28 +269,53 @@
 ;;; A symbol, or an empty one for an id the table has no place for: asking another build's table,
 ;;; which may be smaller, is safe.
 (defn symbol-at [(t Table) (s i64)] (-> Symbol)
-  (if (and (>= s 0) (< s (len (.symbols t))))
-      (get (.symbols t) s)
-      (Symbol
-        :name ""
-        :scope -1
-        :uses 0
-        :final ""
-        :pinned false)))
+  (match (.joined t)
+    (Some [j] (joined-symbol-at j s))
+    (None []
+          (if (and (>= s 0) (< s (len (.symbols t))))
+              (get (.symbols t) s)
+              (no-symbol)))))
+
+(defn no-symbol [] (-> Symbol)
+  (Symbol
+    :name ""
+    :scope -1
+    :uses 0
+    :final ""
+    :pinned false))
 
 ;;; A scope, or an empty one for an id the table has no place for.
 (defn scope-at [(t Table) (s i64)] (-> Scope)
-  (if (and (>= s 0) (< s (len (.scopes t))))
-      (get (.scopes t) s)
-      (Scope
-        :parent -1
-        :names (names-map)
-        :symbols (ArrayList::new [i64] (rt/value-allocator))
-        :children (ArrayList::new [i64] (rt/value-allocator))
-        :dynamic false)))
+  (match (.joined t)
+    (Some [j]
+          (if (= s 0)
+              (get (.scopes t) 0)
+              (joined-scope-at j s)))
+    (None []
+          (if (and (>= s 0) (< s (len (.scopes t))))
+              (get (.scopes t) s)
+              (no-scope)))))
+
+(defn no-scope [] (-> Scope)
+  (Scope
+    :parent -1
+    :names (names-map)
+    :symbols (ArrayList::new [i64] (rt/value-allocator))
+    :children (ArrayList::new [i64] (rt/value-allocator))
+    :dynamic false))
 
 (defn symbol-count [(t Table)] (-> i64)
-  (len (.symbols t)))
+  (match (.joined t)
+    (Some [j] (.symbols j))
+    (None [] (len (.symbols t)))))
+
+;;; A table to change or copy: one of its own, not joined from blocks it shares.
+(defn own-table! [(t Table) (what (slice u8))] (-> void)
+  (match (.joined t)
+    (Some [_]
+          (panic "symtab: {} of a table joined from blocks, which it shares and may not change or copy"
+                 what))
+    (None [] 0)))
 
 ;;; Where tables of their own land when `joined` puts them in turn under one scope, 0: how far each
 ;;; one's scopes and symbols move, and how many symbols they hold in all. Known from their sizes,
@@ -293,43 +352,84 @@
 
 ;;; How many scopes a table has.
 (defn scope-count [(t Table)] (-> i64)
-  (len (.scopes t)))
+  (match (.joined t)
+    (Some [j] (.scopes j))
+    (None [] (len (.scopes t)))))
 
-;;; `joined`, with each part at a place of its own: its scopes from `scope-shifts[i]` + 1 and its
-;;; symbols from `symbol-shifts[i]`, in a table of `scopes` scopes and `symbols` symbols whose other
-;;; places are empty (a scope nothing is in, a symbol no scope holds); then the symbols no source
-;;; names at `ids`. So a part keeps its numbers while the others' change.
-(defn joined-at [(parts (ArrayList Table))
-                 (scope-shifts (ArrayList i64))
-                 (symbol-shifts (ArrayList i64))
-                 (scopes i64)
-                 (symbols i64)
-                 (ids (ArrayList i64))
-                 (made-scopes (ArrayList i64))
-                 (names (ArrayList (slice u8)))] (-> Table)
-  (let [(mut t) (table-new)
-        (mut total) symbols]
-    (for id ids (when (>= id total) (set! total (+ id 1))))
-    (new-scope! (mut t) -1)
-    (while (< (len (.scopes t)) (+ scopes 1)) (new-scope! (mut t) -1))
-    (for _ (range 0 total)
-      (push! (mut (.symbols t))
+;;; ---------------------------------------------------------------- tables joined from blocks
+
+;;; `part`, a module's own table, at its place among the build's: its scopes from `scope-shift` + 1
+;;; and its symbols from `symbol-shift`, as `joined-at` would put it, made once for as long as the
+;;; part and its place stay the same, and shared by every table joined from it after.
+(defn placed [(part Table) (scope-shift i64) (symbol-shift i64)] (-> Block)
+  (own-table! part "placed")
+  (when (> (len (.outer part)) 0)
+    (panic "symtab: a module's own table uses symbols of a table around it, which no block has"))
+  (let [(mut scopes) (ArrayList::new [Scope] (rt/value-allocator))
+        (mut symbols) (ArrayList::new [Symbol] (rt/value-allocator))
+        (mut roots) (ArrayList::new [i64] (rt/value-allocator))]
+    (for i (range 1 (len (.scopes part)))
+      (let [sc (get (.scopes part) i)
+            (mut names) (names-map)
+            (mut syms) (ArrayList::new [i64] (rt/value-allocator))
+            (mut children) (ArrayList::new [i64] (rt/value-allocator))]
+        (let [(mut src) (.names sc)]
+          (for-entries [k v (mut src)]
+                       (set! (mut names) (load k) (+ (load v) symbol-shift))))
+        (for s (.symbols sc) (push! (mut syms) (+ s symbol-shift)))
+        (for c (.children sc) (push! (mut children) (+ c scope-shift)))
+        (push! (mut scopes)
+               (Scope
+                 :parent (if (= (.parent sc) 0) 0 (+ (.parent sc) scope-shift))
+                 :names names
+                 :symbols syms
+                 :children children
+                 :dynamic (.dynamic sc)))))
+    (for c (.children (get (.scopes part) 0)) (push! (mut roots) (+ c scope-shift)))
+    (for sym (.symbols part)
+      (push! (mut symbols)
              (Symbol
-               :name ""
-               :scope -1
-               :uses 0
-               :final ""
-               :pinned false)))
-    (for i (range 0 (len parts))
-      (graft-at! (mut t)
-                 (get parts i)
-                 0
-                 (get scope-shifts i)
-                 (get symbol-shifts i)))
+               :name (.name sym)
+               :scope (if (= (.scope sym) 0) 0 (+ (.scope sym) scope-shift))
+               :uses (.uses sym)
+               :final (.final sym)
+               :pinned (.pinned sym))))
+    (Block
+      :scopes scopes
+      :symbols symbols
+      :scope-start (+ scope-shift 1)
+      :symbol-start symbol-shift
+      :roots roots
+      :dynamic (.dynamic (get (.scopes part) 0)))))
+
+;;; `joined-at`, from blocks `placed` made: a table of `scopes` scopes and `symbols` symbols that
+;;; shares the blocks and copies none of them, then the symbols no source names at `ids`, each in
+;;; `made-scopes[i]` and called `names[i]`. What it costs is how many blocks and made symbols there
+;;; are, not how many scopes and symbols they hold.
+(defn joined-from [(blocks (ArrayList Block))
+                   (scopes i64)
+                   (symbols i64)
+                   (ids (ArrayList i64))
+                   (made-scopes (ArrayList i64))
+                   (names (ArrayList (slice u8)))] (-> Table)
+  (let [(mut scope-starts) (ArrayList::new [i64] (rt/value-allocator))
+        (mut symbol-starts) (ArrayList::new [i64] (rt/value-allocator))
+        (mut children) (ArrayList::new [i64] (rt/value-allocator))
+        (mut top) (ArrayList::new [i64] (rt/value-allocator))
+        (mut dynamic) false
+        (mut made) (HashMap::new-scalar [i64 Symbol] (rt/value-allocator))
+        (mut extra) (HashMap::new-scalar [i64 (ArrayList i64)] (rt/value-allocator))
+        (mut total) symbols]
+    (for b blocks
+      (push! (mut scope-starts) (.scope-start b))
+      (push! (mut symbol-starts) (.symbol-start b))
+      (for c (.roots b) (push! (mut children) c))
+      (when (.dynamic b) (set! dynamic true)))
+    (for id ids (when (>= id total) (set! total (+ id 1))))
     (for i (range 0 (len ids))
       (let [id (get ids i)
             scope (get made-scopes i)]
-        (set! (mut (.symbols t))
+        (set! (mut made)
               id
               (Symbol
                 :name (get names i)
@@ -337,110 +437,401 @@
                 :uses 0
                 :final (get names i)
                 :pinned false))
-        (push! (mut (.symbols (elem (mut (.scopes t)) scope))) id)))
-    t))
+        (if (= scope 0)
+            (push! (mut top) id)
+            (let [(mut more)
+                    (match (get extra scope)
+                      (Some [xs] xs)
+                      (None [] (ArrayList::new [i64] (rt/value-allocator))))]
+              (push! (mut more) id)
+              (set! (mut extra) scope more)))))
+    (let [by-scope (rt/sort-order-int scope-starts false)
+          (mut sorted) (ArrayList::new [Block] (rt/value-allocator))
+          (mut starts) (ArrayList::new [i64] (rt/value-allocator))
+          (mut own) (ArrayList::new [Scope] (rt/value-allocator))]
+      (for i by-scope (push! (mut sorted) (get blocks i)))
+      (for b sorted (push! (mut starts) (.symbol-start b)))
+      (push! (mut own)
+             (Scope
+               :parent -1
+               :names (names-map)
+               :symbols top
+               :children children
+               :dynamic dynamic))
+      (Table
+        :scopes own
+        :symbols (ArrayList::new [Symbol] (rt/value-allocator))
+        :free (names-map)
+        :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))
+        :joined
+          (Some (Joined
+                  :blocks sorted
+                  :by-symbol (rt/sort-order-int starts false)
+                  :made made
+                  :extra extra
+                  :scopes (+ scopes 1)
+                  :symbols total))))))
 
-;;; `graft!`, into places already there: `from`'s scope i at `scope-shift` + i, its symbol s at
-;;; `symbol-shift` + s.
-(defn graft-at! [(t (mut Table))
-                 (from Table)
-                 (parent i64)
-                 (scope-shift i64)
-                 (symbol-shift i64)] (-> void)
-  (for i (range 1 (len (.scopes from)))
-    (let [sc (get (.scopes from) i)
-          (mut names) (names-map)
-          (mut symbols) (ArrayList::new [i64] (rt/value-allocator))
-          (mut children) (ArrayList::new [i64] (rt/value-allocator))]
-      (let [(mut src) (.names sc)]
-        (for-entries [k v (mut src)]
-                     (set! (mut names) (load k) (+ (load v) symbol-shift))))
-      (for s (.symbols sc) (push! (mut symbols) (+ s symbol-shift)))
-      (for c (.children sc) (push! (mut children) (+ c scope-shift)))
-      (set! (mut (.scopes t))
-            (+ scope-shift i)
-            (Scope
-              :parent
-                (if (= (.parent sc) 0) parent (+ (.parent sc) scope-shift))
-              :names names
-              :symbols symbols
-              :children children
-              :dynamic (.dynamic sc)))))
-  (for c (.children (get (.scopes from) 0))
-    (push! (mut (.children (elem (mut (.scopes t)) parent))) (+ c scope-shift)))
-  (for i (range 0 (len (.symbols from)))
-    (let [sym (get (.symbols from) i)]
-      (set! (mut (.symbols t))
-            (+ symbol-shift i)
-            (Symbol
-              :name (.name sym)
-              :scope (if (= (.scope sym) 0) parent (+ (.scope sym) scope-shift))
-              :uses (.uses sym)
-              :final (.final sym)
-              :pinned (.pinned sym)))))
-  (when (.dynamic (get (.scopes from) 0)) (mark-dynamic! (mut t) parent))
-  (for o (.outer from)
-    (match (get (.outer from) o)
-      (Some [n]
-            (let [(mut sym) (get (.symbols t) o)]
-              (set! (.uses sym) (+ (.uses sym) n))
-              (set! (mut (.symbols t)) o sym)))
-      (None [] 0)))
-  (for name (.free from)
-    (match (get (.free from) name)
-      (Some [n]
-            (set! (mut (.free t))
-                  name
-                  (+ (match (get (.free t) name) (Some [m] m) (None [] 0)) n)))
-      (None [] 0)))
+;;; Which of `blocks` (by where their scopes start) holds scope `s`, or -1.
+(defn block-of-scope [(blocks (ArrayList Block)) (s i64)] (-> i64)
+  (let [(mut lo) 0
+        (mut hi) (len blocks)]
+    ;; The last block that starts at or before `s`.
+    (while (< lo hi)
+      (let [mid (/ (+ lo hi) 2)]
+        (if (<= (.scope-start (get blocks mid)) s)
+            (set! lo (+ mid 1))
+            (set! hi mid))))
+    (if (and (> lo 0)
+             (< s (+ (.scope-start (get blocks (- lo 1)))
+                     (len (.scopes (get blocks (- lo 1)))))))
+        (- lo 1)
+        -1)))
+
+;;; Which of `blocks` holds symbol `s`, `order` their indices by where their symbols start; or -1.
+(defn block-of-symbol [(blocks (ArrayList Block)) (order (ArrayList i64)) (s i64)]
+  (-> i64)
+  (let [(mut lo) 0
+        (mut hi) (len order)]
+    (while (< lo hi)
+      (let [mid (/ (+ lo hi) 2)]
+        (if (<= (.symbol-start (get blocks (get order mid))) s)
+            (set! lo (+ mid 1))
+            (set! hi mid))))
+    (if (> lo 0)
+        (let [b (get blocks (get order (- lo 1)))]
+          (if (< s (+ (.symbol-start b) (len (.symbols b))))
+              (get order (- lo 1))
+              -1))
+        -1)))
+
+(defn joined-symbol-at [(j Joined) (s i64)] (-> Symbol)
+  (match (get (.made j) s)
+    (Some [x] x)
+    (None []
+          (let [at (block-of-symbol (.blocks j) (.by-symbol j) s)]
+            (if (< at 0)
+                (no-symbol)
+                (let [b (get (.blocks j) at)]
+                  (get (.symbols b) (- s (.symbol-start b)))))))))
+
+;;; A block's scope, with the symbols linking made in it after its own.
+(defn joined-scope-at [(j Joined) (s i64)] (-> Scope)
+  (let [at (block-of-scope (.blocks j) s)]
+    (if (< at 0)
+        (no-scope)
+        (let [b (get (.blocks j) at)
+              sc (get (.scopes b) (- s (.scope-start b)))]
+          (match (get (.extra j) s)
+            (None [] sc)
+            (Some [more]
+                  (let [(mut syms) (ArrayList::new [i64] (rt/value-allocator))]
+                    (for x (.symbols sc) (push! (mut syms) x))
+                    (for x more (push! (mut syms) x))
+                    (Scope
+                      :parent (.parent sc)
+                      :names (.names sc)
+                      :symbols syms
+                      :children (.children sc)
+                      :dynamic (.dynamic sc)))))))))
+
+;;; Whether two blocks are the very same one, at the same place.
+(defn same-block? [(a Block) (b Block)] (-> bool)
+  (and (= (.scope-start a) (.scope-start b))
+       (= (.symbol-start a) (.symbol-start b))
+       (= (primitive/cast i64 (data (slice (.scopes a))))
+          (primitive/cast i64 (data (slice (.scopes b)))))
+       (= (primitive/cast i64 (data (slice (.symbols a))))
+          (primitive/cast i64 (data (slice (.symbols b)))))
+       (= (len (.scopes a)) (len (.scopes b)))
+       (= (len (.symbols a)) (len (.symbols b)))))
+
+;;; Where `accessor` (`scope-at`, `symbol-at`) may answer otherwise for `b` than for `a`, as ranges
+;;; of the ids it takes, `lo` then `hi` for each: the places of the blocks either has that the other
+;;; has not, and of the symbols linking made that differ. When `a` and `b` share most of their
+;;; blocks, as one build's table and the next do, that is the blocks an edit changed. One range
+;;; from -1: not known, so any id may differ.
+(defn changes-Table [(a Table) (b Table) (accessor (slice u8))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (rt/value-allocator))]
+    (match (.joined a)
+      (None [] (do (push! (mut out) -1) (push! (mut out) -1)))
+      (Some [ja]
+            (match (.joined b)
+              (None [] (do (push! (mut out) -1) (push! (mut out) -1)))
+              (Some [jb]
+                    (cond (= accessor "scope-at")
+                            (do
+                              ;; Scope 0 holds every block's top scopes: compared once.
+                              (push! (mut out) 0)
+                              (push! (mut out) 1)
+                              (blocks-changed! (mut out) (.blocks ja) (identity-order (len (.blocks ja)))
+                                               (.blocks jb) (identity-order (len (.blocks jb))) true)
+                              (extra-changed! (mut out) (.extra ja) (.extra jb))
+                              (extra-changed! (mut out) (.extra jb) (.extra ja))
+                              (count-changed! (mut out) (.scopes ja) (.scopes jb)))
+                          (= accessor "symbol-at")
+                            (do
+                              (blocks-changed! (mut out) (.blocks ja) (.by-symbol ja)
+                                               (.blocks jb) (.by-symbol jb) false)
+                              (made-changed! (mut out) (.made ja) (.made jb))
+                              (made-changed! (mut out) (.made jb) (.made ja))
+                              (count-changed! (mut out) (.symbols ja) (.symbols jb)))
+                          :else (do (push! (mut out) -1) (push! (mut out) -1)))))))
+    out))
+
+(defn identity-order [(n i64)] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (rt/value-allocator))]
+    (for i (range 0 n) (push! (mut out) i))
+    out))
+
+(defn block-start [(b Block) (scopes bool)] (-> i64)
+  (if scopes (.scope-start b) (.symbol-start b)))
+
+(defn block-end [(b Block) (scopes bool)] (-> i64)
+  (if scopes
+      (+ (.scope-start b) (len (.scopes b)))
+      (+ (.symbol-start b) (len (.symbols b)))))
+
+;;; The places of the blocks of `xs` and `ys`, each in its order by where it starts, that the other
+;;; has not at the same place: a walk of both together.
+(defn blocks-changed! [(out (mut (ArrayList i64)))
+                       (xs (ArrayList Block))
+                       (xo (ArrayList i64))
+                       (ys (ArrayList Block))
+                       (yo (ArrayList i64))
+                       (scopes bool)] (-> void)
+  (let [(mut i) 0
+        (mut j) 0]
+    (while (or (< i (len xo)) (< j (len yo)))
+      (let [x-start (if (< i (len xo)) (block-start (get xs (get xo i)) scopes) -1)
+            y-start (if (< j (len yo)) (block-start (get ys (get yo j)) scopes) -1)]
+        (cond (or (>= j (len yo)) (and (< i (len xo)) (< x-start y-start)))
+                (do
+                  (push! (mut out) x-start)
+                  (push! (mut out) (block-end (get xs (get xo i)) scopes))
+                  (set! i (+ i 1)))
+              (or (>= i (len xo)) (< y-start x-start))
+                (do
+                  (push! (mut out) y-start)
+                  (push! (mut out) (block-end (get ys (get yo j)) scopes))
+                  (set! j (+ j 1)))
+              :else
+                (let [x (get xs (get xo i))
+                      y (get ys (get yo j))]
+                  (unless (same-block? x y)
+                    (push! (mut out) x-start)
+                    (push! (mut out) (max-of (block-end x scopes) (block-end y scopes))))
+                  (set! i (+ i 1))
+                  (set! j (+ j 1)))))))
   0)
+
+(defn max-of [(a i64) (b i64)] (-> i64)
+  (if (> a b) a b))
+
+(defn min-of [(a i64) (b i64)] (-> i64)
+  (if (< a b) a b))
+
+;;; The scopes whose made symbols `xs` and `ys` differ on, of those `xs` has.
+(defn extra-changed! [(out (mut (ArrayList i64)))
+                      (xs (HashMap i64 (ArrayList i64)))
+                      (ys (HashMap i64 (ArrayList i64)))] (-> void)
+  (for s xs
+    (let [same
+            (match (get xs s)
+              (None [] false)
+              (Some [x]
+                    (match (get ys s)
+                      (None [] false)
+                      (Some [y]
+                            (and (= (len x) (len y))
+                                 (block :same
+                                   (for k (range 0 (len x))
+                                     (when (!= (get x k) (get y k)) (return-from :same false)))
+                                   true))))))]
+      (unless same
+        (push! (mut out) s)
+        (push! (mut out) (+ s 1)))))
+  0)
+
+;;; The made symbols `xs` and `ys` differ on, of those `xs` has.
+(defn made-changed! [(out (mut (ArrayList i64)))
+                     (xs (HashMap i64 Symbol))
+                     (ys (HashMap i64 Symbol))] (-> void)
+  (for s xs
+    (let [same
+            (match (get xs s)
+              (None [] false)
+              (Some [x]
+                    (match (get ys s)
+                      (None [] false)
+                      (Some [y]
+                            (and (= (.name x) (.name y))
+                                 (= (.scope x) (.scope y))
+                                 (= (.final x) (.final y)))))))]
+      (unless same
+        (push! (mut out) s)
+        (push! (mut out) (+ s 1)))))
+  0)
+
+;;; Ids one of two counts numbers and the other does not.
+(defn count-changed! [(out (mut (ArrayList i64))) (a i64) (b i64)] (-> void)
+  (unless (= a b)
+    (push! (mut out) (min-of a b))
+    (push! (mut out) (max-of a b)))
+  0)
+
+;;; A table joined from blocks keeps no free names: ask each module's own table.
+(defn own-free! [(t Table)] (-> void)
+  (match (.joined t)
+    (Some [_]
+          (panic "symtab: a table joined from blocks keeps no free names; each module's own table has them"))
+    (None [] 0)))
 
 ;;; A copy of `t` with each of `parts` grafted under `parent` in turn.
 (defn grafted [(t Table) (parts (ArrayList Table)) (parent i64)] (-> Table)
+  (own-table! t "grafted")
   (let [(mut out) (table-copy t)]
     (for p parts (graft! (mut out) p parent))
     out))
 
 (defn set-final! [(t (mut Table)) (s i64) (name (slice u8))] (-> void)
+  (own-table! t "set-final!")
   (let [(mut symbol) (get (.symbols t) s)]
     (set! (.final symbol) name)
     (set! (mut (.symbols t)) s symbol)))
 
 ;;; The names no scope declared.
 (defn free-names [(t Table)] (-> (ArrayList (slice u8)))
+  (own-free! t)
   (let [(mut out) (ArrayList::new [(slice u8)] (rt/value-allocator))]
     (for k (.free t) (push! (mut out) k))
     out))
 
 (defn has-free? [(t Table) (name (slice u8))] (-> bool)
+  (own-free! t)
   (match (get (.free t) name) (Some [_] true) (None [] false)))
 
 ;; ---------------------------------------------------------------- the cache on disk
 
-;;; A table, for the cache (see the cache in hl.rt): its scopes, symbols, free names and outer uses.
+;;; A table, for the cache (see the cache in hl.rt): its scopes, symbols, free names and outer uses;
+;;; or, joined from blocks, its own scope 0, its blocks and what is laid over them.
 (defn persist-encode-Table [(w (ptr rt/Writer)) (t Table)] (-> void)
-  (rt/put-varint! w (len (.scopes t)))
-  (for sc (.scopes t)
+  (encode-scopes! w (.scopes t))
+  (match (.joined t)
+    (Some [j]
+          (rt/put-bool! w true)
+          (rt/put-varint! w (len (.blocks j)))
+          (for b (.blocks j) (persist-encode-Block w b))
+          (rt/put-ints! w (.by-symbol j))
+          (rt/put-varint! w (len (.made j)))
+          (for id (.made j)
+            (rt/put-int! w id)
+            (match (get (.made j) id)
+              (Some [s]
+                    (let [(mut one) (ArrayList::new [Symbol] (rt/value-allocator))]
+                      (push! (mut one) s)
+                      (encode-symbols! w one)))
+              (None [] (panic "a map lost a key while it was written"))))
+          (rt/put-varint! w (len (.extra j)))
+          (for scope (.extra j)
+            (rt/put-int! w scope)
+            (match (get (.extra j) scope)
+              (Some [xs] (rt/put-ints! w xs))
+              (None [] (panic "a map lost a key while it was written"))))
+          (rt/put-int! w (.scopes j))
+          (rt/put-int! w (.symbols j)))
+    (None []
+          (rt/put-bool! w false)
+          (encode-symbols! w (.symbols t))
+          (encode-names! w (.free t))
+          (rt/put-varint! w (len (.outer t)))
+          (for key (.outer t)
+            (rt/put-int! w key)
+            (match (get (.outer t) key)
+              (Some [v] (rt/put-int! w v))
+              (None [] (panic "a map lost a key while it was written"))))))
+  0)
+
+;;; A block, for the cache: its scopes, symbols, place, top scopes and whether its top is dynamic.
+(defn persist-encode-Block [(w (ptr rt/Writer)) (b Block)] (-> void)
+  (encode-scopes! w (.scopes b))
+  (encode-symbols! w (.symbols b))
+  (rt/put-int! w (.scope-start b))
+  (rt/put-int! w (.symbol-start b))
+  (rt/put-ints! w (.roots b))
+  (rt/put-bool! w (.dynamic b))
+  0)
+
+(defn persist-decode-Block [(r (ptr rt/Reader))] (-> Block)
+  (let [scopes (decode-scopes r)
+        symbols (decode-symbols r)
+        scope-start (rt/take-int r)
+        symbol-start (rt/take-int r)
+        roots (rt/take-ints r)
+        dynamic (rt/take-bool r)]
+    (Block
+      :scopes scopes
+      :symbols symbols
+      :scope-start scope-start
+      :symbol-start symbol-start
+      :roots roots
+      :dynamic dynamic)))
+
+(defn encode-scopes! [(w (ptr rt/Writer)) (scopes (ArrayList Scope))] (-> void)
+  (rt/put-varint! w (len scopes))
+  (for sc scopes
     (rt/put-int! w (.parent sc))
     (encode-names! w (.names sc))
     (rt/put-ints! w (.symbols sc))
     (rt/put-ints! w (.children sc))
     (rt/put-bool! w (.dynamic sc)))
-  (rt/put-varint! w (len (.symbols t)))
-  (for s (.symbols t)
+  0)
+
+(defn encode-symbols! [(w (ptr rt/Writer)) (symbols (ArrayList Symbol))] (-> void)
+  (rt/put-varint! w (len symbols))
+  (for s symbols
     (rt/put-text! w (.name s))
     (rt/put-int! w (.scope s))
     (rt/put-int! w (.uses s))
     (rt/put-text! w (.final s))
     (rt/put-bool! w (.pinned s)))
-  (encode-names! w (.free t))
-  (rt/put-varint! w (len (.outer t)))
-  (for key (.outer t)
-    (rt/put-int! w key)
-    (match (get (.outer t) key)
-      (Some [v] (rt/put-int! w v))
-      (None [] (panic "a map lost a key while it was written"))))
   0)
+
+(defn decode-scopes [(r (ptr rt/Reader))] (-> (ArrayList Scope))
+  (let [(mut scopes) (ArrayList::new [Scope] (rt/value-allocator))
+        n (rt/take-varint r)]
+    (for _ (range 0 n)
+      (let [parent (rt/take-int r)
+            names (decode-names r)
+            syms (rt/take-ints r)
+            children (rt/take-ints r)
+            dynamic (rt/take-bool r)]
+        (push! (mut scopes)
+               (Scope
+                 :parent parent
+                 :names names
+                 :symbols syms
+                 :children children
+                 :dynamic dynamic))))
+    scopes))
+
+(defn decode-symbols [(r (ptr rt/Reader))] (-> (ArrayList Symbol))
+  (let [(mut symbols) (ArrayList::new [Symbol] (rt/value-allocator))
+        n (rt/take-varint r)]
+    (for _ (range 0 n)
+      (let [name (rt/take-text r)
+            scope (rt/take-int r)
+            uses (rt/take-int r)
+            final (rt/take-text r)
+            pinned (rt/take-bool r)]
+        (push! (mut symbols)
+               (Symbol
+                 :name name
+                 :scope scope
+                 :uses uses
+                 :final final
+                 :pinned pinned))))
+    symbols))
 
 (defn encode-names! [(w (ptr rt/Writer)) (m (HashMap (slice u8) i64))] (-> void)
   (rt/put-varint! w (len m))
@@ -460,44 +851,48 @@
     m))
 
 (defn persist-decode-Table [(r (ptr rt/Reader))] (-> Table)
-  (let [(mut scopes) (ArrayList::new [Scope] (rt/value-allocator))
-        (mut symbols) (ArrayList::new [Symbol] (rt/value-allocator))
-        (mut outer) (HashMap::new-scalar [i64 i64] (rt/value-allocator))
-        nscopes (rt/take-varint r)]
-    (for _ (range 0 nscopes)
-      (let [parent (rt/take-int r)
-            names (decode-names r)
-            syms (rt/take-ints r)
-            children (rt/take-ints r)
-            dynamic (rt/take-bool r)]
-        (push! (mut scopes)
-               (Scope
-                 :parent parent
-                 :names names
-                 :symbols syms
-                 :children children
-                 :dynamic dynamic))))
-    (let [nsymbols (rt/take-varint r)]
-      (for _ (range 0 nsymbols)
-        (let [name (rt/take-text r)
-              scope (rt/take-int r)
-              uses (rt/take-int r)
-              final (rt/take-text r)
-              pinned (rt/take-bool r)]
-          (push! (mut symbols)
-                 (Symbol
-                   :name name
-                   :scope scope
-                   :uses uses
-                   :final final
-                   :pinned pinned)))))
-    (let [free (decode-names r)
-          nouter (rt/take-varint r)]
-      (for _ (range 0 nouter)
-        (let [key (rt/take-int r)]
-          (set! (mut outer) key (rt/take-int r))))
-      (Table
-        :scopes scopes
-        :symbols symbols
-        :free free
-        :outer outer))))
+  (let [scopes (decode-scopes r)]
+    (if (rt/take-bool r)
+        (let [(mut blocks) (ArrayList::new [Block] (rt/value-allocator))
+              nblocks (rt/take-varint r)]
+          (for _ (range 0 nblocks) (push! (mut blocks) (persist-decode-Block r)))
+          (let [by-symbol (rt/take-ints r)
+                (mut made) (HashMap::new-scalar [i64 Symbol] (rt/value-allocator))
+                nmade (rt/take-varint r)]
+            (for _ (range 0 nmade)
+              (let [id (rt/take-int r)
+                    one (decode-symbols r)]
+                (set! (mut made) id (get one 0))))
+            (let [(mut extra) (HashMap::new-scalar [i64 (ArrayList i64)] (rt/value-allocator))
+                  nextra (rt/take-varint r)]
+              (for _ (range 0 nextra)
+                (let [scope (rt/take-int r)]
+                  (set! (mut extra) scope (rt/take-ints r))))
+              (let [nscopes (rt/take-int r)
+                    nsymbols (rt/take-int r)]
+                (Table
+                  :scopes scopes
+                  :symbols (ArrayList::new [Symbol] (rt/value-allocator))
+                  :free (names-map)
+                  :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))
+                  :joined
+                    (Some (Joined
+                            :blocks blocks
+                            :by-symbol by-symbol
+                            :made made
+                            :extra extra
+                            :scopes nscopes
+                            :symbols nsymbols)))))))
+        (let [symbols (decode-symbols r)
+              free (decode-names r)
+              (mut outer) (HashMap::new-scalar [i64 i64] (rt/value-allocator))
+              nouter (rt/take-varint r)]
+          (for _ (range 0 nouter)
+            (let [key (rt/take-int r)]
+              (set! (mut outer) key (rt/take-int r))))
+          (Table
+            :scopes scopes
+            :symbols symbols
+            :free free
+            :outer outer
+            :joined (None [Joined]))))))
