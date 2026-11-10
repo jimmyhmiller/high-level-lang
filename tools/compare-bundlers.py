@@ -31,6 +31,7 @@ parser.add_argument('--tools', default='')
 parser.add_argument('--report-name', default='results')
 parser.add_argument('--plain-only', action='store_true')
 parser.add_argument('--turbopack', default=str(ROOT/'out/bin/turbopack-cli-4ebb2b7'))
+parser.add_argument('--binary', default=str(ROOT/'out/bin/esb'), help='our executable; use an explicitly built release binary to compare optimization levels')
 args = parser.parse_args()
 assert args.runs > 0
 WORK = ROOT/'out/bundler-comparison'
@@ -40,6 +41,7 @@ try: fcntl.flock(comparison_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError: raise SystemExit('Another comparison is running; timing runs must be sequential.')
 ADAPTER = ROOT/'benchmarks/bundlers/build.mjs'
 TP = Path(args.turbopack)
+BINARY = Path(args.binary).resolve()
 TOOLS = [f'ours-{policy}-{unit}' for policy in ['exact','package','balanced'] for unit in ['modules','fragments']] + ['esbuild','rolldown','rollup','webpack']
 if TP.exists(): TOOLS += ['turbopack']
 if args.tools: TOOLS = [tool for tool in TOOLS if tool in args.tools.split(',')]
@@ -51,7 +53,7 @@ metadata = dict(runs=args.runs, node=subprocess.check_output(['node','--version'
                 turbopack=str(TP), turbopack_revision='4ebb2b7a5b' if '4ebb2b7' in TP.name else None,
                 persistent_cache=False, cross_build_reuse=False, filesystem_cache_flushed=False,
                 layout='one bootstrap with independently invoked dynamic report roots')
-metadata['binary_sha256']={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in [ROOT/'out/bin/esb',TP] if path.exists()}
+metadata['binary_sha256']={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in [BINARY,TP] if path.exists()}
 metadata['versions'] = {'esbuild': json.loads((ROOT/'tests/node_modules/esbuild/package.json').read_text())['version']}
 for package in ['rolldown','rollup','webpack','@rollup/plugin-node-resolve','@rollup/plugin-commonjs','@rollup/plugin-terser']:
     metadata['versions'][package] = json.loads((ROOT/'benchmarks/bundlers/node_modules'/package/'package.json').read_text())['version']
@@ -103,7 +105,7 @@ def prepare(case):
 def command(tool, root, output, minify, config):
     if tool.startswith('ours-'):
         _,policy,unit=tool.split('-')
-        return [str(ROOT/'out/bin/esb'),'main.js','--splitting','--format=esm','--pipeline=full','--no-cache','--strategy=once',f'--chunk-policy={policy}',f'--fragments={str(unit=="fragments").lower()}',f'--outdir={output}',*(['--minify'] if minify else [])]
+        return [str(BINARY),'main.js','--splitting','--format=esm','--pipeline=full','--no-cache','--strategy=once',f'--chunk-policy={policy}',f'--fragments={str(unit=="fragments").lower()}',f'--outdir={output}',*(['--minify'] if minify else [])]
     if tool=='esbuild':
         return [str(ROOT/'tests/node_modules/.bin/esbuild'),'main.js','--bundle','--splitting','--format=esm','--platform=browser','--target=esnext','--log-level=warning',f'--outdir={output}',*(['--minify'] if minify else [])]
     if tool=='turbopack':
