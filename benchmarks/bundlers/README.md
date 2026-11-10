@@ -5,6 +5,10 @@ webpack and an existing experimental Turbopack CLI. It measures clean builds,
 chunk transfer sizes and execution of the emitted code. It does not measure
 incremental rebuilds, framework integration or comprehensive application support.
 
+The tables under “Baseline results” preserve the original measurements. The
+optimization follow-up below compares the updated implementation against that
+baseline; both use the normal `-O1 --meta-opt=2` development build.
+
 ## Reproduce on macOS
 
 From the repository root, with Coil, Node, Python and Chrome installed:
@@ -23,7 +27,8 @@ uses `out/bin/esb`. Turbopack is included only if
 `--turbopack=PATH`. That binary is not installed by npm. Set `CHROME` to override
 the default macOS Chrome executable. Use `--cases=real,mixed`,
 `--tools=ours-exact-fragments,esbuild` or `--plain-only` for smaller runs.
-Run comparisons sequentially; the harness enforces a lock.
+Use `--binary=PATH` to measure another explicitly built executable; its hash is
+recorded. Run comparisons sequentially; the harness enforces a lock.
 
 Raw measurements, exact commands, binary hashes, versions, build logs and browser
 checks are written under `out/bundler-comparison/`. The checked-in
@@ -79,7 +84,7 @@ and sets `TURBOPACK_CHUNK_BASE_PATH="/"`; emitted code is not modified. A separa
 two-static-entry probe panicked on this snapshot and is recorded in the project
 audit pad. The common single-bootstrap workload passes validation.
 
-## Results
+## Baseline results (before optimization)
 
 See the tables below and the complete JSON for all six of our combinations
 (exact/package/balanced × modules/fragments). Conclusions apply to these
@@ -150,3 +155,89 @@ output overhead, then extend support with real application acceptance cases.
 These measurements do not exercise CSS/assets, client/server boundaries, HMR,
 source maps or every package resolution edge case; those need separate
 coverage before claiming production parity.
+
+## Optimization follow-up
+
+The updated implementation is at `3f59b61` (normal `-O1 --meta-opt=2` build).
+[optimized-results.json](optimized-results.json) records five new fresh processes
+for all six of our configurations, on each fixture, plain and minified:
+**180 builds and 36 browser-validated final outputs**. Persistent caching remains
+disabled. External-tool controls below are the unchanged, pinned versions from
+[the baseline run](results.json), not newly timed external-tool runs. The
+interrupted exploratory `optimized-results` run under `out/` is not this report;
+the final source file was `out/bundler-comparison/optimized-final.json`.
+
+### Before and after: exact policy with fragments, minified
+
+| Fixture | Build seconds, before → after | Peak MiB, before → after | First-route gzip bytes, before → after | Total gzip bytes, before → after |
+|---|---:|---:|---:|---:|
+| large | 1.4459 → 1.1548 | 1816.2 → 1367.3 | 8,461 → 4,422 | 206,630 → 97,758 |
+| real | 0.1417 → 0.1343 | 219.1 → 188.1 | 12,476 → 12,476 | 16,320 → 16,315 |
+| mixed | 0.0252 → 0.0233 | 38.8 → 37.7 | 4,081 → 4,081 | 7,848 → 7,848 |
+
+The large graph improves by **20.1% in build time, 24.7% in peak memory,
+52.7% in total gzip and 47.7% in first-route gzip**. Across all 36 configurations,
+peak memory is lower in every case, and neither total nor first-route gzip
+increases. Build medians improve in 33 configurations. Three real-package
+variants take 2–6 ms longer; their timing ranges overlap the baseline ranges.
+This is not a claim that every variant becomes faster.
+
+### Updated large graph against the original controls, minified
+
+| Bundler | Build seconds | Peak MiB | First-route gzip bytes | Total gzip bytes |
+|---|---:|---:|---:|---:|
+| Ours: fragments | 1.155 | 1367.3 | 4,422 | 97,758 |
+| esbuild | 0.308 | 479.1 | 5,474 | 122,270 |
+| Rolldown | 0.329 | 613.2 | 4,889 | 105,213 |
+| Rollup + Terser | 7.775 | 2391.2 | 3,621 | 67,155 |
+| webpack | 3.868 | 1861.7 | 5,066 | 79,923 |
+| Turbopack (pinned CLI) | 1.925 | 777.1 | 9,033 | 89,954 |
+
+Our payload now beats esbuild and Rolldown on both gzip measures for this graph.
+We still take about 3.75× esbuild's build time and 2.85× its peak memory. Rollup
+still emits the smallest payload here, and webpack's total gzip is also smaller.
+The real-package fixture retains a payload gap against the leading controls.
+The goal of winning every category against every tool is **not achieved**.
+
+### Changes and correctness
+
+- Initializer equivalence is a declarative fold in
+  [analysis.attrs](../../src/bundle/analysis.attrs). Inert synchronous modules
+  can share the sole initializer they forward to. Cycles, asynchronous graphs,
+  require-driven wrappers and opaque dependencies retain their existing guards.
+  The large output falls from 10,162 initializer-like allocations to two; the
+  remaining guards preserve shared initialization and cached exception behavior.
+- Safe nonnegative integer remainder folding lives in the minifier rules. Unsafe
+  integers, zero divisors, signed zero, fractional and legacy-octal forms remain
+  conservative. Ten thousand constant modulo operations disappear from the graph.
+- Generic generated parsers allocate speculation in isolated scratch storage and
+  copy accepted trees/error diagnostics out. Known-size lists and node children
+  reserve storage once, with single evaluation of slice bounds.
+- The generic runtime packs large memo values densely behind small hash indices;
+  removed slots are reused. Small values keep direct hashing. This reduces
+  within-build storage and does not depend on cross-build reuse.
+- Joined symbol tables use bounded binary search within ID pages. Canonical path
+  resolution shares a tracked within-build answer between resolution and graph
+  loading. Symlink identity still comes from real-path resolution.
+- Freed-page poisoning now releases backing storage while preserving unreadable
+  reservations. Small-allocation arena growth no longer gets stuck creating
+  individual chunks. These changes are generic runtime behavior, not bundler
+  policy embedded in the compiler.
+
+The full verification suite passed **222 checks**, including parser round trips,
+source maps, real application CRUD/assets, all package-resolution checks,
+client/server splitting, cache/watch mechanisms and memory stability. The final
+declarative initializer fold additionally passed the complete evaluation suite,
+with all policies, modules/fragments and minification, both entry orders,
+cycles, async evaluation and cached failures. New allocation-budget assertions
+check that forwarding wrappers disappear as well as executing correctly.
+Generic runtime checks cover sparse/duplicate block starts, indexed lookup,
+scratch lifetime, large/small memo values, removal and slot reuse. An intentional
+read of released scratch memory faults in check mode.
+
+Further work is still required for competitive large-graph speed and memory:
+reduce parser/analysis work and introduce sound, bounded lifetimes for more
+intermediate graphs and emitted trees. One-shot value arenas still retain much
+of that work until process exit. More aggressive function/constant propagation
+and inlining are needed to close the remaining output-size gaps. These are
+remaining engineering tasks, not completed optimizations or promises of wins.
