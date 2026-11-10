@@ -438,21 +438,55 @@ brings the last database up to date by deleting and deriving again (DRed), group
 relations that derive each other, so what an edit's facts do not reach is not derived again. A
 group where an edit takes out more than a quarter of the rows (a change reaching most of the tree
 shaking, which Turbopack's build also does over the whole graph) is solved afresh from the groups
-below it. Set `HL_CHECK_DATALOG` to check every update against solving afresh. The Datalog lap of a
-rebuild: zod 27–35 M instructions against 53 M solving afresh; twelve copies of zod 318–366 M
-against 593–607 M. What remains whole-program in a rebuild is the facts' list and the database's
-copy, the joined symbol table, and naming.
+below it. Set `HL_CHECK_DATALOG` to check every update against solving afresh.
 
-Rebuilds after one edit, on Linux (`tools/bench.py`, 2026-11-09 at 0e2a2f6, median of 7; esbuild
-0.28.2 and Turbopack's CLI built from next.js sources). The edit is to a module the app imports:
+None of linking's three whole-program steps redoes the whole program after an edit:
+
+- **The symbol table.** Each module's own table is placed once at its stable place
+  (`modules.file-block`), and the build's table is joined from those blocks without copying them
+  (`sym.joined-from`): joining costs one entry per module. A table that knows its blocks says where
+  it differs from the last (`changes-Table`), so a setting given it looks only at what was read in
+  the blocks that changed, not at everything anyone read.
+- **Facts and Datalog.** The facts come in blocks, one per module and kind (`an.fact-blocks`); a
+  block a build kept is the very block it was and is not looked into. Each row counts the facts that
+  state it, and the database is changed in place: a row taken out stays where it is, marked, so an
+  update reads a relation as it began (rows below its start, those it took out included) without a
+  copy. Each update says which rows each relation lost and gained, and only queries that see those
+  rows change. A database read back from the cache counts every fact once, on its first update.
+- **Naming.** esbuild's renamer tries `x`, `x2`, `x3`… for a name, all of one stem (the name
+  without the digits it ends in), so only names of one stem can take each other's, and the top
+  level is named stem by stem (`nm.stem-named`). Linking's database says which modules claim or
+  reserve names of each stem; modules keep ranks in the program's order while the order around them
+  does (`rt.Ranks`), so adding a module renumbers nothing. Each module's block is named on its own
+  (its claims' names, its nested scopes'), and the output's names are a table joined from those.
+
+Dependencies here are marked dirty all the way up from what changed, and an answer that comes out
+the same stops nothing already marked. What naming reads of the modules (their claims, by stem)
+and of the top level (each stem's names) is therefore given as settings, which are compared part by
+part, so an edit dirties only the stems it changed and the modules that read them.
+
+Rebuild laps on Linux for twelve copies of zod, one statement added to a module (before → after):
+the table 12.8 → 0.2 ms, facts and Datalog 11.6 → 2.7 ms. Naming, a statement edit 2.8 → about 2
+ms; an edit that declares a new name, about 33 → 5 ms (on macOS). What a rebuild still does for
+every module is a short pass: each module's block, facts and names found unchanged.
+
+Rebuilds after one edit, on Linux (`tools/bench.py`, median of 7; esbuild 0.28.2 and Turbopack's
+CLI built from next.js sources, measured 2026-11-09; ours 2026-11-10 at dea365e). The edit is to a
+module the app imports:
 
 | App | Rebuild (`--watch`) | esbuild `context().rebuild()` | Turbopack dev | One-shot, ours / esbuild |
 |---|---|---|---|---|
-| zod (96 modules) | 3.3 ms | 14.9 ms | 15.1 ms | 111 ms / 29 ms |
-| date-fns | 4.0 ms | 14.8 ms | 12.6 ms | 55 ms / 31 ms |
-| rx (225 modules) | 3.0 ms | 12.0 ms | 12.5 ms | 53 ms / 29 ms |
-| three | 25.8 ms | 54.6 ms | not observable (the package says it has no side effects, and dev never serves the edit) | 135 ms / 71 ms |
-| 12 copies of zod | 35.0 ms | 81.6 ms | 20.9 ms | 909 ms (302 ms on all threads) / 115 ms |
+| zod (96 modules) | 1.9 ms | 14.9 ms | 15.1 ms | 93 ms / 29 ms |
+| date-fns | 3.1 ms | 14.8 ms | 12.6 ms | 48 ms / 31 ms |
+| rx (225 modules) | 2.2 ms | 12.0 ms | 12.5 ms | 46 ms / 29 ms |
+| three | 25.3 ms | 54.6 ms | not observable (the package says it has no side effects, and dev never serves the edit) | 143 ms / 71 ms |
+| 12 copies of zod | 24.7 ms | 81.6 ms | 20.9 ms | 924 ms / 115 ms |
+
+Making the three steps incremental cost a little elsewhere: more answers kept (zod's first build
+makes 3,725 against 2,165), so first builds take 5–20% longer, the cache is about 10% bigger, and a
+watcher holds a few percent more memory. For twelve copies of zod, a rebuild went from 40.1 to 24.7
+ms and a run from a warm cache with one edit from 279 to 262 ms; what the rebuild spends now is
+mostly parsing the edited file again (about 10 ms) and printing (about 10 ms).
 
 `--hmr` watches too, writing a development format: no scope hoisting or renaming, each module a
 function registered with `hmr_runtime.js` by path, its imports read through live namespace objects
