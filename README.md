@@ -493,7 +493,9 @@ what it spends now is mostly parsing the edited file again (about 10 ms) and pri
 `--hmr` watches too, writing a development format: no scope hoisting or renaming, each module a
 function registered with `hmr_runtime.js` by path, its imports read through live namespace objects
 (`hmr.attrs`, 170 lines without comments). `--serve=PORT` serves the output's directory and an
-event stream at `/hmr`, from a thread in `hl.rt`. After each rebuild the modules whose functions
+event stream at `/hmr`, from a thread in `hl.rt`. The `.rules` caller chooses that event path;
+the runtime serves events at the path it is given. `tools/serve-check.py` checks a different path
+without bundler code. After each rebuild the modules whose functions
 changed are sent; `hmr.facts` (Datalog, 4 rules) finds which modules run again, stopping at those
 that call `import.meta.hot.accept()`, and reloads when an entry that does not accept changed.
 `import.meta.hot.dispose` and `hot.data` carry state across a replacement.

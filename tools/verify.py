@@ -356,6 +356,9 @@ print("== watching")
 code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch-check.py"), ESB, "datefns"],
                                       8000, 300, quiet=True)
 check(code == 0 and out.strip().endswith("all identical"), f"--watch: {out.strip().splitlines()[-1] if out.strip() else err[-200:]}")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve-check.py")], 300)
+check(code == 0, "HTTP runtime with a caller-chosen event path: " + out.strip().split("\n")[-1])
+
 # Hot module replacement end to end, and the development format running every app as the bundle does.
 code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hmr-check.py"), ESB],
                                       8000, 600, quiet=True)
