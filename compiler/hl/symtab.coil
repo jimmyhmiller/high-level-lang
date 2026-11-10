@@ -687,6 +687,116 @@
           (panic "symtab: a table joined from blocks keeps no free names; each module's own table has them"))
     (None [] 0)))
 
+;;; A block of nothing: what a module with no table of its own (an outside import) has.
+(defn no-block [] (-> Block)
+  (Block
+    :scopes (ArrayList::new [Scope] (rt/value-allocator))
+    :symbols (ArrayList::new [Symbol] (rt/value-allocator))
+    :scope-start 0
+    :symbol-start 0
+    :roots (ArrayList::new [i64] (rt/value-allocator))
+    :dynamic false))
+
+;;; `b` with each of its symbols named as it is in the output: `names[s]`, or else its own name. It
+;;; shares its scopes with `b`.
+(defn renamed [(b Block) (names (HashMap i64 (slice u8)))] (-> Block)
+  (let [(mut symbols) (ArrayList::new [Symbol] (rt/value-allocator))]
+    (reserve! (mut symbols) (len (.symbols b)))
+    (for i (range 0 (len (.symbols b)))
+      (let [s (get (.symbols b) i)]
+        (push! (mut symbols)
+               (Symbol
+                 :name (.name s)
+                 :scope (.scope s)
+                 :uses (.uses s)
+                 :final
+                   (match (get names (+ (.symbol-start b) i))
+                     (Some [n] n)
+                     (None [] (.name s)))
+                 :pinned (.pinned s)))))
+    (Block
+      :scopes (.scopes b)
+      :symbols symbols
+      :scope-start (.scope-start b)
+      :symbol-start (.symbol-start b)
+      :roots (.roots b)
+      :dynamic (.dynamic b))))
+
+;;; Whether symbol `s` is one of `b`'s.
+(defn block-has? [(b Block) (s i64)] (-> bool)
+  (and (>= s (.symbol-start b)) (< s (+ (.symbol-start b) (len (.symbols b))))))
+
+;;; `t`, a table joined from blocks, with `blocks` in place of its own, one for each (each the same
+;;; but for what its symbols are named), and the symbols linking made named `made[s]`, or else as
+;;; they are: every symbol's name in the output. It costs what joining does.
+(defn named-from [(t Table) (blocks (ArrayList Block)) (made (HashMap i64 (slice u8)))] (-> Table)
+  (match (.joined t)
+    (None [] (panic "symtab: named-from takes a table joined from blocks"))
+    (Some [j]
+          (unless (= (len blocks) (len (.blocks j)))
+            (panic "symtab: named-from was given {} blocks for a table of {}" (len blocks) (len (.blocks j))))
+          (let [(mut scope-starts) (ArrayList::new [i64] (rt/value-allocator))
+                (mut named) (HashMap::new-scalar [i64 Symbol] (rt/value-allocator))]
+            (for b blocks (push! (mut scope-starts) (.scope-start b)))
+            ;; A symbol a module claims is in its block, or one linking made: any other would be
+            ;; named in no block.
+            (for id made
+              (match (get (.made j) id)
+                (Some [_] 0)
+                (None [] (panic "symtab: symbol {} is named by a module whose block does not hold it, and linking did not make it" id))))
+            (for id (.made j)
+              (match (get (.made j) id)
+                (Some [s]
+                      (set! (mut named)
+                            id
+                            (Symbol
+                              :name (.name s)
+                              :scope (.scope s)
+                              :uses (.uses s)
+                              :final (match (get made id) (Some [n] n) (None [] (.name s)))
+                              :pinned (.pinned s))))
+                (None [] 0)))
+            (let [(mut sorted) (ArrayList::new [Block] (rt/value-allocator))
+                  (mut starts) (ArrayList::new [i64] (rt/value-allocator))]
+              (for i (rt/sort-order-int scope-starts false) (push! (mut sorted) (get blocks i)))
+              (for b sorted (push! (mut starts) (.symbol-start b)))
+              (Table
+                :scopes (.scopes t)
+                :symbols (ArrayList::new [Symbol] (rt/value-allocator))
+                :free (names-map)
+                :outer (HashMap::new-scalar [i64 i64] (rt/value-allocator))
+                :joined
+                  (Some (Joined
+                          :blocks sorted
+                          :by-symbol (rt/sort-order-int starts false)
+                          :made named
+                          :extra (.extra j)
+                          :scopes (.scopes j)
+                          :symbols (.symbols j)))))))))
+
+;;; `t` with every symbol named `finals[s]`: names given the whole program at once.
+(defn renamed-all [(t Table) (finals (ArrayList (slice u8)))] (-> Table)
+  (match (.joined t)
+    (None [] (panic "symtab: renamed-all takes a table joined from blocks"))
+    (Some [j]
+          (let [(mut blocks) (ArrayList::new [Block] (rt/value-allocator))
+                (mut made) (HashMap::new-scalar [i64 (slice u8)] (rt/value-allocator))]
+            (for b (.blocks j)
+              (let [(mut names) (HashMap::new-scalar [i64 (slice u8)] (rt/value-allocator))]
+                (for i (range 0 (len (.symbols b)))
+                  (let [s (+ (.symbol-start b) i)]
+                    (when (< s (len finals)) (set! (mut names) s (get finals s)))))
+                (push! (mut blocks) (renamed b names))))
+            (for id (.made j)
+              (when (< id (len finals)) (set! (mut made) id (get finals id))))
+            (named-from t blocks made)))))
+
+;;; Every symbol's name in the output, by id.
+(defn final-names [(t Table)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] (rt/value-allocator))]
+    (for s (range 0 (symbol-count t)) (push! (mut out) (.final (symbol-at t s))))
+    out))
+
 ;;; A copy of `t` with each of `parts` grafted under `parent` in turn.
 (defn grafted [(t Table) (parts (ArrayList Table)) (parent i64)] (-> Table)
   (own-table! t "grafted")
@@ -721,7 +831,7 @@
     (Some [j]
           (rt/put-bool! w true)
           (rt/put-varint! w (len (.blocks j)))
-          (for b (.blocks j) (persist-encode-Block w b))
+          (for b (.blocks j) (put-block! w b))
           (rt/put-ints! w (.by-symbol j))
           (rt/put-varint! w (len (.made j)))
           (for id (.made j)
@@ -752,9 +862,14 @@
               (None [] (panic "a map lost a key while it was written"))))))
   0)
 
-;;; A block, for the cache: its scopes, symbols, place, top scopes and whether its top is dynamic.
+;;; A block, for the cache: its scopes, symbols, place, top scopes and whether its top is dynamic. Its
+;;; scopes are an object of the cache's, written once for every block that shares them (a module's
+;;; block and the same named for the output).
 (defn persist-encode-Block [(w (ptr rt/Writer)) (b Block)] (-> void)
-  (encode-scopes! w (.scopes b))
+  (let [(mut scopes) (.scopes b)]
+    (when (rt/put-object-bytes! w "hl.symtab.Scopes" (cast (ptr u8) (mut scopes)) (sizeof (ArrayList Scope)))
+      (encode-scopes! w (.scopes b))
+      (rt/put-object-end! w)))
   (encode-symbols! w (.symbols b))
   (rt/put-int! w (.scope-start b))
   (rt/put-int! w (.symbol-start b))
@@ -763,7 +878,7 @@
   0)
 
 (defn persist-decode-Block [(r (ptr rt/Reader))] (-> Block)
-  (let [scopes (decode-scopes r)
+  (let [scopes (take-scopes r)
         symbols (decode-symbols r)
         scope-start (rt/take-int r)
         symbol-start (rt/take-int r)
@@ -776,6 +891,41 @@
       :symbol-start symbol-start
       :roots roots
       :dynamic dynamic)))
+
+;;; A block where a table joined from it holds it: an object of the cache's, as a block a memo's
+;;; answer holds is, so the two are written once and read back as one.
+(defn put-block! [(w (ptr rt/Writer)) (b Block)] (-> void)
+  (let [(mut v) b]
+    (when (rt/put-object-bytes! w "hl.symtab.Block" (cast (ptr u8) (mut v)) (sizeof Block))
+      (persist-encode-Block w b)
+      (rt/put-object-end! w)))
+  0)
+
+(defn take-block [(r (ptr rt/Reader))] (-> Block)
+  (let [id (rt/take-object r)]
+    (if (rt/object-ready? r id)
+        (do
+          (rt/object-skip! r)
+          (load (cast (ptr Block) (rt/object-value r id))))
+        (do
+          (rt/object-enter! r)
+          (let [(mut v) (persist-decode-Block r)]
+            (rt/object-leave! r (cast (ptr u8) (mut v)) (sizeof Block))
+            (rt/writer-know-bytes! "hl.symtab.Block" (cast (ptr u8) (mut v)) (sizeof Block) id)
+            v)))))
+
+(defn take-scopes [(r (ptr rt/Reader))] (-> (ArrayList Scope))
+  (let [id (rt/take-object r)]
+    (if (rt/object-ready? r id)
+        (do
+          (rt/object-skip! r)
+          (load (cast (ptr (ArrayList Scope)) (rt/object-value r id))))
+        (do
+          (rt/object-enter! r)
+          (let [(mut v) (decode-scopes r)]
+            (rt/object-leave! r (cast (ptr u8) (mut v)) (sizeof (ArrayList Scope)))
+            (rt/writer-know-bytes! "hl.symtab.Scopes" (cast (ptr u8) (mut v)) (sizeof (ArrayList Scope)) id)
+            v)))))
 
 (defn encode-scopes! [(w (ptr rt/Writer)) (scopes (ArrayList Scope))] (-> void)
   (rt/put-varint! w (len scopes))
@@ -855,7 +1005,7 @@
     (if (rt/take-bool r)
         (let [(mut blocks) (ArrayList::new [Block] (rt/value-allocator))
               nblocks (rt/take-varint r)]
-          (for _ (range 0 nblocks) (push! (mut blocks) (persist-decode-Block r)))
+          (for _ (range 0 nblocks) (push! (mut blocks) (take-block r)))
           (let [by-symbol (rt/take-ints r)
                 (mut made) (HashMap::new-scalar [i64 Symbol] (rt/value-allocator))
                 nmade (rt/take-varint r)]

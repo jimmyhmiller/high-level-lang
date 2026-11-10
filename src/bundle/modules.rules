@@ -56,6 +56,11 @@ setting order: [Int]
 setting entry: Int
 setting entries: [Int]
 setting table: sym.Table
+# Each module's own table at its place, by module: what the shared table is joined from.
+setting blocks: {Int:sym.Block}
+# Each module's rank in the order the program runs in: modules in that order, by numbers that stay
+# while the order around a module does (see `order-ranks`).
+setting ranks: {Int:Int}
 
 # The scope around every module's top level: the table's first.
 const bundle-scope: Int = 0
@@ -89,6 +94,10 @@ record Loading {
 setting loading: Loading
 
 fn name-id(s: Text) -> Int = intern!(names, s)
+
+# A name's stem: the name without the digits it ends in. Every name renaming tries in place of a
+# name, `x`, `x2`, `x3`…, has the name's stem, so only names of one stem can take each other's.
+fn stem-of(name: Text) -> Text = name[0..len(name) - span-back-of(name, "0123456789")]
 
 # `node_modules/lodash-es/_root.js` -> `root`, as esbuild names things.
 fn base-name(path: Text) -> Text = match text-of-bytes([name-byte(c) for c in raw[start..len(raw)]]) {
@@ -1018,8 +1027,8 @@ fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] = match wave {
 # A program's modules, as the settings above hold them.
 # Its blocks are the modules' own tables, each at its place among the build's, which the shared
 # one is joined from; it holds `symbols` symbols before linking makes more.
-record Graph { modules: [Module], by-path: {Text:Int}, order: [Int], entries: [Int], blocks: [sym.Block], symbols: Int,
-               scopes: Int, scope-shifts: [Int], symbol-shifts: [Int] }
+record Graph { modules: [Module], by-path: {Text:Int}, order: [Int], ranks: {Int:Int}, entries: [Int], blocks: [sym.Block],
+               module-blocks: {Int:sym.Block}, symbols: Int, scopes: Int, scope-shifts: [Int], symbol-shifts: [Int] }
 
 # Where each module's symbols, scopes and statements are numbered in the build's one table and its
 # facts: a block of each, kept from one build to the next while it is big enough, so a module that
@@ -1031,6 +1040,11 @@ setting scope-places: rt.Places = places-new()
 setting part-places: rt.Places = places-new()
 setting module-places: rt.Places = places-new()
 
+# Each module's rank in the order the program runs in, by what it is: kept from one build to the
+# next while it stays in order with the modules around it, so a module added, or moved, ranks again
+# alone and the others keep theirs.
+setting order-ranks: rt.Ranks = ranks-new()
+
 # Each module's id, by what it is (a path, or an outside import): kept from one build to the next,
 # the runtime's 0 and the rest from 1 on, in the order the walk first reaches them. An id no module
 # has this build holds an empty one.
@@ -1040,9 +1054,9 @@ fn module-ids(keys: [Text]) -> [Int] = [place!(module-places, k, 1) + 1 for k in
 # where all of them end.
 record Placement { scope-shifts: [Int], symbol-shifts: [Int], symbols: Int, scopes: Int }
 
-fn placement(keys: [Text], tables: [sym.Table]) -> Placement =
-  Placement(symbol-shifts: [place!(symbol-places, keys[i], sym.symbol-count(tables[i])) for i in 0..len(keys)],
-            scope-shifts: [place!(scope-places, keys[i], sym.scope-count(tables[i]) - 1) for i in 0..len(keys)],
+fn placement(keys: [Text], sizes: [TableSize]) -> Placement =
+  Placement(symbol-shifts: [place!(symbol-places, keys[i], sizes[i].symbols) for i in 0..len(keys)],
+            scope-shifts: [place!(scope-places, keys[i], sizes[i].scopes - 1) for i in 0..len(keys)],
             symbols: places-end(symbol-places), scopes: places-end(scope-places))
 
 # The symbols linking makes, by what each is for.
@@ -1154,14 +1168,16 @@ fn external?(key: Text) -> Bool = key is "external:" ++ _
 fn graph(runtime: Text, paths: [Text]) -> Graph =
   Graph(modules: updated([runtime-module(rt, lay)] ++ [blank-module(id, "", External, bundle-scope) for id in 1..top],
                          {numbers[i]: module-at(w, i, ids, lay, parts, wholes) for i in 0..len(w.pre)}),
-        by-path: ids, order: [0] ++ [numbers[i] for i in w.post if not external?(w.pre[i])],
+        by-path: ids, order: [0] ++ [numbers[i] for i in post], ranks: {order-ids[k]: ranked[k] for k in 0..len(order-ids)},
         entries: [ids[p] ?? (panic "{} was not loaded", p) for p in paths],
-        blocks: [runtime-block(runtime, lay.scope-shifts[0], lay.symbol-shifts[0])]
-                ++ [file-block(files[k], lay.scope-shifts[k + 1], lay.symbol-shifts[k + 1]) for k in 0..len(files)],
+        blocks: blocks, module-blocks: {0: blocks[0]} ++ {ids[files[k]] ?? (panic "{} has no id", files[k]): blocks[k + 1] for k in 0..len(files)},
         symbols: lay.symbols,
         scopes: lay.scopes, scope-shifts: lay.scope-shifts, symbol-shifts: lay.symbol-shifts)
   where w = depth-first(paths, led-to),
         numbers = module-ids(w.pre),
+        post = [i for i in w.post if not external?(w.pre[i])],
+        order-ids = [0] ++ [numbers[i] for i in post],
+        ranked = rank!(order-ranks, ["<runtime>"] ++ [w.pre[i] for i in post]),
         ids = {w.pre[i]: numbers[i] for i in 0..len(w.pre)},
         top = (fold t = 1 for n in numbers: max(t, n + 1)),
         files = [key for key in w.pre if not external?(key)],
@@ -1170,8 +1186,9 @@ fn graph(runtime: Text, paths: [Text]) -> Graph =
         # Where each file's scopes are among the parts the table is made of: after the runtime's.
         parts = {files[k]: k + 1 for k in 0..len(files)},
         rt = runtime-parsed(runtime).analysis,
-        tables = [rt.table] ++ [scopes-of(f) for f in files],
-        lay = placement(["<runtime>"] ++ files, tables)
+        lay = placement(["<runtime>"] ++ files, [size-of(rt.table)] ++ [table-size(f) for f in files]),
+        blocks = [runtime-block(runtime, lay.scope-shifts[0], lay.symbol-shifts[0])]
+                 ++ [file-block(files[k], lay.scope-shifts[k + 1], lay.symbol-shifts[k + 1]) for k in 0..len(files)]
 
 # A module's own table at its place among the build's, made once for as long as the table and the
 # place stay the same: the blocks the build's one table is joined from (see `an.linked-table`), so an
@@ -1199,6 +1216,14 @@ fn runtime-module(rt: sym.Analysis, lay: Placement) -> Module =
 fn leads-of(path: Text) -> [Lead] = loaded(path).leads
 fn whole-of(path: Text) -> [Text] = loaded(path).whole
 fn scopes-of(path: Text) -> sym.Table = loaded(path).scopes
+
+# How many scopes and symbols a file's own table has: all that placing it needs, kept by itself so
+# a build that finds the file unchanged reads two numbers and not the table.
+record TableSize { scopes: Int, symbols: Int }
+
+fn table-size(path: Text) -> TableSize = size-of(scopes-of(path))
+
+fn size-of(t: sym.Table) -> TableSize = TableSize(scopes: sym.scope-count(t), symbols: sym.symbol-count(t))
 
 # The module the walk reached `i`th: an outside import, or a file, with side effects as the import
 # that first reached it says, or as an entry has them.

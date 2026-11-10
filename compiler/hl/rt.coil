@@ -2052,21 +2052,6 @@
 (defn row-col [(r (mut Rel)) (row i64) (col i64)] (-> i64)
   (if (< col (.arity r)) (rel-at (mut r) row col) 0))
 
-;;; A relation of its own with `r`'s rows in `r`'s order, but those `gone` has; its indexes made again
-;;; as queries ask for them, and every row counted seen.
-(defn rel-without [(r (mut Rel)) (gone (mut Rel))] (-> Rel)
-  (let [(mut out) (rel-new (.arity r))]
-    (rel-reserve! (mut out) (.count r))
-    (for row (range 0 (.count r))
-      (let [a (row-col (mut r) row 0)
-            b (row-col (mut r) row 1)
-            c (row-col (mut r) row 2)
-            d (row-col (mut r) row 3)]
-        (unless (and (> (.count gone) 0) (rel-has? (mut gone) a b c d))
-          (rel-add! (mut out) a b c d))))
-    (set! (.seen out) (.count out))
-    out))
-
 ;;; A database's id of its own, one more than the last: which a database made from it in place names.
 (defn db-id-next! [] (-> i64)
   (let [cell (primitive/alloc-static DbIds)]
@@ -2267,29 +2252,6 @@
                   :else (rel-count-set! (mut r) at now))))))
     n))
 
-;;; How many rows would change were `r` to hold just what `tally` counts: those it holds that
-;;; `tally` has not, and those `tally` counts that it has not.
-(defn rel-reset-changes [(r (mut Rel)) (tally (mut Rel))] (-> i64)
-  (let [(mut n) 0]
-    (for row (range 0 (.count r))
-      (when (and (rel-live-row? (mut r) row)
-                 (< (rel-find (mut tally)
-                              (row-col (mut r) row 0)
-                              (row-col (mut r) row 1)
-                              (row-col (mut r) row 2)
-                              (row-col (mut r) row 3))
-                    0))
-        (set! n (+ n 1))))
-    (for row (range 0 (.count tally))
-      (when (< (rel-find (mut r)
-                         (row-col (mut tally) row 0)
-                         (row-col (mut tally) row 1)
-                         (row-col (mut tally) row 2)
-                         (row-col (mut tally) row 3))
-               0)
-        (set! n (+ n 1))))
-    n))
-
 ;;; `r` made to hold just what `tally` counts, each row stated by as many facts as it says: what it
 ;;; held that `tally` has not taken out (and added to `minus`), what `tally` has that it had not
 ;;; added (and to `plus`). For a relation whose counts are not known: one read back from the cache.
@@ -2338,27 +2300,6 @@
   (let [(mut out) (ArrayList::new [i64] a)]
     (reserve! (mut out) (len xs))
     (for x xs (push! (mut out) x))
-    out))
-
-;;; A relation of its own with `r`'s rows in `r`'s order: one to add to while `r` stays as it is. Its
-;;; rows and their hashes are copied as they are; its indexes are made again as queries ask for them.
-(defn rel-clone [(r (mut Rel))] (-> Rel)
-  (let [(mut out) (rel-new (.arity r))
-        a (.alc out)
-        (mut present) (ArrayList::new [u8] a)]
-    (for x (.present r) (push! (mut present) x))
-    (set! (.data out) (ints-copy-in (.data r) a))
-    (set! (.next out) (ints-copy-in (.next r) a))
-    (set! (.heads out)
-          (IntTable
-            :keys (ints-copy-in (.keys (.heads r)) a)
-            :vals (ints-copy-in (.vals (.heads r)) a)
-            :count (.count (.heads r))
-            :mask (.mask (.heads r))
-            :alc a))
-    (set! (.present out) present)
-    (set! (.count out) (.count r))
-    (set! (.seen out) (.count r))
     out))
 
 ;;; Rows `from` to `to` of `a` that `b` has not, added to `out`. Answers how many.
@@ -2585,6 +2526,96 @@
                         (= (match (get (.size a) key) (Some [n] n) (None [] -1))
                            (match (get (.size b) key) (Some [n] n) (None [] -1))))
              (return-from :same false)))
+         true)))
+
+;;; Ranks that keep keys in order: each key's rank, kept from one order to the next while the key
+;;; stays in order with the keys around it, so a key that arrives, or moves, takes a rank between its
+;;; new neighbours' and no other key's changes. Ranks are spaced apart to leave room; only when a run
+;;; of new keys finds no room between its neighbours is every key ranked afresh. `version` counts the
+;;; orders that changed any rank.
+(defstruct Ranks
+  [(at (HashMap (slice u8) i64))
+   (keys (ArrayList (slice u8)))
+   (version i64)])
+
+(defn ranks-new [] (-> Ranks)
+  (Ranks
+    :at (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :keys (ArrayList::new [(slice u8)] (malloc-allocator))
+    :version 0))
+
+;;; A key's rank, or -1 when it has none.
+(defn rank-of [(r Ranks) (key (slice u8))] (-> i64)
+  (match (get (.at r) key) (Some [n] n) (None [] -1)))
+
+(defn ranks-version [(r Ranks)] (-> i64)
+  (.version r))
+
+(defn rank-gap [] (-> i64)
+  1048576)
+
+;;; Ranks for `keys`, in that order, each greater than the one before: the most keys that can keep
+;;; the ranks they had keep them (the longest run of them already in order), and the rest are spread
+;;; between their neighbours.
+(defn rank! [(r (mut Ranks)) (keys (ArrayList (slice u8)))] (-> (ArrayList i64))
+  (let [n (len keys)
+        (mut old) (ArrayList::new [i64] (value-allocator))
+        (mut kept) (ArrayList::new [bool] (value-allocator))
+        (mut out) (ArrayList::new [i64] (value-allocator))]
+    (for key keys (push! (mut old) (rank-of r key)) (push! (mut kept) false) (push! (mut out) 0))
+    ;; The longest strictly increasing run of old ranks, by patience: `tails[j]` ends the best run of
+    ;; length j + 1 found so far, and each key links to the key before it in its run.
+    (let [(mut tails) (ArrayList::new [i64] (value-allocator))
+          (mut before) (ArrayList::new [i64] (value-allocator))]
+      (for i (range 0 n)
+        (push! (mut before) -1)
+        (let [o (get old i)]
+          (when (>= o 0)
+            (let [(mut lo) 0
+                  (mut hi) (len tails)]
+              (while (< lo hi)
+                (let [mid (/ (+ lo hi) 2)]
+                  (if (< (get old (get tails mid)) o) (set! lo (+ mid 1)) (set! hi mid))))
+              (when (> lo 0) (set! (mut before) i (get tails (- lo 1))))
+              (if (= lo (len tails)) (push! (mut tails) i) (set! (mut tails) lo i))))))
+      (let [(mut at) (if (> (len tails) 0) (get tails (- (len tails) 1)) -1)]
+        (while (>= at 0)
+          (set! (mut kept) at true)
+          (set! at (get before at)))))
+    ;; Each run of keys that keep no rank, between the kept ranks around it.
+    (let [(mut room) true
+          (mut i) 0]
+      (while (and room (< i n))
+        (if (get kept i)
+            (do (set! (mut out) i (get old i)) (set! i (+ i 1)))
+            (let [(mut j) i]
+              (while (and (< j n) (not (get kept j))) (set! j (+ j 1)))
+              (let [m (- j i)
+                    lo (if (> i 0) (get out (- i 1)) -1)
+                    hi (if (< j n) (get old j) (+ lo (* (rank-gap) (+ m 1))))]
+                (if (< (- hi lo 1) m)
+                    (set! room false)
+                    (let [step (/ (- hi lo) (+ m 1))]
+                      (for k (range 0 m) (set! (mut out) (+ i k) (+ lo (* step (+ k 1)))))))
+                (set! i j)))))
+      (unless room
+        (for i (range 0 n) (set! (mut out) i (* (rank-gap) (+ i 1))))))
+    (let [(mut changed) false]
+      (for i (range 0 n)
+        (let [key (get keys i)]
+          (unless (= (get old i) (get out i))
+            (set! changed true)
+            (when (< (get old i) 0) (push! (mut (.keys r)) (own-text key)))
+            (set! (mut (.at r)) key (get out i)))))
+      (when changed (set! (.version r) (+ (.version r) 1))))
+    out))
+
+;;; Whether two give the same keys the same ranks.
+(defn ranks-same? [(a Ranks) (b Ranks)] (-> bool)
+  (and (= (len (.keys a)) (len (.keys b)))
+       (block :same
+         (for key (.keys a)
+           (unless (= (rank-of a key) (rank-of b key)) (return-from :same false)))
          true)))
 
 ;; ---------------------------------------------------------------- files
@@ -4893,15 +4924,19 @@
             (set! (mut (.changed d)) id now))
         ;; Everything that read it, through any number of answers, may have changed.
         (push! (mut todo) id)
-        (while (> (len todo) 0)
-          (let [at (match (pop! (mut todo)) (Some [x] x) (None [] -1))]
-            (let [(mut e) (dep-head d at)]
-              (while (>= e 0)
-                (let [out (get (.edge-to d) e)]
-                  (unless (get (.dirty d) out)
-                    (set! (mut (.dirty d)) out true)
-                    (push! (mut todo) out)))
-                (set! e (get (.edge-next d) e))))))
+        (let [(mut marked) 0]
+          (while (> (len todo) 0)
+            (let [at (match (pop! (mut todo)) (Some [x] x) (None [] -1))]
+              (let [(mut e) (dep-head d at)]
+                (while (>= e 0)
+                  (let [out (get (.edge-to d) e)]
+                    (unless (get (.dirty d) out)
+                      (set! (mut (.dirty d)) out true)
+                      (set! marked (+ marked 1))
+                      (push! (mut todo) out)))
+                  (set! e (get (.edge-next d) e))))))
+          (when (and (dep-tracing-checks?) (> marked 0))
+            (println "[deps] {} changed: {} more may have" (dep-node-text d id) marked)))
         (free! (mut todo)))
       (deps-unlock! d)
       (when (dep-tracing?) (println "[deps] changed {}" (dep-node-text d id))))
@@ -4932,20 +4967,46 @@
                   node (dep-node-text d me)]
               (deps-unlock! d)
               (block :check
+                ;; What it read that no memo makes first (inputs, and settings' parts): telling
+                ;; whether one changed computes nothing, and one that did settles it.
                 (for read reads
-                  (let [changed (dep-bring-up! d read)]
-                    (when (> changed since)
-                      (when (dep-tracing?)
-                        (deps-lock! d)
-                        (let [what (dep-node-text d read)]
-                          (deps-unlock! d)
-                          (println "[deps] {} because {}" node what)))
-                      (return-from :check false))))
+                  (unless (dep-made? d read)
+                    (let [changed (dep-bring-up! d read)]
+                      (when (> changed since)
+                        (when (dep-tracing?)
+                          (deps-lock! d)
+                          (let [what (dep-node-text d read)]
+                            (deps-unlock! d)
+                            (println "[deps] {} because {}" node what)))
+                        (return-from :check false)))))
+                (for read reads
+                  (when (dep-made? d read)
+                    (let [changed (dep-bring-up! d read)]
+                      (when (> changed since)
+                        (when (dep-tracing?)
+                          (deps-lock! d)
+                          (let [what (dep-node-text d read)]
+                            (deps-unlock! d)
+                            (println "[deps] {} because {}" node what)))
+                        (return-from :check false)))))
                 (deps-lock! d)
                 (set! (mut (.verified d)) me (atomic/read (field d revision)))
                 (set! (mut (.dirty d)) me false)
                 (deps-unlock! d)
+                (when (dep-tracing-checks?)
+                  (println "[deps] checked {}, {} reads" node (len reads)))
                 true))))))
+
+;;; Whether a node is a memo's answer, which bringing up to date may compute: one whose text names
+;;; its function and key.
+(defn dep-made? [(d (ptr Deps)) (id i64)] (-> bool)
+  (if (numbered? id)
+      false
+      (do
+        (deps-lock! d)
+        (let [made (match (index-of (get (.texts d) id) "\0") (Some [_] true) (None [] false))]
+          (deps-unlock! d)
+          made))))
 
 ;;; A node up to date, and the revision it last changed in: an input or setting as it stands, a
 ;;; memo's answer through its memo.
@@ -4978,6 +5039,21 @@
     (push-str! (mut b) "\0")
     (push-str! (mut b) key)
     (finish! (mut b))))
+
+;;; Whether HL_TRACE_CHECKS is set: each memo answer that might have changed, checked and found
+;;; current, is printed, with how many reads it checked.
+(defn dep-tracing-checks? [] (-> bool)
+  (let [t (primitive/alloc-static DepTrace)]
+    (when (= (.known t) 0)
+      (set! (.on t)
+            (if (= (primitive/cast i64
+                                   (os/getenv (str/to-cstr (malloc-allocator)
+                                                           "HL_TRACE_CHECKS")))
+                   0)
+                0
+                1))
+      (set! (.known t) 1))
+    (= (.on t) 1)))
 
 ;;; Whether HL_TRACE_DEPS is set: each memo answer computed is printed, and whether it changed.
 (defn dep-tracing? [] (-> bool)
@@ -6322,6 +6398,24 @@
                 (Some [n] n)
                 (None [] (panic "place {} has a start and no size" key)))))
   (put-int! w (.end p)))
+
+(defn persist-encode-Ranks [(w (ptr Writer)) (x Ranks)] (-> void)
+  (put-varint! w (len (.keys x)))
+  (for key (.keys x)
+    (put-text! w key)
+    (put-int! w (rank-of x key)))
+  (put-int! w (.version x)))
+
+(defn persist-decode-Ranks [(r (ptr Reader))] (-> Ranks)
+  (let [(mut out) (ranks-new)
+        n (take-varint r)]
+    (for _ (range 0 n)
+      (let [key (take-text r)
+            rank (take-int r)]
+        (push! (mut (.keys out)) key)
+        (set! (mut (.at out)) key rank)))
+    (set! (.version out) (take-int r))
+    out))
 
 (defn persist-decode-Places [(r (ptr Reader))] (-> Places)
   (let [(mut out) (places-new)

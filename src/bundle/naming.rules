@@ -1,22 +1,39 @@
 # Every symbol's name in the output, as esbuild's number renamer gives them: reserved words and the
 # free names of the output's modules first, then each top-level claim in the program's order, the
 # first of `x`, `x2`, `x3`… that nothing has; then each nested scope's symbols, clear of the top
-# level's names and of the scopes around them. What the build chose, emitting reads: `finals` has a
-# name for each symbol.
+# level's names and of the scopes around them. What the build chose, emitting reads: `finals` names
+# every symbol.
 #
-# Each module's part is its own: the names it reserves, the claims its statements make, and its
-# nested scopes' names, which read of the top level only whether each name they try is taken. So
-# an edit to a module names again that module, and the top level only when its claims change.
+# The top level is named stem by stem (see `m.stem-of`): every name renaming tries for a claim has
+# the claim's stem, so one stem's names are decided by the claims and the reserved names of that
+# stem alone. Which modules may claim, or reserve, names of a stem, linking's database says
+# (`claims-stem`, `reserves-stem`), and it is brought up to date with the rest. Each module's part
+# is its own: the names it reserves, the claims its statements make, and its nested scopes' names,
+# which read of the top level only whether each name they try is taken, stem by stem. So an edit
+# names again the stems its module's claims are of, and the modules those stems name, and no more.
 rules bundle.naming over bundle.js
 use bundle.modules as m
 use bundle.analysis as an
 
-setting finals: [Text]
+# Every symbol, named as the output names it: the build's table with each module's block named.
+setting finals: sym.Table
 
-# The names the top level took, and which symbol took each (-1: reserved).
-setting top-taken: {Text:Int}
+# Whether every global the runtime refers to is kept from the program's names: when any of the
+# runtime is in the output, or lowering may add its helpers. Otherwise only those the bundle writes.
+setting runtime-kept: Bool
 
-fn final-of(s: Int) -> Text = finals[s]
+# What each module in the output claims, by stem, and the names each keeps from everything else:
+# what naming a stem reads of the modules. Given as settings, which are compared module by module,
+# so a module whose claims an edit left as they were changes nothing that names a stem.
+setting claims-of: {Int:{Text:[Claim]}}
+setting reserved-of: {Int:[Text]}
+
+# The top level's names, stem by stem, for every stem a module claims or reserves names of: what a
+# module's names read of the top level. A setting, compared stem by stem, so a stem whose names an
+# edit left as they were changes nothing that reads it, though the edit named it again.
+setting top-names: {Text:StemNames}
+
+fn final-of(s: Int) -> Text = sym.symbol-at(finals, s).final
 
 const keywords: [Text] = ["arguments", "await", "break", "case", "catch", "class", "const", "continue",
   "debugger", "default", "delete", "do", "else", "enum", "eval", "export", "extends", "false", "finally",
@@ -37,31 +54,12 @@ fn parts-of(id: Int) -> [Int] = [p for m.db.part-of(?p, id)]
 fn import-symbol?(s: Int) -> Bool = m.db.import-of(s, _, _) or m.db.ns-import(s, _)
 
 # Names nothing may take: reserved words, and the free names of the modules in the output, the
-# runtime's being `runtime-globals`.
+# runtime's being `runtime-globals`: what minifying, which names the whole program at once, keeps.
 fn reserved(extra: [Text]) -> {Text:Int} =
-  {w: -1 for w in keywords ++ extra ++ [f for id in m.order if id != 0 and included?(id) for f in module-reserved(id)]}
-
-# The names a module keeps from everything else.
-fn module-reserved(id: Int) -> [Text] = m.modules[id].free ++ eval-kept(m.modules[id])
-
-# The names of a module's nested scopes that `eval` can reach: they keep them, and nothing else may
-# take them, as esbuild has it.
-fn eval-kept(mo: m.Module) -> [Text] = match mo.kind {
-  m.Cjs => kept-below(root.parent)
-  _ => [n for child in root.children for n in kept-below(child)]
-} where root = sym.scope-at(m.table, mo.root)
-
-fn kept-below(scope: Int) -> [Text] = match now.dynamic {
-  true => [sym.symbol-at(m.table, s).name for s in now.symbols] ++ [kept-below(child)... for child in now.children]
-  false => []
-} where now = sym.scope-at(m.table, scope)
+  {w: -1 for w in keywords ++ extra ++ [f for id in m.order if id != 0 and included?(id) for f in an.module-reserved(id)]}
 
 # A name a statement takes at the top level: a symbol's, or one only kept from use, as -1.
 record Claim { symbol: Int, name: Text }
-
-# The top level's claims in order: each live statement's own symbols, and before them its imports
-# from CommonJS, which are rewritten to property reads but whose names stay taken, as in esbuild.
-fn claims() -> [Claim] = [c for id in m.order if included?(id) for c in module-claims(id)]
 
 # A module's claims, in its statements' order.
 fn module-claims(id: Int) -> [Claim] =
@@ -76,6 +74,45 @@ fn cjs-claims(s: Node, mo: m.Module) -> [Claim] = match s {
   _ => []
 }
 
+# A module's claims, by their names' stems.
+fn module-stem-claims(id: Int) -> {Text:[Claim]} =
+  fold g = {} for c in module-claims(id): g ++ {m.stem-of(c.name): (g[m.stem-of(c.name)] ?? []) ++ [c]}
+
+# The names of one stem taken at the top level, and which symbol took each (-1: reserved); and the
+# name each claim of the stem was given, by its symbol.
+record StemNames { taken: {Text:Int}, names: {Int:Text} }
+
+# Naming a stem, as far as it has come: the names taken, each claim's name, and, for each name
+# claimed, the number its last claim stopped at, where its next starts trying, since what was taken
+# then is taken still.
+record Naming { taken: {Text:Int}, names: {Int:Text}, tries: {Text:Int} }
+
+# One stem's names: its reserved names first, then each claim of the stem, in the program's order.
+fn stem-named(stem: Text) -> StemNames = StemNames(taken: done.taken, names: done.names)
+  where sid = known-name(m.names, stem),
+        # A stem no name of any module's has: nothing claims or reserves it.
+        reserving = [id for x in [sid] if x >= 0 for m.db.reserves-stem(?id, x) if id != 0 and included?(id)],
+        reserved = {w: -1 for w in keywords ++ globals() ++ [n for id in reserving for n in reserved-of[id] ?? []]
+                    if m.stem-of(w) == stem},
+        claimers = sort id in [id for x in [sid] if x >= 0 for m.db.claims-stem(?id, x) if included?(id)] by m.ranks[id] ?? -1,
+        claims = [c for id in claimers for c in (claims-of[id] ?? {})[stem] ?? []],
+        done = fold t = Naming(taken: reserved, names: {}, tries: {}) for c in claims:
+          (t with { taken: t.taken ++ {name: c.symbol}, names: t.names ++ {c.symbol: name}, tries: t.tries ++ {c.name: i} }
+           where i = first j in (t.tries[c.name] ?? 1).. if not (spelled(c.name, j) in t.taken): j,
+                 name = spelled(c.name, i))
+
+# Whether the top level took a name. Of a stem no module claims or reserves, only a reserved word or
+# a global can be taken.
+fn top-taken?(name: Text) -> Bool = match top-names[m.stem-of(name)] {
+  some(x) => name in x.taken
+  none => name in keywords or name in globals()
+}
+
+fn globals() -> [Text] = match runtime-kept {
+  true => runtime-globals
+  false => bundle-globals
+}
+
 # `name`, or `name2`, `name3`… the first not taken: at the top level, in a scope around, or before
 # it in its own scope.
 fn unique(name: Text, frames: [{Text:Int}], frame: {Text:Int}) -> Text =
@@ -87,18 +124,10 @@ fn spelled(name: Text, i: Int) -> Text = match i {
 }
 
 fn free?(c: Text, frames: [{Text:Int}], frame: {Text:Int}) -> Bool =
-  not (c in top-taken) and not (c in frame) and not (any f in frames: c in f)
+  not (c in frame) and not (any f in frames: c in f) and not top-taken?(c)
 
 # A symbol and the name it has.
 record Named { symbol: Int, name: Text }
-
-# The names taken at the top level, and which symbol took each; and the claims' names, in order.
-record TopLevel { taken: {Text:Int}, names: [Named] }
-
-fn top-level(reserved: {Text:Int}) -> TopLevel =
-  fold t = TopLevel(taken: reserved, names: []) for c in claims():
-    (t with { taken: t.taken ++ {name: c.symbol}, names: t.names ++ [Named(symbol: c.symbol, name: name)] }
-     where name = first i in 1.. if not (spelled(c.name, i) in t.taken): spelled(c.name, i))
 
 # A scope's names, chosen in order: what they are, and which symbol has each.
 record Frame { taken: {Text:Int}, named: [Named] }
@@ -129,20 +158,35 @@ fn module-nested(mo: m.Module) -> [Named] = match mo.kind {
 # A module's nested scopes' names, clear of the names the top level took.
 fn module-named(id: Int) -> [Named] = module-nested(m.modules[id])
 
-# The top level's names. `lowering`: whether lowering may add the runtime's helpers once the names
-# are given.
-fn top-level-now(lowering: Bool) -> TopLevel =
-  top-level(reserved(match lowering or included?(0) {
-    true => runtime-globals
-    false => bundle-globals
-  }))
+# A module's symbols as the output names them: its block, each claim's name from its stem and its
+# nested scopes' names in it; and the names of the symbols linking made that its statements claim.
+record ModuleNames { block: sym.Block, made: [Named] }
 
-# esbuild's names for every symbol: the top level's, then the nested scopes'.
-fn esbuild-names(lowering: Bool) -> [Text] =
-  with top-taken = top.taken {
-    updated(updated(own-names(), {x.symbol: x.name for x in top.names if x.symbol >= 0}),
-            {x.symbol: x.name for id in m.order if included?(id) for x in module-named(id)})
-  } where top = top-level-now(lowering)
+fn module-names(id: Int) -> ModuleNames = match included?(id) {
+  false => ModuleNames(block: sym.renamed(block, {}), made: [])
+  true => ModuleNames(block: sym.renamed(block, {x.symbol: x.name for x in top ++ module-named(id)}),
+                      made: [x for x in top if not sym.block-has?(block, x.symbol)])
+} where block = m.blocks[id] ?? (panic "module {} has no block", id),
+        top = [Named(symbol: c.symbol, name: (top-names[m.stem-of(c.name)] ?? (panic "no module claims names of {}", c.name)).names[c.symbol] ?? c.name)
+               for c in module-claims(id) if c.symbol >= 0]
+
+# esbuild's names for every symbol. `lowering`: whether lowering may add the runtime's helpers once
+# the names are given.
+fn esbuild-names(lowering: Bool) -> sym.Table =
+  with runtime-kept = lowering or included?(0), claims-of = claims-now(), reserved-of = reserved-now() {
+    with top-names = top-names-now() {
+      named(m.table, [module-names(id) for id in m.order])
+    }
+  }
+
+# The settings naming reads, each made by a function of its own: an edit that leaves every module's
+# claims as they were leaves each the answer it was, which the setting given it finds the same at once.
+fn claims-now() -> {Int:{Text:[Claim]}} = {id: module-stem-claims(id) for id in m.order if included?(id)}
+fn reserved-now() -> {Int:[Text]} = {id: an.module-reserved(id) for id in m.order if id != 0 and included?(id)}
+fn top-names-now() -> {Text:StemNames} = {s: stem-named(s) for sid in [x for m.db.stem(?x)] for s in [name-of(m.names, sid)]}
+
+fn named(t: sym.Table, all: [ModuleNames]) -> sym.Table =
+  sym.named-from(t, [x.block for x in all], {n.symbol: n.name for x in all for n in x.made})
 
 # Each symbol's own name.
 fn own-names() -> [Text] = [sym.symbol-at(m.table, s).name for s in 0..sym.symbol-count(m.table)]
