@@ -178,8 +178,11 @@
 ;;; A lock on one word that a structure holds, for work queues: spin, then let others run.
 (extern sched_yield :cc (cc/C) [] (-> i32))
 
+;;; Taken only when it looks free: a thread that waits reads the word, which every waiter can do
+;;; at once, and writes to it only to take it. Writing while it is held would pull the word from
+;;; whoever holds it and from every other waiter, each time round.
 (defn spin-lock! [(word (ptr i64))] (-> void)
-  (while (!= (atomic/cas word 0 1) 0) 0)
+  (while (or (!= (atomic/read word) 0) (!= (atomic/cas word 0 1) 0)) 0)
   0)
 
 (defn spin-unlock! [(word (ptr i64))] (-> void)
@@ -197,9 +200,8 @@
   (primitive/cast (ptr i64) (primitive/alloc-static InitLock)))
 
 (defn init-lock! [] (-> void)
-  (let [l (init-lock-word)]
-    (while (!= (atomic/cas l 0 1) 0) 0)
-    0))
+  (spin-lock! (init-lock-word))
+  0)
 
 (defn init-unlock! [] (-> void)
   (atomic/store (init-lock-word) 0)
@@ -473,7 +475,13 @@
                           (apart i64)
                           ;; The text this thread last asked the kept texts for: a key goes
                           ;; into several tables in a row.
-                          (kept-last (slice u8))])
+                          (kept-last (slice u8))
+                          ;; Whether this thread is doing one of a run of jobs done at once
+                          ;; (`run-workers`): the thread that started the run too.
+                          (in-job i64)
+                          ;; While this thread helps with another's job (`run-map-workers`):
+                          ;; that thread's worker slot, plus one, whose own settings it reads.
+                          (settings-view i64)])
 
 ;;; The thread-specific key of the threads' region stacks, plus one, as each place that asks keeps
 ;;; it: the key never changes once made, so a place asks `workers` only the first time.
@@ -502,7 +510,7 @@
     (store! t (ThreadRegions :top (primitive/make-dyn Allocator c)
                              :region r
                              :stack (ArrayList::new [i64] (malloc-allocator)) :scratch 0 :apart 0
-                             :kept-last ""))
+                             :kept-last "" :in-job 0 :settings-view 0))
     (push! (mut (.stack t)) (primitive/cast i64 r))
     (push! (mut (.stack t)) (primitive/cast i64 c))
     (push! (mut (.stack t)) 0)
@@ -713,13 +721,36 @@
 
 (defstruct KeptKeyOps [(ready i64) (ops KeyOps)])
 
+;;; A text key's hash for a table: eight bytes at a time (`text-hash`). Keys here are often a
+;;; file's whole path, and are hashed for every table that has them.
+(defn text-key-hash [(slot (ptr i8)) (n i64)] (-> i64)
+  (text-hash (load (primitive/cast (ptr (slice u8)) slot))))
+
+;;; A table's own copies of its text keys, as `str/keyops` keeps them, hashed as above.
+(defn text-keyops [] (-> (ptr KeyOps))
+  (let [c (text-keyops-cell)]
+    (when (once-mine? (field c ready))
+      (let [base (load (str/keyops))]
+        (set! (.ops c)
+              (KeyOps :hash (primitive/fnptr-of text-key-hash)
+                      :eq (.eq base)
+                      :size (.size base)
+                      :copy (.copy base)
+                      :free (.free base)
+                      :owns 1)))
+      (once-made! (field c ready)))
+    (field c ops)))
+
+(defn text-keyops-cell [] (-> (ptr KeptKeyOps))
+  (primitive/alloc-static KeptKeyOps))
+
 ;;; A text key's hash and equality as every table's, with these in place of copying and freeing.
 (defn kept-keyops [] (-> (ptr KeyOps))
   (let [c (primitive/alloc-static KeptKeyOps)]
     (when (once-mine? (field c ready))
       (let [base (load (str/keyops))]
         (set! (.ops c)
-              (KeyOps :hash (.hash base)
+              (KeyOps :hash (primitive/fnptr-of text-key-hash)
                       :eq (.eq base)
                       :size (.size base)
                       :copy (primitive/fnptr-of kept-key-copy)
@@ -731,7 +762,7 @@
 ;;; How a table of kept answers holds its Text keys: views of kept texts; or, in a run that
 ;;; reclaims memory, copies of its own that go when it lets them go.
 (defn memo-keyops [] (-> (ptr KeyOps))
-  (if (reclaiming?) (str/keyops) (kept-keyops)))
+  (if (reclaiming?) (text-keyops) (kept-keyops)))
 
 ;; ---------------------------------------------------------------- values out of scratch storage
 ;;;
@@ -1112,8 +1143,8 @@
 ;;; The labels whose live regions hold the most, with how many and how much.
 (defn regions-labels-report! [] (-> void)
   (let [l (region-labels-state)
-        (mut counts) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
-        (mut bytes) (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+        (mut counts) (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))
+        (mut bytes) (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))]
     (spin-lock! (field l lock))
     (for key (.live l)
       (let [r (primitive/cast (ptr Region) key)
@@ -1268,11 +1299,11 @@
     :ids (ArrayList::new [i64] (malloc-allocator))
     :mask -1
     :filled 0
-    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))
     :next-id 0
     :defined (ArrayList::new [i64] (malloc-allocator))
     :open (ArrayList::new [i64] (malloc-allocator))
-    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))))
 
 ;;; What a copy writer wrote, as a reader of its bytes copied where values go now; the writer let go.
 (defn copy-reader [(w (ptr Writer))] (-> (ptr Reader))
@@ -3127,7 +3158,7 @@
             :parent (ArrayList::new [i64] (tree-allocator))
             :slot (ArrayList::new [i64] (tree-allocator)))
         (mut seen)
-          (HashMap::new [(slice u8) i64] (value-allocator) (str/keyops))
+          (HashMap::new [(slice u8) i64] (value-allocator) (text-keyops))
         (mut path)
           (WalkPath
             :at (ArrayList::new [i64] (value-allocator))
@@ -3169,7 +3200,7 @@
 
 (defn names-new [] (-> Names)
   (Names
-    :ids (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :ids (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))
     :strs (ArrayList::new [(slice u8)] (malloc-allocator))))
 
 ;;; A copy that interns apart from `ns`, with the same ids.
@@ -4383,7 +4414,19 @@
    ;; region it works in: what the workers make is made there too, each through a cursor of
    ;; its own, so the answer's copy out finds it and the rest goes with the region.
    (apart i64)
-   (apart-region i64)])
+   (apart-region i64)
+   ;; A run inside a run. A job that maps over a list of its own (`run-map-workers`) while the
+   ;; pool runs offers it here, and whichever workers have nothing to do in the run under way
+   ;; take part: `help-seq` counts the offers, `help-on` says one stands, `help-left` how many
+   ;; workers are in it, and the rest is as for a run.
+   (help-seq i64)
+   (help-on bool)
+   (help-left i64)
+   (help-body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
+   (help-job (ptr i8))
+   (help-apart i64)
+   (help-apart-region i64)
+   (help-slot i64)])
 
 (defn pool-fail [(what (slice u8))] (-> void)
   (panic "worker pool: {}" what))
@@ -4444,53 +4487,105 @@
     0))
 
 ;;; A worker: wait for a run that wants it, do its part, say so; forever.
+;;; A worker's job is done and its stack is shallow again: the pages below, which a deep job
+;;; wrote to (a tree walked to its leaves), go back to the system. They stay the stack's, empty
+;;; until it next grows into them; kept, every worker would hold its deepest job's stack for
+;;; as long as the program runs. A worker's stack is 512 MB (`spawn-worker!`), so the 64 MB
+;;; below where it stands now are its own.
+(defn stack-trim! [] (-> void)
+  (let [(mut here) 0
+        sp (primitive/cast i64 (primitive/cast (ptr i8) (mut here)))
+        hi (& (- sp 262144) -16384)
+        lo (- hi 67108864)
+        p (mmap (primitive/cast (ptr i8) lo) (primitive/cast isize (- hi lo)) (: 3 i32)
+                (primitive/cast i32 (+ MAP-ANON-PRIVATE 16)) (: -1 i32) 0)]
+    (when (!= (primitive/cast i64 p) lo) (panic "cannot give back a worker's stack pages"))
+    0))
+
 (defn pool-worker [(arg (ptr i8))] (-> (ptr i8))
   (let [slot (primitive/cast i64 arg)
         p (pool)
-        (mut seen) 0]
+        (mut seen) 0
+        (mut seen-help) 0]
     (register-worker! slot)
     (prefer-fast-cores!)
     (pool-lock! p)
     ;; Started for the run about to begin, which may have begun before this got the lock.
     (set! seen (.born p))
     (loop
-      ;; Runs often come one after another: look for the next a little while, then sleep.
-      (while (= (.round p) seen)
+      ;; Runs often come one after another: look for the next a little while, then sleep. An
+      ;; offer of work inside the run under way wakes a worker too.
+      (while (and (= (.round p) seen)
+                  (not (and (.help-on p) (!= (.help-seq p) seen-help))))
         (pool-unlock! p)
         (let [(mut spins) 0]
-          (while (and (< spins 20000) (= (atomic/read (field p round)) seen))
+          (while (and (< spins 20000)
+                      (= (atomic/read (field p round)) seen)
+                      (= (atomic/read (field p help-seq)) seen-help))
             (set! spins (+ spins 1))))
         (pool-lock! p)
-        (when (= (.round p) seen) (pool-wait! p (field p wake))))
-      (set! seen (.round p))
-      (when (< slot (.want p))
-        (let [body (.body p)
-              job (.job p)
-              inherit (.inherit p)
-              region (.region p)
-              apart (.apart p)
-              apart-region (.apart-region p)]
-          (pool-unlock! p)
-          (when inherit (dep-begin!))
-          (when (!= region 0) (region-enter-id! region))
-          (when (!= apart-region 0) (region-enter-id! apart-region))
-          (apart-inherit! apart)
-          (body job)
-          (apart-inherit! 0)
-          (when (!= apart-region 0) (region-leave!))
-          (when (!= region 0) (region-leave!))
-          (let [(mut read)
-                  (if inherit
-                      (dep-take-notes!)
-                      (ArrayList::new [i64] (malloc-allocator)))]
+        (when (and (= (.round p) seen)
+                   (not (and (.help-on p) (!= (.help-seq p) seen-help))))
+          (pool-wait! p (field p wake))))
+      (if (= (.round p) seen)
+          ;; Help with a run inside the run: this worker has no part in that one, or has done it.
+          (let [body (.help-body p)
+                job (.help-job p)
+                apart (.help-apart p)
+                apart-region (.help-apart-region p)
+                view (.help-slot p)]
+            (set! seen-help (.help-seq p))
+            (set! (.help-left p) (+ (.help-left p) 1))
+            (pool-unlock! p)
+            (when (!= apart-region 0) (region-enter-id! apart-region))
+            (apart-inherit! apart)
+            (set! (.in-job (thread-regions)) 1)
+            (set! (.settings-view (thread-regions)) (+ view 1))
+            (body job)
+            (set! (.settings-view (thread-regions)) 0)
+            (set! (.in-job (thread-regions)) 0)
+            (stack-trim!)
+            (apart-inherit! 0)
+            (when (!= apart-region 0) (region-leave!))
             (pool-lock! p)
-            (for x read (push! (mut (.read p)) x))
-            (free! (mut read)))
-          (atomic/store (field p left) (- (.left p) 1))
-          (when (= (.left p) 0)
-            (match (Condition::notify-all! (field p done))
-              (Ok [_] 0)
-              (Err [_] (pool-fail "cannot notify")))))))
+            (set! (.help-left p) (- (.help-left p) 1))
+            (when (= (.help-left p) 0)
+              (match (Condition::notify-all! (field p done))
+                (Ok [_] 0)
+                (Err [_] (pool-fail "cannot notify")))))
+          (do
+            (set! seen (.round p))
+            (when (< slot (.want p))
+              (let [body (.body p)
+                    job (.job p)
+                    inherit (.inherit p)
+                    region (.region p)
+                    apart (.apart p)
+                    apart-region (.apart-region p)]
+                (pool-unlock! p)
+                (when inherit (dep-begin!))
+                (when (!= region 0) (region-enter-id! region))
+                (when (!= apart-region 0) (region-enter-id! apart-region))
+                (apart-inherit! apart)
+                (set! (.in-job (thread-regions)) 1)
+                (body job)
+                (set! (.in-job (thread-regions)) 0)
+                (stack-trim!)
+                (apart-inherit! 0)
+                (when (!= apart-region 0) (region-leave!))
+                (when (!= region 0) (region-leave!))
+                (let [(mut read)
+                        (if inherit
+                            (dep-take-notes!)
+                            (ArrayList::new [i64] (malloc-allocator)))]
+                  (pool-lock! p)
+                  (for x read (push! (mut (.read p)) x))
+                  (free! (mut read)))
+                (atomic/store (field p left) (- (.left p) 1))
+                (when (= (.left p) 0)
+                  (match (Condition::notify-all! (field p done))
+                    (Ok [_] 0)
+                    (Err [_] (pool-fail "cannot notify")))))))))
     arg))
 
 ;;; Arrivals: of the `total` callers that arrive with one key, the last is told so, and goes on
@@ -4503,7 +4598,7 @@
       (init-lock!)
       (unless (.ready a)
         (set! (.counts a)
-              (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+              (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
         (set! (.ready a) true))
       (init-unlock!))
     a))
@@ -4521,7 +4616,7 @@
 (defn arrivals-reset! [] (-> void)
   (let [a (arrivals)]
     (set! (.counts a)
-          (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+          (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
     0))
 
 ;;; A lock to wait under: whoever finds nothing to do sleeps on it until whoever adds work, or
@@ -4604,7 +4699,11 @@
             (Ok [_] 0)
             (Err [_] (pool-fail "cannot notify")))
           (pool-unlock! p)
-          (body job)
+          (let [t (thread-regions)
+                was (.in-job t)]
+            (set! (.in-job t) 1)
+            (body job)
+            (set! (.in-job t) was))
           ;; The others are usually nearly done: watch a little while before sleeping.
           (let [(mut spins) 0]
             (while (and (< spins 20000) (> (atomic/read (field p left)) 0))
@@ -4617,6 +4716,42 @@
             ;; What the workers read, this thread's memo read.
             (for x read (dep-note-id! x))
             (free! (mut read)))))
+    0))
+
+;;; Run `body(job)` for a map over a list: each thread in it takes the next element it finds
+;;; free until none is left, so it does not matter how many take part or when they come. Asked
+;;; while the pool runs (by one of its jobs), the work is offered to the workers with nothing to
+;;; do in that run, and this thread does its share and waits for those that joined; one offer
+;;; stands at a time, and a second asker does its work alone. Not while what answers were made
+;;; from is tracked: there a run's workers say what they read to the one who asked.
+(defn run-map-workers [(body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
+                       (job (ptr i8))
+                       (n i64)] (-> void)
+  (let [p (pool)]
+    (if (and (> n 1) (.running p) (> (.started p) 0) (not (dep-tracking?)) (not (reclaiming?)))
+        (do
+          (pool-lock! p)
+          (if (or (.help-on p) (not (.running p)))
+              (do (pool-unlock! p) (body job))
+              (do
+                (set! (.help-body p) body)
+                (set! (.help-job p) job)
+                (set! (.help-apart p) (.apart (thread-regions)))
+                (set! (.help-apart-region p)
+                      (if (> (.apart (thread-regions)) 0) (primitive/cast i64 (region-current)) 0))
+                (set! (.help-slot p) (worker-slot))
+                (set! (.help-on p) true)
+                (atomic/store (field p help-seq) (+ (.help-seq p) 1))
+                (match (Condition::notify-all! (field p wake))
+                  (Ok [_] 0)
+                  (Err [_] (pool-fail "cannot notify")))
+                (pool-unlock! p)
+                (body job)
+                (pool-lock! p)
+                (set! (.help-on p) false)
+                (while (> (.help-left p) 0) (pool-wait! p (field p done)))
+                (pool-unlock! p))))
+        (run-workers body job n))
     0))
 
 ;;; What a program answered, carried from the thread it ran on to `main`.
@@ -4774,7 +4909,7 @@
       (init-lock!)
       (unless (.ready d)
         (set! (.ids d)
-              (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+              (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
         (set! (.texts d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.changed d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.verified d) (ArrayList::new [i64] (malloc-allocator)))
@@ -4788,7 +4923,7 @@
         (set! (.queries d)
               (HashMap::new [(slice u8) (ArrayList i64)]
                             (malloc-allocator)
-                            (str/keyops)))
+                            (text-keyops)))
         (set! (.sites d) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (set! (.site-settings d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.site-prefixes d)
@@ -4800,13 +4935,13 @@
         (set! (.site-keys d)
               (ArrayList::new [(ArrayList (slice u8))] (malloc-allocator)))
         (set! (.site-ids d)
-              (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+              (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
         (set! (.site-key-ids d)
               (ArrayList::new [(HashMap (slice u8) i64)] (malloc-allocator)))
         (set! (.setting-sites d)
               (HashMap::new [(slice u8) (ArrayList i64)]
                             (malloc-allocator)
-                            (str/keyops)))
+                            (text-keyops)))
         (set! (.num-changed d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.num-heads d) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.num-sites d) (ArrayList::new [i64] (malloc-allocator)))
@@ -4816,11 +4951,11 @@
         (set! (.ensurers d)
               (HashMap::new [(slice u8) (fnptr (cc/C) [i64] i64)]
                             (malloc-allocator)
-                            (str/keyops)))
+                            (text-keyops)))
         (set! (.paths d)
               (HashMap::new [(slice u8) (ArrayList (slice u8))]
                             (malloc-allocator)
-                            (str/keyops)))
+                            (text-keyops)))
         (set! (.stacks d)
               (ArrayList::new [(ArrayList DepFrame)] (malloc-allocator)))
         (for _ (range 0 (max-workers))
@@ -5031,7 +5166,7 @@
     (push! (mut (.site-keys d))
            (ArrayList::new [(slice u8)] (malloc-allocator)))
     (push! (mut (.site-key-ids d))
-           (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+           (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
     ;; `.rel(_,_,` is a query by one column: the relation and which column.
     (let [open (name-end-at prefix 40)
           query
@@ -6056,7 +6191,7 @@
     (when (= (.known w) 0)
       (set! (.kq w) (: -1 i32))
       (set! (.fds w)
-            (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+            (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
       (set! (.paths w)
             (HashMap::new [i64 (slice u8)] (malloc-allocator) (i64-keyops)))
       (cond (and (!= (primitive/cast i64 (kqueue-fn)) 0)
@@ -6568,11 +6703,11 @@
     :ids (ArrayList::new [i64] (malloc-allocator))
     :mask -1
     :filled 0
-    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))
+    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))
     :next-id 0
     :defined (ArrayList::new [i64] (malloc-allocator))
     :open (ArrayList::new [i64] (malloc-allocator))
-    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))))
 
 ;;; A buffer to write the next part in, at `base`, keeping what objects are known.
 (defn writer-restart! [(w (ptr Writer)) (base i64)] (-> void)
@@ -6593,7 +6728,7 @@
     :values (ArrayList::new [i64] (malloc-allocator))
     :arena (ArrayList::new [u8] (malloc-allocator))
     :frames (ArrayList::new [i64] (malloc-allocator))
-    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))))
+    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))))
 
 (defn written-bytes [(w (ptr Writer))] (-> (slice u8))
   (subslice (.mem w) 0 (.pos w)))
@@ -7161,7 +7296,7 @@
         (mut out)
           (HashMap::new [(slice u8) (ArrayList i64)]
                         (malloc-allocator)
-                        (str/keyops))]
+                        (text-keyops))]
     (for _ (range 0 n)
       (let [key (take-text r)]
         (set! (mut out) key (take-ints r))))
@@ -7323,7 +7458,7 @@
         (mut paths)
           (HashMap::new [(slice u8) (ArrayList (slice u8))]
                         (malloc-allocator)
-                        (str/keyops))]
+                        (text-keyops))]
     (for _ (range 0 n)
       (let [key (take-text r)]
         (set! (mut paths) key (take-texts r))))
@@ -7340,7 +7475,7 @@
     (for _ (range 0 n)
       (let [keys (take-texts r)
             (mut by)
-              (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+              (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))]
         (for i (range 0 (len keys)) (set! (mut by) (get keys i) i))
         (push! (mut all) keys)
         (push! (mut ids) by)))
@@ -7358,11 +7493,11 @@
     (set! (.site-pages d) all))
   ;; Found by text: nodes, and sites.
   (let [(mut ids)
-          (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+          (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))]
     (for i (range 0 (len (.texts d))) (set! (mut ids) (get (.texts d) i) i))
     (set! (.ids d) ids))
   (let [(mut sites)
-          (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops))]
+          (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))]
     (for i (range 0 (len (.sites d)))
       (set! (mut sites)
             (site-key (get (.texts d) (get (.site-settings d) i))
@@ -7493,7 +7628,7 @@
     (unless (.ready l)
       (set! (.claimed l) (ArrayList::new [bool] (malloc-allocator)))
       (set! (.pending l)
-            (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+            (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
       (set! (.ready l) true))
     l))
 
@@ -7567,7 +7702,7 @@
   (let [f (primitive/alloc-static ForceVisits)]
     (unless (.ready f)
       (set! (.seen f)
-            (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+            (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
       (set! (.ready f) true))
     (match (get (.seen f) name)
       (Some [_] false)
@@ -7967,7 +8102,7 @@
         (set! (.by f)
               (HashMap::new [(slice u8) (ArrayList (fnptr (cc/C) [] void))]
                             (malloc-allocator)
-                            (str/keyops)))
+                            (text-keyops)))
         (set! (.ready f) true))
       (init-unlock!))
     f))
@@ -7995,12 +8130,45 @@
               (None []
                     (ArrayList::new [(fnptr (cc/C) [] void)] (malloc-allocator))))]
       (spin-unlock! (cast (ptr i64) f))
-      (for forget xs (forget))))
+      ;; Given to one job among several at once, a setting is that job's own: an answer kept
+      ;; from it would be handed to the other jobs as theirs.
+      (when (and (in-job?) (> (len xs) 0))
+        (panic "the setting {} is given to one of several jobs done at once, and this run keeps {} answers made from it"
+               setting
+               (len xs)))
+      (unless (in-job?) (for forget xs (forget)))))
   0)
 
 ;;; Whether threads are running work at once now (`run-workers`).
 (defn in-parallel? [] (-> bool)
   (.running (pool)))
+
+;;; Whether this thread is doing one of a run of jobs done at once. A setting given by `with`
+;;; meanwhile is given to this thread's job alone (see `settings-own-enter!` in a rules module).
+(defn in-job? :inline (Always) [] (-> bool)
+  (> (.in-job (thread-regions)) 0))
+
+;;; The worker slot whose own settings this thread reads where it has none of its own: the
+;;; thread it is helping; -1 while it helps no one.
+(defn settings-view :inline (Always) [] (-> i64)
+  (- (.settings-view (thread-regions)) 1))
+
+;;; A job's own copy of a module's state, `size` bytes as they are at `from`, and its end.
+(defn own-state-new [(from (ptr u8)) (size i64)] (-> i64)
+  (let [p (malloc (primitive/cast isize size))]
+    (when (= (primitive/cast i64 p) 0) (panic "no memory for a job's own settings"))
+    (mem/copy [u8] (primitive/cast (ptr u8) p) from size)
+    (primitive/cast i64 p)))
+
+(defn own-state-free! [(p i64)] (-> void)
+  (primitive/free (primitive/cast (ptr i8) p))
+  0)
+
+;;; How many threads work whose jobs each give settings of their own may use: one, while what
+;;; answers were made from is tracked, since an answer kept there says nothing of which job's
+;;; settings it was made under.
+(defn own-threads [(n i64)] (-> i64)
+  (if (dep-tracking?) 1 n))
 
 ;; ---------------------------------------------------------------- which functions a run keeps
 
@@ -8119,7 +8287,7 @@
       (init-lock!)
       (unless (.ready h)
         (set! (.by h)
-              (HashMap::new [(slice u8) i64] (malloc-allocator) (str/keyops)))
+              (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
         (set! (.ready h) true))
       (init-unlock!))
     h))
@@ -8153,7 +8321,7 @@
       (set! (.sweeps s)
             (HashMap::new [(slice u8) (fnptr (cc/C) [] i64)]
                           (malloc-allocator)
-                          (str/keyops)))
+                          (text-keyops)))
       (set! (.sweeps-ready s) true))
     (set! (mut (.sweeps s)) name f)
     (init-unlock!))
@@ -8284,7 +8452,7 @@
         (set! (.rows a)
               (HashMap::new [(slice u8) AuditRow]
                             (malloc-allocator)
-                            (str/keyops)))
+                            (text-keyops)))
         (set! (.known a) 1))
       (init-unlock!))
     a))
@@ -8315,7 +8483,7 @@
                         :keys
                           (HashMap::new [(slice u8) i64]
                                         (malloc-allocator)
-                                        (str/keyops))))))
+                                        (text-keyops))))))
           seen (match (get (.keys row) key) (Some [n] n) (None [] 0))]
       (set! (.calls row) (+ (.calls row) 1))
       (set! (.us row) (+ (.us row) us))

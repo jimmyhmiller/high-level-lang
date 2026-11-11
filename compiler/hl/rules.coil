@@ -1852,7 +1852,7 @@
   (map-with (mut k) t `(malloc-allocator) `(rt/memo-keyops)))
 
 (defn map-in [(k (mut Comp)) (t (slice u8)) (allocator Code)] (-> Code)
-  (map-with (mut k) t allocator `(str/keyops)))
+  (map-with (mut k) t allocator `(rt/text-keyops)))
 
 ;;; A map whose Text keys are held as `text-keys` says: its own copies, or views of kept texts
 ;;; for a table of kept answers (see `rt/memo-keyops`).
@@ -4124,14 +4124,21 @@
                         (cat3 "[" (map-key (.ty e)) "]"))))
           ;; `parallel-map(xs, f, n)`: `f` of each element on `n` threads, results in the order of `xs`.
           ;; Each thread takes the next index it finds free, so uneven work evens out.
-          (and (= name "parallel-map") (= count 3))
+          ;; `parallel-map-own(xs, f, n)`: the same, for an `f` that gives settings by `with`: each
+          ;; call's are its own (see `settings-own-enter!`), and one call runs at a time while what
+          ;; answers were made from is tracked (`rt/own-threads`).
+          (and (or (= name "parallel-map") (= name "parallel-map-own")) (= count 3))
             (let [xs (expr (mut k) (get args 0) "")
                   f (expr (mut k) (get args 1) "")
-                  threads
+                  asked
                     (expect (mut k)
                             (get args 2)
                             (expr (mut k) (get args 2) "Int")
-                            "Int")]
+                            "Int")
+                  threads
+                    (if (= name "parallel-map-own")
+                        (te `(rt/own-threads ~(.code asked)) "Int")
+                        asked)]
               (unless (list? (.ty xs))
                 (die (mut k) n "parallel-map needs a list"))
               (unless (fn? (.ty f))
@@ -4187,7 +4194,7 @@
                                          :xs ~(sym xs-v)
                                          :out ~(sym out-v)
                                          :f ~(.code f))]
-                                 (rt/run-workers (fnptr-of ~(sym body))
+                                 (rt/run-map-workers (fnptr-of ~(sym body))
                                                  (cast (ptr i8)
                                                        (mut ~(sym job-v)))
                                                  ~(.code threads))
@@ -4439,7 +4446,7 @@
                                        :seen
                                          (HashMap::new [(slice u8) bool]
                                                        (rt/owned-allocator)
-                                                       (str/keyops))
+                                                       (rt/text-keyops))
                                        :results
                                          (ArrayList::new [~cr]
                                                          (rt/owned-allocator))
@@ -4452,7 +4459,7 @@
                                        :group-of
                                          (HashMap::new [(slice u8) i64]
                                                        (rt/owned-allocator)
-                                                       (str/keyops))
+                                                       (rt/text-keyops))
                                        :left
                                          (ArrayList::new [i64]
                                                          (rt/owned-allocator))
@@ -6933,6 +6940,10 @@
                       (mut saves) (primitive/code-list-new)
                       (mut sets) (primitive/code-list-new)
                       (mut restores) (primitive/code-list-new)
+                      ;; A setting given while this thread does one of several jobs at once is
+                      ;; given to the job alone (see `settings-own-enter!`).
+                      (mut enters) (primitive/code-list-new)
+                      (mut leaves) (primitive/code-list-new)
                       m (self-mod (mut k))]
                   (for init inits
                     (let [qname (.text (kid init 0))
@@ -7011,6 +7022,11 @@
                                                             `(> ~bound-now 1))]
                                 (push! (mut saves) (sym saved))
                                 (push! (mut saves) field)
+                                (when (= (.attr x) 5)
+                                  (push! (mut enters)
+                                         `(~(sym (qualified (mut k) module "settings-own-enter!"))))
+                                  (push! (mut leaves)
+                                         `(~(sym (qualified (mut k) module "settings-own-leave!")))))
                                 (if (= (.attr x) 5)
                                     (let [bound
                                             `(~(primitive/code-symbol "."
@@ -7074,13 +7090,20 @@
                         r (fresh (mut k) "r")]
                     (set! (.in-with k) (- (.in-with k) 1))
                     (if (or (= (.ty body) "Void") (= (.ty body) "Never"))
-                        (te `(let [~@saves] ~@sets ~(.code body) ~@restores 0)
+                        (te `(do
+                               ~@enters
+                               (let [~@saves] ~@sets ~(.code body) ~@restores 0)
+                               ~@leaves
+                               0)
                             "Void")
-                        (te `(let [~@saves]
-                               ~@sets
-                               (let [~(sym r) ~(.code body)]
-                                 ~@restores
-                                 ~(sym r)))
+                        (te `(do
+                               ~@enters
+                               (let [~@saves]
+                                 ~@sets
+                                 (let [~(sym r) ~(.code body)]
+                                   ~@restores
+                                   ~@leaves
+                                   ~(sym r))))
                             (.ty body))))))
     (g/KPrint []
               (let [(mut args) (primitive/code-list-new)]
@@ -9983,7 +10006,7 @@
                       forcer (sym (cat "setting-force--" g-name))]
                   (push! (mut accessors)
                          `(defn ~accessor [] (-> (ptr RulesState))
-                            (let [st (rules-state)]
+                            (let [st (rules-settings)]
                               (when (> (atomic/read (field st ~lazy-name)) 0)
                                 (~forcer st))
                               st)))
@@ -11387,6 +11410,59 @@
                               (atomic/store (field s rules-ready) 1))
                             (rt/spin-unlock! (field s rules-lock))
                             s)))))
+          ;; Settings a job gives itself. A `with` on a setting while this thread does one of
+          ;; several jobs at once (`rt/in-job?`) gives the setting to this job alone: the thread
+          ;; takes a copy of the module's state for as long as such a `with` is open, gives and
+          ;; reads its settings there, and lets the copy go. The other jobs, and the program's
+          ;; own state, see nothing of it. `count`: how many threads hold a copy now, so that
+          ;; while none does a setting is read as ever; a thread's copy and how many of its
+          ;; `with`s are open, by worker slot.
+          (emit! (mut out)
+                 `(defstruct SettingsOwn
+                    [(count i64) (own (array i64 64)) (depth (array i64 64))]))
+          (emit! (mut out)
+                 `(defn settings-own [] (-> (ptr SettingsOwn))
+                    (primitive/alloc-static SettingsOwn)))
+          (emit! (mut out)
+                 `(defn rules-settings [] (-> (ptr RulesState))
+                    (let [o (settings-own)]
+                      (if (= (atomic/read (field o count)) 0)
+                          (rules-state)
+                          ;; This thread's own; or those of the thread it helps; or the program's.
+                          (let [own (get (.own o) (rt/worker-slot))]
+                            (if (!= own 0)
+                                (cast (ptr RulesState) own)
+                                (let [view (rt/settings-view)
+                                      seen (if (< view 0) 0 (get (.own o) view))]
+                                  (if (= seen 0)
+                                      (rules-state)
+                                      (cast (ptr RulesState) seen)))))))))
+          (emit! (mut out)
+                 `(defn settings-own-enter! [] (-> void)
+                    (when (rt/in-job?)
+                      (let [o (settings-own)
+                            slot (rt/worker-slot)
+                            depth (get (.depth o) slot)]
+                        (when (= depth 0)
+                          (set! (mut (.own o))
+                                slot
+                                (rt/own-state-new (cast (ptr u8) (rules-settings)) (sizeof RulesState)))
+                          (atomic/add (field o count) 1))
+                        (set! (mut (.depth o)) slot (+ depth 1))))
+                    0))
+          (emit! (mut out)
+                 `(defn settings-own-leave! [] (-> void)
+                    (let [o (settings-own)
+                          slot (rt/worker-slot)
+                          depth (get (.depth o) slot)]
+                      (when (> depth 0)
+                        (set! (mut (.depth o)) slot (- depth 1))
+                        (when (= depth 1)
+                          (let [own (get (.own o) slot)]
+                            (set! (mut (.own o)) slot 0)
+                            (atomic/add (field o count) -1)
+                            (rt/own-state-free! own)))))
+                    0))
           ;; Task state: one copy per worker slot, made the first time its own thread asks. The
           ;; slots and the key are published by an atomic store of `ready`, after them.
           (emit! (mut out)

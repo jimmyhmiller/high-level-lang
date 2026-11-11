@@ -13,6 +13,7 @@ use bundle.final as final
 use bundle.minhost as host
 use bundle.sourcemap as map
 use bundle.jsx as jsx
+use bundle.fragments as fragments
 use bundle.chunks as chunks
 use bundle.naming as nm
 use bundle.lower as lower
@@ -58,11 +59,13 @@ record Plan {
   optimize-threads: Int,
   print-threads: Int,
   facts-threads: Int,
-  emit-threads: Int
+  emit-threads: Int,
+  sides-threads: Int,
+  chunks-threads: Int
 }
 
 fn serial-plan() -> Plan =
-  Plan(name: "serial", load-threads: 1, optimize-threads: 1, print-threads: 1, facts-threads: 1, emit-threads: 1)
+  Plan(name: "serial", load-threads: 1, optimize-threads: 1, print-threads: 1, facts-threads: 1, emit-threads: 1, sides-threads: 1, chunks-threads: 1)
 
 boxed record Options {
   entry: Text,
@@ -689,6 +692,32 @@ fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.
         stmts = chunks.imports-of(c, all) ++ p.body.kids ++ chunk-root-statements(c) ++ chunks.exports-of(c, all),
         r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
 
+# With the bundler's own optimiser and nothing to lower (see `grouped?`), a chunk's whole body is
+# its own work: the chunks are made at once, each giving the settings that say which chunk it is
+# to itself alone.
+setting chunk-list: [chunks.Chunk]
+setting chunk-selected: [[e.Unit]]
+setting chunk-options: Options
+
+fn chunk-at(i: Int) -> Printed = chunk-own(chunk-options, chunk-list[i], chunk-list, chunk-selected[i])
+
+fn chunk-own(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.Unit]) -> Printed =
+  Printed(text: r.text ++ "\n", base: 0, marks: r.marks)
+  where emission = with e.units = selected, e.chunk-parts = some(c.parts), e.initializer-parts = c.initializers { e.program() },
+        p = ascii-of(o, dropped-of(o, match o.minify-syntax {
+          true => default-optimize(emission.tree)
+          false => fold.run(emission.tree)
+        })),
+        stmts = chunks.imports-of(c, all) ++ p.body.kids ++ chunk-root-statements(c) ++ chunks.exports-of(c, all),
+        r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
+
+fn chunk-programs(o: Options, all: [chunks.Chunk], selected: [[e.Unit]]) -> [Printed] = match grouped?(o) {
+  false => [chunk-program(o, all[i], all, selected[i]) for i in 0..len(all)]
+  true => with chunk-list = all, chunk-selected = selected, chunk-options = o {
+    parallel-map-own([i for i in 0..len(all)], chunk-at, o.plan.chunks-threads)
+  }
+}
+
 fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text = match c.root {
   r if r < 0 => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"
   r if r in static-roots => entry-output(o, (first entry in o.entries if real-path(entry) == m.modules[r].path: entry) ?? m.modules[r].path, base)
@@ -715,10 +744,31 @@ fn linked-split(o: Options, g: m.Graph) -> [Written] =
   with an.linked = timed(o.timing, "link: modules", an.link(g.symbols)),
        m.table = timed(o.timing, "link: table", an.linked-table(g)),
        m.db = timed(o.timing, "link: facts and Datalog", an.solved-facts()) {
-    with e.units = e.units-of-order() {
-      with nm.finals = timed(o.timing, "naming", final-names(o)) { named-split(o) }
-    }
+    with e.units = e.units-of-order() { units-split(o) }
   }
+
+# Every symbol's name, and the units the chunks are packed from (see `fragments.model`): neither
+# reads the other, and both are worked out at once. The model is an answer the build keeps, which
+# packing then finds made.
+record Side { names: [sym.Table], units: Int }
+setting side-options: Options
+
+fn side(i: Int) -> Side = match i {
+  0 => Side(names: [final-names(side-options)], units: 0)
+  _ => Side(names: [], units: len(fragments.model(side-options.chunking.fragments).units))
+}
+
+# Minified names are counted and handed out; esbuild's numbered names are worked out through the
+# build's table of names, which grows as they are, and that is one thread's work with nothing
+# beside it.
+fn names-beside-units(o: Options) -> sym.Table = match o.minify-identifiers {
+  true => both[0].names[0]
+    where both = with side-options = o { parallel-map-own([0, 1], side, o.plan.sides-threads) }
+  false => final-names(o)
+}
+
+fn units-split(o: Options) -> [Written] =
+  with nm.finals = timed(o.timing, "naming, and the units of chunks", names-beside-units(o)) { named-split(o) }
 
 # The rest of a split build, once every symbol has its name: a chunk for each root, which an import
 # of it names by a placeholder until every chunk's name is known.
@@ -727,7 +777,7 @@ fn named-split(o: Options) -> [Written] =
        e.chunk-styles = {styles[i].root: chunks.placeholder(len(all) + i) for i in 0..len(styles)} {
     chunks-written(o, all, styles)
   } where roots = m.entries ++ an.linked.dynamic-roots,
-          all = timed(o.timing, "chunk: policy and fragments", chunks.configured(roots, o.chunking)),
+          all = timed(o.timing, "chunk: policy", chunks.configured(roots, o.chunking)),
           ids = {c.root: c.id for c in all if c.root >= 0},
           styles = [root-stylesheet(o, r, sheets) for r in roots for sheets in [m.stylesheets(r)] if len(sheets) > 0]
 
@@ -748,7 +798,7 @@ fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> 
   ++ [sheet-written(s.path, s.bundle)... for s in styles]
   ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
-        printed = [chunk-program(o, c, all, chunk-units(c, unit-index)) for c in all],
+        printed = chunk-programs(o, all, [chunk-units(c, unit-index) for c in all]),
         texts = [p.text for p in printed] ++ [s.bundle.text for s in styles],
         holes = [chunks.holes-in(t) for t in texts],
         base = base-dir(o),
