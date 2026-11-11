@@ -226,13 +226,35 @@ disables that limit. Size/request settings apply to `balanced`.
 
 `--fragments` allows independent declarations in the same module to land in different chunks.
 It uses existing parsed statements and linker facts; it does not reparse synthetic modules.
-Functions, inert object/array literals, and classes without eager side effects can separate.
-Calls, writes, inheritance, computed keys and other order-sensitive initialization form one
-initialization island per module. Every fragment depends on that island; symbol cycles pull in
-anything initialization reads or calls, preserving source order and shared state. Unrelated
-exports can still separate even when the module initializes state or runs effects. Consumers
-propagate through the resulting graph before packing. Property reads, spreads and eager binding
-reads are conservatively grouped because getters, coercion and read-before-initialization matter.
+Each top-level statement is placed one of four ways (`fragments.rules`). *Deferred* statements
+run nothing as they are defined: functions, inert values, imports that initialize nothing.
+*Eager* ones compute as they are defined, but only what cannot be told apart wherever it runs:
+calls and `new` the author marked `/*@__PURE__*/` (methods of them included, as in
+`new Matrix3().set(…)`), classes whose heritage is a name, static blocks that only mark their
+class (`this.prototype.isVector3 = true`), well-known symbol keys, names and constants.
+*Attached* writes put such a value on a class or function the module declares
+(`Object3D.DEFAULT_UP = new Vector3(0, 1, 0)`) and go with it. Anything else is an *effect*,
+and stays in the module's initialization island, in source order.
+
+What a statement runs is told apart from what it only refers to, as Turbopack does: defining
+`const v = new Vector3()` runs Vector3's constructor, not its methods. A statement leaves the
+island only when nothing could tell: no initialization before it reads it; an eager one reads
+nothing defined after it, nothing still waiting for its module's initializer, and nothing that
+initialization in its own module, or in one evaluated before it, may change (what it writes, calls
+a method of, or hands on); an attached write's target is not run before the write. A statement
+and the declarations of the names it assigns share a unit, since another chunk's import of a
+name cannot be assigned. These are decided for the whole program at once and grown to a fixed
+point. What a module that imports this one changes is not counted, as it ran after this module's
+statements. An eager value whose chunk loads only later, after an `import()`, would see such
+changes where the original saw none; that case is not checked. Placed apart, a fragment depends only on what it reads; an import of its module still runs
+that module's initializer. Consumers propagate through the resulting graph before packing.
+
+On three.js, three pages each using one part of it (math, a scene, loaders) load 292, 361 and
+485 KB minified, where whole modules load 485 KB for each (esbuild: 480 KB); each bundled alone
+is 271, 330 and 482 KB. An immer page using only `produce` loads 11.5 KB rather than 18.1, and a
+d3 page 39.3 KB rather than 44.9; zod, rxjs, date-fns and lodash-es are unchanged, as their pages
+need what they share. Placing statements apart costs 9–16% more CPU on these builds
+(`tools/fragments-real.py` measures, and runs every output against the unbundled source).
 Dynamic scopes, `import.meta`, wrappers, duplicate declarations, module cycles and dependencies
 that cannot be analyzed retain a whole-module boundary. Dependency cycles are condensed and
 dynamic imports retain their lazy boundary. For bundled modules with observable evaluation,

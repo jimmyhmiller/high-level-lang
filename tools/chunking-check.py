@@ -483,6 +483,97 @@ for policy, fragments in MODES:
     assert "ONLY_X_COMPUTES" not in closure(output, "b.js")
 print("ok   a side-effect-free module that computes as it loads is loaded only by the entry using it")
 
+# What runs as a library loads, placed apart from its initialization when nothing could tell:
+# `/*@__PURE__*/` values (three.js's scratch vectors), classes extending a name, static blocks that
+# mark a class, and writes to a class's own properties. Each entry loads only its own.
+def only_own(output, entry, own, other):
+    text = closure(output, entry)
+    return own in text and other not in text
+
+root = fixture("eager-fragments", {
+    "package.json": '{"type":"module"}',
+    "library.js": """globalThis.__inits = (globalThis.__inits || 0) + 1;
+export class Vec { constructor(x = 0) { this.x = x; } add(o) { _scratch.x = o.x; return new Vec(this.x + _scratch.x + "VEC_ONLY".length); } }
+Vec.prototype.isVec = true;
+Vec.ZERO = /*@__PURE__*/ new Vec(0);
+const _scratch = /*@__PURE__*/ new Vec();
+export class Late { size() { return "LATE_ONLY".length; } }
+const _late = /*@__PURE__*/ new Late();
+Late.prototype.isLate = true;
+export function late() { return _late.size() + (new Late().isLate ? 1 : 0); }
+class Base { static { this.prototype.isBase = true; } base() { return "BASE_ONLY"; } }
+export class Shape extends Base { area() { return "SHAPE_ONLY".length; } }
+export class Color { static NAMES = { red: 1 }; *[Symbol.iterator]() { yield "COLOR_ONLY"; } }
+const _white = /*@__PURE__*/ new Color();
+export function white() { return [..._white][0]; }
+""",
+    "a.js": 'import {Vec} from "./library.js"; export const result = [new Vec(1).add(new Vec(2)).x, new Vec().isVec, Vec.ZERO.x, globalThis.__inits];\n',
+    "b.js": 'import {Shape, white, late} from "./library.js"; export const result = [new Shape().area(), new Shape().isBase, new Shape().base(), white(), late(), globalThis.__inits];\n',
+})
+expected = original(root, "[m0.result,m1.result]")
+for policy, fragments in MODES:
+    output = build(root, ["a.js", "b.js"], policy, fragments)
+    assert execute(root, output, ["a.js", "b.js"], "[m0.result,m1.result]") == expected
+    if fragments:
+        assert only_own(output, "a.js", "VEC_ONLY", "SHAPE_ONLY"), policy
+        assert only_own(output, "b.js", "SHAPE_ONLY", "VEC_ONLY"), policy
+        assert "COLOR_ONLY" not in closure(output, "a.js"), policy
+        # A write after something already made of the class stays in the initialization, and so does
+        # what was made: every importer constructs it as the library loads, as native ESM does.
+        assert "LATE_ONLY" in closure(output, "a.js"), policy
+print("ok   pure values, extended classes, static marks and own-class writes leave the island")
+
+# What must not leave it: a value initialization changes before it is made; a value read before
+# it stands; a class property initialization reads before it is written; a function that assigns
+# the module's state, which stays with that state.
+root = fixture("eager-fragments-ordered", {
+    "package.json": '{"type":"module"}',
+    "library.js": """export const settings = { mode: "start" };
+function configure() { settings.mode = "configured"; }
+configure();
+function copy(o) { return { mode: o.mode }; }
+export const snapshot = /*@__PURE__*/ copy(settings);
+globalThis.__seen = typeof early === "undefined" ? "before" : early.tag;
+var early = { tag: "EARLY_VALUE" };
+export class Thing { label() { return Thing.LABEL; } }
+globalThis.__label = Thing.LABEL;
+Thing.LABEL = "THING_LABEL";
+export const ahead = /*@__PURE__*/ peek();
+var later = { tag: "LATER_VALUE" };
+function peek() { return typeof later === "undefined" ? "not yet" : later.tag; }
+let count = 0;
+export function bump() { count += 1; return count; }
+export function current() { return count; }
+""",
+    "a.js": 'import {snapshot, Thing, ahead} from "./library.js"; export const result = [snapshot.mode, new Thing().label(), globalThis.__label, globalThis.__seen, ahead];\n',
+    "b.js": 'import {bump, current} from "./library.js"; bump(); bump(); export const result = [current(), globalThis.__seen];\n',
+})
+expected = original(root, "[m0.result,m1.result]")
+for policy, fragments in MODES:
+    output = build(root, ["a.js", "b.js"], policy, fragments)
+    assert execute(root, output, ["a.js", "b.js"], "[m0.result,m1.result]") == expected, (policy, fragments)
+print("ok   values initialization changes or reads first, and state with its writers, keep their order")
+
+# A value placed apart that a module importing its library changes what it reads: it loads before
+# that module's initialization, as it was computed before it, even when only an `import()` uses it.
+root = fixture("eager-fragments-importer-changes", {
+    "package.json": '{"type":"module"}',
+    "library.js": """export const registry = { items: [] };
+function count(r) { return r.items.length; }
+export const view = /*@__PURE__*/ count(registry);
+export function size() { return "SIZE_ONLY".length; }
+""",
+    "plugin.js": 'import {registry} from "./library.js"; registry.items.push("added");\nexport const plugged = true;\n',
+    "lazy.js": 'import {view} from "./library.js"; export const seen = view;\n',
+    "a.js": 'import {plugged} from "./plugin.js"; const lazy = await import("./lazy.js"); export const result = [plugged, lazy.seen];\n',
+    "b.js": 'import {size} from "./library.js"; export const result = size();\n',
+})
+expected = original(root, "[m0.result,m1.result]")
+for policy, fragments in MODES:
+    output = build(root, ["a.js", "b.js"], policy, fragments)
+    assert execute(root, output, ["a.js", "b.js"], "[m0.result,m1.result]") == expected, (policy, fragments)
+print("ok   a value an importer of its library changes loads before that importer's initialization")
+
 root=fixture("function-alias-order", {
     "library.js": 'export function fn(){return 1;} fn=()=>2; export const alias=fn; export function home(){return "HOME_ALIAS:"+alias();} export function admin(){return "ADMIN_ALIAS:"+alias();}\n',
     "a.js": 'import {home} from "./library.js"; export const result=home();\n',

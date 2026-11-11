@@ -74,34 +74,35 @@ fn bytes-of(parts: [Int], id: Int) -> Int =
 
 fn node-bytes(n: Node) -> Int = max(1, n.hi - n.lo)
 
-# Asked of each of a module's parts in turn, inside that module (`here` and `body` are its own).
+# Whether a whole module's part runs nothing it would not run anywhere: what decides, with fragments
+# off, whether the module is one of initialization. Asked inside the module (`here` and `body`).
 fn movable(part: Int) -> Bool =
   ev.inert-stmt(stmt) and not writes-module?(stmt)
   and not (ev.static-import?(stmt) and (m.db.effect(part) or len([target for m.db.initializes(part, ?target)]) > 0))
   where stmt = an.stmt-in(body, here, part)
 
-# All order-sensitive parts of one module form a single evaluation island. Deferred writers are
-# included too: the symbol edges pull their state and initialization into the same SCC. Every
-# other fragment depends on the island; anything it reads/calls therefore joins it in a cycle.
-# This preserves source-order initialization and effects without forcing unrelated exports together.
-fn groups(parts: [Int], moving: {Int:Bool}, split: Bool) -> [[Int]] = match split {
-  false => [parts]
-  true => [anchor for anchor in [[p for p in parts if not (moving[p] ?? false)]] if len(anchor) > 0]
-          ++ [[p] for p in parts if moving[p] ?? false]
-}
 
 # A module's units are its own work.
-fn raw-units(split: Bool, eligible: [Bool]) -> [Unit] =
-  [u for units in [module-units(id, split, eligible[id]) for id in m.order if emit.included?(id)] for u in units]
+fn raw-units(split: Bool, eligible: [Bool], placed: {Int:Int}) -> [Unit] =
+  [u for units in [module-units(id, split, eligible[id], placed) for id in m.order if emit.included?(id)] for u in units]
 
-fn module-units(id: Int, split: Bool, eligible: Bool) -> [Unit] =
-  [Unit(id: 0, module: id, modules: [id], path: m.modules[id].path, parts: group, roots: roots,
-        bytes: bytes-of(group, id), portable: eligible and not evaluating, evaluation: evaluating)
-   for parts in [[p for p in emit.parts-of(id) if emit.live?(p)]] if len(parts) > 0
-   for moving in [with here = m.modules[id], body = m.body-of(id) { {p: movable(p) for p in parts} }]
-   for group in groups(parts, moving, split and eligible)
-   for evaluating in [any p in group: not (moving[p] ?? false) or (not eligible and m.db.effect(p))]
-   for roots in [if split and eligible and not evaluating then part-roots(group[0], module-roots(id)) else module-roots(id)]]
+# Placed apart (fragments on, an eligible module), a module's island is what does not move (see
+# `placed-apart`), and each other unit is the parts placed together; otherwise the module is one unit.
+fn module-units(id: Int, split: Bool, eligible: Bool, placed: {Int:Int}) -> [Unit] = match split and eligible {
+  true => [Unit(id: 0, module: id, modules: [id], path: m.modules[id].path, parts: group, roots: roots,
+                bytes: bytes-of(group, id), portable: not evaluating, evaluation: evaluating)
+           for parts in [[p for p in emit.parts-of(id) if emit.live?(p)]] if len(parts) > 0
+           for group in [island for island in [[p for p in parts if not (p in placed)]] if len(island) > 0]
+                        ++ [[p for p in parts if (placed[p] ?? -1) == first] for first in [f for p in parts for f in placed[p] distinct f]]
+           for evaluating in [not (group[0] in placed)]
+           for roots in [if evaluating then module-roots(id) else sort r in [r for p in group for r in part-roots(p, module-roots(id)) distinct r] by r]]
+  false => [Unit(id: 0, module: id, modules: [id], path: m.modules[id].path, parts: group, roots: module-roots(id),
+                 bytes: bytes-of(group, id), portable: eligible and not evaluating, evaluation: evaluating)
+            for parts in [[p for p in emit.parts-of(id) if emit.live?(p)]] if len(parts) > 0
+            for moving in [with here = m.modules[id], body = m.body-of(id) { {p: movable(p) for p in parts} }]
+            for group in [parts]
+            for evaluating in [any p in group: not (moving[p] ?? false) or (not eligible and m.db.effect(p))]]
+}
 
 # `uses` already contains resolved ES imports and namespace reads. Resolving those names again
 # for every mention would repeat export resolution in a large module. Only opaque CJS bindings
@@ -114,14 +115,22 @@ fn reads(parts: [Int]) -> [Int] =
 
 # What a unit depends on is its own question once every symbol's home and every module's
 # evaluation are known.
-fn unit-dependencies(u: Unit, homes: {Int:Int}, evaluation: {Int:[Int]}) -> [Int] =
+# A unit placed apart from its module's island (fragments on) depends on what it reads, and on
+# nothing else: what its module's initialization does before it is ordered by the checks of
+# `placed-apart`, and an import of its module still runs that initialization. Any other unit also
+# depends on its module's initialization and its static dependencies'.
+fn unit-dependencies(u: Unit, homes: {Int:Int}, evaluation: {Int:[Int]}, split: Bool) -> [Int] =
   [to for to in [to for symbol in reads(u.parts) for to in homes[symbol]]
-                ++ [to for id in u.modules for targets in evaluation[id] for to in targets]
+                ++ [to for id in u.modules if not (split and u.portable) for targets in evaluation[id] for to in targets]
       if to != u.id distinct to]
 
-fn dependencies(units: [Unit]) -> [[Int]] =
-  [unit-dependencies(u, homes, evaluation) for u in units]
-  where homes = {s: u.id for u in units for p in u.parts for m.db.declares(p, ?s)},
+fn dependencies(units: [Unit], split: Bool, before: {Int:[Int]}) -> [[Int]] =
+  [[to for to in own[i] ++ ordered[i] distinct to] for i in 0..len(units)]
+  where own = [unit-dependencies(u, homes, evaluation, split) for u in units],
+        part-units = {p: u.id for u in units for p in u.parts},
+        # A module's initialization loads after what is placed apart that it may change.
+        ordered = [[to for id in u.modules if not (split and u.portable) for p in before[id] ?? [] for to in part-units[p] if to != u.id] for u in units],
+        homes = {s: u.id for u in units for p in u.parts for m.db.declares(p, ?s)},
         effects = effect-units(units),
         evaluation = {id: [to for dep in [id] ++ static-deps(id) for targets in effects[dep] for to in targets distinct to]
                       for id in m.order if emit.included?(id)}
@@ -136,8 +145,10 @@ fn effect-units(units: [Unit]) -> {Int:[Int]} {
   found
 }
 
-fn model(split: Bool) -> Model = collapsed(numbered, dependencies(numbered))
-  where raw = raw-units(split, eligibility()), numbered = [raw[i] with { id: i } for i in 0..len(raw)]
+fn model(split: Bool) -> Model = collapsed(numbered, dependencies(numbered, split, placed.before))
+  where eligible = eligibility(),
+        placed = if split then placed-apart(eligible) else Placed(together: {}, before: {}),
+        raw = raw-units(split, eligible, placed.together), numbered = [raw[i] with { id: i } for i in 0..len(raw)]
 
 # Dependency cycles form one semantic unit. Cycles cannot acquire different initializers or
 # separate instances merely because a packing policy wants smaller chunks.
@@ -175,3 +186,463 @@ fn combined(units: [Unit]) -> Unit =
        parts: [p for u in units for p in u.parts],
        roots: sort r in [r for u in units for r in u.roots distinct r] by r,
        bytes: sum u in units: u.bytes, portable: all u in units: u.portable, evaluation: any u in units: u.evaluation)
+
+# ---------------------------------------------------------------- what may leave the island
+
+# How a statement may be placed apart from its module's initialization island, with fragments on.
+# Deferred: it runs nothing as it is defined (functions, inert values, imports that initialize
+# nothing). Eager: it computes as it is defined, but only what its author marked pure
+# (`/*@__PURE__*/`), classes whose heritage is a name, names and constants: it may run as its chunk
+# loads, if nothing that initialization does could tell. Attached: a write of such a value to a
+# property of a class or function the module declares, which goes with that declaration. Effect:
+# anything else, which stays in the island, in source order.
+enum Placement { Deferred, Eager, Attached, Effect }
+
+fn placement(part: Int) -> Placement = match stmt {
+  _ if ev.static-import?(stmt) and (m.db.effect(part) or len([t for m.db.initializes(part, ?t)]) > 0) => Effect
+  _ if ev.inert-stmt(stmt) => Deferred
+  _ if relocatable-stmt(stmt) => Eager
+  _ if (attached-to(stmt) ?? -1) >= 0 => Attached
+  _ => Effect
+} where stmt = an.stmt-in(body, here, part)
+
+# Properties of the language's own objects a statement may read wherever it runs: constants.
+const constant-reads: [Text] = [
+  "Math.E", "Math.LN10", "Math.LN2", "Math.LOG10E", "Math.LOG2E", "Math.PI", "Math.SQRT1_2", "Math.SQRT2",
+  "Number.EPSILON", "Number.MAX_SAFE_INTEGER", "Number.MIN_SAFE_INTEGER", "Number.MAX_VALUE", "Number.MIN_VALUE",
+  "Number.POSITIVE_INFINITY", "Number.NEGATIVE_INFINITY", "Number.NaN", "Symbol.asyncIterator", "Symbol.hasInstance",
+  "Symbol.isConcatSpreadable", "Symbol.iterator", "Symbol.match", "Symbol.matchAll", "Symbol.replace", "Symbol.search",
+  "Symbol.species", "Symbol.split", "Symbol.toPrimitive", "Symbol.toStringTag", "Symbol.unscopables"]
+
+fn free-name?(n: Node) -> Bool = is-none(m.symbol-in(body, here, n.lo))
+
+fn known-global?(n: Node) -> Bool = n is Ident(_) and free-name?(n) and n.text in an.known-globals
+
+fn relocatable-value(n: Node) -> Bool = match n {
+  CallExpr(callee, args) | NewExpr(callee, args) =>
+    (m.pure-annotated?(body, n) and relocatable-callee(callee) and (all a in args.items.kids: relocatable-value(a)))
+    or (n is NewExpr(...) and len(args.items.kids) == 0 and known-collection?(callee))
+  NewNoArgs(callee) => (m.pure-annotated?(body, n) and relocatable-callee(callee)) or known-collection?(callee)
+  Ident(_) => module-binding?(n) or known-global?(n)
+  Member(...) => constant-read?(n) or own-class-read?(n)
+  Paren(x) | Not(x) | Void(x) | Elem(x) | ElemLast(x) => relocatable-value(x)
+  Add(...) | Sub(...) | Mul(...) | Div(...) | Mod(...) => primitive-value(n)
+  ArrayLit(List(xs...)) => all x in xs: relocatable-value(x)
+  ObjectLit(List(xs...)) => all x in xs: relocatable-property(x)
+  ClassExpr(_, heritage, cls) => relocatable-class(heritage, cls)
+  _ => ev.inert(n)
+}
+
+fn constant-read?(n: Node) -> Bool = (first name in m.dotted-name(n, body.bindings): name in constant-reads) ?? false
+
+# A value no `valueOf` or `toString` of anyone's can be run to make: literals and constants, and
+# arithmetic of them.
+fn primitive-value(n: Node) -> Bool = match n {
+  Num(_) | Str(_) | TemplateFull(_) | Neg(Num(_)) => true
+  Paren(x) => primitive-value(x)
+  Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Mod(a, b) => primitive-value(a) and primitive-value(b)
+  Member(...) => constant-read?(n)
+  _ => false
+}
+
+fn known-collection?(c: Node) -> Bool = known-global?(c) and c.text in an.known-collections
+
+# What a call its author marked pure may call: a name, or a method of something itself
+# relocatable (`new Matrix3().set(…)`, `/re/.source.replace(…)`, `Object.freeze`).
+fn relocatable-callee(c: Node) -> Bool = match c {
+  Member(object, _) => relocatable-value(object) or relocatable-callee(object) or known-global?(object)
+  Paren(x) => relocatable-callee(x)
+  _ => relocatable-value(c)
+}
+
+fn relocatable-property(n: Node) -> Bool = match n {
+  Prop(key, value) => relocatable-key(key) and relocatable-value(value)
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...) | AsyncGenMethod(key, ...) =>
+    relocatable-key(key)
+  _ => false
+}
+
+fn relocatable-key(key: Node) -> Bool = match key {
+  Computed(x) => primitive-value(x)
+  _ => true
+}
+
+fn relocatable-class(heritage: Node, cls: Node) -> Bool =
+  relocatable-heritage(heritage) and all member in cls.members.kids: relocatable-member(member)
+
+fn relocatable-heritage(h: Node) -> Bool = match h {
+  None() => true
+  ClassHeritage(Ident(_) as name) => module-binding?(name) or known-global?(name)
+  _ => false
+}
+
+fn relocatable-member(n: Node) -> Bool = match n {
+  ClassEmpty() => true
+  StaticField(key, init) => relocatable-key(key) and relocatable-value(init)
+  Field(key, _) => relocatable-key(key)
+  StaticMethod(method) => relocatable-property(method)
+  StaticBlock(FuncBody(List(stmts...))) => all s in stmts: own-write?(s)
+  _ => relocatable-property(n)
+}
+
+# A static block's `this.x = v` or `this.prototype.x = v`, of a relocatable value.
+fn own-write?(s: Node) -> Bool = match s {
+  ExprStmt(Assignment(Member(This(), PropName(_)), AssignOp("="), value)) => relocatable-value(value)
+  ExprStmt(Assignment(Member(Member(This(), PropName("prototype")), PropName(_)), AssignOp("="), value)) => relocatable-value(value)
+  _ => false
+}
+
+fn relocatable-stmt(n: Node) -> Bool = match n {
+  VarDecl(List(ds...)) | LetDecl(List(ds...)) | ConstDecl(List(ds...)) | ExportVar(List(ds...)) =>
+    all d in ds: d.target is BindName(_) and relocatable-value(d.init)
+  ClassDecl(_, heritage, cls) => relocatable-class(heritage, cls)
+  ExportLexical(d) | ExportClass(d) => relocatable-stmt(d)
+  _ => false
+}
+
+# A write to a property of a class or function this module declares, or of its prototype, of a
+# value that may run as it loads: the statement declaring what is written.
+fn attached-to(n: Node) -> Int? = match n {
+  ExprStmt(Assignment(Member(object, PropName(_)), AssignOp("="), value)) if relocatable-value(value) =>
+    first c in written-of(object) for d in own-code(c): d
+  _ => none
+}
+
+fn written-of(object: Node) -> [Node] = match object {
+  Member(Ident(_) as c, PropName("prototype")) => [c]
+  Ident(_) => [object]
+  _ => []
+}
+
+# The statement of this module declaring the class or function a name means here.
+fn own-code(c: Node) -> [Int] =
+  [d for s in m.symbol-in(body, here, c.lo) if sym.symbol-at(m.table, s).scope == here.root
+     for m.db.declares(?d, s) if code-declaration?(an.stmt-in(body, here, d))]
+
+# The bundle declares a top-level class as `var C = class _C {…}`.
+fn code-declaration?(s: Node) -> Bool = match s {
+  ClassDecl(...) | FuncDecl(...) => true
+  ExportClass(d) | ExportFunction(d) | ExportLexical(d) => code-declaration?(d)
+  VarDecl(List(d)) | LetDecl(List(d)) | ConstDecl(List(d)) | ExportVar(List(d)) => match d.init {
+    ClassExpr(...) | FuncExpr(...) => true
+    _ => false
+  }
+  _ => false
+}
+
+# `C.prototype.m` or `C.x`, of a class this module declares with no getters or setters: reading it
+# runs nothing.
+fn own-class-read?(n: Node) -> Bool = match n {
+  Member(Member(Ident(_) as c, PropName("prototype")), PropName(_)) | Member(Ident(_) as c, PropName(_)) =>
+    any d in own-code(c): plain-class?(an.stmt-in(body, here, d))
+  _ => false
+}
+
+fn plain-class?(s: Node) -> Bool = match s {
+  ClassDecl(_, _, cls) | ClassExpr(_, _, cls) => not (any x in cls.members.kids: accessor?(x))
+  ExportClass(d) | ExportLexical(d) => plain-class?(d)
+  VarDecl(List(d)) | LetDecl(List(d)) | ConstDecl(List(d)) | ExportVar(List(d)) => plain-class?(d.init)
+  _ => false
+}
+
+fn accessor?(x: Node) -> Bool = match x {
+  Getter(...) | Setter(...) => true
+  StaticMethod(method) => accessor?(method)
+  _ => false
+}
+
+fn hoisted?(s: Node) -> Bool = match s {
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) => true
+  ExportFunction(d) => hoisted?(d)
+  _ => false
+}
+
+# ---------------------------------------------------------------- what runs, and when
+
+# A module-level name a statement's code reaches: the statement declaring what it means, and how:
+# read (0); called or constructed (1), which runs its body or constructor; or a property of it
+# called (2), which may run any of its code.
+record Ref { part: Int, how: Int }
+
+# The statements declaring what a name means here, through imports; none for a function's own name
+# or a free one.
+fn declaration-of(n: Node) -> [Int] =
+  [d for s in m.symbol-in(body, here, n.lo) if sym.symbol-at(m.table, s).scope == here.root
+     for d in [d for m.db.declares(?d, symbol-target(s))] distinct d]
+
+# What code reaches: `deep`, everything in it; otherwise only what runs as it is defined, and not
+# the bodies of the functions and methods it defines, which run when called. A class's heritage,
+# computed keys and static members run as it is defined.
+fn refs-in(n: Node, deep: Bool) -> [Ref] = match n {
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncExpr(...) | GenExpr(...)
+    | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) if not deep => []
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...)
+    | AsyncGenMethod(key, ...) | Field(key, _) if not deep => refs-in(key, false)
+  Ident(_) => [Ref(part: d, how: 0) for d in declaration-of(n)]
+  CallExpr(callee, args) | NewExpr(callee, args) => invoked(callee) ++ refs-in(callee, deep) ++ [r for a in args.items.kids for r in refs-in(a, deep)]
+  NewNoArgs(callee) => invoked(callee) ++ refs-in(callee, deep)
+  Tagged(tag, template) => invoked(tag) ++ refs-in(tag, deep) ++ refs-in(template, deep)
+  _ => [r for k in n.kids for r in refs-in(k, deep)]
+}
+
+fn invoked(callee: Node) -> [Ref] = match callee {
+  Ident(_) => [Ref(part: d, how: 1) for d in declaration-of(callee)]
+  Paren(x) => invoked(x)
+  _ => [Ref(part: d, how: 2) for r in chain-root(callee) for d in declaration-of(r)]
+}
+
+# The name a chain of property reads and calls starts from, or what it constructs.
+fn chain-root(n: Node) -> [Node] = match n {
+  Ident(_) => [n]
+  Member(object, _) | Index(object, _) | Paren(object) | CallExpr(object, _) | NewExpr(object, _) | NewNoArgs(object) => chain-root(object)
+  _ => []
+}
+
+# What calling or constructing what a statement declares runs: a function's body; a class's
+# heritage's constructor, its fields' values and its constructor, and every method when the
+# constructor calls one of its own.
+fn called-refs(s: Node) -> [Ref] = match s {
+  ClassDecl(_, heritage, cls) => constructed-refs(heritage, cls)
+  ExportClass(d) | ExportFunction(d) | ExportLexical(d) => called-refs(d)
+  VarDecl(List(ds...)) | LetDecl(List(ds...)) | ConstDecl(List(ds...)) | ExportVar(List(ds...)) =>
+    [r for d in ds for r in match d.init {
+      ClassExpr(_, heritage, cls) => constructed-refs(heritage, cls)
+      init => refs-in(init, true)
+    }]
+  _ => refs-in(s, true)
+}
+
+fn constructed-refs(heritage: Node, cls: Node) -> [Ref] =
+  [Ref(part: r.part, how: 1) for r in refs-in(heritage, false)]
+  ++ [r for x in cls.members.kids for r in constructed-member-refs(x, own-calls)]
+  where own-calls = any x in cls.members.kids: constructor?(x) and calls-own-method?(x)
+
+fn constructed-member-refs(x: Node, own-calls: Bool) -> [Ref] = match x {
+  Field(_, init) => refs-in(init, false)
+  StaticMethod(_) | StaticField(...) | StaticBlock(...) => []
+  _ if constructor?(x) or own-calls => refs-in(x, true)
+  _ => []
+}
+
+fn constructor?(x: Node) -> Bool = x is Method(PropName("constructor"), ...)
+
+everywhere fn calls-own-method?(n: Node) -> Bool = match n { CallExpr(Member(This(), _), _) => true }
+
+# What running code may change: what it assigns, or assigns a property of, or deletes; what it
+# calls a method of; and what it hands to a call or keeps in another value, which may then be
+# changed through it. `deep` as for `refs-in`.
+fn writes-in(n: Node, deep: Bool) -> [Int] = match n {
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncExpr(...) | GenExpr(...)
+    | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) if not deep => []
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...)
+    | AsyncGenMethod(key, ...) | Field(key, _) if not deep => writes-in(key, false)
+  Assignment(target, _, value) => rooted(target) ++ rooted(value) ++ writes-in(target, deep) ++ writes-in(value, deep)
+  PreInc(t) | PostInc(t) | PreDec(t) | PostDec(t) | Delete(t) => rooted(t) ++ writes-in(t, deep)
+  CallExpr(callee, args) | NewExpr(callee, args) =>
+    receiver(callee) ++ [d for a in args.items.kids for d in rooted(a)] ++ writes-in(callee, deep)
+    ++ [d for a in args.items.kids for d in writes-in(a, deep)]
+  Declarator(_, v) | Elem(v) | ElemLast(v) | Prop(_, v) | Return(v) | Spread(v) | SpreadProp(v) | Shorthand(v) =>
+    rooted(v) ++ [d for k in n.kids for d in writes-in(k, deep)]
+  _ => [d for k in n.kids for d in writes-in(k, deep)]
+}
+
+fn rooted(n: Node) -> [Int] = [d for r in written-root(n) for d in declaration-of(r)]
+
+# The name a chain of property reads starts from: what assigning through the chain changes. What a
+# call or `new` gives is another value, not the name.
+fn written-root(n: Node) -> [Node] = match n {
+  Ident(_) => [n]
+  Member(object, _) | Index(object, _) | Paren(object) => written-root(object)
+  _ => []
+}
+
+fn receiver(callee: Node) -> [Int] = match callee {
+  Member(object, _) | Index(object, _) => rooted(object)
+  _ => []
+}
+
+# The names a statement's code assigns, anywhere in it: what has to stay with their declarations,
+# as another chunk's import of a name cannot be assigned.
+everywhere fn assigned-names(n: Node) -> [Node] = match n {
+  Assignment(target, _, value) => pattern-names(target) ++ assigned-names(value)
+  PreInc(Ident(_) as t) | PostInc(Ident(_) as t) | PreDec(Ident(_) as t) | PostDec(Ident(_) as t) => [t]
+  ForIn(Ident(_) as t, right, b) | ForOf(_, Ident(_) as t, right, b) => [t] ++ assigned-names(right) ++ assigned-names(b)
+}
+
+fn pattern-names(t: Node) -> [Node] = match t {
+  Ident(_) => [t]
+  Member(...) | Index(...) => []
+  _ => [x for k in t.kids for x in pattern-names(k)]
+}
+
+# ---------------------------------------------------------------- placing statements apart
+
+# One live statement, as the program-wide placement sees it: what it runs as it is defined, when
+# what it declares is called, and when anything of it may run; what each may change; the
+# declarations of the names it assigns; and, for an attached write, what it writes to (-1: none).
+record Statement {
+  part: Int, module: Int, placement: Placement, hoisted: Bool, code: Bool, attached: Int,
+  runs: [Ref], run-writes: [Int], calls: [Ref], call-writes: [Int], anything: [Ref], anything-writes: [Int], binds: [Int]
+}
+
+# A module's statements, each its own question.
+fn module-statements(id: Int) -> [Statement] = match m.modules[id] {
+  m.Module(kind: m.Esm, ...) => with here = m.modules[id], body = m.body-of(id) { [statement(p) for p in parts] }
+  m.Module(kind: m.Runtime, ...) => [opaque-statement(id, p, Deferred, true) for p in parts]
+  _ => [opaque-statement(id, p, Effect, false) for p in parts]
+} where parts = [p for p in emit.parts-of(id) if emit.live?(p)]
+
+fn statement(part: Int) -> Statement =
+  Statement(part: part, module: here.id, placement: placement(part), hoisted: hoisted?(s), code: code-declaration?(s),
+            attached: attached-to(s) ?? -1, runs: refs-in(s, false), run-writes: writes-in(s, false),
+            calls: called-refs(s), call-writes: writes-in(s, true), anything: refs-in(s, true), anything-writes: writes-in(s, true),
+            binds: [d for t in assigned-names(s) for d in declaration-of(t)])
+  where s = an.stmt-in(body, here, part)
+
+# A statement of a runtime's helpers, there before anything runs, or of CommonJS: what it reads is
+# all it runs.
+fn opaque-statement(id: Int, part: Int, placement: Placement, hoisted: Bool) -> Statement =
+  Statement(part: part, module: id, placement: placement, hoisted: hoisted, code: false, attached: -1,
+            runs: refs, run-writes: [], calls: refs, call-writes: [], anything: refs, anything-writes: [], binds: [])
+  where refs = [Ref(part: d, how: 0) for s in reads([part]) for m.db.declares(?d, s)]
+
+# The program's statements as a graph of three nodes each: defining it (i), calling what it
+# declares (n + i), and running any of its code (2n + i), each to what that runs or reads.
+# Part numbers say where a statement stands only within its module, and a module placed apart
+# reaches itself only within itself (its dependencies have no cycle back), so what stands before
+# what is asked of `local`, the edges within a module.
+record Placing {
+  stmts: [Statement], n: Int, edges: [[Int]], reverse: [[Int]], local-reverse: [[Int]], writes: [[Int]], split: [Bool], wrapped: [Bool],
+  # For each module, as bits, it and the modules whose evaluation an ES import of it puts after it.
+  forward: [Bool], early: [Bool], dependents: [[Int]]
+}
+
+fn ref-node(r: Ref, at: {Int:Int}, n: Int) -> [Int] = [r.how * n + i for i in at[r.part]]
+
+fn placing(eligible: [Bool]) -> Placing =
+  Placing(stmts: stmts, n: n, edges: edges, reverse: reverse-edges(edges), local-reverse: reverse-edges(local), writes: writes, split: split, wrapped: wrapped,
+          dependents: graph.reached-bits(reverse-edges([es-imports(id) for id in 0..len(m.modules)]),
+                                         [graph.bits-of([id], graph.bit-words(len(m.modules))) for id in 0..len(m.modules)]),
+          forward: [later[i] < 0 - stmts[i].part for i in 0..n],
+          early: [stmts[i].attached >= 0 and ((first c in at[stmts[i].attached]: before-target[c] < stmts[i].part) ?? true) for i in 0..n])
+  where stmts = [s for ss in [module-statements(id) for id in m.order] for s in ss],
+        n = len(stmts),
+        at = {stmts[i].part: i for i in 0..n},
+        refs = [s.runs for s in stmts] ++ [s.calls for s in stmts] ++ [s.anything for s in stmts],
+        edges = [[x for r in refs[k] for x in ref-node(r, at, n)] ++ [k - n for x in [k] if k >= n] for k in 0..3 * n],
+        local = [[x for x in edges[k] if stmts[x % n].module == stmts[k % n].module] for k in 0..3 * n],
+        writes = [[i for d in w for i in at[d]] for w in [s.run-writes for s in stmts] ++ [s.call-writes for s in stmts] ++ [s.anything-writes for s in stmts]],
+        split = [eligible[s.module] for s in stmts],
+        wrapped = [an.wrapped?(m.modules[s.module]) for s in stmts],
+        # The last statement, not a hoisted function, each one's definition reaches: past itself, it
+        # would read what is not there yet where it stands.
+        later = graph.reached-min(local, [if k < n and not stmts[k].hoisted then 0 - stmts[k].part else no-part for k in 0..3 * n]),
+        # The first statement that runs code (not a definition) reaching what an attached write writes
+        # to, its own writes to it aside: before the write, it would see it unwritten.
+        unattached = [[x for x in local[k] if not (k < n and stmts[k].attached >= 0 and ((first i in at[stmts[k].attached]: i == x) ?? false))] for k in 0..3 * n],
+        unattached-reverse = reverse-edges(unattached),
+        first-run = graph.reached-min(unattached-reverse, [if k < n and stmts[k].placement != Deferred then stmts[k].part else no-part for k in 0..3 * n]),
+        before-target = [fold least = no-part for x in unattached-reverse[c]: min(least, first-run[x]) for c in 0..n]
+
+fn es-imports(id: Int) -> [Int] = match m.modules[id] {
+  m.Module(kind: m.Esm, ...) => static-deps(id)
+  _ => []
+}
+
+fn reverse-edges(edges: [[Int]]) -> [[Int]] =
+  graph.adjacency(len(edges), [x for k in 0..len(edges) for x in edges[k]], [k for k in 0..len(edges) for x in edges[k]])
+
+const no-part: Int = 4611686018427387904
+
+# What leaves its module's island: each part placed apart, by the first part of the unit it is
+# placed in. A part not here stays in its module's island, and so does every part of a module not
+# placed apart.
+# What leaves the islands: `together`, each part placed apart, by the first part of its unit (a part
+# not there stays in its module's island); and `before`, for a module, the parts placed apart that
+# its initialization may change what they read as they ran: they load before it, as they ran before
+# it.
+record Placed { together: {Int:Int}, before: {Int:[Int]} }
+
+fn placed-apart(eligible: [Bool]) -> Placed =
+  Placed(together: {g.stmts[i].part: g.stmts[together[i]].part for i in 0..g.n if not island[i]},
+         before: {module: [g.stmts[i].part for i in later] for module in modules
+                  for later in [[i for i in 0..g.n if not island[i] and changed-later?(g, c, i, module)]] if len(later) > 0})
+  where g = placing(eligible),
+        island = settled(g, [not g.split[i] or g.stmts[i].placement == Effect for i in 0..g.n]),
+        together = graph.components(joined(g, island)),
+        c = changes(g, island),
+        modules = [module for i in 0..g.n if not island[i] for module in graph.bits-list(c.changers[i]) ++ attached-changers(g, c, i) distinct module]
+
+fn attached-changers(g: Placing, c: Changes, i: Int) -> [Int] =
+  [x for t in [g.stmts[i].attached] if t >= 0 for k in 0..g.n if g.stmts[k].part == t for x in graph.bits-list(c.changed[k])]
+
+# Whether module `changer`, one that imports statement `i`'s, may change what `i` reads as it runs.
+fn changed-later?(g: Placing, c: Changes, i: Int, changer: Int) -> Bool =
+  (g.stmts[i].placement == Eager or g.stmts[i].placement == Attached) and changer != g.stmts[i].module
+  and (graph.bits-has?(c.changers[i], changer) or changer in attached-changers(g, c, i))
+
+# Parts that must share a unit: an attached write that leaves the island and what it writes to; a
+# statement and the declarations of what it assigns.
+fn joined(g: Placing, island: [Bool]) -> [[Int]] =
+  [[j for j in together[i]] for i in 0..g.n]
+  where at = {g.stmts[i].part: i for i in 0..g.n},
+        targets = [(if island[i] then [] else [g.stmts[i].attached]) ++ g.stmts[i].binds for i in 0..g.n],
+        pairs = [[i, j] for i in 0..g.n if g.split[i] for d in targets[i] if d >= 0 for j in at[d] if j != i],
+        together = graph.adjacency(g.n, [p[0] for p in pairs] ++ [p[1] for p in pairs], [p[1] for p in pairs] ++ [p[0] for p in pairs])
+
+# The island, grown until nothing more has to join it.
+fn settled(g: Placing, island: [Bool]) -> [Bool] = match len([x for x in next if x]) == len([x for x in island if x]) {
+  true => island
+  false => settled(g, next)
+} where next = grown(g, island)
+
+# Whether module `changer`'s initialization may run before module `own`'s statements: unless it
+# imports `own`, it may. One that imports it runs after it, and what is placed apart loads before
+# it (`before` in `Placed`).
+fn earlier?(g: Placing, changer: Int, own: Int) -> Bool = changer == own or not graph.bits-has?(g.dependents[own], changer)
+
+# What initialization may change, by the modules whose initialization it is (`changed`): what it
+# reaches that is not code, and what what it runs writes; and who may change anything each node
+# reaches (`changers`). Sets of modules, as bits.
+record Changes { changed: [[Int]], changers: [[Int]] }
+
+fn changes(g: Placing, island: [Bool]) -> Changes = Changes(changed: changed, changers: graph.reached-bits(g.edges, changed))
+  where n = g.n,
+        words = graph.bit-words(len(m.modules)),
+        nothing = graph.bits-of([], words),
+        reached = graph.reached-bits(g.reverse, [graph.bits-of([g.stmts[k % n].module for x in [k] if k < n and island[k]
+                                                                and (g.stmts[k].placement == Effect or g.stmts[k].placement == Attached)], words)
+                                                 for k in 0..3 * n]),
+        pairs = [[x, k] for k in 0..3 * n if any w in reached[k]: w != 0 for x in g.writes[k]],
+        writers = graph.adjacency(3 * n, [p[0] for p in pairs], [p[1] for p in pairs]),
+        changed = [fold bits = (if k < n and not g.stmts[k].code then reached[k] else nothing) for w in writers[k]: graph.bits-or(bits, reached[w])
+                   for k in 0..3 * n]
+
+fn changed-earlier?(g: Placing, changers: [Int], own: Int) -> Bool = any c in graph.bits-list(changers): earlier?(g, c, own)
+
+# What has to join the island, as it stands: a statement placed apart must not be read, before it
+# stands, by initialization (`first-island`); one that runs as it loads must read only what is
+# there by then (`available`), nothing defined after it (`forward`), and nothing initialization
+# that runs before it may change (`changers`); an attached write's target must not be run before
+# the write (`early`), nor changed by such initialization; and a statement shares the island of
+# anything it must share a unit with.
+fn grown(g: Placing, island: [Bool]) -> [Bool] =
+  [island[i] or together[i] in bound for i in 0..g.n]
+  where n = g.n,
+        first-island = graph.reached-min(g.local-reverse, [if k < n and island[k] then g.stmts[k].part else no-part for k in 0..3 * n]),
+        available = graph.closed-safe(g.edges, [k >= n or g.stmts[k].hoisted or not g.wrapped[k] or (g.split[k] and not island[k]) for k in 0..3 * n]),
+        c = changes(g, island),
+        changed = c.changed,
+        changers = c.changers,
+        runs = [g.stmts[i].placement == Eager or g.stmts[i].placement == Attached for i in 0..n],
+        hazard = [not island[i] and (
+                    (not g.stmts[i].hoisted and first-island[i] < g.stmts[i].part)
+                    or (runs[i] and (not available[i] or g.forward[i] or changed-earlier?(g, changers[i], g.stmts[i].module)))
+                    or (g.stmts[i].attached >= 0 and (g.early[i] or (any c in at[g.stmts[i].attached]: island[c] or changed-earlier?(g, changed[c], g.stmts[i].module)))))
+                  for i in 0..n],
+        at = {g.stmts[i].part: i for i in 0..n},
+        # A write that cannot go with what it writes joins the island alone; what must share a unit
+        # with a statement joining the island joins it too.
+        leaving = [island[i] or hazard[i] for i in 0..n],
+        together = graph.components(joined(g, leaving)),
+        bound = {together[i]: true for i in 0..n if leaving[i]}
