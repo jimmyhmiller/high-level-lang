@@ -661,6 +661,7 @@ fn part-visited(path: Text, item: Text, what: Text) -> Parsed = match what {
   "rest" => finished-file(path)
   "early" => worked(item) where problem = early-of(path)
   "from" => worked(item) where p = from-of(path)
+  "leads" => worked(item) where l = loaded-ahead(path)
   "w" ++ _ => worked(item) where w = walked-of(item)
   "?" ++ batch => blank-parsed(path) with { role: Resolved, targets: {request-key(r): t for r in asked if let some(t) = unhooked-target(r, path)} }
     where requests = requests-of(visit-file(path)), from = parse-int(batch) * resolve-batch,
@@ -697,11 +698,17 @@ fn visit-step(item: Text) -> Step = Step(next: next-files(p), first: first-files
   where p = visit-file(item)
 
 # A file visited whole and analysed: its place in the graph is worked out by whoever parsed it,
-# while the others parse, and the graph's walk finds it made.
+# while the others parse, and the graph's walk finds it made. One with many imports has them
+# resolved first, a batch at a time on many threads (`first-files`), and its place worked out
+# after (`after-files`): worked out here, it would resolve every import alone, with the batches
+# and all they lead to waiting for it.
 fn leads-ahead(item: Text, p: Parsed) -> Int = match p.role {
-  Whole if item == p.path and p.analysed => len(loaded-ahead(item).leads)
+  Whole if item == p.path and p.analysed and not batched?(p) => len(loaded-ahead(item).leads)
   _ => 0
 }
+
+# Whether a file's imports are resolved as items of their own.
+fn batched?(p: Parsed) -> Bool = len(p.specs) > resolve-alone and len(keys(p.targets)) == 0
 
 fn step-next(s: Step) -> [Text] = s.next
 fn step-first(s: Step) -> [Text] = s.first
@@ -719,7 +726,7 @@ fn first-files(p: Parsed) -> [Text] = match p.role {
   Split => [p.path ++ "\n" ++ int-text(k) for k in 0..p.pieces]
   # Then its parts' walks, its early errors and the rest, at once.
   Prepare => [p.path ++ "\nw" ++ int-text(k) for k in 0..p.pieces] ++ [p.path ++ "\nearly", p.path ++ "\nfrom"]
-  Whole => if len(p.specs) > resolve-alone and len(keys(p.targets)) == 0
+  Whole => if batched?(p)
            then [p.path ++ "\n?" ++ int-text(k) for k in 0..(len(requests-of(p)) + resolve-batch - 1) / resolve-batch] else []
   _ => []
 }
@@ -729,6 +736,8 @@ fn first-files(p: Parsed) -> [Text] = match p.role {
 fn after-files(p: Parsed) -> [Text] = match p.role {
   Split => [p.path ++ "\nprepare"]
   Prepare => [p.path ++ "\nrest"]
+  # A file's place in the graph, once its many imports are resolved.
+  Whole if p.analysed and batched?(p) => [p.path ++ "\nleads"]
   _ => []
 }
 
@@ -1271,9 +1280,9 @@ fn graph(runtime: Text, paths: [Text]) -> Graph =
         files = [w.pre[i] for i in file-at],
         part-at = updated([0 for key in w.pre], {file-at[k]: k + 1 for k in 0..len(file-at)}),
         # The files something requires, or imports the default or namespace of.
-        wholes = {key: true for f in files for key in whole-of(f)},
+        wholes = {key: true for whole in parallel-map(files, whole-of, loading.load-threads) for key in whole},
         rt = runtime-parsed(runtime).analysis,
-        lay = placement(["<runtime>"] ++ files, [size-of(rt.table)] ++ [table-size(f) for f in files]),
+        lay = placement(["<runtime>"] ++ files, [size-of(rt.table)] ++ parallel-map(files, table-size, loading.load-threads)),
         # Each module, and each file's table at its place, is its own work: all are made at once.
         made = parallel-map([Spot(w: w, i: i, numbers: numbers, lay: lay, part-at: part-at, wholes: wholes) for i in 0..len(w.pre)],
                             module-spot, loading.load-threads),

@@ -55,6 +55,13 @@
                 1)
           (None [] 0))
         (HashMap::remove! (mut (.direct m)) key)))
+  ;; Empty again, with the room it has.
+  (clear! [(m (mut (MemoMap K V)))] (-> i64)
+    (HashMap::clear! (mut (.direct m)))
+    (HashMap::clear! (mut (.index m)))
+    (clear! (mut (.values m)))
+    (clear! (mut (.vacant m)))
+    0)
   (free! [(m (mut (MemoMap K V)))] (-> i64)
     (free! (mut (.direct m)))
     (free! (mut (.index m)))
@@ -186,15 +193,19 @@
 (defn yields [] (-> (ptr Yields))
   (primitive/alloc-static Yields))
 
+(defn lock-looks :inline (Always) [] (-> i64) 4000)
+
 ;;; Taken only when it looks free: a thread that waits reads the word, which every waiter can do
 ;;; at once, and writes to it only to take it. Writing while it is held would pull the word from
 ;;; whoever holds it and from every other waiter, each time round.
 (defn spin-lock! [(word (ptr i64))] (-> void)
   (let [(mut turns) 0]
     (while (or (!= (atomic/read word) 0) (!= (atomic/cas word 0 1) 0))
-      ;; Whoever holds it may have lost its core: after a while, let it have this one.
+      ;; Whoever holds it may have lost its core: after a while, let it have this one. What is
+      ;; done under such a lock takes well under the time giving a core away does, so the while
+      ;; is some thousands of looks (`lock-looks`).
       (set! turns (+ turns 1))
-      (when (> turns 200)
+      (when (> turns (lock-looks))
         (atomic/add (field (yields) whole) 1)
         (sched_yield)
         (set! turns 0))))
@@ -216,7 +227,7 @@
             (set! in true)
             (do
               (set! turns (+ turns 1))
-              (when (> turns 200)
+              (when (> turns (lock-looks))
                 (atomic/add (field (yields) beside) 1)
                 (sched_yield)
                 (set! turns 0)))))))
@@ -357,24 +368,30 @@
         (push! (mut (.stretches r)) took)
         (set! (.space-at r) at)
         (set! (.space-end r) (+ at took))))
-    (let [p (.space-at r)]
+    ;; The header is written once the lock is let go: its page is new, and the first write to
+    ;; it waits for the system, which nobody else should wait behind. Nothing reads a region's
+    ;; chunks while it is still being allocated in.
+    (let [p (.space-at r)
+          before (.chunks r)]
       (set! (.space-at r) (+ p want))
-      (store! (primitive/cast (ptr i64) p) (.chunks r))
-      (store! (primitive/cast (ptr i64) (+ p 8)) want)
       (set! (.chunks r) p)
       (set! (.bytes r) (+ (.bytes r) want))
       (spin-unlock! (field r lock))
+      (store! (primitive/cast (ptr i64) p) before)
+      (store! (primitive/cast (ptr i64) (+ p 8)) want)
       (+ p (chunk-header-bytes)))))
 
 (defn chunk-add-own! [(r (ptr Region)) (size i64)] (-> i64)
   (let [p (primitive/cast i64 (chunk-memory size))]
     (when (= p 0) (oom-at c"a region's chunk" size))
+    ;; Its header is written outside the lock, as a scratch chunk's is.
     (spin-lock! (field r lock))
-    (store! (primitive/cast (ptr i64) p) (.chunks r))
-    (store! (primitive/cast (ptr i64) (+ p 8)) size)
-    (set! (.chunks r) p)
-    (set! (.bytes r) (+ (.bytes r) size))
-    (spin-unlock! (field r lock))
+    (let [before (.chunks r)]
+      (set! (.chunks r) p)
+      (set! (.bytes r) (+ (.bytes r) size))
+      (spin-unlock! (field r lock))
+      (store! (primitive/cast (ptr i64) p) before)
+      (store! (primitive/cast (ptr i64) (+ p 8)) size))
     (unless (.lasting r) (atomic/add (field (region-queue) bytes-made) size))
     (+ p (chunk-header-bytes))))
 
@@ -802,6 +819,26 @@
 
 ;;; How a table of kept answers holds its Text keys: views of kept texts; or, in a run that
 ;;; reclaims memory, copies of its own that go when it lets them go.
+;;; Text keys a table only looks at: whoever fills it keeps each text for as long as the table.
+(defn held-key-copy [(ap (ptr (dyn Allocator))) (slot (ptr i8))] (-> i64)
+  0)
+
+(defn held-keyops [] (-> (ptr KeyOps))
+  (let [c (primitive/alloc-static HeldKeyOps)]
+    (when (once-mine? (field c ready))
+      (let [base (load (str/keyops))]
+        (set! (.ops c)
+              (KeyOps :hash (primitive/fnptr-of text-key-hash)
+                      :eq (.eq base)
+                      :size (.size base)
+                      :copy (primitive/fnptr-of held-key-copy)
+                      :free (primitive/fnptr-of kept-key-free)
+                      :owns 1)))
+      (once-made! (field c ready)))
+    (field c ops)))
+
+(defstruct HeldKeyOps [(ready i64) (ops KeyOps)])
+
 (defn memo-keyops [] (-> (ptr KeyOps))
   (if (reclaiming?) (text-keyops) (kept-keyops)))
 
@@ -1803,6 +1840,12 @@
 ;;; `MemoPart--` in the rules compiler), and which of them a key of this hash is in: by bits a
 ;;; table does not place its keys by.
 (defn memo-parts :inline (Always) [] (-> i64) 64)
+
+;;; How many answers a thread keeps by itself, of each memo, in a run that only makes answers and
+;;; reads them: the ones it last asked for, which it asks for again without touching what the
+;;; threads share. A thread that works through every module in turn would otherwise hold a copy
+;;; of every answer.
+(defn near-most :inline (Always) [] (-> i64) 64)
 
 (defn memo-part-of :inline (Always) [(hash i64)] (-> i64)
   (& (>> hash 40) 63))
@@ -3325,8 +3368,9 @@
             :parent (ArrayList::new [i64] (tree-allocator))
             :slot (ArrayList::new [i64] (tree-allocator))
             :targets (ArrayList::new [(ArrayList i64)] (tree-allocator)))
+        ;; Every node's text is the walk's own (`pre`), for as long as this table is.
         (mut seen)
-          (HashMap::new [(slice u8) i64] (value-allocator) (text-keyops))
+          (HashMap::new [(slice u8) i64] (value-allocator) (held-keyops))
         (mut path)
           (WalkPath
             :at (ArrayList::new [i64] (value-allocator))
@@ -3655,11 +3699,36 @@
 ;;; With HL_READ_TRACE set, when files are read: how long after the first each tenth, hundredth
 ;;; and thousandth was. A build's loading is as fast as its files arrive; this shows where they
 ;;; stop arriving.
-(defstruct ReadTrace [(count i64) (start i64) (on i64)])
+(defstruct ReadTrace [(count i64) (start i64) (on i64) (walked i64)])
 
-(defn read-trace! [] (-> void)
+(defn read-trace-state [] (-> (ptr ReadTrace))
   (let [t (primitive/alloc-static ReadTrace)]
     (when (= (.on t) 0) (set! (.on t) (if (env-on? "HL_READ_TRACE") 1 2)) (set! (.start t) (now-ns)))
+    t))
+
+;;; With the same set: a directory listed, when it was done and how long it took.
+(defn read-trace-listed! [(path (slice u8)) (began i64)] (-> void)
+  (let [t (read-trace-state)]
+    (when (= (.on t) 1)
+      (eprintln "listed {} at {} us, in {} us" path (/ (- (now-ns) (.start t)) 1000) (/ (- (now-ns) began) 1000)))
+    0))
+
+;;; With the same set: the first items a walk visits, when each was done and how long it took.
+(defn walk-trace-on? :inline (Always) [] (-> bool)
+  (= (.on (read-trace-state)) 1))
+
+(defn walk-trace! [(item (slice u8)) (began i64)] (-> void)
+  (let [t (read-trace-state)]
+    (when (and (= (.on t) 1) (< (atomic/add (field t walked) 1) 160))
+      (eprintln "walked {} at {} us, in {} us, by {}"
+                (if (> (len item) 40) (subslice item (- (len item) 40) (len item)) item)
+                (/ (- (now-ns) (.start t)) 1000)
+                (/ (- (now-ns) began) 1000)
+                (worker-slot)))
+    0))
+
+(defn read-trace! [] (-> void)
+  (let [t (read-trace-state)]
     (when (= (.on t) 1)
       (let [n (atomic/add (field t count) 1)]
         (when (or (= (% n 1000) 0) (and (< n 1000) (= (% n 100) 0)) (and (< n 100) (= (% n 10) 0)))
@@ -4393,7 +4462,8 @@
     listing))
 
 (defn dir-listing-raw [(path (slice u8))] (-> (slice u8))
-  (let [(mut out) (ArrayList::new [u8] (value-allocator))]
+  (let [(mut out) (ArrayList::new [u8] (value-allocator))
+        began (now-ns)]
     (match (fs/Directory::open (malloc-allocator)
                                (if (= (len path) 0) "." path))
       (Ok [d]
@@ -4413,6 +4483,7 @@
             (fs/Directory::close! (mut dir))
             0))
       (Err [_] 0))
+    (read-trace-listed! path began)
     (slice out)))
 
 ;;; Exists and can be read: a directory exists, but is not a file.
@@ -4798,6 +4869,27 @@
           (set! at i))))
     at))
 
+;;; With HL_RUN_TRACE set, each run on many threads says how long it took and how long its
+;;; threads were at it, all together: a run whose threads were mostly waiting shows as a small
+;;; share of what that many threads could have done.
+(defstruct RunTrace [(on i64) (busy i64) (joined i64) (seq i64) (began i64)])
+
+(defn run-trace [] (-> (ptr RunTrace))
+  (let [t (primitive/alloc-static RunTrace)]
+    (when (= (.on t) 0) (set! (.on t) (if (env-on? "HL_RUN_TRACE") 1 2)))
+    t))
+
+(defn run-tracing? :inline (Always) [] (-> bool)
+  (= (.on (run-trace)) 1))
+
+;;; A thread's part in a run, from `began`.
+(defn run-trace-part! [(began i64)] (-> void)
+  (when (> began 0)
+    (let [t (run-trace)]
+      (atomic/add (field t busy) (- (now-ns) began))
+      (atomic/add (field t joined) 1)))
+  0)
+
 (defn pool-worker [(arg (ptr i8))] (-> (ptr i8))
   (let [slot (primitive/cast i64 arg)
         p (pool)
@@ -4840,7 +4932,9 @@
             (apart-inherit! apart)
             (set! (.in-job (thread-regions)) 1)
             (set! (.settings-view (thread-regions)) (+ view 1))
-            (body job)
+            (let [began (if (run-tracing?) (now-ns) 0)]
+              (body job)
+              (run-trace-part! began))
             (set! (.settings-view (thread-regions)) 0)
             (set! (.in-job (thread-regions)) 0)
             (stack-trim!)
@@ -4867,7 +4961,9 @@
                 (when (!= apart-region 0) (region-enter-id! apart-region))
                 (apart-inherit! apart)
                 (set! (.in-job (thread-regions)) 1)
-                (body job)
+                (let [began (if (run-tracing?) (now-ns) 0)]
+                  (body job)
+                  (run-trace-part! began))
                 (set! (.in-job (thread-regions)) 0)
                 (stack-trim!)
                 (apart-inherit! 0)
@@ -4947,6 +5043,11 @@
     (Ok [_] 0)
     (Err [_] (pool-fail "cannot wait"))))
 
+(defn gate-wake-one! [(g (ptr Gate))] (-> void)
+  (match (Condition::notify-one! (field g cond))
+    (Ok [_] 0)
+    (Err [_] (pool-fail "cannot notify"))))
+
 (defn gate-wake-all! [(g (ptr Gate))] (-> void)
   (match (Condition::notify-all! (field g cond))
     (Ok [_] 0)
@@ -4999,9 +5100,15 @@
             (Err [_] (pool-fail "cannot notify")))
           (pool-unlock! p)
           (let [t (thread-regions)
-                was (.in-job t)]
+                was (.in-job t)
+                began (if (run-tracing?) (now-ns) 0)]
+            (when (> began 0)
+              (atomic/store (field (run-trace) busy) 0)
+              (atomic/store (field (run-trace) joined) 0)
+              (set! (.began (run-trace)) began))
             (set! (.in-job t) 1)
             (body job)
+            (run-trace-part! began)
             (set! (.in-job t) was))
           ;; The others are usually nearly done: watch a little while before sleeping.
           (let [(mut spins) 0]
@@ -5009,6 +5116,19 @@
               (set! spins (+ spins 1))))
           (pool-lock! p)
           (while (> (.left p) 0) (pool-wait! p (field p done)))
+          (when (run-tracing?)
+            (let [r (run-trace)
+                  wall (- (now-ns) (.began r))]
+              (set! (.seq r) (+ (.seq r) 1))
+              (when (> wall 300000)
+                (eprintln "[run {}] {} us, {} threads asked, its threads at it {} us in {} parts: {}% of {} threads"
+                          (.seq r)
+                          (/ wall 1000)
+                          count
+                          (/ (atomic/read (field r busy)) 1000)
+                          (atomic/read (field r joined))
+                          (/ (* 100 (atomic/read (field r busy))) (* wall count))
+                          count))))
           (set! (.running p) false)
           (let [(mut read) (.read p)]
             (pool-unlock! p)

@@ -21,8 +21,9 @@ everywhere fn tags-in(n: Node, b: m.Body, mo: m.Module) -> [Int] = match n {
 fn jsx-file?(path: Text) -> Bool = m.loader-of(path) == "jsx" or m.loader-of(path) == "tsx"
 
 # What one unit of live code uses: each symbol once for each use, which name kept JSX tags, how
-# often each byte, and the top-level symbols its parts declare, in order. Units are counted at once;
-# the sums do not depend on the order they are added in.
+# often each byte, and the top-level symbols its parts declare outside a dynamic scope (whose names
+# are kept), in order. Units are counted at once; the sums do not depend on the order they are
+# added in.
 record Usage { used: [Int], tags: [Int], freq: [Int], toplevel: [Int] }
 
 fn unit-usage(u: e.Unit) -> Usage = match nm.included?(u.module) {
@@ -36,10 +37,17 @@ fn unit-usage(u: e.Unit) -> Usage = match nm.included?(u.module) {
                   true => byte-counts(b.text)
                   false => []
                 },
-                toplevel: [s for p in live for m.db.declares(p, ?s) if not nm.import-symbol?(s)])
+                toplevel: [s for p in live for m.db.declares(p, ?s) if not nm.import-symbol?(s) and not in-dynamic-scope?(s)])
 } where mo = m.modules[u.module],
         b = m.body-of(u.module),
         live = [p for p in u.parts if nm.live?(p)]
+
+fn in-dynamic-scope?(s: Int) -> Bool = sym.scope-at(m.table, sym.symbol-at(m.table, s).scope).dynamic
+
+# How often each byte, over some units: summed a run of units at a time, each run at once.
+fn bytes-of(usages: [Usage]) -> [Int] = [sum u in usages if len(u.freq) > 0: u.freq[c] for c in 0..256]
+
+const usage-run: Int = 256
 
 # A symbol's slot.
 record Slotted { symbol: Int, at: Int }
@@ -95,10 +103,12 @@ fn minified-names(threads: Int) -> [Text] =
   where usages = parallel-map(e.units, unit-usage, threads),
         uses = histogram(sym.symbol-count(m.table), [s for u in usages for s in u.used]),
         tagged = {s: true for u in usages for s in u.tags},
-        freq = [sum u in usages if len(u.freq) > 0: u.freq[c] for c in 0..256],
-        nested = [module-slots(id)... for id in m.order if nm.included?(id)],
+        runs = parallel-map([usages[k * usage-run..min(len(usages), (k + 1) * usage-run)] for k in 0..(len(usages) + usage-run - 1) / usage-run],
+                            bytes-of, threads),
+        freq = [sum r in runs: r[c] for c in 0..256],
+        nested = [x for found in parallel-map([id for id in m.order if nm.included?(id)], module-slots, threads) for x in found],
         first-top = fold top = 0 for x in nested: max(top, x.at + 1),
-        toplevel = [s for u in usages for s in u.toplevel if not sym.scope-at(m.table, sym.symbol-at(m.table, s).scope).dynamic],
+        toplevel = [s for u in usages for s in u.toplevel],
         slotted = nested ++ [Slotted(symbol: toplevel[i], at: first-top + i) for i in 0..len(toplevel)],
         slots = first-top + len(toplevel),
         counts = histogram(slots, [x.at for x in slotted], [uses[x.symbol] for x in slotted]),

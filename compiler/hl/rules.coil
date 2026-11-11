@@ -4286,7 +4286,11 @@
                              (busy i64)
                              (waiting i64)
                              (done i64)
+                             ;; How many workers sleep at the gate, for whoever adds work to wake.
+                             (asleep i64)
+                             (lock i64)
                              (queue (ArrayList (slice u8)))
+                             (found (ArrayList (slice u8)))
                              (seen (HashMap (slice u8) bool))
                              (results (ArrayList ~cr))
                              (visit (fnptr (cc/C) [(slice u8)] ~cr))
@@ -4303,22 +4307,44 @@
                   (push! (mut (.aux k))
                          `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
                             ;; A worker with nothing to do sleeps until another adds work or finishes
-                            ;; the last of it.
+                            ;; the last of it. The queue and all that goes with it are under a
+                            ;; lock held for a few instructions at a time (`lk`); the gate is
+                            ;; only for sleeping at, and is never asked for while that is held.
                             (let [j (cast (ptr ~(sym job)) arg)
                                   g (.gate j)
+                                  lk (field j lock)
                                   visit (.visit j)
                                   follow (.follow j)
                                   urgent (.urgent j)
                                   later (.later j)
+                                  ;; What a visit leads to (`found`) is taken last found first, and
+                                  ;; what carries on an item's own work (`queue`) in turn. Every
+                                  ;; other worker takes what was found first, the rest what carries
+                                  ;; on: a walk over files spends most of its time in the system
+                                  ;; opening them, one at a time whatever asks, so a file found is
+                                  ;; opened as soon as it is known, while the others go on finding.
+                                  found-first (= (% (rt/worker-slot) 2) 0)
                                   (mut go) true]
-                              (rt/gate-lock! g)
+                              (rt/spin-lock! lk)
                               (while go
-                                (if (< (.head j) (len (.queue j)))
-                                    (let [item (get (.queue j) (.head j))]
-                                      (set! (.head j) (+ (.head j) 1))
+                                (if (or (< (.head j) (len (.queue j))) (> (len (.found j)) 0))
+                                    (let [from-found
+                                            (if found-first
+                                                (> (len (.found j)) 0)
+                                                (>= (.head j) (len (.queue j))))
+                                          item
+                                            (if from-found
+                                                (match (pop! (mut (.found j)))
+                                                  (Some [x] x)
+                                                  (None [] (panic "a walk's found items ran out under its lock")))
+                                                (let [x (get (.queue j) (.head j))]
+                                                  (set! (.head j) (+ (.head j) 1))
+                                                  x))]
                                       (set! (.busy j) (+ (.busy j) 1))
-                                      (rt/gate-unlock! g)
-                                      (let [r (visit item)
+                                      (rt/spin-unlock! lk)
+                                      (let [began (if (rt/walk-trace-on?) (rt/now-ns) 0)
+                                            r (visit item)
+                                            traced (if (rt/walk-trace-on?) (do (rt/walk-trace! item began) 0) 0)
                                             more (follow r)
                                             now
                                               (if (.has-urgent j)
@@ -4331,7 +4357,7 @@
                                                   (ArrayList::new [(slice u8)]
                                                                   (rt/owned-allocator)))
                                             (mut added) false]
-                                        (rt/gate-lock! g)
+                                        (rt/spin-lock! lk)
                                         (push! (mut (.results j)) r)
                                         ;; Ahead of what waits: into the places already taken, or a new queue.
                                         (let [(mut fresh)
@@ -4407,16 +4433,28 @@
                                                     (Some [_] true)
                                                     (None [] false))
                                             (set! (mut (.seen j)) x true)
-                                            (push! (mut (.queue j)) x)
+                                            (push! (mut (.found j)) x)
                                             (set! added true)))
                                         (set! (.busy j) (- (.busy j) 1))
                                         (atomic/store (field j waiting)
-                                                      (- (len (.queue j))
-                                                         (.head j)))
+                                                      (+ (len (.found j))
+                                                         (- (len (.queue j)) (.head j))))
                                         (when (= (.busy j) 0)
                                           (atomic/store (field j done) 1))
-                                        (when (or added (= (.busy j) 0))
-                                          (rt/gate-wake-all! g))))
+                                        ;; Whoever sleeps is woken: all of them when the walk is
+                                        ;; over, else one for each item that waits. A worker still
+                                        ;; looking for work finds it without being told.
+                                        (let [over (= (.busy j) 0)
+                                              waits (+ (len (.found j)) (- (len (.queue j)) (.head j)))]
+                                          (when (and (or over added) (> (atomic/read (field j asleep)) 0))
+                                            (rt/spin-unlock! lk)
+                                            (rt/gate-lock! g)
+                                            (if over
+                                                (rt/gate-wake-all! g)
+                                                (for _ (range 0 (min (atomic/read (field j asleep)) waits))
+                                                  (rt/gate-wake-one! g)))
+                                            (rt/gate-unlock! g)
+                                            (rt/spin-lock! lk)))))
                                     (if (= (.busy j) 0)
                                         (do
                                           (atomic/store (field j done) 1)
@@ -4424,11 +4462,10 @@
                                         ;; A while looking for new work, then asleep until some comes.
                                         (do
                                           (atomic/store (field j waiting)
-                                                        (- (len (.queue j))
-                                                           (.head j)))
-                                          (rt/gate-unlock! g)
+                                                        (+ (len (.found j)) (- (len (.queue j)) (.head j))))
+                                          (rt/spin-unlock! lk)
                                           (let [(mut spins) 0]
-                                            (while (and (< spins 4000)
+                                            (while (and (< spins 20000)
                                                         (= (atomic/read (field j
                                                                                waiting))
                                                            0)
@@ -4436,13 +4473,22 @@
                                                                                done))
                                                            0))
                                               (set! spins (+ spins 1)))
-                                            (rt/gate-lock! g)
-                                            (when (and (= spins 4000)
-                                                       (>= (.head j)
-                                                           (len (.queue j)))
-                                                       (> (.busy j) 0))
-                                              (rt/gate-wait! g)))))))
-                              (rt/gate-unlock! g)
+                                            ;; To sleep: say so, then look once more, at the gate. Work
+                                            ;; added before this said so is seen here; whoever adds
+                                            ;; after sees a sleeper, and wakes it from the gate.
+                                            (when (= spins 20000)
+                                              (rt/gate-lock! g)
+                                              (atomic/add (field j asleep) 1)
+                                              (rt/spin-lock! lk)
+                                              (let [idle (and (>= (.head j) (len (.queue j)))
+                                                              (= (len (.found j)) 0)
+                                                              (> (.busy j) 0))]
+                                                (rt/spin-unlock! lk)
+                                                (when idle (rt/gate-wait! g)))
+                                              (atomic/add (field j asleep) -1)
+                                              (rt/gate-unlock! g))
+                                            (rt/spin-lock! lk))))))
+                              (rt/spin-unlock! lk)
                               arg)))
                   (Some (te `(let [(mut ~(sym job-v))
                                      (~(sym job)
@@ -4451,7 +4497,12 @@
                                        :busy 0
                                        :waiting 0
                                        :done 0
+                                       :asleep 0
+                                       :lock 0
                                        :queue
+                                         (ArrayList::new [(slice u8)]
+                                                         (rt/owned-allocator))
+                                       :found
                                          (ArrayList::new [(slice u8)]
                                                          (rt/owned-allocator))
                                        :seen
@@ -11219,8 +11270,18 @@
                                   (do
                                     ;; Not while names are only noted: see `noted` above.
                                     (unless (rt/names-recording?)
-                                      (set! (mut (~near t)) key v)
-                                      (set! (mut (~near-regions t)) key answer-region))
+                                      (if simple
+                                          ;; Only the last few asked for (see `rt/near-most`); such
+                                          ;; a run's answers have no region to note.
+                                          (do
+                                            (when (>= (len (~near t)) (rt/near-most))
+                                              (rt/MemoMap::clear! (mut (~near t))))
+                                            (set! (mut (~near t)) key v)
+                                            0)
+                                          (do
+                                            (set! (mut (~near t)) key v)
+                                            (set! (mut (~near-regions t)) key answer-region)
+                                            0)))
                                     (rt/region-uses-id! answer-region)
                                     v))
                             (None [] (panic "memo fn {} lost its answer" ~name)))))))))
