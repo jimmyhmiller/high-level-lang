@@ -1,0 +1,190 @@
+# The analysis as one page (`--analyze=DIR` writes DIR/index.html): HTML made from templates over the
+# report's records, with no script. What a route loads is a map of its files, side by side as wide as
+# their bytes, and in each file its modules, one above another as tall as theirs; every module is a
+# link to its own section. The section shown is the one the address names (CSS `:target`): a route,
+# a module, or the list of all of them; with none named, the first route.
+rules bundle.view over bundle.html
+use bundle.html as h
+use bundle.analyze as a
+quote html at 1 0 ;
+
+fn page(r: a.Analysis) -> Text = "<!doctype html>\n" ++ h.render(document, false) ++ "\n"
+  where style = join(css, "\n"),
+        nav = [route-link(r, i) for i in 0..len(r.roots)],
+        routes = [route-section(r, i) for i in 0..len(r.roots)],
+        modules = [module-section(r, i) for i in 0..len(r.modules)],
+        all = all-section(r),
+        document = html`<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Bundle analysis</title>
+<style>$style</style>
+</head>
+<body>
+<header><h1>Bundle analysis</h1><nav>$$nav<a href="#all">All modules</a></nav></header>
+<main>
+<div class="routes">$$routes</div>
+<div class="modules">$$modules</div>
+<div class="lists">$all</div>
+</main>
+</body>
+</html>`
+
+# ---------------------------------------------------------------- routes
+
+fn route-link(r: a.Analysis, i: Int) -> h.Node = html`<a href=$href>$name</a>`
+  where href = attr("#r" ++ int-text(i)), name = text(path-base(r.roots[i].path))
+
+fn route-section(r: a.Analysis, i: Int) -> h.Node = html`<section class="route" id=$id>
+<h2>$title</h2>
+<p class="muted">$summary</p>
+<div class="map">$$files</div>
+</section>`
+  where root = r.roots[i],
+        id = attr("r" ++ int-text(i)),
+        title = text(root.path ++ " · " ++ root.kind),
+        summary = text(size(root.bytes) ++ " loaded before it runs, in " ++ int-text(len(root.loads)) ++ " files"),
+        files = [file-box(r, o) for o in root.loads]
+
+fn file-box(r: a.Analysis, o: Int) -> h.Node = html`<div class="file" style=$grow>
+<div class="name">$name</div>
+<div class="boxes">$$boxes</div>
+</div>`
+  where file = r.outputs[o],
+        grow = attr("flex-grow:" ++ int-text(file.bytes)),
+        name = text(path-base(file.path) ++ " · " ++ size(file.bytes)),
+        boxes = [module-box(r, held) for held in file.modules] ++ [own-box(file) for x in [file.own] if x > 0]
+
+fn module-box(r: a.Analysis, held: a.Held) -> h.Node = html`<a class="box" href=$href style=$look title=$tip>$label</a>`
+  where m = r.modules[held.module],
+        href = attr("#m" ++ int-text(held.module)),
+        look = attr("flex-grow:" ++ int-text(held.bytes) ++ ";background:" ++ shade(m)),
+        tip = attr(m.path ++ " · " ++ size(held.bytes)),
+        label = text(path-base(m.path) ++ " " ++ size(held.bytes))
+
+fn own-box(file: a.OutputReport) -> h.Node = html`<span class="box own" style=$look title=$tip>$label</span>`
+  where look = attr("flex-grow:" ++ int-text(file.own)),
+        tip = attr("the file's own imports, exports and wrappers · " ++ size(file.own)),
+        label = text("own " ++ size(file.own))
+
+# A module's colour: its package's, or the program's own.
+fn shade(m: a.ModuleReport) -> Text = "hsl(" ++ int-text(hue) ++ " 55% 74%)"
+  where key = if m.package == "" then m.kind else m.package,
+        hue = (sum c in code-points-of(key): c) * 37 % 360
+
+# ---------------------------------------------------------------- modules
+
+fn module-section(r: a.Analysis, i: Int) -> h.Node = html`<section class="module" id=$id>
+<h2>$path</h2>
+<p class="muted">$about</p>
+<table>
+<tr><td>In the output</td><td class="n">$output</td></tr>
+<tr><td>Source</td><td class="n">$source</td></tr>
+<tr><td>Statements kept</td><td class="n">$kept</td></tr>
+</table>
+<div>$note</div>
+<h3>In files</h3>
+<ul>$$files</ul>
+<h3>How each route reaches it</h3>
+<div>$$chains</div>
+<h3>What is used of it, and by whom</h3>
+<ul>$$users</ul>
+<h3>Kept for what they do as it loads</h3>
+<div>$$kept_for</div>
+</section>`
+  where m = r.modules[i],
+        id = attr("m" ++ int-text(i)),
+        path = text(m.path),
+        about = text(if m.package == "" then m.kind else m.package ++ " · " ++ m.kind),
+        output = text(size(sum w in m.outputs: w.bytes)),
+        source = text(size(m.source)),
+        kept = text(int-text(m.kept) ++ " of " ++ int-text(m.statements)),
+        note = effects-only(r, i),
+        files = or-none([file-line(r, w) for w in m.outputs]),
+        chains = or-none-block([chain-list(r, c) for c in m.chains]),
+        users = or-none([user-line(r, u) for u in m.used-by]),
+        kept-for = or-none-block([kept-line(k) for k in m.kept-for])
+
+# A module nothing reads, kept only for what some of its statements do as it loads.
+fn effects-only(r: a.Analysis, i: Int) -> h.Node = match len(m.used-by) == 0 and len(m.kept-for) > 0 and not (any x in r.roots: x.module == i) {
+  true => html`<p class="note">Nothing it declares is used: it is in the output only for what the statements below do as it loads.</p>`
+  false => html`<span></span>`
+} where m = r.modules[i]
+
+fn file-line(r: a.Analysis, w: a.Within) -> h.Node = html`<li><span>$name</span> <span class="muted">$bytes</span></li>`
+  where name = text(path-base(r.outputs[w.output].path)), bytes = text(size(w.bytes))
+
+fn chain-list(r: a.Analysis, c: a.Chain) -> h.Node = html`<ol class="chain">$$steps</ol>`
+  where steps = [html-step(r, m) for m in c.modules]
+
+fn html-step(r: a.Analysis, m: Int) -> h.Node = html`<li>$link</li>` where link = module-link(r, m)
+
+fn user-line(r: a.Analysis, u: a.UsedBy) -> h.Node = html`<li><span>$link</span> <span class="muted">$names</span></li>`
+  where link = module-link(r, u.module), names = text(join(u.names, ", "))
+
+fn kept-line(k: a.KeptFor) -> h.Node = html`<pre class="stmt">$line</pre>`
+  where line = text(int-text(k.line) ++ ": " ++ k.text)
+
+# A module by its file's name; its section gives its path.
+fn module-link(r: a.Analysis, m: Int) -> h.Node = html`<a href=$href>$name</a>`
+  where href = attr("#m" ++ int-text(m)), name = text(path-base(r.modules[m].path))
+
+fn or-none(items: [h.Node]) -> [h.Node] = match len(items) {
+  0 => [html`<li class="muted">none</li>`]
+  _ => items
+}
+
+fn or-none-block(items: [h.Node]) -> [h.Node] = match len(items) {
+  0 => [html`<p class="muted">none</p>`]
+  _ => items
+}
+
+# ---------------------------------------------------------------- every module
+
+fn all-section(r: a.Analysis) -> h.Node = html`<section class="list" id="all">
+<h2>All modules, largest first</h2>
+<table>$$rows</table>
+</section>`
+  where rows = [all-row(r, i) for i in sort i in [i for i in 0..len(r.modules)] by 0 - (sum w in r.modules[i].outputs: w.bytes)]
+
+fn all-row(r: a.Analysis, i: Int) -> h.Node = html`<tr><td>$link</td><td class="n">$bytes</td></tr>`
+  where link = module-link(r, i), bytes = text(size(sum w in r.modules[i].outputs: w.bytes))
+
+# ---------------------------------------------------------------- text
+
+# Text as HTML shows it, and an attribute's value, quoted.
+fn text(t: Text) -> Text = replace-many(t, ["&", "<", ">"], ["&amp;", "&lt;", "&gt;"])
+fn attr(t: Text) -> Text = "\"" ++ replace-many(t, ["&", "\""], ["&amp;", "&quot;"]) ++ "\""
+
+fn size(bytes: Int) -> Text = match bytes {
+  b if b >= 1048576 => int-text(b / 1048576) ++ "." ++ int-text(b * 100 / 1048576 % 100) ++ " MB"
+  b if b >= 1024 => int-text(b / 1024) ++ "." ++ int-text(b * 10 / 1024 % 10) ++ " KB"
+  b => int-text(b) ++ " B"
+}
+
+const css: [Text] = [
+  ":root { --bg: #fbfbfa; --panel: #fff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e4e3df; --accent: #2f6fdb; --own: #d9d6cf; --note: #ffe08a; }",
+  "@media (prefers-color-scheme: dark) { :root { --bg: #161615; --panel: #1f1f1d; --ink: #ecebe7; --muted: #9c9a93; --line: #34332f; --accent: #7aa7ff; --own: #4a4843; --note: #7a5d00; } }",
+  "body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 system-ui, sans-serif; }",
+  "header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }",
+  "header h1 { font-size: 15px; margin: 0; }",
+  "nav { display: flex; flex-wrap: wrap; gap: 12px; }",
+  "a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }",
+  "main { padding: 12px 16px; }",
+  ".route, .module, .list { display: none; }",
+  ".route:target, .module:target, .list:target { display: block; }",
+  "main:not(:has(:target)) .route:first-child { display: block; }",
+  ".map { display: flex; height: 72vh; gap: 4px; }",
+  ".file { display: flex; flex-direction: column; flex-basis: 0; min-width: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); }",
+  ".file .name { font-size: 11px; color: var(--muted); padding: 2px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  ".boxes { display: flex; flex-direction: column; flex: 1; min-height: 0; }",
+  ".box { display: block; flex-basis: 0; min-height: 0; overflow: hidden; padding: 1px 4px; font-size: 11px; color: #111; border-top: 1px solid var(--bg); white-space: nowrap; text-overflow: ellipsis; }",
+  ".box.own { background: var(--own); color: var(--muted); }",
+  ".muted { color: var(--muted); }",
+  "table { border-collapse: collapse; font-variant-numeric: tabular-nums; } td { padding: 2px 8px 2px 0; border-bottom: 1px solid var(--line); } td.n { text-align: right; }",
+  "h2 { font-size: 14px; word-break: break-all; } h3 { font-size: 13px; margin: 16px 0 4px; }",
+  "ul { padding-left: 18px; } ol.chain { padding-left: 22px; margin: 4px 0 10px; }",
+  "pre.stmt { margin: 2px 0; padding: 3px 6px; background: var(--panel); border-radius: 4px; white-space: pre-wrap; word-break: break-all; }",
+  ".note { background: var(--note); padding: 6px 8px; border-radius: 6px; }"
+]

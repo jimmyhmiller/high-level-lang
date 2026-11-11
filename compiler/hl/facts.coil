@@ -180,11 +180,33 @@
             (for _ (range n 3) (push! (mut groups) `0))
             `(rt/agg-step! (mut agg) ~@groups ~(var-sym (.text (get (.args a) (.agg-col k))))))
         (= sink "found") `(return-from :found true)
+        ;; Explaining a row: each row of the body that matched, explained in turn, after it.
+        (= sink "explain")
+          ;; In the order the rule is written, whatever order the joins took.
+          (let [(mut steps) (primitive/code-list-new)
+                (mut done) (ArrayList::new [bool] (malloc-allocator))]
+            (for _ (.body k) (push! (mut done) false))
+            (for _ (.body k)
+              (let [(mut next) -1]
+                (for j (range 0 (len (.body k)))
+                  (let [b (get (.body k) j)]
+                    (when (and (not (get done j))
+                               (or (< next 0) (written-before? b (get (.body k) next))))
+                      (set! next j))))
+                (set! (mut done) next true)
+                (let [b (get (.body k) next)]
+                  (unless (or (.negated b) (differs? b))
+                    (push! (mut steps) `(why-into! (mut db) ~(.rel b) ~@(row-args b) (+ depth 1) (mut out)))))))
+            `(do ~@steps (return-from :found true)))
         ;; A rule run as a task of a round (see `stratum-rounds`) queues what it finds for itself.
         (= sink "rule-out") `(rt/row-queue! rule-out ~@(row-args a))
         :else
           `(rt/rel-queue! (mut (~(field-sym (.rel a)) ~(primitive/code-symbol sink)))
                           ~@(row-args a)))))
+
+(defn written-before? [(a Atom) (b Atom)] (-> bool)
+  (or (< (.line (.tok a)) (.line (.tok b)))
+      (and (= (.line (.tok a)) (.line (.tok b))) (< (.col (.tok a)) (.col (.tok b))))))
 
 ;;; A row going where `sink` says, its four columns given.
 (defn sink-code [(rel (slice u8)) (sink (slice u8)) (cols Code)] (-> Code)
@@ -292,20 +314,26 @@
                                                  ~key
                                                  ~key2)]
                            (for ~(row-sym i) ~(bucket-sym i)
-                             (when ~(row-seen a i) ~body))))
+                             (when ~(seen-code k a i) ~body))))
                     (>= key-col 0)
                       (let [key (var-sym (.text (get (.args a) key-col)))
                             body (columns-code (mut c) k i 0 (mut bound))]
                         `(let [~(bucket-sym i)
                                  (rt/rel-bucket (mut (~rel ~db)) ~key-col ~key)]
                            (for ~(row-sym i) ~(bucket-sym i)
-                             (when ~(row-seen a i) ~body))))
+                             (when ~(seen-code k a i) ~body))))
                     :else
                       (let [body (columns-code (mut c) k i 0 (mut bound))]
                         `(for ~(row-sym i) (range 0 ~(if (old? a)
                                                           `(.start (~rel ~db))
                                                           `(.count (~rel ~db))))
-                           (when ~(row-seen a i) ~body))))))))))
+                           (when ~(seen-code k a i) ~body))))))))))
+
+;;; Whether a scan sees atom `i`'s row: explaining a row, only rows that came before it count.
+(defn seen-code [(k Clause) (a Atom) (i i64)] (-> Code)
+  (if (= (.sink k) "explain")
+      `(and ~(row-seen a i) (< (rt/rel-row-time (mut (~(field-sym (.rel a)) ~(src-sym a))) ~(row-sym i)) why-time))
+      (row-seen a i)))
 
 ;;; Does any rule add to this relation? One that none does never has a delta.
 (defn derived? [(clauses (ArrayList Clause)) (name (slice u8))] (-> bool)
@@ -456,8 +484,10 @@
         (push! (mut starts)
                `(rt/rel-advance! (mut (~(field-sym (.name r)) db))))
         (push! (mut marks)
-               `(when (rt/rel-advance! (mut (~(field-sym (.name r)) db)))
-                  (set! changed true)))))
+               `(do
+                  (when (rt/rel-advance! (mut (~(field-sym (.name r)) db)))
+                    (set! changed true))
+                  (rt/rel-stamp! (mut (~(field-sym (.name r)) db)) rounds)))))
     (for k clauses
       (when (bound? group (.rel (.head k)))
         (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
@@ -527,8 +557,10 @@
         (push! (mut starts)
                `(rt/rel-advance! (mut (~(field-sym (.name r)) db))))
         (push! (mut marks)
-               `(when (rt/rel-advance! (mut (~(field-sym (.name r)) db)))
-                  (set! changed true)))))
+               `(do
+                  (when (rt/rel-advance! (mut (~(field-sym (.name r)) db)))
+                    (set! changed true))
+                  (rt/rel-stamp! (mut (~(field-sym (.name r)) db)) rounds)))))
     (for k clauses
       (when (bound? group (.rel (.head k)))
         (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
@@ -768,6 +800,42 @@
            (let [~@lets]
              (when (and true ~@checks) ~inner))
            false))))))
+
+;;; Whether rule `k` (the i-th) derives row `a0`..`a3` of its head from rows that came before
+;;; `why-time`; when it does, those rows are explained into `out`, at `depth` + 1. An aggregate's row is
+;;; its rule's, from all of its group, and is explained by that alone.
+(defn explain-code [(c (mut dsl/Cur)) (k Clause) (i i64)] (-> Code)
+  (let [name (primitive/code-symbol "explained-" i)]
+    (if (> (.agg k) 0)
+        `(defn ~name [(db (mut Db)) (a0 i64) (a1 i64) (a2 i64) (a3 i64) (why-time i64) (depth i64) (out (mut (ArrayList Why)))] (-> bool)
+           true)
+        (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
+              (mut binds) (ArrayList::new [i64] (malloc-allocator))
+              head (.head k)]
+          (for j (range 0 (len (.args head)))
+            (let [n (.text (get (.args head) j))]
+              (if (bound? bound n)
+                  (push! (mut binds) -1)
+                  (do (push! (mut bound) n) (push! (mut binds) j)))))
+          (let [(mut checks) (primitive/code-list-new)
+                (mut lets) (primitive/code-list-new)
+                inner (atoms-code (mut c)
+                                  (planned-from (Clause :head head :body (.body k) :sink "explain" :agg 0 :agg-col -1)
+                                                (texts-copy bound)
+                                                false)
+                                  0
+                                  (mut bound))]
+            (for j (range 0 (len (.args head)))
+              (let [n (.text (get (.args head) j))
+                    col (primitive/code-symbol "a" j)]
+                (if (>= (get binds j) 0)
+                    (do (push! (mut lets) (var-sym n)) (push! (mut lets) col))
+                    (push! (mut checks) `(= ~(var-sym n) ~col)))))
+            `(defn ~name [(db (mut Db)) (a0 i64) (a1 i64) (a2 i64) (a3 i64) (why-time i64) (depth i64) (out (mut (ArrayList Why)))] (-> bool)
+               (block :found
+                 (let [~@lets]
+                   (when (and true ~@checks) ~inner))
+                 false)))))))
 
 ;;; Stratum `s` brought up to date from what changed below it, by deleting and deriving again: what
 ;;; a row taken out below, or one added to a relation read negated, derived in the old database is
@@ -1077,6 +1145,7 @@
           (mut encodes) (primitive/code-list-new)
           (mut decodes) (primitive/code-list-new)
           (mut holds) (primitive/code-list-new)
+          (mut why-steps) (primitive/code-list-new)
           (mut index) 0]
       (for r rels
         (let [field (primitive/code-symbol (.name r))
@@ -1144,7 +1213,41 @@
           (push! (mut reserves) `(= name ~(.name r)))
           (push! (mut reserves) `(rt/rel-reserve! (mut (~access db)) n))))
       (for ci (range 0 (len clauses))
-        (push! (mut rederive-fns) (rederive-code (mut c) (get clauses ci) ci)))
+        (push! (mut rederive-fns) (rederive-code (mut c) (get clauses ci) ci))
+        (push! (mut rederive-fns) (explain-code (mut c) (get clauses ci) ci)))
+      ;; `why-REL`: a row explained, step by step (see `why-step`).
+      (for r rels
+        (let [(mut params) (primitive/code-list-new)
+              (mut args) (primitive/code-list-new)
+              (mut tries) (primitive/code-list-new)]
+          (for i (range 0 4)
+            (if (< i (.arity r))
+                (let [p (primitive/code-symbol "a" i)]
+                  (push! (mut params) `(~p i64))
+                  (push! (mut args) p))
+                (push! (mut args) `0)))
+          (for ci (range 0 (len clauses))
+            (when (= (.rel (.head (get clauses ci))) (.name r))
+              (push! (mut tries) `(~(primitive/code-symbol "explained-" ci) (mut db) a0 a1 a2 a3 time depth (mut out)))
+              (push! (mut tries) `(set! (mut out) at (Why :relation ~(.name r) :a a0 :b a1 :c a2 :d a3 :rule ~ci :depth depth)))))
+          (push! (mut why-steps) `(= rel ~(.name r)))
+          (push! (mut why-steps)
+                 `(let [row (rt/rel-find (mut (~(field-sym (.name r)) db)) a0 a1 a2 a3)]
+                    (if (< row 0)
+                        false
+                        (let [time (rt/rel-row-time (mut (~(field-sym (.name r)) db)) row)
+                              at (len out)]
+                          (push! (mut out) (Why :relation ~(.name r) :a a0 :b a1 :c a2 :d a3 :rule -1 :depth depth))
+                          (cond ~@tries :else 0)
+                          true))))
+          (push! (mut api)
+                 `(defn ~(primitive/code-symbol "why-" (.name r)) [(given Db) ~@params] (-> (ArrayList Why))
+                    (let [(mut db) given
+                          (mut out) (ArrayList::new [Why] (rt/value-allocator))]
+                      (when (>= (.from db) 0)
+                        (panic "why: this database was brought up to date in place, where the order of its rows says nothing of how they came; solve it afresh"))
+                      (why-into! (mut db) ~(.name r) ~@args 0 (mut out))
+                      out)))))
       (for group (groups-in-order rels clauses)
         (push! (mut updates) (update-stratum (mut c) rels clauses group)))
       (for r rels
@@ -1181,6 +1284,8 @@
                      ;; bits, which keeps a program's many rows small.
                      (defstruct Fact
                        [(rel i32) (a i32) (b i32) (c i32) (d i32)])
+                     (defstruct Why
+                       [(relation (slice u8)) (a i64) (b i64) (c i64) (d i64) (rule i64) (depth i64)])
                      (defstruct Db
                        [~@fields
                         (known bool)
@@ -1325,6 +1430,13 @@
                          ~@strata
                          ~(if (rule-times?) `(rt/rule-times-report!) `0)
                          rounds))
+                     ;;; A row explained: the row (`rule` -1 when no rule derives it, a given fact),
+                     ;;; then, when a rule derives it, which (its number in the file) and each row of
+                     ;;; its body explained after it, one deeper (`depth`). Only rows that came before a
+                     ;;; row explain it, so an explanation ends; in a recursion each step is one of the
+                     ;;; fewest. Answers false for a row that is not there.
+                     (defn why-into! [(db (mut Db)) (rel (slice u8)) (a0 i64) (a1 i64) (a2 i64) (a3 i64) (depth i64) (out (mut (ArrayList Why)))] (-> bool)
+                       (cond ~@why-steps :else (panic "why: no relation named {}" rel)))
                      ~@rederive-fns
                      ~@rule-fns
 ;;; What `solved-blocks` makes of `blocks`, made from `last`, what it made of others: only

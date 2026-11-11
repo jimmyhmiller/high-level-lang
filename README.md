@@ -13,8 +13,9 @@ build.pipeline       stages, and plans of how many threads run them → plans, c
 ├── package.syntax   package.json, only the parts resolution reads  → a parser
 ├── js.scopes        which nodes open scopes, where bindings land   → resolver
 ├── link.facts       ES linking and tree shaking, as Datalog        → nested loops with indexes
-├── report.facts     what a build made, and why: Datalog with        → the same, and aggregates
-│                    count, sum, min and max, and !=
+├── report.facts     what a build made, and why: Datalog with        → the same, aggregates, and
+│                    count, sum, min, max and !=                       explanations (why-REL)
+├── html.syntax      HTML as the analysis page writes it             → printer, templates
 ├── minify.rewrite   syntax minification rules                      → pattern matcher, peephole
 └── *.rules          the logic: resolution, loading, early errors,  → typed native code
                      analysis, emit, renaming, source maps, the build
@@ -317,10 +318,10 @@ and disk caching retain their existing CLI restriction; single-output caching ac
 
 ## What a build says of itself
 
-`--analyze=DIR` writes what the build made, and why, beside its outputs, the data Turbopack's
-`next analyze` shows: `DIR/analysis.json`, and `DIR/analysis.jsonl`, one record a line for
-scripts. Keep a directory per build to compare them. The outputs themselves are byte for byte those
-of the same build without it.
+`--analyze=DIR` writes what the build made, and why, beside its outputs, what Turbopack's
+`next analyze` shows: `DIR/index.html`, a page to read it in; `DIR/analysis.json`; and
+`DIR/analysis.jsonl`, one record a line for scripts. Keep a directory per build to compare them.
+The outputs themselves are byte for byte those of the same build without it.
 
 - **Outputs**: each file's size, the files it imports and loads with `import()`, and what of each
   module it holds, to the byte; the rest is its own (imports, exports).
@@ -331,20 +332,33 @@ of the same build without it.
   kept only for what they do as the module loads, with their lines. On three.js's math page,
   `three.module.js`'s 163 KB is used by nothing, and kept by 13 such statements (`ShaderLib = {…}`).
 
+The page has no script. Each route is a map of the files it loads, side by side as wide as their
+bytes, and in each its modules, one above another as tall as theirs, so every area is its bytes;
+each module is a link to its section: its sizes, the files it is in, how each route reaches it,
+what is used of it and by whom, and the statements kept for what they do as it loads, with a note
+when nothing it declares is used. The section shown is the one the address names (`:target`). It
+is HTML defined as a grammar (`src/bundle/html.syntax`), which gives its nodes, its printer and its
+templates, and views written as templates over the report's records (`src/bundle/view.rules`).
+
 The analysis is stated as rules, `src/bundle/report.facts`: what each output holds of each module
 is a sum over the stretches of its code the printer marked (`held(O, M, sum B) :- span(O, M, N, B)`),
 what a root loads is what its output imports, and on (`loads`), what is used of a module and by
 whom is a join over linking's parts (`used-by(M, R, S) :- …, M != R`), and what is kept for its
-effects is another. The report is records (`src/bundle/analyze.rules`), written as JSON by `json`,
+effects is another. How a route reaches a module is the explanation of a row: `.facts` answers
+`why-REL(db, …)` with the row's derivation, each row explained only by rows derived before it, so
+in a recursion every step is one of the fewest; `why-reached(db, root, module)` is the chain of
+imports. The report is records (`src/bundle/analyze.rules`), written as JSON by `json`,
 which the rules compiler derives from their types. The report's database is solved only with
 `--analyze`, from the outputs and from linking's relations.
 
 The emitter gives each statement, and a few levels inside it, its module, and the printer marks only
 where the output passes from one module's code to another's (`render-files`), not every token as a
-source map does. It costs 2–6% more CPU (three.js, zod, d3) and 11% on rxjs's many small modules.
+source map does. With the page it costs 2–5% more CPU (three.js, zod, d3), and 18% on rxjs, whose
+226 modules make a 551 KB page.
 `tools/analyze-check.py` checks the outputs are unchanged, every byte is attributed, each route
 loads what its files import, and what each module holds agrees with the same build's source map,
-up to the output's own bytes (its imports and exports, which a map gives to the code beside them).
+up to the output's own bytes (its imports and exports, which a map gives to the code beside them);
+and the page has no script, a section for each route and module, and every link leads to one.
 
 ## Paired client/server builds
 

@@ -10,8 +10,11 @@
 - analysis.json and analysis.jsonl hold the same records; every module index is a module.
 - What each module holds of each output agrees with the same build's source map, which marks every
   token's source, up to the output's own bytes (its imports and exports, which a map gives to the
-  code beside them); a map leaves out the runtime's helpers."""
+  code beside them); a map leaves out the runtime's helpers.
+- The page (index.html) has no script; every link within it leads to a section of it, and there is a
+  section for each route and each module, each import chain leading from its route to its module."""
 import json, os, re, shutil, subprocess, sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,6 +77,37 @@ def map_shares(js, mapfile):
     return shares
 
 
+class Page(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.ids, self.links, self.scripts, self.sections = set(), [], 0, []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if "id" in a:
+            self.ids.add(a["id"])
+        if tag == "a" and a.get("href", "").startswith("#"):
+            self.links.append(a["href"][1:])
+        if tag == "script":
+            self.scripts += 1
+        if tag == "section":
+            self.sections.append(a.get("id"))
+
+
+def check_page(report, data, label):
+    page = Page()
+    page.feed((report / "index.html").read_text())
+    assert page.scripts == 0, f"{label}: the page has a script"
+    missing = [l for l in page.links if l not in page.ids]
+    assert not missing, f"{label}: links to no section: {missing[:5]}"
+    want = {f"r{i}" for i in range(len(data["roots"]))} | {f"m{i}" for i in range(len(data["modules"]))} | {"all"}
+    assert want == set(page.sections), f"{label}: sections {sorted(set(page.sections) ^ want)[:5]} differ"
+    for m, mod in enumerate(data["modules"]):
+        for c in mod["chains"]:
+            assert c["modules"][0] == data["roots"][[r["module"] for r in data["roots"]].index(c["root"])]["module"] and c["modules"][-1] == m, \
+                f"{label}: a chain of {mod['path']} does not lead from its route to it"
+
+
 def files(d):
     return {str(p.relative_to(d)): p.read_bytes() for p in sorted(Path(d).rglob("*")) if p.is_file()}
 
@@ -110,6 +144,7 @@ for entries, label in SPLITS:
         assert [l for l in lines if l["about"] == "output"] == data["outputs"]
         assert [l for l in lines if l["about"] == "module"] == data["modules"]
         assert [l for l in lines if l["about"] == "root"] == data["roots"]
+        check_page(report, data, f"{label} {mode}")
         modules, outputs = data["modules"], data["outputs"]
         names = [os.path.relpath(TESTS / o["path"], out) if not os.path.isabs(o["path"]) else os.path.relpath(o["path"], out) for o in outputs]
         for o, name in zip(outputs, names):
