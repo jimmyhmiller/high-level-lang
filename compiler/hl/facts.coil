@@ -22,6 +22,7 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
 (import "hl.rt" :as rt)
+(import "coil.os" :as os)
 (import "hl.dsl" :as dsl)
 (import "hl.grammars.facts" :as g)
 
@@ -139,10 +140,12 @@
                (dsl/join3 "the head variable "
                           (.text t)
                           " is not bound by the body"))))
-  (if (= sink "found")
-      `(return-from :found true)
-      `(rt/rel-queue! (mut (~(field-sym (.rel a)) ~(primitive/code-symbol sink)))
-                      ~@(row-args a))))
+  (cond (= sink "found") `(return-from :found true)
+        ;; A rule run as a task of a round (see `stratum-rounds`) queues what it finds for itself.
+        (= sink "rule-out") `(rt/row-queue! rule-out ~@(row-args a))
+        :else
+          `(rt/rel-queue! (mut (~(field-sym (.rel a)) ~(primitive/code-symbol sink)))
+                          ~@(row-args a))))
 
 ;;; Test or bind column `col` of the row atom `i` holds, then continue.
 (defn columns-code [(c (mut dsl/Cur))
@@ -344,6 +347,24 @@
 
 ;;; The relations of `group` solved over `db` from what is there, every relation they read outside it
 ;;; finished: every rule once, then from each round's new rows until a round adds none.
+;;; Built with HL_RULE_TIMES set, each rule's work is timed, by its head, its body and which of
+;;; its atoms drives it ("first" for the whole rule once, "new R" for the rows R gained in a
+;;; round), and `solve!` says where the time went (`rt/rule-times-report!`). Built without it,
+;;; nothing changes.
+(defn rule-times? [] (-> bool)
+  (!= (primitive/cast i64 (os/getenv c"HL_RULE_TIMES")) 0))
+
+(defn rule-timed [(k Clause) (which (slice u8)) (code Code)] (-> Code)
+  (if (rule-times?)
+      (let [(mut label) (rt/join (.rel (.head k)) " <-")]
+        (for a (.body k)
+          (set! label (rt/join label (rt/join (if (.negated a) " not " " ") (.rel a)))))
+        (set! label (rt/join label (rt/join " [" (rt/join which "]"))))
+        `(let [rule-started (rt/now-ns)]
+           ~code
+           (rt/rule-time! ~label (- (rt/now-ns) rule-started))))
+      code))
+
 (defn stratum-code [(c (mut dsl/Cur))
                     (rels (ArrayList Relation))
                     (clauses (ArrayList Clause))
@@ -364,8 +385,11 @@
         (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
               flush (field-sym (.rel (.head k)))]
           (push! (mut once)
-                 (atoms-code (mut c) (planned k) 0 (mut bound)))
-          (push! (mut once) `(rt/rel-flush! (mut (~flush db))))
+                 (rule-timed k
+                             "first"
+                             `(do
+                                ~(atoms-code (mut c) (planned k) 0 (mut bound))
+                                (rt/rel-flush! (mut (~flush db))))))
           (for i (range 0 (len (.body k)))
             (let [a (get (.body k) i)
                   ra (rel-index rels (.rel a))]
@@ -373,11 +397,14 @@
                 (let [(mut b2) (ArrayList::new [(slice u8)] (malloc-allocator))]
                   (push! (mut again)
                          `(when (rt/rel-delta? (mut (~(field-sym (.rel a)) db)))
-                            ~(atoms-code (mut c)
-                                         (delta-variant k i)
-                                         0
-                                         (mut b2))
-                            (rt/rel-flush! (mut (~flush db))))))))))))
+                            ~(rule-timed k
+                                         (rt/join "new " (.rel a))
+                                         `(do
+                                            ~(atoms-code (mut c)
+                                                         (delta-variant k i)
+                                                         0
+                                                         (mut b2))
+                                            (rt/rel-flush! (mut (~flush db))))))))))))))
     `(do
        ~@starts
        ~@once
@@ -387,6 +414,113 @@
            (set! rounds (+ rounds 1))
            ~@marks
            (when changed ~@again))))))
+
+;;; A rule with its head's rows going to the queue of whichever task runs it.
+(defn to-rule-out [(k Clause)] (-> Clause)
+  (Clause :head (.head k) :body (.body k) :sink "rule-out"))
+
+;;; A stratum solved in rounds whose rules run at once. Each rule, and each rule driven by the
+;;; rows one of its atoms gained in the last round, is a task: it reads the relations as they
+;;; stood when the round began and queues what it finds for itself. When every task is done the
+;;; queues are added to the relations, in the tasks' order, and what was new drives the next
+;;; round. A relation is read by many and written by none while a round's tasks run; the order
+;;; rows are added in is the tasks', whichever thread ran each.
+;;; What solves the stratum, and the function that runs one of its rules.
+(defstruct Rounds [(solve Code) (run Code)])
+
+(defn stratum-rounds [(c (mut dsl/Cur))
+                      (rels (ArrayList Relation))
+                      (clauses (ArrayList Clause))
+                      (group (ArrayList (slice u8)))
+                      (stratum i64)] (-> Rounds)
+  (let [(mut marks) (primitive/code-list-new)
+        (mut starts) (primitive/code-list-new)
+        (mut arms) (primitive/code-list-new)
+        (mut firsts) (primitive/code-list-new)
+        (mut driven) (primitive/code-list-new)
+        (mut heads) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut rule-heads) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut take-arms) (primitive/code-list-new)
+        run (primitive/code-symbol (rt/join "rules-run-" (rt/num-text stratum)))
+        take (primitive/code-symbol (rt/join "rules-take-" (rt/num-text stratum)))
+        (mut n) 0]
+    (for r rels
+      (when (bound? group (.name r))
+        (push! (mut starts)
+               `(rt/rel-advance! (mut (~(field-sym (.name r)) db))))
+        (push! (mut marks)
+               `(when (rt/rel-advance! (mut (~(field-sym (.name r)) db)))
+                  (set! changed true)))))
+    (for k clauses
+      (when (bound? group (.rel (.head k)))
+        (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
+              head (field-sym (.rel (.head k)))]
+          (push! (mut arms) `(= rule ~n))
+          (push! (mut arms)
+                 (rule-timed k "first" (atoms-code (mut c) (to-rule-out (planned k)) 0 (mut bound))))
+          (push! (mut firsts) `(set! (mut active) ~n true))
+          (push! (mut driven) `(set! (mut active) ~n false))
+          (push! (mut rule-heads) (.rel (.head k)))
+          (unless (bound? heads (.rel (.head k))) (push! (mut heads) (.rel (.head k))))
+          (set! n (+ n 1))
+          (for i (range 0 (len (.body k)))
+            (let [a (get (.body k) i)]
+              (when (and (not (.negated a)) (bound? group (.rel a)))
+                (let [(mut b2) (ArrayList::new [(slice u8)] (malloc-allocator))]
+                  (push! (mut arms) `(= rule ~n))
+                  (push! (mut arms)
+                         (rule-timed k
+                                     (rt/join "new " (.rel a))
+                                     (atoms-code (mut c) (to-rule-out (delta-variant k i)) 0 (mut b2))))
+                  (push! (mut firsts) `(set! (mut active) ~n false))
+                  (push! (mut driven)
+                         `(set! (mut active) ~n (rt/rel-delta? (mut (~(field-sym (.rel a)) db)))))
+                  (push! (mut rule-heads) (.rel (.head k)))
+                  (set! n (+ n 1)))))))))
+    ;; What the rules queued goes into their heads' relations a relation at a time, each
+    ;; relation's rules in their order: a relation is its own memory, and many are filled at once.
+    (for h (range 0 (len heads))
+      (let [(mut takes) (primitive/code-list-new)]
+        (for i (range 0 n)
+          (when (= (get rule-heads i) (get heads h))
+            (push! (mut takes)
+                   `(rt/rel-take! (mut (~(field-sym (get heads h)) db)) (elem outs ~i)))))
+        (push! (mut take-arms) `(= head ~h))
+        (push! (mut take-arms) `(do ~@takes 0))))
+    (Rounds
+      :run
+        `(do
+           (defn ~run [(arg (ptr i8)) (rule i64) (out (ptr i8))] (-> (ptr i8))
+             (let [db (primitive/cast (ptr Db) arg)
+                   rule-out (primitive/cast (ptr (ArrayList i64)) out)]
+               (cond ~@arms :else 0)
+               arg))
+           (defn ~take [(arg (ptr i8)) (head i64) (queued (ptr i8))] (-> (ptr i8))
+             (let [db (primitive/cast (ptr Db) arg)
+                   outs (primitive/cast (ptr (ArrayList (ArrayList i64))) queued)]
+               (cond ~@take-arms :else 0)
+               arg)))
+      :solve
+    (if (= n 0)
+        `(do ~@starts 0)
+        `(let [(mut outs) (rt/rule-outs ~n)
+               (mut active) (rt/rule-flags ~n)]
+           ~@starts
+           ~@firsts
+           (rt/rules-run! (primitive/cast (ptr i8) (mut db)) (fnptr-of ~run) active (mut outs))
+           (rt/rules-take! (primitive/cast (ptr i8) (mut db)) (fnptr-of ~take) ~(len heads) (mut outs))
+           (let [(mut changed) true]
+             (while changed
+               (set! changed false)
+               (set! rounds (+ rounds 1))
+               ~@marks
+               (when changed
+                 ~@driven
+                 (rt/rules-run! (primitive/cast (ptr i8) (mut db)) (fnptr-of ~run) active (mut outs))
+                 (rt/rules-take! (primitive/cast (ptr i8) (mut db)) (fnptr-of ~take) ~(len heads) (mut outs)))))
+           (rt/rule-outs-free! (mut outs))
+           (free! (mut active))
+           0)))))
 
 ;; ---------------------------------------------------------------- updating a solved database
 
@@ -806,6 +940,7 @@
           (mut adds) (primitive/code-list-new)
           (mut room) (primitive/code-list-new)
           (mut rederive-fns) (primitive/code-list-new)
+          (mut rule-fns) (primitive/code-list-new)
           (mut updates) (primitive/code-list-new)
           (mut same-checks) (primitive/code-list-new)
           (mut tallies) (primitive/code-list-new)
@@ -907,13 +1042,16 @@
           (for r rels
             (when (and (= (.stratum r) s) (derived? clauses (.name r)))
               (push! (mut group) (.name r))))
-          (push! (mut strata) (stratum-code (mut c) rels clauses group))))
+          (let [made (stratum-rounds (mut c) rels clauses group s)]
+            (push! (mut strata) (.solve made))
+            (push! (mut rule-fns) (.run made)))))
       (dsl/render `(do
                      (import "hl.rt" :as rt)
                      (import "coil.primitive" :as primitive)
                      (import "coil.arraylist" :use [ArrayList])
                      (import "coil.alloc" :use [malloc-allocator])
                      (import "coil.control" :use [return-from])
+                     (import "coil.atomic" :as atomic)
                      ;; A row of a relation, numbered in the file's order. Every id a relation holds fits in 32
                      ;; bits, which keeps a program's many rows small.
                      (defstruct Fact
@@ -967,11 +1105,38 @@
                                (set! (mut counts) r (+ (get counts r) 1)))))
                          ~@room
                          (free! (mut counts))
-                         (for b blocks (tally! (mut db) b 1))
+                         (tally-apart! (mut db) blocks)
                          (solve! (mut db))
                          (set! (.known db) true)
                          (set! (.blocks db) blocks)
                          db))
+                     ;;; Every block's facts counted in, a relation at a time: a relation's rows are its
+                     ;;; own memory, so each is filled by whichever thread takes it, in the order the
+                     ;;; blocks give its facts, while others fill others.
+                     (defstruct TallyJob [(next i64) (db (ptr Db)) (facts (ArrayList (ArrayList Fact)))])
+                     (defn tally-apart! [(db (mut Db)) (blocks (ArrayList (ArrayList Fact)))] (-> void)
+                       (let [(mut by-relation) (ArrayList::new [(ArrayList Fact)] (malloc-allocator))]
+                         (for i (range 0 ~index)
+                           (push! (mut by-relation) (ArrayList::new [Fact] (malloc-allocator))))
+                         (for b blocks
+                           (for (ref f) b
+                             (push! (elem (mut by-relation) (cast i64 (.rel f))) (load f))))
+                         (let [(mut job) (TallyJob :next 0
+                                                   :db (primitive/cast (ptr Db) (mut db))
+                                                   :facts by-relation)]
+                           (rt/run-map-workers (fnptr-of tally-job) (cast (ptr i8) (mut job)) (rt/pool-size)))
+                         (for i (range 0 ~index) (free! (elem (mut by-relation) i)))
+                         (free! (mut by-relation)))
+                       0)
+                     (defn tally-job [(arg (ptr i8))] (-> (ptr i8))
+                       (let [j (cast (ptr TallyJob) arg)
+                             (mut go) true]
+                         (while go
+                           (let [i (atomic/add (cast (ptr i64) j) 1)]
+                             (if (< i (len (.facts j)))
+                                 (tally! (.db j) (get (.facts j) i) 1)
+                                 (set! go false))))
+                         arg))
                      ;;; Each fact of `facts` counted `by` more (or fewer) times in `db`'s relation for it.
                      (defn tally! [(db (mut Db)) (facts (ArrayList Fact)) (by i64)] (-> void)
                        (for (ref f) facts
@@ -1033,8 +1198,10 @@
                      (defn solve! [(db (mut Db))] (-> i64)
                        (let [(mut rounds) 0]
                          ~@strata
+                         ~(if (rule-times?) `(rt/rule-times-report!) `0)
                          rounds))
                      ~@rederive-fns
+                     ~@rule-fns
 ;;; What `solved-blocks` makes of `blocks`, made from `last`, what it made of others: only
                      ;;; what the facts that differ change is derived again or taken out (see
                      ;;; `update-stratum`), in place: `last`'s relations are changed, and `last` is not to be

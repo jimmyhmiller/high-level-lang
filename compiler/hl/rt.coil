@@ -195,6 +195,27 @@
   (atomic/store word 0)
   0)
 
+;;; The same word read under by many at once: each reader adds two while it reads, so the word is
+;;; even and above zero while only readers hold it, and whoever would take it whole (`spin-lock!`,
+;;; which waits for zero and makes it one) waits for them, as they wait for it.
+(defn read-lock! [(word (ptr i64))] (-> void)
+  (let [(mut in) false
+        (mut turns) 0]
+    (while (not in)
+      (let [v (atomic/read word)]
+        (if (and (= (& v 1) 0) (= (atomic/cas word v (+ v 2)) v))
+            (set! in true)
+            (do
+              (set! turns (+ turns 1))
+              (when (> turns 200)
+                (sched_yield)
+                (set! turns 0)))))))
+  0)
+
+(defn read-unlock! [(word (ptr i64))] (-> void)
+  (atomic/add word -2)
+  0)
+
 (defn pause! [] (-> void)
   (sched_yield)
   0)
@@ -2790,7 +2811,7 @@
 ;;; once nothing adds rows, so the first to need it makes it under a lock, and says so last.
 (defn rel-bucket :inline (Always) [(r (mut Rel)) (col i64) (key i64)]
   (-> RelRows)
-  (when (= (atomic/read (elem (mut (.indexed r)) col)) 0)
+  (when (!= (atomic/read (elem (mut (.indexed r)) col)) 1)
     (rel-index-column! (mut r) col))
   (if (dense-key? key)
       (let [d (get (.dense r) col)
@@ -2800,27 +2821,141 @@
 
 ;;; The rows whose two columns equal these keys, and perhaps a few others. Stable until the next flush.
 ;;; The index a query needs first, made under a lock by whichever thread needs it first.
+;;; Made by the first thread to need it, with the column's own word to say so: threads that need
+;;; other columns, of this relation or another, make theirs meanwhile.
 (defn rel-index-column! [(r (mut Rel)) (col i64)] (-> void)
   (let [flag (elem (mut (.indexed r)) col)]
-    (init-lock!)
-    (when (= (atomic/read flag) 0)
+    (when (once-mine? flag)
       (for row (range 0 (.count r)) (index-add! (mut r) col row))
-      (atomic/store flag 1))
-    (init-unlock!)
+      (once-made! flag))
     0))
+
+;; ---------------------------------------------------------------- rules run at once
+;;;
+;;; A round of a stratum's rules (see `stratum-rounds` in hl.facts): `run(db, i, out)` runs rule
+;;; `i`, which queues the rows it finds on `out`; the rules marked `active` run, each once, on
+;;; however many threads the program has at work.
+
+(defn row-queue! [(q (ptr (ArrayList i64))) (a i64) (b i64) (c i64) (d i64)] (-> void)
+  (push! q a)
+  (push! q b)
+  (push! q c)
+  (push! q d)
+  0)
+
+(defn rule-outs [(n i64)] (-> (ArrayList (ArrayList i64)))
+  (let [(mut outs) (ArrayList::new [(ArrayList i64)] (malloc-allocator))]
+    (for _ (range 0 n) (push! (mut outs) (ArrayList::new [i64] (malloc-allocator))))
+    outs))
+
+(defn rule-outs-free! [(outs (mut (ArrayList (ArrayList i64))))] (-> void)
+  (for i (range 0 (len outs)) (free! (elem (mut outs) i)))
+  (free! (mut outs))
+  0)
+
+(defn rule-flags [(n i64)] (-> (ArrayList bool))
+  (let [(mut flags) (ArrayList::new [bool] (malloc-allocator))]
+    (for _ (range 0 n) (push! (mut flags) false))
+    flags))
+
+(defstruct RulesJob
+  [(next i64)
+   (db (ptr i8))
+   (run (fnptr (cc/C) [(ptr i8) i64 (ptr i8)] (ptr i8)))
+   (active (ArrayList bool))
+   (outs (ptr (ArrayList (ArrayList i64))))])
+
+(defn rules-job [(arg (ptr i8))] (-> (ptr i8))
+  (let [j (primitive/cast (ptr RulesJob) arg)
+        n (len (.active j))
+        (mut go) true]
+    (while go
+      (let [i (atomic/add (primitive/cast (ptr i64) j) 1)]
+        (if (< i n)
+            (when (get (.active j) i)
+              (primitive/call-ptr (.run j)
+                                  (.db j)
+                                  i
+                                  (primitive/cast (ptr i8) (elem (.outs j) i))))
+            (set! go false))))
+    arg))
+
+(defn rules-run! [(db (ptr i8))
+                  (run (fnptr (cc/C) [(ptr i8) i64 (ptr i8)] (ptr i8)))
+                  (active (ArrayList bool))
+                  (outs (mut (ArrayList (ArrayList i64))))] (-> void)
+  (let [(mut count) 0]
+    (for a active (when a (set! count (+ count 1))))
+    (let [(mut job) (RulesJob :next 0
+                              :db db
+                              :run run
+                              :active active
+                              :outs (primitive/cast (ptr (ArrayList (ArrayList i64))) (mut outs)))]
+      (if (> count 1)
+          (run-map-workers (primitive/fnptr-of rules-job) (primitive/cast (ptr i8) (mut job)) (pool-size))
+          (rules-job (primitive/cast (ptr i8) (mut job)))))
+    0))
+
+;;; What a round's rules queued, taken into the relations: `take(db, h, outs)` takes what the rules
+;;; of head `h` queued, in their order; each of the `heads` is taken once, many at once when
+;;; there is enough queued to be worth waking anyone for.
+(defstruct TakeJob
+  [(next i64)
+   (db (ptr i8))
+   (take (fnptr (cc/C) [(ptr i8) i64 (ptr i8)] (ptr i8)))
+   (heads i64)
+   (outs (ptr i8))])
+
+(defn take-job [(arg (ptr i8))] (-> (ptr i8))
+  (let [j (primitive/cast (ptr TakeJob) arg)
+        (mut go) true]
+    (while go
+      (let [i (atomic/add (primitive/cast (ptr i64) j) 1)]
+        (if (< i (.heads j))
+            (primitive/call-ptr (.take j) (.db j) i (.outs j))
+            (set! go false))))
+    arg))
+
+(defn rules-take! [(db (ptr i8))
+                   (take (fnptr (cc/C) [(ptr i8) i64 (ptr i8)] (ptr i8)))
+                   (heads i64)
+                   (outs (mut (ArrayList (ArrayList i64))))] (-> void)
+  (let [(mut queued) 0]
+    (for i (range 0 (len outs)) (set! queued (+ queued (len (get outs i)))))
+    (let [(mut job) (TakeJob :next 0
+                             :db db
+                             :take take
+                             :heads heads
+                             :outs (primitive/cast (ptr i8) (mut outs)))]
+      (if (and (> heads 1) (> queued 16000))
+          (run-map-workers (primitive/fnptr-of take-job) (primitive/cast (ptr i8) (mut job)) (pool-size))
+          (take-job (primitive/cast (ptr i8) (mut job)))))
+    0))
+
+;;; The rows a rule queued, added to its head's relation. True when any was new.
+(defn rel-take! [(r (mut Rel)) (rows (ptr (ArrayList i64)))] (-> bool)
+  (let [(mut changed) false
+        q (load rows)
+        n (/ (len q) 4)]
+    (for i (range 0 n)
+      (when (rel-add! (mut r)
+                      (get q (* i 4))
+                      (get q (+ (* i 4) 1))
+                      (get q (+ (* i 4) 2))
+                      (get q (+ (* i 4) 3)))
+        (set! changed true)))
+    (clear! rows)
+    changed))
 
 (defn rel-bucket2 [(r (mut Rel)) (c1 i64) (c2 i64) (k1 i64) (k2 i64)]
   (-> RelRows)
   (let [slot (+ (* c1 (.arity r)) c2)
         flag (elem (mut (.pair-indexed r)) slot)]
-    (when (= (atomic/read flag) 0)
-      (init-lock!)
-      (when (= (atomic/read flag) 0)
-        (set! (.table (elem (mut (.pair-index r)) slot))
-              (int-table-in (int-capacity (.count r)) (.alc r)))
-        (for row (range 0 (.count r)) (pair-index-add! (mut r) slot c1 c2 row))
-        (atomic/store flag 1))
-      (init-unlock!))
+    (when (once-mine? flag)
+      (set! (.table (elem (mut (.pair-index r)) slot))
+            (int-table-in (int-capacity (.count r)) (.alc r)))
+      (for row (range 0 (.count r)) (pair-index-add! (mut r) slot c1 c2 row))
+      (once-made! flag))
     (index-rows (elem (mut (.pair-index r)) slot) (pair-key k1 k2))))
 
 ;; -------------------------------------------------------------- relations updated, not solved again
@@ -4393,6 +4528,18 @@
     (Ok [n] (if (> n 0) n 1))
     (Err [_] 1)))
 
+;;; One offer of work inside a run: `seq` which offer this place holds (0: none yet), `on`
+;;; while workers may still join, `left` how many are in it, and the rest as for a run.
+(defstruct HelpRun
+  [(seq i64)
+   (on bool)
+   (left i64)
+   (body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
+   (job (ptr i8))
+   (apart i64)
+   (apart-region i64)
+   (slot i64)])
+
 ;;; The workers: started the first time a program runs anything in parallel, then parked between
 ;;; runs, so a run costs a wake-up rather than a thread's start. Each has a slot, 1…; the thread
 ;;; that asks for a run is slot 0 and works too.
@@ -4425,14 +4572,10 @@
    ;; pool runs offers it here, and whichever workers have nothing to do in the run under way
    ;; take part: `help-seq` counts the offers, `help-on` says one stands, `help-left` how many
    ;; workers are in it, and the rest is as for a run.
+   ;; Several offers may stand at once, each in a place of its own (`helps`); `help-seq` counts
+   ;; every offer made, for a worker looking out for one.
    (help-seq i64)
-   (help-on bool)
-   (help-left i64)
-   (help-body (fnptr (cc/C) [(ptr i8)] (ptr i8)))
-   (help-job (ptr i8))
-   (help-apart i64)
-   (help-apart-region i64)
-   (help-slot i64)])
+   (helps (ArrayList HelpRun))])
 
 (defn pool-fail [(what (slice u8))] (-> void)
   (panic "worker pool: {}" what))
@@ -4450,6 +4593,8 @@
         (Ok [_] 0)
         (Err [_] (pool-fail "no condition")))
       (set! (.threads p) (ArrayList::new [Thread] (malloc-allocator)))
+      (set! (.helps p) (ArrayList::new [HelpRun] (malloc-allocator)))
+      (for _ (range 0 4) (push! (mut (.helps p)) (primitive/zeroed HelpRun)))
       (set! (.read p) (ArrayList::new [i64] (malloc-allocator)))
       (for _ (range 0 (max-workers))
         (push! (mut (.threads p)) (Thread :handle (cast (ptr i8) 0))))
@@ -4508,11 +4653,22 @@
     (when (!= (primitive/cast i64 p) lo) (panic "cannot give back a worker's stack pages"))
     0))
 
+;;; The place of an offer this worker may still join and has not, or -1. Under the pool's lock.
+(defn help-open [(p (ptr Pool)) (seen (ArrayList i64))] (-> i64)
+  (let [(mut at) -1]
+    (for i (range 0 (len (.helps p)))
+      (let [h (get (.helps p) i)]
+        (when (and (< at 0) (.on h) (!= (.seq h) (get seen i)))
+          (set! at i))))
+    at))
+
 (defn pool-worker [(arg (ptr i8))] (-> (ptr i8))
   (let [slot (primitive/cast i64 arg)
         p (pool)
         (mut seen) 0
-        (mut seen-help) 0]
+        ;; The offer this worker last took from each place.
+        (mut seen-help) (ArrayList::new [i64] (malloc-allocator))]
+    (for _ (range 0 4) (push! (mut seen-help) 0))
     (register-worker! slot)
     (prefer-fast-cores!)
     (pool-lock! p)
@@ -4521,27 +4677,28 @@
     (loop
       ;; Runs often come one after another: look for the next a little while, then sleep. An
       ;; offer of work inside the run under way wakes a worker too.
-      (while (and (= (.round p) seen)
-                  (not (and (.help-on p) (!= (.help-seq p) seen-help))))
+      (while (and (= (.round p) seen) (< (help-open p seen-help) 0))
         (pool-unlock! p)
-        (let [(mut spins) 0]
+        (let [(mut spins) 0
+              offers (atomic/read (field p help-seq))]
           (while (and (< spins 20000)
                       (= (atomic/read (field p round)) seen)
-                      (= (atomic/read (field p help-seq)) seen-help))
+                      (= (atomic/read (field p help-seq)) offers))
             (set! spins (+ spins 1))))
         (pool-lock! p)
-        (when (and (= (.round p) seen)
-                   (not (and (.help-on p) (!= (.help-seq p) seen-help))))
+        (when (and (= (.round p) seen) (< (help-open p seen-help) 0))
           (pool-wait! p (field p wake))))
       (if (= (.round p) seen)
           ;; Help with a run inside the run: this worker has no part in that one, or has done it.
-          (let [body (.help-body p)
-                job (.help-job p)
-                apart (.help-apart p)
-                apart-region (.help-apart-region p)
-                view (.help-slot p)]
-            (set! seen-help (.help-seq p))
-            (set! (.help-left p) (+ (.help-left p) 1))
+          (let [at (help-open p seen-help)
+                h (elem (mut (.helps p)) at)
+                body (.body h)
+                job (.job h)
+                apart (.apart h)
+                apart-region (.apart-region h)
+                view (.slot h)]
+            (set! (mut seen-help) at (.seq h))
+            (set! (.left h) (+ (.left h) 1))
             (pool-unlock! p)
             (when (!= apart-region 0) (region-enter-id! apart-region))
             (apart-inherit! apart)
@@ -4554,8 +4711,8 @@
             (apart-inherit! 0)
             (when (!= apart-region 0) (region-leave!))
             (pool-lock! p)
-            (set! (.help-left p) (- (.help-left p) 1))
-            (when (= (.help-left p) 0)
+            (set! (.left h) (- (.left h) 1))
+            (when (= (.left h) 0)
               (match (Condition::notify-all! (field p done))
                 (Ok [_] 0)
                 (Err [_] (pool-fail "cannot notify")))))
@@ -4734,30 +4891,78 @@
                        (job (ptr i8))
                        (n i64)] (-> void)
   (let [p (pool)]
-    (if (and (> n 1) (.running p) (> (.started p) 0) (not (dep-tracking?)) (not (reclaiming?)))
+    ;; A thread that is itself helping does its own maps alone: whoever joined would read its
+    ;; settings, and it reads another's.
+    (if (and (> n 1) (.running p) (> (.started p) 0) (not (dep-tracking?)) (not (reclaiming?))
+             (= (.settings-view (thread-regions)) 0))
         (do
           (pool-lock! p)
-          (if (or (.help-on p) (not (.running p)))
-              (do (pool-unlock! p) (body job))
-              (do
-                (set! (.help-body p) body)
-                (set! (.help-job p) job)
-                (set! (.help-apart p) (.apart (thread-regions)))
-                (set! (.help-apart-region p)
-                      (if (> (.apart (thread-regions)) 0) (primitive/cast i64 (region-current)) 0))
-                (set! (.help-slot p) (worker-slot))
-                (set! (.help-on p) true)
-                (atomic/store (field p help-seq) (+ (.help-seq p) 1))
-                (match (Condition::notify-all! (field p wake))
-                  (Ok [_] 0)
-                  (Err [_] (pool-fail "cannot notify")))
-                (pool-unlock! p)
-                (body job)
-                (pool-lock! p)
-                (set! (.help-on p) false)
-                (while (> (.help-left p) 0) (pool-wait! p (field p done)))
-                (pool-unlock! p))))
+          ;; A place no offer stands in and no worker is still leaving.
+          (let [(mut at) -1]
+            (for i (range 0 (len (.helps p)))
+              (let [h (get (.helps p) i)]
+                (when (and (< at 0) (not (.on h)) (= (.left h) 0)) (set! at i))))
+            (if (or (< at 0) (not (.running p)))
+                (do (pool-unlock! p) (body job))
+                (let [h (elem (mut (.helps p)) at)]
+                  (set! (.body h) body)
+                  (set! (.job h) job)
+                  (set! (.apart h) (.apart (thread-regions)))
+                  (set! (.apart-region h)
+                        (if (> (.apart (thread-regions)) 0) (primitive/cast i64 (region-current)) 0))
+                  (set! (.slot h) (worker-slot))
+                  (atomic/store (field p help-seq) (+ (.help-seq p) 1))
+                  (set! (.seq h) (.help-seq p))
+                  (set! (.on h) true)
+                  (match (Condition::notify-all! (field p wake))
+                    (Ok [_] 0)
+                    (Err [_] (pool-fail "cannot notify")))
+                  (pool-unlock! p)
+                  (body job)
+                  (pool-lock! p)
+                  (set! (.on h) false)
+                  (while (> (.left h) 0) (pool-wait! p (field p done)))
+                  (pool-unlock! p)))))
         (run-workers body job n))
+    0))
+
+;;; How many threads the program has put to work so far, this one among them: what work with
+;;; no plan of its own to ask may spread over. One, until something runs in parallel.
+(defn pool-size [] (-> i64)
+  (+ (.started (pool)) 1))
+
+;;; Where a solve's time went, rule by rule (see `rule-timed` in hl.facts): each label's
+;;; nanoseconds and how often it ran, said after each solve, most first.
+(defstruct RuleTimes [(ready bool) (ns (HashMap (slice u8) i64)) (runs (HashMap (slice u8) i64))])
+
+(defn rule-times [] (-> (ptr RuleTimes))
+  (let [t (primitive/alloc-static RuleTimes)]
+    (unless (.ready t)
+      (set! (.ns t) (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
+      (set! (.runs t) (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
+      (set! (.ready t) true))
+    t))
+
+(defn rule-time! [(label (slice u8)) (ns i64)] (-> void)
+  (let [t (rule-times)]
+    (set! (mut (.ns t)) label (+ ns (match (get (.ns t) label) (Some [n] n) (None [] 0))))
+    (set! (mut (.runs t)) label (+ 1 (match (get (.runs t) label) (Some [n] n) (None [] 0))))
+    0))
+
+(defn rule-times-report! [] (-> void)
+  (let [t (rule-times)
+        (mut labels) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut costs) (ArrayList::new [i64] (malloc-allocator))]
+    (for label (.ns t)
+      (push! (mut labels) label)
+      (push! (mut costs) (match (get (.ns t) label) (Some [n] n) (None [] 0))))
+    (for i (sort-order-int costs true)
+      (eprintln "{} us  {} runs  {}"
+                (/ (get costs i) 1000)
+                (match (get (.runs t) (get labels i)) (Some [n] n) (None [] 0))
+                (get labels i)))
+    (free! (mut labels))
+    (free! (mut costs))
     0))
 
 ;;; What a program answered, carried from the thread it ran on to `main`.
