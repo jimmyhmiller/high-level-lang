@@ -4127,13 +4127,19 @@
           ;; `parallel-map-own(xs, f, n)`: the same, for an `f` that gives settings by `with`: each
           ;; call's are its own (see `settings-own-enter!`), and one call runs at a time while what
           ;; answers were made from is tracked (`rt/own-threads`).
-          (and (or (= name "parallel-map") (= name "parallel-map-own")) (= count 3))
+          ;; `parallel-map-naming(xs, f, namer, n)`: the same, for an `f` whose work meets names that
+          ;; get ids in the order they are met (`intern!`). `f` runs over every element once only to
+          ;; say which names it needs; `namer` is given those, in the elements' order, as one thread
+          ;; would have met them; and `f` runs again, every name known (see `rt/names-record-begin!`).
+          (or (and (or (= name "parallel-map") (= name "parallel-map-own")) (= count 3))
+              (and (= name "parallel-map-naming") (= count 4)))
             (let [xs (expr (mut k) (get args 0) "")
                   f (expr (mut k) (get args 1) "")
+                  naming (= name "parallel-map-naming")
                   asked
                     (expect (mut k)
-                            (get args 2)
-                            (expr (mut k) (get args 2) "Int")
+                            (get args (if naming 3 2))
+                            (expr (mut k) (get args (if naming 3 2)) "Int")
                             "Int")
                   threads
                     (if (= name "parallel-map-own")
@@ -4179,10 +4185,13 @@
                               (while go
                                 (let [i (atomic/add (cast (ptr i64) j) 1)]
                                   (if (< i (len xs))
-                                      (set! (mut out) i (Some (f (get xs i))))
+                                      (do
+                                        (rt/item-begin! i)
+                                        (set! (mut out) i (Some (f (get xs i)))))
                                       (set! go false))))
                               arg)))
-                  (Some (te `(let [~(sym xs-v) ~(.code xs)
+                  (Some (te (parallel-map-twice (mut k) n naming args xs
+                             `(let [~(sym xs-v) ~(.code xs)
                                    (mut ~(sym out-v))
                                      (ArrayList::new [(Option ~cr)]
                                                      (rt/value-allocator))]
@@ -4208,7 +4217,7 @@
                                                     ~(sym v-v)))
                                        (None []
                                              (panic "a parallel task left no result"))))
-                                   ~(sym res-v))))
+                                   ~(sym res-v)))))
                             (cat3 "[" r "]"))))))
           ;; `parallel-walk(roots, visit, next, n)`: a graph found as it is walked. Each name is visited
           ;; once, on whichever of `n` threads takes it, and `next` of its result names more, visited
@@ -7810,6 +7819,28 @@
 
 (defn compile-fn [(k (mut Comp)) (d g/Node)] (-> Code)
   (compile-fn-as (mut k) d (.text (kid d 0))))
+
+;;; A map's code as it is; or, for `parallel-map-naming`, run twice: once while names are only
+;;; noted, its answers dropped, the names then given to the namer in order, and once for good.
+(defn parallel-map-twice [(k (mut Comp))
+                          (n g/Node)
+                          (naming bool)
+                          (args (ArrayList g/Node))
+                          (xs TE)
+                          (once Code)] (-> Code)
+  (if (not naming)
+      once
+      (let [namer (expr (mut k) (get args 2) "")]
+        (unless (and (fn? (.ty namer))
+                     (= (len (fn-params (.ty namer))) 1)
+                     (= (get (fn-params (.ty namer)) 0) "Text")
+                     (= (fn-ret (.ty namer)) "Int"))
+          (die (mut k) n "parallel-map-naming's namer takes a Text and answers its Int"))
+        `(do
+           (rt/names-record-begin!)
+           ~once
+           (rt/names-record-end! ~(.code namer) (len ~(.code xs)))
+           ~once))))
 
 ;; ---------------------------------------------------------------- working apart
 

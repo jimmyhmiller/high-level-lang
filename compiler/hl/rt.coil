@@ -508,7 +508,9 @@
                           (in-job i64)
                           ;; While this thread helps with another's job (`run-map-workers`):
                           ;; that thread's worker slot, plus one, whose own settings it reads.
-                          (settings-view i64)])
+                          (settings-view i64)
+                          ;; Which element of a map this thread is working on now.
+                          (item i64)])
 
 ;;; The thread-specific key of the threads' region stacks, plus one, as each place that asks keeps
 ;;; it: the key never changes once made, so a place asks `workers` only the first time.
@@ -537,7 +539,7 @@
     (store! t (ThreadRegions :top (primitive/make-dyn Allocator c)
                              :region r
                              :stack (ArrayList::new [i64] (malloc-allocator)) :scratch 0 :apart 0
-                             :kept-last "" :in-job 0 :settings-view 0))
+                             :kept-last "" :in-job 0 :settings-view 0 :item 0))
     (push! (mut (.stack t)) (primitive/cast i64 r))
     (push! (mut (.stack t)) (primitive/cast i64 c))
     (push! (mut (.stack t)) 0)
@@ -3363,6 +3365,71 @@
   (match (get (.ids ns) s)
     (Some [id] id)
     (None []
+          (if (names-recording?) (name-record! s) (name-new! (mut ns) s)))))
+
+;;; Names met while a map looks for the names it will need (`parallel-map-naming` in the rules
+;;; language). A name's id is its place in the order names are first met, and a map run on many
+;;; threads meets them in no order: so the map runs once only to say which names each element
+;;; needs, these are given ids in the elements' order, as one thread would have met them, and
+;;; the map runs again with every name known. While it looks, a name not yet known is noted with
+;;; the element that asked, by the thread that met it, and answered -1.
+(defstruct NameNote [(item i64) (name (slice u8))])
+
+(defstruct NamesRecord [(on i64) (notes (ArrayList (ArrayList NameNote)))])
+
+(defn names-record [] (-> (ptr NamesRecord))
+  (primitive/alloc-static NamesRecord))
+
+(defn names-recording? :inline (Always) [] (-> bool)
+  (= (atomic/read (field (names-record) on)) 1))
+
+;;; Which element of a map this thread works on from here.
+(defn item-begin! :inline (Always) [(i i64)] (-> void)
+  (set! (.item (thread-regions)) i)
+  0)
+
+(defn name-record! [(s (slice u8))] (-> i64)
+  (let [r (names-record)]
+    (push! (elem (mut (.notes r)) (worker-slot))
+           (NameNote :item (.item (thread-regions)) :name (own-text s)))
+    -1))
+
+(defn names-record-begin! [] (-> void)
+  (let [r (names-record)]
+    (when (= (len (.notes r)) 0)
+      (set! (.notes r) (ArrayList::new [(ArrayList NameNote)] (malloc-allocator)))
+      (for _ (range 0 (max-workers))
+        (push! (mut (.notes r)) (ArrayList::new [NameNote] (malloc-allocator)))))
+    (atomic/store (field r on) 1)
+    0))
+
+;;; The names noted, each given to `namer` in the order of the elements that asked, and within an
+;;; element in the order it asked: `count` elements in all.
+(defn names-record-end! [(namer (fnptr (cc/C) [(slice u8)] i64)) (count i64)] (-> void)
+  (let [r (names-record)
+        (mut by-item) (ArrayList::new [(ArrayList (slice u8))] (malloc-allocator))]
+    (atomic/store (field r on) 0)
+    (for _ (range 0 count)
+      (push! (mut by-item) (ArrayList::new [(slice u8)] (malloc-allocator))))
+    (for slot (range 0 (len (.notes r)))
+      (for note (get (.notes r) slot)
+        (push! (elem (mut by-item) (.item note)) (.name note)))
+      (clear! (elem (mut (.notes r)) slot)))
+    (for i (range 0 count)
+      (for name (get by-item i)
+        (primitive/call-ptr namer name)
+        (free [u8] (malloc-allocator) name))
+      (free! (elem (mut by-item) i)))
+    (free! (mut by-item))
+    0))
+
+(defn name-new! [(ns (mut Names)) (s (slice u8))] (-> i64)
+  (match (get (.ids ns) s)
+    (Some [id] id)
+    (None []
+          ;; A table that grows under one job is read wrong by the others.
+          (when (in-job?)
+            (panic "the name {} is new to the build's table while several jobs run: a map whose work meets new names is `parallel-map-naming`" s))
           ;; Its own copy: the text is a value, of whatever region made it.
           (let [id (len (.strs ns))
                 kept (own-text s)]
@@ -3540,7 +3607,22 @@
     (when tracked (dep-input! (join "f:" path) (print-of bytes) stamp))
     bytes))
 
+;;; With HL_READ_TRACE set, when files are read: how long after the first each tenth, hundredth
+;;; and thousandth was. A build's loading is as fast as its files arrive; this shows where they
+;;; stop arriving.
+(defstruct ReadTrace [(count i64) (start i64) (on i64)])
+
+(defn read-trace! [] (-> void)
+  (let [t (primitive/alloc-static ReadTrace)]
+    (when (= (.on t) 0) (set! (.on t) (if (env-on? "HL_READ_TRACE") 1 2)) (set! (.start t) (now-ns)))
+    (when (= (.on t) 1)
+      (let [n (atomic/add (field t count) 1)]
+        (when (or (= (% n 1000) 0) (and (< n 1000) (= (% n 100) 0)) (and (< n 100) (= (% n 10) 0)))
+          (eprintln "read {} at {} us" n (/ (- (now-ns) (.start t)) 1000)))))
+    0))
+
 (defn read-all-raw [(path (slice u8))] (-> (slice u8))
+  (read-trace!)
   (let [a (value-allocator)
         fd
           (os/open (str/to-cstr a path)
