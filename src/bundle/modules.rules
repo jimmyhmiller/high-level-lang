@@ -106,8 +106,6 @@ boxed record Loading {
   jsx-options: jsx.Options,
   # Where the output goes, for the paths the file loader writes into modules.
   out-dir: Text,
-  # How many threads parse ahead.
-  load-threads: Int,
   packages-external: Bool,
   public-path: Text
 }
@@ -1064,15 +1062,13 @@ fn ahead-target(request: Request, importer: Text) -> Text? = match request.spec 
     where spec = request.spec, wanted = aliased(spec)
 }
 
-# Every file the entries can reach, parsed on many threads before the graph is made, into memos the
-# graph then finds them in; how many. Without hooks, a worker can resolve what it parsed: a walk
-# that never waits for a wave. With them, a wave at a time: each wave's files are parsed at once,
-# and their imports are the next wave. On one thread, nothing: the graph parses each file as it
-# reaches it.
-fn parsed-ahead(paths: [Text]) -> Int = match loading.load-threads > 1, hooked?() {
-  false, _ => 0
-  true, false => len(parallel-walk(roots, visit-step, step-next, step-first, step-after, file-read, loading.load-threads))
-  true, true => len(parsed-waves(roots, {p: true for p in roots}))
+# Every file the entries can reach, parsed before the graph is made, into memos the graph then
+# finds them in; how many. Without hooks, whoever parsed a file resolves what it imports: a walk.
+# With them, a wave at a time: a wave's texts are asked of the hooks, its files parsed, and their
+# imports are the next wave.
+fn parsed-ahead(paths: [Text]) -> Int = match hooked?() {
+  false => len(parallel-walk(roots, visit-step, step-next, step-first, step-after, file-read))
+  true => len(parsed-waves(roots, {p: true for p in roots}))
 } where roots = [real-path(p) for p in paths if ahead?(p) distinct real-path(p)]
 
 # With hooks, which only this thread may call: a wave's texts are asked for here, its files parsed
@@ -1081,7 +1077,7 @@ fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] = match wave {
   [] => []
   _ => done ++ parsed-waves(next, {p: true for ps in [keys(seen), next] for p in ps})
     where texts = [hooked-text(p) for p in wave],
-          done = match len(texts) { _ => parallel-map(wave, parsed-hooked, loading.load-threads) },
+          done = match len(texts) { _ => [parsed-hooked(p) for p in wave] },
           next = [t for d in done for request in requests-of(d) if let some(t) = ahead-target(request, d.path) if ahead?(t) and not (t in seen) distinct t]
 }
 
@@ -1146,7 +1142,7 @@ fn loaded(path: Text) -> Loaded = match ahead-whole?(path) {
 # Whether the walk ahead left this file whole and analysed, in a build with no hooks: then whoever
 # parsed it worked out its place in the graph too (see `visit-step`), with nothing to ask a hook.
 fn ahead-whole?(path: Text) -> Bool =
-  loading.load-threads > 1 and ahead?(path) and not hooked?() and walked-file(path).analysed
+  ahead?(path) and not hooked?() and walked-file(path).analysed
 
 fn loaded-ahead(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: p.tree, analysis: p.analysis, scopes: p.scopes, specs: specs, calls: p.calls,
@@ -1193,7 +1189,7 @@ fn loaded-here(path: Text) -> Loaded =
 # walk ahead made of it, found again in the memos it filled (a big file put together from its
 # pieces once they are done); with load hooks, the wave's parse of the text a hook gave; on one
 # thread, a parse here.
-fn parsed-for-graph(path: Text) -> Parsed = match loading.load-threads > 1 and ahead?(path), hooked?() {
+fn parsed-for-graph(path: Text) -> Parsed = match ahead?(path), hooked?() {
   true, false => walked-file(path)
   true, true => parsed-hooked(path)
   false, _ => parsed-alone(path)
@@ -1288,22 +1284,13 @@ fn graph(runtime: Text, paths: [Text]) -> Graph =
         files = [w.pre[i] for i in file-at],
         part-at = updated([0 for key in w.pre], {file-at[k]: k + 1 for k in 0..len(file-at)}),
         # The files something requires, or imports the default or namespace of.
-        wholes = {key: true for whole in parallel-map(files, whole-of, loading.load-threads) for key in whole},
+        wholes = {key: true for whole in [whole-of(path) for path in files] for key in whole},
         rt = runtime-parsed(runtime).analysis,
-        lay = placement(["<runtime>"] ++ files, [size-of(rt.table)] ++ parallel-map(files, table-size, loading.load-threads)),
-        # Each module, and each file's table at its place, is its own work: all are made at once.
-        made = parallel-map([Spot(w: w, i: i, numbers: numbers, lay: lay, part-at: part-at, wholes: wholes) for i in 0..len(w.pre)],
-                            module-spot, loading.load-threads),
+        lay = placement(["<runtime>"] ++ files, [size-of(rt.table)] ++ [table-size(path) for path in files]),
+        # Each module, and each file's table at its place, is its own work.
+        made = [module-at(w, i, numbers, lay, part-at, wholes) for i in 0..len(w.pre)],
         blocks = [runtime-block(runtime, lay.scope-shifts[0], lay.symbol-shifts[0])]
-                 ++ parallel-map([Place(path: files[k], scope-shift: lay.scope-shifts[k + 1], symbol-shift: lay.symbol-shifts[k + 1])
-                                  for k in 0..len(files)], place-block, loading.load-threads)
-
-# One of the walk's nodes, with what its module is made from; and one file's table, with its place.
-record Spot { w: Walk, i: Int, numbers: [Int], lay: Placement, part-at: [Int], wholes: {Text:Bool} }
-record Place { path: Text, scope-shift: Int, symbol-shift: Int }
-
-fn module-spot(s: Spot) -> Module = module-at(s.w, s.i, s.numbers, s.lay, s.part-at, s.wholes)
-fn place-block(p: Place) -> sym.Block = file-block(p.path, p.scope-shift, p.symbol-shift)
+                 ++ [file-block(files[k], lay.scope-shifts[k + 1], lay.symbol-shifts[k + 1]) for k in 0..len(files)]
 
 # A module's own table at its place among the build's, made once for as long as the table and the
 # place stay the same: the blocks the build's one table is joined from (see `an.linked-table`), so an

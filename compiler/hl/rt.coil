@@ -539,7 +539,13 @@
                           (settings-view i64)
                           ;; Which element of a map this thread is working on now.
                           (item i64)
-                          (name-notes i64)])
+                          (name-notes i64)
+                          ;; For a worker that looks for offers of work between the items of
+                          ;; a run of its own (`help-wanted?`): how many offers had been made
+                          ;; when it last found none to take, and the offer it last took from
+                          ;; each place.
+                          (help-seq i64)
+                          (help-took (ArrayList i64))])
 
 ;;; The thread-specific key of the threads' region stacks, plus one, as each place that asks keeps
 ;;; it: the key never changes once made, so a place asks `workers` only the first time.
@@ -568,7 +574,8 @@
     (store! t (ThreadRegions :top (primitive/make-dyn Allocator c)
                              :region r
                              :stack (ArrayList::new [i64] (malloc-allocator)) :scratch 0 :apart 0
-                             :kept-last "" :in-job 0 :settings-view 0 :item 0 :name-notes 0))
+                             :kept-last "" :in-job 0 :settings-view 0 :item 0 :name-notes 0
+                             :help-seq 0 :help-took (ArrayList::new [i64] (malloc-allocator))))
     (push! (mut (.stack t)) (primitive/cast i64 r))
     (push! (mut (.stack t)) (primitive/cast i64 c))
     (push! (mut (.stack t)) 0)
@@ -2001,6 +2008,16 @@
     (for i (range 0 (len s))
       (let [c (cast i64 (get s i))]
         (set! (mut out) c (+ (get out c) 1))))
+    out))
+
+;;; Lists of numbers added place by place: as long as the longest, a shorter one adding nothing
+;;; past its end.
+(defn summed-lists [(lists (ArrayList (ArrayList i64)))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (tree-allocator))]
+    (for (ref xs) lists
+      (while (< (len out) (len xs)) (push! (mut out) 0))
+      (for i (range 0 (len xs))
+        (set! (mut out) i (+ (get out i) (get xs i)))))
     out))
 
 ;;; Does the text hold this byte?
@@ -5019,7 +5036,10 @@
    ;; Several offers may stand at once, each in a place of its own (`helps`); `help-seq` counts
    ;; every offer made, for a worker looking out for one.
    (help-seq i64)
-   (helps (ArrayList HelpRun))])
+   (helps (ArrayList HelpRun))
+   ;; Where the workers of the run under way sleep when they find nothing to do, if they look
+   ;; for offers too (`help-wanted?`): an offer wakes them there. 0 for none.
+   (idle-gate i64)])
 
 (defn pool-fail [(what (slice u8))] (-> void)
   (panic "worker pool: {}" what))
@@ -5410,13 +5430,82 @@
                   (match (Condition::notify-all! (field p wake))
                     (Ok [_] 0)
                     (Err [_] (pool-fail "cannot notify")))
-                  (pool-unlock! p)
+                  (let [idle (.idle-gate p)]
+                    (pool-unlock! p)
+                    (when (!= idle 0)
+                      (let [g (primitive/cast (ptr Gate) idle)]
+                        (gate-lock! g)
+                        (gate-wake-all! g)
+                        (gate-unlock! g))))
                   (body job)
                   (pool-lock! p)
                   (set! (.on h) false)
                   (while (> (.left h) 0) (pool-wait! p (field p done)))
                   (pool-unlock! p)))))
         (run-workers body job n))
+    0))
+
+;;; A run whose workers find their work as they go (a walk) has them take offers too: a job of
+;;; the run that maps over a list of its own (a big file's pieces, say) is helped by the others
+;;; before they take anything new, so one job's own work never waits behind the rest's.
+;;; `idle-gate!` says where such workers sleep, for an offer to wake them; 0 when the run is over.
+(defn idle-gate! [(g (ptr Gate))] (-> void)
+  (let [p (pool)]
+    (pool-lock! p)
+    (set! (.idle-gate p) (primitive/cast i64 g))
+    (pool-unlock! p)
+    0))
+
+;;; Whether offers have been made since this thread last found none to take: a read of one
+;;; number, for a worker to ask between items.
+(defn help-wanted? :inline (Always) [] (-> bool)
+  (!= (atomic/read (field (pool) help-seq)) (.help-seq (thread-regions))))
+
+;;; Take part in an offer this thread has not taken, if one stands, as a worker with nothing to
+;;; do would (see `pool-worker`), and come back to what this thread was at: its own place among
+;;; the regions, its own settings, its own item.
+(defn help-now! [] (-> void)
+  (let [p (pool)
+        t (thread-regions)]
+    (while (< (len (.help-took t)) (len (.helps p))) (push! (mut (.help-took t)) 0))
+    (pool-lock! p)
+    (let [at (help-open p (.help-took t))]
+      (if (< at 0)
+          (do
+            (set! (.help-seq t) (.help-seq p))
+            (pool-unlock! p))
+          (let [h (elem (mut (.helps p)) at)
+                body (.body h)
+                job (.job h)
+                apart (.apart h)
+                apart-region (.apart-region h)
+                view (.slot h)
+                own-apart (.apart t)
+                own-view (.settings-view t)
+                own-item (.item t)
+                own-job (.in-job t)]
+            (set! (mut (.help-took t)) at (.seq h))
+            (set! (.left h) (+ (.left h) 1))
+            (pool-unlock! p)
+            (when (!= apart-region 0) (region-enter-id! apart-region))
+            (apart-inherit! apart)
+            (set! (.in-job t) 1)
+            (set! (.settings-view t) (+ view 1))
+            (let [began (if (run-tracing?) (now-ns) 0)]
+              (body job)
+              (run-trace-part! began))
+            (set! (.settings-view t) own-view)
+            (set! (.in-job t) own-job)
+            (set! (.item t) own-item)
+            (set! (.apart t) own-apart)
+            (when (!= apart-region 0) (region-leave!))
+            (pool-lock! p)
+            (set! (.left h) (- (.left h) 1))
+            (when (= (.left h) 0)
+              (match (Condition::notify-all! (field p done))
+                (Ok [_] 0)
+                (Err [_] (pool-fail "cannot notify"))))
+            (pool-unlock! p))))
     0))
 
 ;;; How many threads the program has put to work so far, this one among them: what work with
@@ -8871,6 +8960,31 @@
 ;;; settings it was made under.
 (defn own-threads [(n i64)] (-> i64)
   (if (dep-tracking?) 1 n))
+
+;; ---------------------------------------------------------------- a run's plan
+
+;;; How many threads each stage of the program's pipeline works on this run, by the stage's number
+;;; (see `plan` in the pipeline language). The rules say nothing of threads: where they make a
+;;; list of a stage's function's answers, the list is made on that stage's threads. Until a run
+;;; chooses a plan, every stage works on one.
+(defstruct Stages [(threads (ArrayList i64))])
+
+(defn stages-state [] (-> (ptr Stages))
+  (primitive/alloc-static Stages))
+
+(defn stage-threads! [(stage i64) (n i64)] (-> void)
+  (let [s (stages-state)]
+    (when (.running (pool))
+      (panic "a run's plan is chosen before any work runs on many threads"))
+    (when (= (cap (.threads s)) 0)
+      (set! (.threads s) (ArrayList::new [i64] (malloc-allocator))))
+    (while (<= (len (.threads s)) stage) (push! (mut (.threads s)) 1))
+    (set! (mut (.threads s)) stage (if (< n 1) 1 n))
+    0))
+
+(defn stage-threads [(stage i64)] (-> i64)
+  (let [s (stages-state)]
+    (if (< stage (len (.threads s))) (get (.threads s) stage) 1)))
 
 ;; ---------------------------------------------------------------- which functions a run keeps
 

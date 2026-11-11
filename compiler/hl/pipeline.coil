@@ -2,16 +2,20 @@
 ;;; whether each works per file, per part or on the whole program, and the functions that do it.
 ;;; Plans then choose, stage by stage, serial or parallel, on how many threads, in how many parts.
 ;;;
-;;;   pipeline app.pipelines fills bundle.api/Plan
+;;;   pipeline app.pipelines
 ;;;   stage load     per file bundle.modules/visit-file bundle.modules/next-files
-;;;   stage optimize per part bundle.api/default-optimize
+;;;   stage optimize per group bundle.api/group-optimized
 ;;;   stage link     whole    bundle.analysis/link
 ;;;
 ;;;   plan quick
 ;;;     threads auto
 ;;;     load parallel
-;;;     optimize parallel 4 parts 8
+;;;     optimize parallel 4
 ;;;   end
+;;;
+;;; The rules that do the work say nothing of threads. Where they make a list of one of a `per`
+;;; stage's functions' answers, the rules compiler has the list made on as many threads as the run's
+;;; plan gives the stage (see "a stage's work" there, and `rt/stage-threads`).
 ;;;
 ;;; A plan may run a stage in parallel only if every function the stage names, and everything
 ;;; they call, writes no state shared between threads. That is decided here, from the `.rules`
@@ -21,7 +25,8 @@
 ;;; construction; a `.facts` or `.scopes` call may change what it is given. A plan that breaks
 ;;; this does not compile, and the error says what was written, and where.
 ;;;
-;;; The output is a `plan(name)` answering the record the pipeline fills, and `plan-names()`.
+;;; The output is `use-plan!(name)`, which gives each stage the threads that plan says,
+;;; `use-threads!(n)`, which gives every stage n, and `plan-names()`.
 (module hl.pipeline)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
@@ -1031,7 +1036,7 @@
 (defn mechanisms-of [(src (slice u8)) (path (slice u8)) (tree g/Node)]
   (-> (ArrayList MechanismDecl))
   (let [(mut out) (ArrayList::new [MechanismDecl] (malloc-allocator))]
-    (for d (.kids (kid-of tree 2))
+    (for d (.kids (kid-of tree 1))
       (let [name (.text (kid-of d 0))
             (mut m)
               (MechanismDecl
@@ -1302,7 +1307,7 @@
         (mut watching) ""
         (mut union) (texts)
         (mut apart-union) (texts)]
-    (for d (.kids (kid-of tree 3))
+    (for d (.kids (kid-of tree 2))
       (let [name (.text (kid-of d 0))
             (mut from) ""
             (mut tracks) false
@@ -1458,8 +1463,8 @@
 ;;; The functions stages make, which every strategy keeps.
 (defn made-of [(tree g/Node)] (-> (ArrayList (slice u8)))
   (let [(mut out) (texts)]
-    (for d (.kids (kid-of tree 4))
-      (let [makes (if (= (.kind d) (g/KPerStage)) (kid-of d 3) (kid-of d 2))]
+    (for d (.kids (kid-of tree 3))
+      (let [makes (if (= (.kind d) (g/KPerStage)) (kid-of d 4) (kid-of d 2))]
         (unless (= (.kind makes) (g/KNone))
           (for t (.kids (kid-of makes 0)) (add-unique! (mut out) (.text t))))))
     out))
@@ -1471,7 +1476,43 @@
    (unit (slice u8))
    (functions (ArrayList (slice u8)))
    (makes (ArrayList (slice u8)))
-   (tok rt/Tok)])
+   ;; Its functions give settings by `with` (`gives settings`).
+   (gives bool)
+   ;; What its functions' names are given to, in order (`names by`), or "".
+   (namer (slice u8))
+   ;; How many of its units a thread takes at a time (`per N units`); 1 when it does not say.
+   (run i64)
+   (lo i64)])
+
+;;; A pipeline file's stages, in order: a stage's place is its number, the same for every compiler
+;;; that reads the file.
+(defn stages-of [(tree g/Node)] (-> (ArrayList Stage))
+  (let [(mut stages) (ArrayList::new [Stage] (malloc-allocator))]
+    (for d (.kids (kid-of tree 3))
+      (let [(mut fns) (texts)
+            (mut makes) (texts)
+            per (= (.kind d) (g/KPerStage))
+            fn-list (if per (kid-of d 3) (kid-of d 1))
+            makes-node (if per (kid-of d 4) (kid-of d 2))]
+        (for t (.kids fn-list) (push! (mut fns) (.text t)))
+        (unless (= (.kind makes-node) (g/KNone))
+          (for t (.kids (kid-of makes-node 0)) (push! (mut makes) (.text t))))
+        (push! (mut stages)
+               (Stage
+                 :name (.text (kid-of d 0))
+                 :unit (if per (.text (kid-of d 2)) "whole")
+                 :functions fns
+                 :makes makes
+                 :gives (and per (not (= (.kind (kid-of d 5)) (g/KNone))))
+                 :namer (if (and per (not (= (.kind (kid-of d 6)) (g/KNone))))
+                            (.text (kid-of (kid-of d 6) 0))
+                            "")
+                 :run (if (and per (not (= (.kind (kid-of d 1)) (g/KNone))))
+                          (let [n (rt/parse-int (.text (kid-of (kid-of d 1) 0)))]
+                            (if (< n 1) 1 n))
+                          1)
+                 :lo (.lo d)))))
+    stages))
 
 (defn tok-of [(src (slice u8)) (n g/Node)] (-> rt/Tok)
   (let [at (rt/line-col src (.lo n))]
@@ -1552,15 +1593,13 @@
                               (dsl/join2 "expected " (.want e)))))
         (mut chk)
           (checker-new (dsl/manifest-entries (meta/read-context-manifest context)))
-        fills (split-fn (mut c) (tok-of src (kid-of tree 1)))
-        record-module (get fills 0)
-        record-name (get fills 1)
-        (mut stages) (ArrayList::new [Stage] (malloc-allocator))
+        stages (stages-of tree)
+        (mut every) (primitive/code-list-new)
         (mut arms) (primitive/code-list-new)
         (mut names) (primitive/code-list-new)]
     ;; What is kept is the rules compiler's to apply (see `keep` in the rules compiler): here each is
     ;; only a function's name, and a run's choice of strategy is a switch for each.
-    (for d (.kids (kid-of tree 3))
+    (for d (.kids (kid-of tree 2))
       (for item (.kids (kid-of d 1))
         (when (= (.kind item) (g/KKeep))
           (for t (.kids (kid-of item 0))
@@ -1571,34 +1610,44 @@
         (when (= (.kind item) (g/KApart))
           (for t (.kids (kid-of item 0))
             (split-fn (mut c) (tok-of src t))))))
-    (for d (.kids (kid-of tree 4))
-      (let [(mut fns) (texts)
-            (mut makes) (texts)
-            per (= (.kind d) (g/KPerStage))
-            fn-list (if per (kid-of d 2) (kid-of d 1))
-            makes-node (if per (kid-of d 3) (kid-of d 2))]
-        (for t (.kids fn-list)
-          (split-fn (mut c) (tok-of src t))
-          (push! (mut fns) (.text t)))
+    ;; Each stage's functions named as `module/function`; what it makes is kept by every strategy.
+    (for d (.kids (kid-of tree 3))
+      (let [per (= (.kind d) (g/KPerStage))
+            fn-list (if per (kid-of d 3) (kid-of d 1))
+            makes-node (if per (kid-of d 4) (kid-of d 2))]
+        (for t (.kids fn-list) (split-fn (mut c) (tok-of src t)))
         (unless (= (.kind makes-node) (g/KNone))
           (for t (.kids (kid-of makes-node 0))
             (split-fn (mut c) (tok-of src t))
-            (push! (mut makes) (.text t))
             (push! (mut (.made chk)) (.text t))))
-        (push! (mut stages)
-               (Stage
-                 :name (.text (kid-of d 0))
-                 :unit (if per (.text (kid-of d 1)) "whole")
-                 :functions fns
-                 :makes makes
-                 :tok (tok-of src d)))))
-    (for p (.kids (kid-of tree 5))
+        (when (and per (not (= (.kind (kid-of d 6)) (g/KNone))))
+          (split-fn (mut c) (tok-of src (kid-of (kid-of d 6) 0))))))
+    ;; A function is one stage's work: the list the rules make of its answers runs on that
+    ;; stage's threads.
+    (for i (range 0 (len stages))
+      (for j (range 0 i)
+        (when (and (not (= (.unit (get stages i)) "whole"))
+                   (not (= (.unit (get stages j)) "whole")))
+          (for f (.functions (get stages i))
+            (when (has? (.functions (get stages j)) f)
+              (let [at (rt/line-col src (.lo (get stages i)))]
+                (dsl/fail-at path
+                             (.line at)
+                             (.col at)
+                             (dsl/join3 f
+                                        " is the work of two stages: "
+                                        (dsl/join3 (.name (get stages j))
+                                                   " and "
+                                                   (.name (get stages i)))))))))))
+    (for i (range 0 (len stages))
+      (unless (= (.unit (get stages i)) "whole")
+        (push! (mut every) `(rt/stage-threads! ~i n))))
+    (for p (.kids (kid-of tree 4))
       (let [plan-name (.text (kid-of p 0))
             (mut threads) `1
-            (mut fields) (primitive/code-list-new)
+            (mut sets) (primitive/code-list-new)
             (mut parallel) (texts)
-            (mut counts) (ArrayList::new [Code] (malloc-allocator))
-            (mut parts) (ArrayList::new [Code] (malloc-allocator))]
+            (mut counts) (ArrayList::new [Code] (malloc-allocator))]
         (for item (.kids (kid-of p 1))
           (when (= (.kind item) (g/KThreads))
             (set! threads (count-code (kid-of item 0)))))
@@ -1625,46 +1674,22 @@
                                          plan-name
                                          s
                                          (kid-of item 0))
-                           (when (and (not (= (.kind (kid-of item 2)) (g/KNone)))
-                                      (not (= (.unit s) "part")))
-                             (dsl/die (mut c)
-                                      (tok-of src (kid-of item 2))
-                                      (dsl/join3 sname
-                                                 " works per "
-                                                 (dsl/join2 (.unit s)
-                                                            ", not in parts: it has no part count"))))
                            (push! (mut parallel) sname)
                            (push! (mut counts)
                                   (if (= (.kind (kid-of item 1)) (g/KNone))
                                       threads
-                                      (count-code (kid-of item 1))))
-                           (push! (mut parts)
-                                  (if (= (.kind (kid-of item 2)) (g/KNone))
-                                      (if (= (.kind (kid-of item 1)) (g/KNone))
-                                          threads
-                                          (count-code (kid-of item 1)))
-                                      (count-code (kid-of (kid-of item 2) 0)))))))))))
-        ;; Every stage that works in units has a thread count; one that works in parts, a part count.
-        (for s stages
-          (unless (= (.unit s) "whole")
+                                      (count-code (kid-of item 1)))))))))))
+        ;; Every stage that works in units has a thread count: one, unless the plan says.
+        (for i (range 0 (len stages))
+          (unless (= (.unit (get stages i)) "whole")
             (let [(mut at) -1]
-              (for i (range 0 (len parallel))
-                (when (= (get parallel i) (.name s)) (set! at i)))
-              (push! (mut fields)
-                     (primitive/code-symbol ":"
-                                            (dsl/join2 (.name s) "-threads")))
-              (push! (mut fields) (if (>= at 0) (get counts at) `1))
-              (when (= (.unit s) "part")
-                (push! (mut fields)
-                       (primitive/code-symbol ":"
-                                              (dsl/join2 (.name s) "-parts")))
-                (push! (mut fields) (if (>= at 0) (get parts at) `1))))))
+              (for j (range 0 (len parallel))
+                (when (= (get parallel j) (.name (get stages i))) (set! at j)))
+              (push! (mut sets)
+                     `(rt/stage-threads! ~i ~(if (>= at 0) (get counts at) `1))))))
         (push! (mut names) `(push! (mut out) ~plan-name))
         (push! (mut arms) `(= name ~plan-name))
-        (push! (mut arms)
-               `(~(primitive/code-symbol "plan-module/" record-name) :name
-                   ~plan-name
-                   ~@fields))))
+        (push! (mut arms) `(do ~@sets 0))))
     (let [(mut deps) (primitive/code-list-new)
           all (strategies-of src path tree (made-of tree))
           (mut uses) (primitive/code-list-new)
@@ -1740,15 +1765,21 @@
           (push! (mut strategy-names) `(push! (mut out) ~(.name d)))))
       (for d (.depends chk) (push! (mut deps) `~d))
       (dsl/render `(do
-                     (import ~record-module :as plan-module)
                      ~@hook-imports
                      (import "hl.rt" :as rt)
                      (import "coil.arraylist" :use [ArrayList])
                      (import "coil.alloc" :use [malloc-allocator])
                      ~(if (> (len (.depends chk)) 0) `(depends-on ~@deps) `(do))
-                     (defn plan [(name (slice u8))]
-                       (-> ~(primitive/code-symbol "plan-module/" record-name))
-                       (cond ~@arms :else (panic "no plan named {}" name)))
+                     ;; The run gives each stage the threads this plan says.
+                     (defn use-plan! [(name (slice u8))] (-> void)
+                       (cond ~@arms :else
+                             (panic "no plan named {}: the pipeline has {}"
+                                    name
+                                    (rt/joined (plan-names) ", "))))
+                     ;; The run gives every stage that works in units `n` threads.
+                     (defn use-threads! [(n i64)] (-> void)
+                       ~@every
+                       0)
                      (defn plan-names [] (-> (ArrayList (slice u8)))
                        (let [(mut out)
                                (ArrayList::new [(slice u8)] (rt/tree-allocator))]

@@ -51,22 +51,6 @@ fn esm-format() -> Format =
 
 record DefineText { key: Text, value: Text }
 
-# How a build divides its work: how many threads load files, and into how many parts, on how many
-# threads, the program is optimised and printed. All ones is the serial build.
-record Plan {
-  name: Text,
-  load-threads: Int,
-  optimize-threads: Int,
-  print-threads: Int,
-  facts-threads: Int,
-  emit-threads: Int,
-  sides-threads: Int,
-  chunks-threads: Int
-}
-
-fn serial-plan() -> Plan =
-  Plan(name: "serial", load-threads: 1, optimize-threads: 1, print-threads: 1, facts-threads: 1, emit-threads: 1, sides-threads: 1, chunks-threads: 1)
-
 boxed record Options {
   entry: Text,
   entries: [Text],
@@ -104,7 +88,6 @@ boxed record Options {
   packages-external: Bool,
   public-path: Text,
   tsconfig: Text,
-  plan: Plan,
   legal-comments: Text,
   jsx: jsx.Options,
   target: Int,
@@ -127,7 +110,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           defines: [], main-fields: ["browser", "module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
-          packages-external: false, public-path: "", tsconfig: "", plan: serial-plan(), legal-comments: "eof", jsx: jsx.options-new(), target: lower.no-lowering,
+          packages-external: false, public-path: "", tsconfig: "", legal-comments: "eof", jsx: jsx.options-new(), target: lower.no-lowering,
           on-resolve: [], on-load: [],
           transform: keep-as-is, optimize: default-optimize)
 
@@ -347,18 +330,17 @@ fn with-node-env(o: Options) -> Options = match o {
 fn loading-of(o: Options, out-dir: Text) -> m.Loading =
   m.Loading(defines: [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines], transform: o.transform,
             has-transform: o.has-transform, aliases: o.aliases, loaders: o.loaders, on-resolve: o.on-resolve,
-            on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir, load-threads: o.plan.load-threads,
+            on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir,
             packages-external: o.packages-external, public-path: o.public-path)
 
 fn linking-of(o: Options, entry-namespace: Bool, splitting: Bool, f: Format) -> an.Linking =
   an.Linking(entry-namespace: entry-namespace, tree-shaking: o.tree-shaking,
              splitting: splitting, esm-output: f.es-module, native-require: f.native-require, compact: o.minify-identifiers,
-             pure-names: o.pure,
-             facts-threads: o.plan.facts-threads)
+             pure-names: o.pure)
 
 fn emitting-of(o: Options, f: Format) -> e.Emitting =
   e.Emitting(void-undefined: o.minify-syntax, native-require: f.native-require,
-             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, emit-threads: o.plan.emit-threads)
+             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap)
 
 # The names esbuild gives output files: the entry's path below the entries' common directory.
 fn common-dir(paths: [Text]) -> Text = fold dir = dir-of(paths[0]) for p in paths: enclosing(dir, p)
@@ -561,7 +543,7 @@ fn linked-built(o: Options, f: Format, g: m.Graph) -> [Written] =
 
 # Each symbol's name: minified, or as esbuild's number renamer gives them.
 fn final-names(o: Options) -> sym.Table = match o.minify-identifiers {
-  true => sym.renamed-all(m.table, mangle.minified-names(o.plan.emit-threads))
+  true => sym.renamed-all(m.table, mangle.minified-names())
   false => nm.esbuild-names(o.target < lower.no-lowering)
 }
 
@@ -593,7 +575,7 @@ fn flat-output(o: Options, f: Format) -> Printed =
   Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
   where groups = match o.has-optimize {
           true => [spec-optimized(o, e.group-made(g)) for g in e.groups()]
-          false => parallel-map(e.groups(), group-optimized, o.plan.optimize-threads)
+          false => [group-optimized(g) for g in e.groups()]
         },
         entry = match o.has-optimize {
           true => spec-optimized(o, entry-calls(f))
@@ -601,7 +583,7 @@ fn flat-output(o: Options, f: Format) -> Printed =
         },
         lowered = timed(o.timing, "lower", lowered-of(o, program-of(None(), flagged(groups ++ [entry])))),
         exports = export-statements(f),
-        all = pieces-joined(o, parallel-map(stable-runs(lowered.body.kids), run-printed, o.plan.print-threads)
+        all = pieces-joined(o, [run-printed(run) for run in stable-runs(lowered.body.kids)]
                                ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
 
 # Lists of statements one after another, a `Flag()` between each that has any and the one before.
@@ -642,7 +624,7 @@ fn grouped?(o: Options) -> Bool = not o.has-optimize and o.target >= lower.no-lo
 fn grouped-output(o: Options, f: Format) -> Printed =
   Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
   where exports = export-statements(f),
-        all = pieces-joined(o, parallel-map(e.groups(), group-output, o.plan.print-threads)
+        all = pieces-joined(o, [group-output(g) for g in e.groups()]
                                ++ [group-rendered(o, entry-calls(f))]
                                ++ [render-part(Program(None(), List(exports...))) for x in [exports] if len(x) > 0])
 
@@ -714,7 +696,7 @@ fn chunk-own(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.Unit
 fn chunk-programs(o: Options, all: [chunks.Chunk], selected: [[e.Unit]]) -> [Printed] = match grouped?(o) {
   false => [chunk-program(o, all[i], all, selected[i]) for i in 0..len(all)]
   true => with chunk-list = all, chunk-selected = selected, chunk-options = o {
-    parallel-map-own([i for i in 0..len(all)], chunk-at, o.plan.chunks-threads)
+    [chunk-at(i) for i in 0..len(all)]
   }
 }
 
@@ -763,7 +745,7 @@ fn side(i: Int) -> Side = match i {
 # beside it.
 fn names-beside-units(o: Options) -> sym.Table = match o.minify-identifiers {
   true => both[0].names[0]
-    where both = with side-options = o { parallel-map-own([0, 1], side, o.plan.sides-threads) }
+    where both = with side-options = o { [side(i) for i in [0, 1]] }
   false => final-names(o)
 }
 
@@ -794,17 +776,16 @@ fn root-stylesheet(o: Options, root: Int, sheets: [Text]) -> RootStylesheet =
         }
 
 fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> [Written] =
-  [w for ws in parallel-map([Writing(o: o, chunk: all[i], printed: printed[i], holes: holes[i], path: paths[i], paths: paths)
-                             for i in 0..len(all)], chunk-writing, o.plan.print-threads) for w in ws]
+  [w for ws in [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths) for i in 0..len(all)] for w in ws]
   ++ [sheet-written(s.path, s.bundle)... for s in styles]
   ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
         printed = chunk-programs(o, all, [chunk-units(c, unit-index) for c in all]),
         texts = [p.text for p in printed] ++ [s.bundle.text for s in styles],
-        holes = parallel-map(texts, chunks.holes-in, o.plan.print-threads),
+        holes = [chunks.holes-in(text) for text in texts],
         base = base-dir(o),
         # A chunk's hash is its own work, over its text and those it reaches: all are made at once.
-        hashes = parallel-map([chunks.Hashing(id: c.id, texts: texts, holes: holes) for c in all], chunks.hashed, o.plan.print-threads),
+        hashes = [chunks.content-hash(c.id, texts, holes) for c in all],
         paths = [chunk-path-of(o, all[i], hashes[i], base, m.entries) for i in 0..len(all)]
                 ++ [s.path for s in styles]
 
@@ -814,11 +795,7 @@ fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> 
 fn chunk-units(c: chunks.Chunk, index: {Int:Int}) -> [e.Unit] =
   [e.units[i] for i in sort i in [id for p in keys(c.parts) for id in index[p] distinct id] by i]
 
-# A chunk's files are its own work, once every chunk's name is known: all are made at once.
-record Writing { o: Options, chunk: chunks.Chunk, printed: Printed, holes: [chunks.Hole], path: Text, paths: [Text] }
-
-fn chunk-writing(w: Writing) -> [Written] = chunk-written(w.o, w.chunk, w.printed, w.holes, w.path, w.paths)
-
+# A chunk's files are its own work, once every chunk's name is known.
 fn chunk-written(o: Options, c: chunks.Chunk, pr: Printed, holes: [chunks.Hole], path: Text, paths: [Text]) -> [Written] =
   beside(path ++ ".LEGAL.txt", notes.file) ++ with-map(o, path, done.text ++ notes.tail, done.text, pr.base, done.marks)
   where done = chunks.filled(pr.text, pr.base, pr.marks, holes, path, paths),

@@ -152,6 +152,8 @@
    ;; functions may read the module whose code they serve (see `rt/hook-cell`).
    (sig-only (ArrayList (slice u8)))
    (staged (ArrayList (slice u8)))  ; every stage's own functions
+   ;; The program's pipeline's stages, in order (see "a stage's work").
+   (stages (ArrayList pl/Stage))
    (checker pl/Checker)])
 
 ;;; A name a rewrite's pattern binds to a child, or to its node, and that one's rewritten form.
@@ -544,12 +546,15 @@
                              :role role
                              :fns hooks)))))))
           (for m made (push! (mut (.made k)) m))
-          (for d (.kids (get (.kids tree) 4))
-            (let [fns
-                    (if (= (.kind d) (gpl/KPerStage))
-                        (get (.kids d) 2)
-                        (get (.kids d) 1))]
-              (for n (.kids fns) (push! (mut (.staged k)) (.text n)))))
+          (let [stages (pl/stages-of tree)]
+            (when (> (len stages) 0)
+              (when (> (len (.stages k)) 0)
+                (dsl/fail-at path
+                             1
+                             1
+                             "a second pipeline with stages: one program has one numbering of its stages"))
+              (set! (.stages k) stages))
+            (for s stages (for f (.functions s) (push! (mut (.staged k)) f))))
           (for m made
             (unless (has-text? (.keeps k) m)
               (push! (mut (.keeps k)) m)
@@ -1321,45 +1326,42 @@
       (push! (mut (.funcs m)) f))
     m))
 
-;;; A `.pipeline` module: `plan(name)` answers the record its header says it fills.
+;;; A `.pipeline` module: what a run asks of it.
 (defn pipeline-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))]
   (-> Mod)
-  (let [(mut m) (mod-new module (SRewrite) "")
-        fills (.text (get (.kids (pipeline-tree path)) 1))]
-    (let [(mut slash) 0]
-      (for i (range 0 (len fills)) (when (= (get fills i) #\/) (set! slash i)))
-      (let [record-module (subslice fills 0 slash)
-            record
-              (cat3 record-module "." (subslice fills (+ slash 1) (len fills)))]
-        (ensure-loaded! (mut k) record-module)
-        (let [(mut f) (func-of "plan" record)]
-          (param (mut f) "name" "Text" false)
-          (push! (mut (.funcs m)) f))
-        (push! (mut (.funcs m)) (func-of "plan-names" "[Text]"))
-        ;; Its strategies: which a run uses (see `strategy` in the pipeline language).
-        (let [(mut f) (func-of "use-strategy!" "Void")]
-          (param (mut f) "name" "Text" false)
-          (push! (mut (.funcs m)) f))
-        (let [(mut f) (func-of "strategy-tracks?" "Bool")]
-          (param (mut f) "name" "Text" false)
-          (push! (mut (.funcs m)) f))
-        (let [(mut f) (func-of "strategy-persists?" "Bool")]
-          (param (mut f) "name" "Text" false)
-          (push! (mut (.funcs m)) f))
-        (let [(mut f) (func-of "run-started!" "Bool")]
-          (param (mut f) "name" "Text" false)
-          (param (mut f) "cache" "Text" false)
-          (param (mut f) "watching" "Bool" false)
-          (push! (mut (.funcs m)) f))
-        (let [(mut f) (func-of "build-done!" "Void")]
-          (param (mut f) "name" "Text" false)
-          (param (mut f) "cache" "Text" false)
-          (param (mut f) "later" "Bool" false)
-          (param (mut f) "timing" "Bool" false)
-          (push! (mut (.funcs m)) f))
-        (push! (mut (.funcs m)) (func-of "default-strategy" "Text"))
-        (push! (mut (.funcs m)) (func-of "watching-strategy" "Text"))
-        (push! (mut (.funcs m)) (func-of "strategy-names" "[Text]"))))
+  (let [(mut m) (mod-new module (SRewrite) "")]
+    ;; Its plans: which a run uses (see `plan` in the pipeline language).
+    (let [(mut f) (func-of "use-plan!" "Void")]
+      (param (mut f) "name" "Text" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "use-threads!" "Void")]
+      (param (mut f) "n" "Int" false)
+      (push! (mut (.funcs m)) f))
+    (push! (mut (.funcs m)) (func-of "plan-names" "[Text]"))
+    ;; Its strategies: which a run uses (see `strategy` in the pipeline language).
+    (let [(mut f) (func-of "use-strategy!" "Void")]
+      (param (mut f) "name" "Text" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "strategy-tracks?" "Bool")]
+      (param (mut f) "name" "Text" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "strategy-persists?" "Bool")]
+      (param (mut f) "name" "Text" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "run-started!" "Bool")]
+      (param (mut f) "name" "Text" false)
+      (param (mut f) "cache" "Text" false)
+      (param (mut f) "watching" "Bool" false)
+      (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "build-done!" "Void")]
+      (param (mut f) "name" "Text" false)
+      (param (mut f) "cache" "Text" false)
+      (param (mut f) "later" "Bool" false)
+      (param (mut f) "timing" "Bool" false)
+      (push! (mut (.funcs m)) f))
+    (push! (mut (.funcs m)) (func-of "default-strategy" "Text"))
+    (push! (mut (.funcs m)) (func-of "watching-strategy" "Text"))
+    (push! (mut (.funcs m)) (func-of "strategy-names" "[Text]"))
     m))
 
 (defn scopes-mod [(k (mut Comp)) (module (slice u8)) (path (slice u8))] (-> Mod)
@@ -4221,20 +4223,21 @@
                                              (panic "a parallel task left no result"))))
                                    ~(sym res-v)))))
                             (cat3 "[" r "]"))))))
-          ;; `parallel-walk(roots, visit, next, n)`: a graph found as it is walked. Each name is visited
-          ;; once, on whichever of `n` threads takes it, and `next` of its result names more, visited
+          ;; `parallel-walk(roots, visit, next)`: a graph found as it is walked. `visit` is a stage's
+          ;; function (see `stage` in the pipeline language). Each name is visited once, on whichever
+          ;; of the stage's threads takes it, and `next` of its result names more, visited
           ;; after what is waiting already. A thread that finds work waiting never waits for a whole
           ;; wave to finish. Results come in the order they finish.
-          ;; `parallel-walk(roots, visit, next, first, n)`: `first` of a result names what goes on with
+          ;; `parallel-walk(roots, visit, next, first)`: `first` of a result names what goes on with
           ;; that item's own work, visited before anything waiting.
-          ;; `parallel-walk(roots, visit, next, first, after, n)`: `after` of a result names what comes
+          ;; `parallel-walk(roots, visit, next, first, after)`: `after` of a result names what comes
           ;; once everything new `first` named for it has been visited, ahead of anything waiting.
-          ;; `parallel-walk(roots, visit, next, first, after, file, n)`: `file` of a name `next` gave
+          ;; `parallel-walk(roots, visit, next, first, after, file)`: `file` of a name `next` gave
           ;; is the path of the file its visit will read, or "" for none. Such a file is read ahead
           ;; by a few threads of their own (see "files read ahead" in hl.rt), and what `next` gave
           ;; is visited in the order it was found, which is the order it is read in.
           (and (= name "parallel-walk")
-               (or (= count 4) (= count 5) (= count 6) (= count 7)))
+               (or (= count 3) (= count 4) (= count 5) (= count 6)))
             (let [roots
                     (expect (mut k)
                             (get args 0)
@@ -4242,17 +4245,21 @@
                             "[Text]")
                   visit (expr (mut k) (get args 1) "")
                   follow (expr (mut k) (get args 2) "")
-                  urgent (if (>= count 5) (expr (mut k) (get args 3) "") follow)
-                  has-urgent (>= count 5)
-                  later (if (>= count 6) (expr (mut k) (get args 4) "") follow)
-                  has-later (>= count 6)
-                  ahead (if (= count 7) (expr (mut k) (get args 5) "") follow)
-                  has-ahead (= count 7)
+                  urgent (if (>= count 4) (expr (mut k) (get args 3) "") follow)
+                  has-urgent (>= count 4)
+                  later (if (>= count 5) (expr (mut k) (get args 4) "") follow)
+                  has-later (>= count 5)
+                  ahead (if (= count 6) (expr (mut k) (get args 5) "") follow)
+                  has-ahead (= count 6)
+                  ;; A visit is a stage's work: the walk runs on that stage's threads.
                   threads
-                    (expect (mut k)
-                            (get args (- count 1))
-                            (expr (mut k) (get args (- count 1)) "Int")
-                            "Int")]
+                    (te (match (stage-fn (mut k) (get args 1))
+                          (Some [sc] `(rt/stage-threads ~(.number sc)))
+                          (None []
+                                (die (mut k)
+                                     (get args 1)
+                                     "parallel-walk visits with a stage's function: no stage of the pipeline names this one")))
+                        "Int")]
               (unless (fn? (.ty visit))
                 (die (mut k) n "parallel-walk needs a function to visit with"))
               (let [ps (fn-params (.ty visit))
@@ -4340,6 +4347,12 @@
                                   (mut go) true]
                               (rt/spin-lock! lk)
                               (while go
+                                ;; A visit that makes a list of its own (a big file's pieces)
+                                ;; offers it to the others, who take part before anything new.
+                                (when (rt/help-wanted?)
+                                  (rt/spin-unlock! lk)
+                                  (rt/help-now!)
+                                  (rt/spin-lock! lk))
                                 (if (or (< (.head j) (len (.queue j))) (> (- (len (.found j)) (.found-head j)) 0))
                                     (let [from-found
                                             (if found-first
@@ -4490,7 +4503,8 @@
                                                            0)
                                                         (= (atomic/read (field j
                                                                                done))
-                                                           0))
+                                                           0)
+                                                        (not (rt/help-wanted?)))
                                               (set! spins (+ spins 1)))
                                             ;; To sleep: say so, then look once more, at the gate. Work
                                             ;; added before this said so is seen here; whoever adds
@@ -4501,7 +4515,8 @@
                                               (rt/spin-lock! lk)
                                               (let [idle (and (>= (.head j) (len (.queue j)))
                                                               (= (- (len (.found j)) (.found-head j)) 0)
-                                                              (> (.busy j) 0))]
+                                                              (> (.busy j) 0)
+                                                              (not (rt/help-wanted?)))]
                                                 (rt/spin-unlock! lk)
                                                 (when idle (rt/gate-wait! g)))
                                               (atomic/add (field j asleep) -1)
@@ -4565,10 +4580,12 @@
                                ;; What arrives where (`arrive!`) is counted afresh for each walk.
                                (rt/arrivals-reset!)
                                ~(if has-ahead `(rt/read-ahead-begin!) `0)
+                               (rt/idle-gate! (.gate ~(sym job-v)))
                                (rt/run-workers (fnptr-of ~(sym body))
                                                (cast (ptr i8)
                                                      (mut ~(sym job-v)))
                                                ~(.code threads))
+                               (rt/idle-gate! (primitive/cast (ptr rt/Gate) 0))
                                ~(if has-ahead `(rt/read-ahead-end!) `0)
                                (let [(mut ~(sym res-v))
                                        (ArrayList::new [~cr]
@@ -5282,7 +5299,225 @@
                 ty))))))
 
 ;;; `[e for …]`, or with `spread`, `[e... for …]`: each `e` a list whose items all go in.
+;;; A stage's work: a list of one of a `per` stage's functions' answers, `[f(x, a) for x in xs]`
+;;; (see `stage` in the pipeline language). The rules say only what the list holds. It is made on
+;;; as many threads as the run's plan gives the stage (`rt/stage-threads`): what `f` is given is
+;;; worked out for every item first, here, in the list's order, by the thread that asks for the
+;;; list; then each thread takes the next item it finds free and calls `f`, so uneven work evens
+;;; out; the answers are in the items' order. A stage of small units (`per N units`) has a thread
+;;; take N at a time, and a list of N or fewer made by the thread that asks for it, alone.
+;;; A stage that `gives settings` has one call run at a time while what answers were made from is
+;;; tracked (`rt/own-threads`). One with `names by` meets names that get ids in the order they are
+;;; met: the calls run once only to say which names they need, the namer is given those in the
+;;; items' order, and they run again, every name known (see `rt/names-record-begin!`).
+(defstruct StageCall [(module (slice u8)) (f Func) (number i64) (stage pl/Stage)])
+
+(defn stage-call [(k (mut Comp)) (value g/Node)] (-> (Option StageCall))
+  (if (!= (.kind value) (g/KCall))
+      (None [StageCall])
+      (stage-fn (mut k) (kid value 0))))
+
+;;; The stage a name is the work of, when it names a function one works per unit by.
+(defn stage-fn [(k (mut Comp)) (callee g/Node)] (-> (Option StageCall))
+  (if (= (len (.stages k)) 0)
+      (None [StageCall])
+      (let [(mut module) ""
+            (mut name) ""]
+        (match (.kind callee)
+          (g/KName []
+                   (match (find-local (mut k) (.text callee))
+                     (Some [_] 0)
+                     (None []
+                           (set! module (.self k))
+                           (set! name (.text callee))
+                           0)))
+          (g/KFieldE []
+                     (match (module-prefix (mut k) (kid callee 0))
+                       (Some [m]
+                             (set! module m)
+                             (set! name (.text (kid callee 1)))
+                             0)
+                       (None [] 0)))
+          (_ 0))
+        (if (= (len name) 0)
+            (None [StageCall])
+            (let [full (cat3 module "/" name)
+                  (mut out) (None [StageCall])]
+              (for i (range 0 (len (.stages k)))
+                (let [st (get (.stages k) i)]
+                  (when (and (!= (.unit st) "whole") (has-text? (.functions st) full))
+                    (match (find-func (mod-at (mut k) module) name)
+                      (Some [f]
+                            (set! out
+                                  (Some (StageCall
+                                          :module module
+                                          :f f
+                                          :number i
+                                          :stage st))))
+                      (None [] 0)))))
+              out)))))
+
+;;; Whether a comprehension is a stage's work, which is made as a list of its own.
+(defn stage-work? [(k (mut Comp)) (comp g/Node)] (-> bool)
+  (match (stage-call (mut k) (kid comp 0))
+    (Some [_] true)
+    (None [] false)))
+
+(defn stage-comprehension [(k (mut Comp)) (n g/Node) (sc StageCall)] (-> TE)
+  ;; HL_SHOW_STAGES set: each list that is a stage's work, where it is, as the compiler found it.
+  (unless (= (primitive/cast i64 (getenv c"HL_SHOW_STAGES")) 0)
+    (let [at (rt/line-col (.src k) (.lo n))]
+      (println "[stage] {}: {}/{} at {}:{}"
+               (.name (.stage sc))
+               (.module sc)
+               (.name (.f sc))
+               (.path k)
+               (.line at))))
+  (let [mark (locals-mark (mut k))
+        value (kid n 0)
+        args (list-kids (kid value 1))
+        f (.f sc)
+        clauses (list-kids (kid n 1))
+        (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+    (for c clauses (push! (mut opened) (clause-open! (mut k) c)))
+    (unless (= (len args) (len (.params f)))
+      (die (mut k)
+           value
+           (cat4 (.name f)
+                 " takes "
+                 (rt/num-text (len (.params f)))
+                 (cat " arguments, this has " (rt/num-text (len args))))))
+    (when (= (len args) 0)
+      (die (mut k) value (cat (.name f) " is a stage's work, done for each of something: it takes what it is done for")))
+    (let [tuple (fresh (mut k) "SArgs")
+          job (fresh (mut k) "SJob")
+          body (fresh (mut k) "sjob-body")
+          items (fresh (mut k) "sitems")
+          out-v (fresh (mut k) "sout")
+          job-v (fresh (mut k) "sjob")
+          res-v (fresh (mut k) "sres")
+          o-v (fresh (mut k) "so")
+          v-v (fresh (mut k) "sv")
+          single (= (len args) 1)
+          (mut fields) (primitive/code-list-new)
+          (mut inits) (primitive/code-list-new)
+          (mut reads) (primitive/code-list-new)
+          (mut first) `0]
+      (for i (range 0 (len args))
+        (let [p (get (.params f) i)
+              a (get args i)
+              field (cat "a" (rt/num-text i))]
+          (when (.by-ref p)
+            (die (mut k)
+                 a
+                 (cat (.name f) " is a stage's work and changes what it is given: it cannot be done for many at once")))
+          (when (or (= (.kind a) (g/KNamed)) (= (.kind a) (g/KSpread)))
+            (die (mut k) a "a stage's work is given plain arguments"))
+          (let [x (expect (mut k) a (expr (mut k) a (.ty p)) (.ty p))]
+            (when (= i 0) (set! first (.code x)))
+            (push! (mut fields) `(~(sym field) ~(coil-type (mut k) (.ty p))))
+            (push! (mut inits) (primitive/code-symbol ":" field))
+            (push! (mut inits) (.code x))
+            (push! (mut reads) `(~(primitive/code-symbol "." field) t)))))
+      (let [ct (if single (coil-type (mut k) (.ty (get (.params f) 0))) (sym tuple))
+            cr (coil-type (mut k) (.ret f))
+            item (if single first `(~(sym tuple) ~@inits))
+            fill (clauses-code (mut k) clauses opened `(push! (mut ~(sym items)) ~item))
+            callee (sym (qualified (mut k) (.module sc) (.coil f)))
+            call (if single `(~callee t) `(~callee ~@reads))
+            asked `(rt/stage-threads ~(.number sc))
+            naming (> (len (.namer (.stage sc))) 0)
+            step (.run (.stage sc))
+            threads (if (or naming (.gives (.stage sc))) `(rt/own-threads ~asked) asked)
+            once
+              `(let [(mut ~(sym out-v))
+                       (ArrayList::new [(Option ~cr)] (rt/value-allocator))]
+                 (reserve! (mut ~(sym out-v)) (len ~(sym items)))
+                 (for _ ~(sym items) (push! (mut ~(sym out-v)) (None [~cr])))
+                 (let [(mut ~(sym job-v))
+                         (~(sym job) :next 0 :xs ~(sym items) :out ~(sym out-v))]
+                   (if (<= (len ~(sym items)) ~step)
+                       (do (~(sym body) (cast (ptr i8) (mut ~(sym job-v)))) 0)
+                       (do
+                         (rt/run-map-workers (fnptr-of ~(sym body))
+                                             (cast (ptr i8) (mut ~(sym job-v)))
+                                             ~threads)
+                         0))
+                   (let [(mut ~(sym res-v)) (ArrayList::new [~cr] (rt/tree-allocator))]
+                     (reserve! (mut ~(sym res-v)) (len ~(sym items)))
+                     (for ~(sym o-v) (.out ~(sym job-v))
+                       (match ~(sym o-v)
+                         (Some [~(sym v-v)] (push! (mut ~(sym res-v)) ~(sym v-v)))
+                         (None [] (panic "a stage's work left no answer for an item"))))
+                     ~(sym res-v))))
+            run
+              (if (not naming)
+                  once
+                  (let [full (.namer (.stage sc))
+                        slash (rt/name-end-at full 47)
+                        nm (subslice full 0 slash)
+                        nf (subslice full (+ slash 1) (len full))]
+                    (when (< (mod-index (mut k) nm) 0)
+                      (die (mut k)
+                           n
+                           (cat4 "this list is the work of a stage whose names go to "
+                                 full
+                                 ": the module that makes it must use "
+                                 nm)))
+                    (match (find-func (mod-at (mut k) nm) nf)
+                      (None [] (die (mut k) n (cat4 nm " has no function named " nf "")))
+                      (Some [g]
+                            (unless (= (func-type g) "Fn(Text)->Int")
+                              (die (mut k)
+                                   n
+                                   (cat full " is given names: it takes a Text and answers its Int")))
+                            ;; While answers are tracked the calls run one at a time, and meet
+                            ;; their names in order.
+                            `(if (rt/dep-tracking?)
+                                 ~once
+                                 (do
+                                   (rt/names-record-begin!)
+                                   ~once
+                                   (rt/names-record-end! ~(fn-value (mut k)
+                                                                    `(fnptr-of ~(sym (qualified (mut k)
+                                                                                                nm
+                                                                                                (.coil g))))
+                                                                    g)
+                                                         (len ~(sym items)))
+                                   ~once))))))]
+        (locals-reset! (mut k) mark)
+        (unless single (push! (mut (.aux k)) `(defstruct ~(sym tuple) [~@fields])))
+        (push! (mut (.aux k))
+               `(defstruct ~(sym job)
+                  [(next i64) (xs (ArrayList ~ct)) (out (ArrayList (Option ~cr)))]))
+        (push! (mut (.aux k))
+               `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
+                  (let [j (cast (ptr ~(sym job)) arg)
+                        xs (.xs j)
+                        (mut out) (.out j)
+                        (mut go) true]
+                    (while go
+                      (let [from (atomic/add (cast (ptr i64) j) ~step)
+                            to (if (< (+ from ~step) (len xs)) (+ from ~step) (len xs))]
+                        (if (< from (len xs))
+                            (for i (range from to)
+                              (rt/item-begin! i)
+                              (let [t (get xs i)]
+                                (set! (mut out) i (Some ~call))))
+                            (set! go false))))
+                    arg)))
+        (te `(let [(mut ~(sym items)) (ArrayList::new [~ct] (rt/tree-allocator))]
+               ~fill
+               ~run)
+            (cat3 "[" (.ret f) "]"))))))
+
 (defn comprehension [(k (mut Comp)) (n g/Node) (want (slice u8)) (spread bool)]
+  (-> TE)
+  (match (if spread (None [StageCall]) (stage-call (mut k) (kid n 0)))
+    (Some [sc] (stage-comprehension (mut k) n sc))
+    (None [] (plain-comprehension (mut k) n want spread))))
+
+(defn plain-comprehension [(k (mut Comp)) (n g/Node) (want (slice u8)) (spread bool)]
   (-> TE)
   (let [mark (locals-mark (mut k))
         value (kid n 0)
@@ -7433,23 +7668,26 @@
                    `(if ~(.code c)
                         (do ~(extend-code (mut k) (kid e 1) target t) 0)
                         (do ~(extend-code (mut k) (kid e 2) target t) 0)))))
+      ;; A stage's work is made as a list of its own (see `stage-comprehension`), then goes in.
       (g/KComp []
-               (let [mark (locals-mark (mut k))
-                     (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
-                 (for c (list-kids (kid e 1))
-                   (push! (mut opened) (clause-open! (mut k) c)))
-                 (let [v
-                         (expect (mut k)
-                                 (kid e 0)
-                                 (expr (mut k) (kid e 0) elem)
-                                 elem)
-                       body
-                         (clauses-code (mut k)
-                                       (list-kids (kid e 1))
-                                       opened
-                                       `(push! (mut ~target) ~(.code v)))]
-                   (locals-reset! (mut k) mark)
-                   `(do ~body 0))))
+               (if (stage-work? (mut k) e)
+                   (extend-whole (mut k) e target t)
+                   (let [mark (locals-mark (mut k))
+                         (mut opened) (ArrayList::new [HeadInfo] (malloc-allocator))]
+                     (for c (list-kids (kid e 1))
+                       (push! (mut opened) (clause-open! (mut k) c)))
+                     (let [v
+                             (expect (mut k)
+                                     (kid e 0)
+                                     (expr (mut k) (kid e 0) elem)
+                                     elem)
+                           body
+                             (clauses-code (mut k)
+                                           (list-kids (kid e 1))
+                                           opened
+                                           `(push! (mut ~target) ~(.code v)))]
+                       (locals-reset! (mut k) mark)
+                       `(do ~body 0)))))
       (g/KCall [] (spread-into (mut k) e target t))
       ;; `e where x = …`: the equations, then `e` goes in.
       (g/KWhereE []
@@ -11521,6 +11759,7 @@
             :hooks (ArrayList::new [Hooks] (malloc-allocator))
             :sig-only (text-list)
             :staged (text-list)
+            :stages (ArrayList::new [pl/Stage] (malloc-allocator))
             :checker
               (pl/checker-new (dsl/manifest-entries (meta/read-context-manifest context))))
         manifest (meta/read-context-manifest context)]
