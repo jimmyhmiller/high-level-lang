@@ -3787,6 +3787,11 @@
 
 (defn read-all-raw [(path (slice u8))] (-> (slice u8))
   (read-trace!)
+  (match (read-ahead-take path)
+    (Some [bytes] bytes)
+    (None [] (read-all-here path))))
+
+(defn read-all-here [(path (slice u8))] (-> (slice u8))
   (let [a (value-allocator)
         fd
           (os/open (str/to-cstr a path)
@@ -3820,6 +3825,188 @@
                (try-or! (fs/read-file (value-allocator) path)
                         (panic "cannot read {}" path))]
          bytes)))
+
+;; ---------------------------------------------------------------- files read ahead
+;;;
+;;; Opening a file is work the system does a little of at a time whoever asks: ten thousand small
+;;; files are read in about 50 ms by four threads and in 121 by twelve (benchmarks/io). So while
+;;; a walk finds files (`parallel-walk` with a path to read for each name it finds), a few
+;;; threads of their own read what was found, in the order it was found, and whoever then reads
+;;; a file (`read-all-raw`) takes what was read for it, waiting only for its own file. A file
+;;; nobody said to read ahead, and any file while no walk is under way, is read where it is
+;;; asked for, as before.
+;;;
+;;; A file's place holds how far it is (0 said, 1 being read, 2 read, 3 could not be read, 4
+;;; taken), its bytes and how many. The lists never move: they have room for `read-ahead-room`
+;;; files from the start, and a file found when they are full is read where it is asked for.
+(defstruct ReadAhead
+  [(lock i64)
+   (on i64)
+   (stop i64)
+   (next i64)
+   (end i64)
+   (paths (ArrayList (ptr i8)))
+   (state (ArrayList i64))
+   (bytes (ArrayList i64))
+   (sizes (ArrayList i64))
+   (places (HashMap (slice u8) i64))
+   (threads (ArrayList Thread))])
+
+(defn read-ahead-state [] (-> (ptr ReadAhead))
+  (primitive/alloc-static ReadAhead))
+
+(defn read-ahead-room [] (-> i64) 1048576)
+
+;;; How many threads read ahead. HL_READ_AHEAD says otherwise; 0 for none.
+(defstruct ReadAheadThreads [(known i64) (n i64)])
+
+(defn read-ahead-threads [] (-> i64)
+  (let [w (primitive/alloc-static ReadAheadThreads)]
+    (when (= (.known w) 0)
+      (let [name (str/to-cstr (malloc-allocator) "HL_READ_AHEAD")
+            said (os/getenv name)]
+        (set! (.n w) (if (!= (primitive/cast i64 said) 0) (parse-int (str/from-cstr said)) 4))
+        (primitive/free (primitive/cast (ptr i8) name))
+        (set! (.known w) 1)))
+    (.n w)))
+
+;;; One file read into memory of its own: its place says so when it is done.
+(defn read-ahead-one! [(r (ptr ReadAhead)) (i i64)] (-> void)
+  (let [fd (os/open (get (.paths r) i) (primitive/cast i32 (| fs/O_RDONLY fs/O_CLOEXEC)) 0)]
+    (if (< fd (: 0 i32))
+        (atomic/store (elem (mut (.state r)) i) 3)
+        (let [size (lseek fd 0 2)]
+          (if (< size 0)
+              (do (os/close fd) (atomic/store (elem (mut (.state r)) i) 3))
+              (let [buf (malloc (primitive/cast isize (+ size 1)))
+                    (mut off) 0
+                    (mut more) true]
+                (lseek fd 0 0)
+                (while (and more (< off size))
+                  (let [n (read fd (primitive/index buf off) (primitive/cast isize (- size off)))]
+                    (if (> (primitive/cast i64 n) 0)
+                        (set! off (+ off (primitive/cast i64 n)))
+                        (set! more false))))
+                (os/close fd)
+                (set! (mut (.bytes r)) i (primitive/cast i64 buf))
+                (set! (mut (.sizes r)) i off)
+                (atomic/store (elem (mut (.state r)) i) 2)))))
+    0))
+
+;;; A reading thread: the next file said and not begun, until told to stop. With nothing to read
+;;; it looks again at once for a while, then lets others have its core between looks.
+(defn read-ahead-thread [(arg (ptr i8))] (-> (ptr i8))
+  (let [r (read-ahead-state)
+        (mut idle) 0]
+    (prefer-fast-cores!)
+    (while (= (atomic/read (field r stop)) 0)
+      (let [i (atomic/read (field r next))]
+        (if (< i (atomic/read (field r end)))
+            (when (= (atomic/cas (field r next) i (+ i 1)) i)
+              (set! idle 0)
+              (atomic/store (elem (mut (.state r)) i) 1)
+              (read-ahead-one! r i))
+            (do
+              (set! idle (+ idle 1))
+              (when (> idle 2000) (sched_yield) (set! idle 0))))))
+    arg))
+
+;;; From here files said (`read-ahead!`) are read by threads of their own, until `read-ahead-end!`.
+(defn read-ahead-begin! [] (-> void)
+  (let [r (read-ahead-state)]
+    (when (and (= (.on r) 0) (> (read-ahead-threads) 0))
+      (set! (.paths r) (ArrayList::new [(ptr i8)] (malloc-allocator)))
+      (set! (.state r) (ArrayList::new [i64] (malloc-allocator)))
+      (set! (.bytes r) (ArrayList::new [i64] (malloc-allocator)))
+      (set! (.sizes r) (ArrayList::new [i64] (malloc-allocator)))
+      (reserve! (mut (.paths r)) (read-ahead-room))
+      (reserve! (mut (.state r)) (read-ahead-room))
+      (reserve! (mut (.bytes r)) (read-ahead-room))
+      (reserve! (mut (.sizes r)) (read-ahead-room))
+      (set! (.places r) (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
+      (set! (.threads r) (ArrayList::new [Thread] (malloc-allocator)))
+      (atomic/store (field r next) 0)
+      (atomic/store (field r end) 0)
+      (atomic/store (field r stop) 0)
+      (for _ (range 0 (read-ahead-threads))
+        (push! (mut (.threads r)) (Thread :handle (cast (ptr i8) 0))))
+      (for i (range 0 (read-ahead-threads))
+        (when (!= (Thread::spawn-configured (elem (mut (.threads r)) i)
+                                            (fnptr-of read-ahead-thread)
+                                            (cast (ptr i8) 0)
+                                            (ThreadConfig :stack-size 524288 :guard-size 0))
+                  (: 0 i32))
+          (panic "could not start a thread to read files ahead")))
+      (atomic/store (field r on) 1))
+    0))
+
+;;; A file to read ahead: said once, in the order files are found.
+(defn read-ahead! [(path (slice u8))] (-> void)
+  (let [r (read-ahead-state)]
+    (when (and (!= (atomic/read (field r on)) 0) (> (len path) 0))
+      (spin-lock! (field r lock))
+      (let [i (len (.paths r))]
+        (when (and (< i (read-ahead-room))
+                   (match (get (.places r) path) (Some [_] false) (None [] true)))
+          (push! (mut (.paths r)) (str/to-cstr (malloc-allocator) path))
+          (push! (mut (.state r)) 0)
+          (push! (mut (.bytes r)) 0)
+          (push! (mut (.sizes r)) 0)
+          (set! (mut (.places r)) path i)
+          (atomic/store (field r end) (+ i 1))))
+      (spin-unlock! (field r lock)))
+    0))
+
+;;; What was read ahead for `path`, as values go now, or nothing: for a file not said, one that
+;;; could not be read (whoever asks reads it, and says why it cannot), and one taken already.
+(defn read-ahead-take [(path (slice u8))] (-> (Option (slice u8)))
+  (let [r (read-ahead-state)]
+    (if (= (atomic/read (field r on)) 0)
+        (None)
+        (let [at (do
+                   (spin-lock! (field r lock))
+                   (let [found (match (get (.places r) path) (Some [i] i) (None [] -1))]
+                     (spin-unlock! (field r lock))
+                     found))]
+          (if (< at 0)
+              (None)
+              (let [(mut looks) 0]
+                ;; Its own file, said and not read yet: one of the readers is at it or about to be.
+                (while (< (atomic/read (elem (mut (.state r)) at)) 2)
+                  (set! looks (+ looks 1))
+                  (when (> looks 2000) (sched_yield) (set! looks 0)))
+                (if (= (atomic/cas (elem (mut (.state r)) at) 2 4) 2)
+                    (let [size (get (.sizes r) at)
+                          from (primitive/cast (ptr u8) (get (.bytes r) at))
+                          out
+                            (match (alloc [u8] (value-allocator) (+ size 1))
+                              (Some [b] b)
+                              (None [] (panic "no memory to read {}" path)))]
+                      (mem/copy [u8] (data out) from size)
+                      (primitive/free (primitive/cast (ptr i8) from))
+                      (set! (mut (.bytes r)) at 0)
+                      (Some (subslice out 0 size)))
+                    (None))))))))
+
+;;; The reading threads stopped and joined, and whatever they read that nobody took let go.
+(defn read-ahead-end! [] (-> void)
+  (let [r (read-ahead-state)]
+    (when (!= (atomic/read (field r on)) 0)
+      (atomic/store (field r stop) 1)
+      (for i (range 0 (len (.threads r)))
+        (join (cast (ptr Thread) (elem (mut (.threads r)) i))))
+      (atomic/store (field r on) 0)
+      (for i (range 0 (len (.paths r)))
+        (primitive/free (get (.paths r) i))
+        (when (!= (get (.bytes r) i) 0)
+          (primitive/free (primitive/cast (ptr i8) (get (.bytes r) i)))))
+      (free! (mut (.paths r)))
+      (free! (mut (.state r)))
+      (free! (mut (.bytes r)))
+      (free! (mut (.sizes r)))
+      (free! (mut (.places r)))
+      (free! (mut (.threads r))))
+    0))
 
 ;;; Directory part of a path: "." when there is none, and "/" for a file at the root.
 (defn dir-of [(path (slice u8))] (-> (slice u8))

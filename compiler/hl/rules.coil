@@ -4229,8 +4229,12 @@
           ;; that item's own work, visited before anything waiting.
           ;; `parallel-walk(roots, visit, next, first, after, n)`: `after` of a result names what comes
           ;; once everything new `first` named for it has been visited, ahead of anything waiting.
+          ;; `parallel-walk(roots, visit, next, first, after, file, n)`: `file` of a name `next` gave
+          ;; is the path of the file its visit will read, or "" for none. Such a file is read ahead
+          ;; by a few threads of their own (see "files read ahead" in hl.rt), and what `next` gave
+          ;; is visited in the order it was found, which is the order it is read in.
           (and (= name "parallel-walk")
-               (or (= count 4) (= count 5) (= count 6)))
+               (or (= count 4) (= count 5) (= count 6) (= count 7)))
             (let [roots
                     (expect (mut k)
                             (get args 0)
@@ -4240,8 +4244,10 @@
                   follow (expr (mut k) (get args 2) "")
                   urgent (if (>= count 5) (expr (mut k) (get args 3) "") follow)
                   has-urgent (>= count 5)
-                  later (if (= count 6) (expr (mut k) (get args 4) "") follow)
-                  has-later (= count 6)
+                  later (if (>= count 6) (expr (mut k) (get args 4) "") follow)
+                  has-later (>= count 6)
+                  ahead (if (= count 7) (expr (mut k) (get args 5) "") follow)
+                  has-ahead (= count 7)
                   threads
                     (expect (mut k)
                             (get args (- count 1))
@@ -4273,6 +4279,8 @@
                        (cat3 "parallel-walk's after must take a "
                              r
                              " and give [Text]")))
+                (when (and has-ahead (!= (.ty ahead) "Fn(Text)->Text"))
+                  (die (mut k) n "parallel-walk's file takes a Text and gives a Text"))
                 (let [cr (coil-type (mut k) r)
                       job (fresh (mut k) "WJob")
                       body (fresh (mut k) "wjob-body")
@@ -4291,6 +4299,11 @@
                              (lock i64)
                              (queue (ArrayList (slice u8)))
                              (found (ArrayList (slice u8)))
+                             ;; With files read ahead, what was found is taken first found first,
+                             ;; from here on; and which file each name's visit reads.
+                             (found-head i64)
+                             (ahead (fnptr (cc/C) [(slice u8)] (slice u8)))
+                             (has-ahead bool)
                              (seen (HashMap (slice u8) bool))
                              (results (ArrayList ~cr))
                              (visit (fnptr (cc/C) [(slice u8)] ~cr))
@@ -4327,16 +4340,20 @@
                                   (mut go) true]
                               (rt/spin-lock! lk)
                               (while go
-                                (if (or (< (.head j) (len (.queue j))) (> (len (.found j)) 0))
+                                (if (or (< (.head j) (len (.queue j))) (> (- (len (.found j)) (.found-head j)) 0))
                                     (let [from-found
                                             (if found-first
-                                                (> (len (.found j)) 0)
+                                                (> (- (len (.found j)) (.found-head j)) 0)
                                                 (>= (.head j) (len (.queue j))))
                                           item
                                             (if from-found
-                                                (match (pop! (mut (.found j)))
-                                                  (Some [x] x)
-                                                  (None [] (panic "a walk's found items ran out under its lock")))
+                                                (if (.has-ahead j)
+                                                    (let [x (get (.found j) (.found-head j))]
+                                                      (set! (.found-head j) (+ (.found-head j) 1))
+                                                      x)
+                                                    (match (pop! (mut (.found j)))
+                                                      (Some [x] x)
+                                                      (None [] (panic "a walk's found items ran out under its lock"))))
                                                 (let [x (get (.queue j) (.head j))]
                                                   (set! (.head j) (+ (.head j) 1))
                                                   x))]
@@ -4434,10 +4451,12 @@
                                                     (None [] false))
                                             (set! (mut (.seen j)) x true)
                                             (push! (mut (.found j)) x)
+                                            (when (.has-ahead j)
+                                              (rt/read-ahead! (primitive/call-ptr (.ahead j) x)))
                                             (set! added true)))
                                         (set! (.busy j) (- (.busy j) 1))
                                         (atomic/store (field j waiting)
-                                                      (+ (len (.found j))
+                                                      (+ (- (len (.found j)) (.found-head j))
                                                          (- (len (.queue j)) (.head j))))
                                         (when (= (.busy j) 0)
                                           (atomic/store (field j done) 1))
@@ -4445,7 +4464,7 @@
                                         ;; over, else one for each item that waits. A worker still
                                         ;; looking for work finds it without being told.
                                         (let [over (= (.busy j) 0)
-                                              waits (+ (len (.found j)) (- (len (.queue j)) (.head j)))]
+                                              waits (+ (- (len (.found j)) (.found-head j)) (- (len (.queue j)) (.head j)))]
                                           (when (and (or over added) (> (atomic/read (field j asleep)) 0))
                                             (rt/spin-unlock! lk)
                                             (rt/gate-lock! g)
@@ -4462,7 +4481,7 @@
                                         ;; A while looking for new work, then asleep until some comes.
                                         (do
                                           (atomic/store (field j waiting)
-                                                        (+ (len (.found j)) (- (len (.queue j)) (.head j))))
+                                                        (+ (- (len (.found j)) (.found-head j)) (- (len (.queue j)) (.head j))))
                                           (rt/spin-unlock! lk)
                                           (let [(mut spins) 0]
                                             (while (and (< spins 20000)
@@ -4481,7 +4500,7 @@
                                               (atomic/add (field j asleep) 1)
                                               (rt/spin-lock! lk)
                                               (let [idle (and (>= (.head j) (len (.queue j)))
-                                                              (= (len (.found j)) 0)
+                                                              (= (- (len (.found j)) (.found-head j)) 0)
                                                               (> (.busy j) 0))]
                                                 (rt/spin-unlock! lk)
                                                 (when idle (rt/gate-wait! g)))
@@ -4505,6 +4524,11 @@
                                        :found
                                          (ArrayList::new [(slice u8)]
                                                          (rt/owned-allocator))
+                                       :found-head 0
+                                       :ahead ~(if has-ahead
+                                                   (.code ahead)
+                                                   `(primitive/zeroed (fnptr (cc/C) [(slice u8)] (slice u8))))
+                                       :has-ahead ~(if has-ahead `true `false)
                                        :seen
                                          (HashMap::new [(slice u8) bool]
                                                        (rt/owned-allocator)
@@ -4540,10 +4564,12 @@
                                           ~(sym root-v))))
                                ;; What arrives where (`arrive!`) is counted afresh for each walk.
                                (rt/arrivals-reset!)
+                               ~(if has-ahead `(rt/read-ahead-begin!) `0)
                                (rt/run-workers (fnptr-of ~(sym body))
                                                (cast (ptr i8)
                                                      (mut ~(sym job-v)))
                                                ~(.code threads))
+                               ~(if has-ahead `(rt/read-ahead-end!) `0)
                                (let [(mut ~(sym res-v))
                                        (ArrayList::new [~cr]
                                                        (rt/tree-allocator))]
