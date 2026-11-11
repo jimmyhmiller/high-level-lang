@@ -366,6 +366,22 @@ for path in sorted(glob.glob("../src/bundle/*.rules") + glob.glob("../src/bundle
             threaded.append(f"{os.path.basename(path)}:{number}")
 check(not threaded, f"the bundler's rules say nothing of threads{': ' + ', '.join(threaded[:5]) if threaded else ''}")
 
+# The pipeline claims pairs of functions give one answer, one dividing the work and one not
+# (`alone F is G`): each app built with the divided way forced and with the undivided way forced
+# is the same file, byte for byte, on one thread and on many.
+alone_bad = []
+for app in ["three", "all", "cjs", "react", "d3"]:
+    for flags in [[], ["--minify"]]:
+        outs = []
+        for way in ["always", "never"]:
+            for plan in ["single", "full"]:
+                target = f"{SCRATCH}/alone-{app}-{way}-{plan}.js"
+                built = subprocess.run([ESB, f"apps/{app}.js", f"--outfile={target}", f"--pipeline={plan}"] + flags,
+                                       env={**os.environ, "HL_ALONE": way}, capture_output=True, timeout=120)
+                outs.append(open(target, "rb").read() if built.returncode == 0 else built.stderr[-200:])
+        if any(o != outs[0] for o in outs): alone_bad.append(f"{app} {' '.join(flags)}")
+check(not alone_bad, f"work divided and undivided is the same work: 5 apps, plain and minified, one thread and many{': ' + ', '.join(alone_bad) if alone_bad else ''}")
+
 print("== paired client/server builds")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "boundary-check.py"), SPEC], 300)
 check(code == 0 and out.strip().endswith("all checks passed"), "paired builds: "

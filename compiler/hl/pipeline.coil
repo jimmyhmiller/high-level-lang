@@ -20,8 +20,9 @@
 ;;; A plan may run a stage in parallel only if every function the stage names, and everything
 ;;; they call, writes no state shared between threads. That is decided here, from the `.rules`
 ;;; sources: an assignment to a `state` (not a `task state`, which each thread has its own of),
-;;; an `assert` into a relation held in one, a `mut` argument that is one, or a call of a
-;;; function value, whose effects nothing here can see. A grammar or a rewrite is pure by
+;;; an `assert` into a relation held in one, or a `mut` argument that is one. A call of a
+;;; function value is a call of any function the program names as a value (a program is all its
+;;; manifest names), so a hook a caller hands in is checked like the rest. A grammar or a rewrite is pure by
 ;;; construction; a `.facts` or `.scopes` call may change what it is given. A plan that breaks
 ;;; this does not compile, and the error says what was written, and where.
 ;;;
@@ -260,6 +261,10 @@
     :reads (texts)
     :made (texts)))
 
+;;; A function named as a value somewhere in the program: where a function value is called, it
+;;; may be this one.
+(defstruct Value [(module (slice u8)) (name (slice u8)) (arity i64)])
+
 (defstruct Checker
   [(entries (ArrayList dsl/Entry))
    (infos (ArrayList Info))
@@ -269,7 +274,10 @@
    (depends (ArrayList (slice u8)))
    ;; Functions some stage makes: asked for by another stage, each is only read. What a stage makes
    ;; is kept, as if the pipeline said so: the stages after it read what it made.
-   (made (ArrayList (slice u8)))])
+   (made (ArrayList (slice u8)))
+   ;; Every function the program names as a value (see `values-of`), once it has looked.
+   (values (ArrayList Value))
+   (values-known bool)])
 
 (defn checker-new [(entries (ArrayList dsl/Entry))] (-> Checker)
   (Checker
@@ -279,7 +287,9 @@
     :memo (ArrayList::new [Effect] (malloc-allocator))
     :visiting (texts)
     :depends (texts)
-    :made (texts)))
+    :made (texts)
+    :values (ArrayList::new [Value] (malloc-allocator))
+    :values-known false))
 
 ;;; The settings `module/name` reads, through everything it calls.
 (defn reads-of [(c (mut Checker)) (module (slice u8)) (name (slice u8))]
@@ -428,6 +438,88 @@
         (set! out (fun-of info name))))
     out))
 
+;;; A program is all its manifest names, so a function value is one of the functions some module
+;;; names as a value: other than as what a call calls. Every such function of the program's
+;;; `.rules` and `.attrs` modules, found once. (A grammar's or a rewrite's function is pure by
+;;; construction, and a foreign one changes only what it is handed, which the call that hands it
+;;; says.) A name a function binds for itself that is also a function's counts too: more than
+;;; can be called, never less.
+(defn values-of [(c (mut Checker))] (-> (ArrayList Value))
+  (unless (.values-known c)
+    (set! (.values-known c) true)
+    (let [(mut found) (ArrayList::new [Value] (malloc-allocator))]
+      (for e (.entries c)
+        (when (or (rt/ends-with (.file e) ".rules") (rt/ends-with (.file e) ".attrs"))
+          (let [info (info-of (mut c) (.name e))]
+            (for f (.funs info) (values! (mut c) info f (.body f) (mut found))))))
+      (set! (.values c) found)))
+  (.values c))
+
+(defn value-add! [(out (mut (ArrayList Value))) (module (slice u8)) (g Fun)] (-> void)
+  (let [(mut seen) false]
+    (for v out (when (and (= (.module v) module) (= (.name v) (.name g))) (set! seen true)))
+    (unless seen
+      (push! (mut out) (Value :module module :name (.name g) :arity (len (.params g)))))))
+
+(defn values! [(c (mut Checker)) (info Info) (f Fun) (n gr/Node) (out (mut (ArrayList Value)))]
+  (-> void)
+  (match (.kind n)
+    (gr/KCall []
+              (let [callee (kid n 0)]
+                ;; What is called is not a value; what it is a field of may hold one.
+                (when (and (= (.kind callee) (gr/KFieldE))
+                           (match (callee-of info f callee) (Some [_] false) (None [] true)))
+                  (values! (mut c) info f (kid callee 0) (mut out)))
+                (unless (or (= (.kind callee) (gr/KName)) (= (.kind callee) (gr/KFieldE)))
+                  (values! (mut c) info f callee (mut out)))
+                (for i (range 1 (len (.kids n)))
+                  (values! (mut c) info f (kid n i) (mut out)))))
+    (gr/KName []
+              (when (< (param-index f (.text n)) 0)
+                (match (fun-of info (.text n))
+                  (Some [g] (value-add! (mut out) (.name info) g))
+                  (None [] 0))))
+    (gr/KFieldE []
+                (match (if (and (= (.kind (kid n 0)) (gr/KName))
+                                (< (param-index f (.text (kid n 0))) 0))
+                           (alias-of info (.text (kid n 0)))
+                           (None [(slice u8)]))
+                  (Some [m]
+                        (let [target (info-of (mut c) m)]
+                          (match (fun-of target (.text (kid n 1)))
+                            (Some [g]
+                                  (when (= (.kind target) (KindRules))
+                                    (value-add! (mut out) m g)))
+                            (None [] 0))))
+                  (None [] (values! (mut c) info f (kid n 0) (mut out)))))
+    (_ (for i (range 0 (len (.kids n)))
+         (unless (label? n i) (values! (mut c) info f (kid n i) (mut out))))))
+  0)
+
+;;; A call of a function value: of any function the program names as a value that takes as many
+;;; arguments, with what each of those does.
+(defn value-call! [(c (mut Checker))
+                   (info Info)
+                   (f Fun)
+                   (locals (ArrayList (slice u8)))
+                   (out (mut Effect))
+                   (args (ArrayList gr/Node))
+                   (where (slice u8))] (-> void)
+  ;; What it may write, not what it reads: a function a build is given is a function of its
+  ;; arguments (see `Effect`), and a kept answer is made from what its own code reads.
+  (for v (values-of (mut c))
+    (when (= (.arity v) (len args))
+      (let [callee (fun-effect (mut c) (.module v) (.name v))]
+        (for w (.writes callee) (add-write! (mut out) (.what w) (.where w)))
+        (for h (.hooks callee) (add-unique! (mut (.hooks out)) h))
+        (for i (.muts callee)
+          (when (< i (len args))
+            (write-root! (mut out)
+                         f
+                         (root-of (mut c) info f locals (arg-expr (get args i)))
+                         where))))))
+  0)
+
 (defn call! [(c (mut Checker))
              (info Info)
              (f Fun)
@@ -461,8 +553,7 @@
                             (>= (param-index f name) 0)
                             (has? (.shared info) name)
                             (has? (.task info) name))
-                          (add-unique! (mut (.hooks out))
-                                       (dsl/join3 where " calls " name))
+                          (value-call! (mut c) info f locals (mut out) args where)
                         (= name "forget-memos!")
                           (add-write! (mut out)
                                       (dsl/join2 (.name info) ".memos")
@@ -553,17 +644,10 @@
                                                                               args
                                                                               where))
                                                    (None [] 0))))))
-                          (None []
-                                (add-unique! (mut (.hooks out))
-                                             (dsl/join3 where
-                                                        " calls a function value "
-                                                        fname)))))))
+                          (None [] (value-call! (mut c) info f locals (mut out) args where))))))
       ;; `module.Record(…)` builds a value.
       (gr/KMember [] 0)
-      (_ (add-unique! (mut (.hooks out))
-                      (dsl/join3 where
-                                 " calls a function value: "
-                                 (gr/kind-name (.kind callee))))))))
+      (_ (value-call! (mut c) info f locals (mut out) args where)))))
 
 ;;; `db.relation(…)` or `m.db.relation(…)`, where `db` is a state or a setting whose type a `.facts`
 ;;; module defines: a query, which reads. (`assert` is the write, and `link.solve!(db)` another.)
@@ -883,6 +967,25 @@
                             (pop! (mut (.open w)))
                             (know! (mut w) key out)
                             out)))))))))
+
+;;; The functions the rules make a list of the answers of, `[f(x, …) for …]`, or ask what they
+;;; reach, `reach(roots, f)`, in `n`: each as `module/name`.
+(defn sites! [(info Info) (f Fun) (n gr/Node) (out (mut (ArrayList (slice u8))))] (-> void)
+  (when (and (= (.kind n) (gr/KComp)) (= (.kind (kid n 0)) (gr/KCall)))
+    (let [callee (kid (kid n 0) 0)]
+      (match (callee-of info f callee)
+        (Some [module] (add-unique! (mut out) (dsl/join3 module "/" (callee-name callee))))
+        (None [] 0))))
+  (when (and (= (.kind n) (gr/KCall))
+             (= (.kind (kid n 0)) (gr/KName))
+             (= (.text (kid n 0)) "reach")
+             (= (len (.kids (kid n 1))) 2))
+    (let [target (arg-expr (get (.kids (kid n 1)) 1))]
+      (match (callee-of info f target)
+        (Some [module] (add-unique! (mut out) (dsl/join3 module "/" (callee-name target))))
+        (None [] 0))))
+  (for x (.kids n) (sites! info f x (mut out)))
+  0)
 
 ;;; The function a call calls, when it is one of a module's: its module and name.
 (defn callee-of [(info Info) (f Fun) (callee gr/Node)] (-> (Option (slice u8)))
@@ -1483,11 +1586,13 @@
    (namer (slice u8))
    ;; How many of its units a thread takes at a time (`per N units`); 1 when it does not say.
    (run i64)
-   ;; What names the file a name's work reads, for a walk of its function (`reads by`), or "".
-   (reads (slice u8))
+   ;; Whether the names its function reaches are files its work reads (`reads files`).
+   (reads bool)
    ;; On one thread `whole` answers for `divided` (`alone F is G`); "" when it does not say.
    (divided (slice u8))
    (whole (slice u8))
+   ;; Functions its threads may be the first to make an answer of, besides its work (`also`).
+   (also (ArrayList (slice u8)))
    (lo i64)])
 
 ;;; The sizes a pipeline file gives (`size module/name N`): each name, and its number as written.
@@ -1506,9 +1611,12 @@
     (for d (.kids (kid-of tree 3))
       (let [(mut fns) (texts)
             (mut makes) (texts)
+            (mut also) (texts)
             per (= (.kind d) (g/KPerStage))
             fn-list (if per (kid-of d 3) (kid-of d 1))
             makes-node (if per (kid-of d 4) (kid-of d 2))]
+        (when (and per (not (= (.kind (kid-of d 9)) (g/KNone))))
+          (for t (.kids (kid-of (kid-of d 9) 0)) (push! (mut also) (.text t))))
         (for t (.kids fn-list) (push! (mut fns) (.text t)))
         (unless (= (.kind makes-node) (g/KNone))
           (for t (.kids (kid-of makes-node 0)) (push! (mut makes) (.text t))))
@@ -1526,15 +1634,14 @@
                           (let [n (rt/parse-int (.text (kid-of (kid-of d 1) 0)))]
                             (if (< n 1) 1 n))
                           1)
-                 :reads (if (and per (not (= (.kind (kid-of d 7)) (g/KNone))))
-                            (.text (kid-of (kid-of d 7) 0))
-                            "")
+                 :reads (and per (not (= (.kind (kid-of d 7)) (g/KNone))))
                  :divided (if (and per (not (= (.kind (kid-of d 8)) (g/KNone))))
                               (.text (kid-of (kid-of d 8) 0))
                               "")
                  :whole (if (and per (not (= (.kind (kid-of d 8)) (g/KNone))))
                             (.text (kid-of (kid-of d 8) 1))
                             "")
+                 :also also
                  :lo (.lo d)))))
     stages))
 
@@ -1646,11 +1753,30 @@
             (push! (mut (.made chk)) (.text t))))
         (when (and per (not (= (.kind (kid-of d 6)) (g/KNone))))
           (split-fn (mut c) (tok-of src (kid-of (kid-of d 6) 0))))
-        (when (and per (not (= (.kind (kid-of d 7)) (g/KNone))))
-          (split-fn (mut c) (tok-of src (kid-of (kid-of d 7) 0))))
         (when (and per (not (= (.kind (kid-of d 8)) (g/KNone))))
           (split-fn (mut c) (tok-of src (kid-of (kid-of d 8) 0)))
-          (split-fn (mut c) (tok-of src (kid-of (kid-of d 8) 1))))))
+          (split-fn (mut c) (tok-of src (kid-of (kid-of d 8) 1))))
+        (when (and per (not (= (.kind (kid-of d 9)) (g/KNone))))
+          (for t (.kids (kid-of (kid-of d 9) 0)) (split-fn (mut c) (tok-of src t))))))
+    ;; Each function that is a stage's work has a list of its answers, or a walk of what it
+    ;; reaches, somewhere in the rules: a stage with none does nothing, whatever a plan gives it.
+    (let [(mut used) (texts)]
+      (for e (.entries chk)
+        (when (or (rt/ends-with (.file e) ".rules") (rt/ends-with (.file e) ".attrs"))
+          (let [info (info-of (mut chk) (.name e))]
+            (for f (.funs info) (sites! info f (.body f) (mut used))))))
+      (for s stages
+        (unless (= (.unit s) "whole")
+          (for f (.functions s)
+            (unless (has? used f)
+              (let [at (rt/line-col src (.lo s))]
+                (dsl/fail-at path
+                             (.line at)
+                             (.col at)
+                             (dsl/join3 f
+                                        " is the work of stage "
+                                        (dsl/join2 (.name s)
+                                                   ", but the rules make no list of its answers, `[f(x) for x in xs]`, and ask nothing of what it reaches: the stage would do nothing (a function its threads only make on the way is named after `also`)")))))))))
     (for d (.kids (kid-of tree 4)) (split-fn (mut c) (tok-of src (kid-of d 0))))
     ;; A function is one stage's work: the list the rules make of its answers runs on that
     ;; stage's threads.

@@ -380,11 +380,8 @@ fn hook-answer(spec: Text, importer: Text) -> Text? = first hook in loading.on-r
 # Is this import left for the runtime? A hook's answer overrides that, as an alias does, and with
 # `--packages=external` so is every package.
 fn stays-external?(spec: Text, importer: Text) -> Bool =
-  is-none(hook-path(aliased(spec), importer)) and unhooked-external?(spec, importer)
-
-# The same, of a build with no resolve hooks to ask.
-fn unhooked-external?(spec: Text, importer: Text) -> Bool =
-  res.external?(aliased(spec)) or (loading.packages-external and package-spec?(aliased(spec), importer))
+  is-none(hook-path(aliased(spec), importer))
+  and (res.external?(aliased(spec)) or (loading.packages-external and package-spec?(aliased(spec), importer)))
 
 fn package-spec?(spec: Text, importer: Text) -> Bool =
   not (res.relative?(spec) or starts-with(spec, "/") or starts-with(spec, "#")) and is-none(configured-path(spec, importer))
@@ -403,11 +400,11 @@ fn resolve-import(spec: Text, importer: Text) -> res.Resolved = resolved-now(imp
 
 fn resolved-now(request: Request, importer: Text) -> res.Resolved = match hook-path(aliased(request.spec), importer) {
   some(p) => res.Resolved(path: p, side-effects: true)
-  none => unhooked-resolved(request, importer)
+  none => searched-for(request, importer)
 }
 
 # Where an import leads when no hook says: the project's paths, then the search.
-fn unhooked-resolved(request: Request, importer: Text) -> res.Resolved = match configured-path(wanted, importer) {
+fn searched-for(request: Request, importer: Text) -> res.Resolved = match configured-path(wanted, importer) {
   some(p) => res.Resolved(path: p, side-effects: res.side-effects-of(p))
   # A relative alias is relative to where the build runs, not to the importing file.
   none => res.resolve-kind(wanted, match wanted != spec and res.relative?(wanted) {
@@ -434,9 +431,9 @@ fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
 }
 
 # A load hook may supply a file's text, or the file does.
-fn source-of(path: Text) -> Text = (first hook in loading.on-load: hook(path)) ?? unhooked-source(path)
+fn source-of(path: Text) -> Text = (first hook in loading.on-load: hook(path)) ?? file-source(path)
 
-fn unhooked-source(path: Text) -> Text = match path {
+fn file-source(path: Text) -> Text = match path {
   "disabled:" ++ _ => "module.exports = {};"
   _ => read-file(path)
 }
@@ -574,7 +571,7 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
 fn parsed-file(item: Pending) -> Parsed = parsed-with(item.path, src, checked.tree, none, some(checked))
   where src = match item.ready {
           true => item.text
-          false => module-text(unhooked-source(item.path), item.path)
+          false => as-module(source-of(item.path), item.path)
         },
         checked = parse-file(src, item.path)
 
@@ -631,9 +628,9 @@ fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
 
 fn imported-specs(tree: Node) -> [Text] = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)]
 
-# A file as a build with no hooks parses it: its text parsed and analysed and its imports resolved;
-# a big file put together from its pieces.
-fn parsed-plain(path: Text) -> Parsed = match len(sp.starts) {
+# A file parsed: its text parsed and analysed and its imports resolved; a big file put together
+# from its pieces.
+fn parsed-of(path: Text) -> Parsed = match len(sp.starts) {
   n if n > 1 => finished-file(path)
   _ => targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true))))
 } where sp = split-source(path)
@@ -642,22 +639,10 @@ fn parsed-plain(path: Text) -> Parsed = match len(sp.starts) {
 fn targets-of(p: Parsed) -> Parsed =
   p with { targets: {request-key(requests[i]): t for i in 0..len(requests) if let some(t) = found[i]} }
   where requests = requests-of(p),
-        found = [unhooked-target(r, p.path) for r in requests]
+        found = [target-of(r, p.path) for r in requests]
 
-# What a file leads to, for the walk that parses every file before the graph is made. Whoever
-# parses a file works out its place in the graph too, when it can (see `plain?`).
-fn led-ahead(path: Text) -> [Text] = match plain?(path) {
-  true => ahead-targets(loaded-plain(path).parsed)
-  false => ahead-targets(parsed-plain(path))
-}
-
-fn ahead-targets(p: Parsed) -> [Text] = [t for t in values-of(p.targets) if ahead?(t)]
-
-# The file the walk reads for a name: its own path; nothing for a module left empty.
-fn file-read(item: Text) -> Text = match item {
-  "disabled:" ++ _ => ""
-  path => path
-}
+# The files a file's imports lead to: what loading follows from the entries.
+fn led-ahead(path: Text) -> [Text] = values-of(loaded(path).parsed.targets)
 
 # ---------------------------------------------------------------- big files, in pieces
 
@@ -680,7 +665,7 @@ fn split-source(path: Text) -> Parts = match whole-source(path) {
 
 # A file's text in one piece. A file parsed whole and a file put together from its pieces are the
 # same file (see `finished-file`).
-fn whole-source(path: Text) -> Parts = Parts(src: module-text(unhooked-source(path), path), starts: [0], open: -1, close: -1)
+fn whole-source(path: Text) -> Parts = Parts(src: as-module(source-of(path), path), starts: [0], open: -1, close: -1)
 
 fn parts-of-source(src: Text) -> Parts = match top-cuts {
   [_, ...] => whole with { starts: [0] ++ top-cuts }
@@ -799,7 +784,7 @@ boxed record PieceTree { tree: Node?, specs: [Text], targets: {Text:Text} }
 # One piece: its statements, parsed as a program of their own, and where what they import leads.
 fn piece-of(path: Text, k: Int) -> PieceTree = match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
   none => PieceTree(tree: none, specs: [], targets: {})
-  some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {request-key(r): t for r in requests-in(tree, found.requires, found.imports) if let some(t) = unhooked-target(r, path)})
+  some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {request-key(r): t for r in requests-in(tree, found.requires, found.imports) if let some(t) = target-of(r, path)})
     where found = calls.run(tree),
           specs = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)] ++ found.requires ++ found.imports
 } where sp = split-source(path)
@@ -947,12 +932,6 @@ fn piece-starts(src: Text) -> [Int] = match co.parse-opt(src, "<coarse>", 0) {
 
 fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
 
-# `ahead-target` without hooks, which only the thread that owns them may call.
-fn unhooked-target(request: Request, importer: Text) -> Text? = match wanted {
-  _ if res.external?(wanted) or (loading.packages-external and package-spec?(wanted, importer)) => none
-  _ => configured-path(wanted, importer) ?? searched(request, wanted, importer)
-} where spec = request.spec, wanted = aliased(spec)
-
 # Where the search finds it. A relative alias is relative to where the build runs.
 fn searched(request: Request, wanted: Text, importer: Text) -> Text? =
   first r in res.resolve-opt-kind(wanted, match wanted != request.spec and res.relative?(wanted) {
@@ -960,33 +939,15 @@ fn searched(request: Request, wanted: Text, importer: Text) -> Text? =
     false => importer
   }, request.kind): r.path
 
-fn ahead?(path: Text) -> Bool = loader-of(path) != "file"
-
 # Where an import would lead, or nothing if it leads nowhere or stays outside the bundle.
-fn ahead-target(request: Request, importer: Text) -> Text? = match request.spec {
+fn target-of(request: Request, importer: Text) -> Text? = match request.spec {
   _ if stays-external?(request.spec, importer) => none
   _ => hook-path(wanted, importer) ?? configured-path(wanted, importer) ?? searched(request, wanted, importer)
     where spec = request.spec, wanted = aliased(spec)
 }
 
-# Every file the entries can reach, parsed before the graph is made, into memos the graph then
-# finds them in; how many. Without hooks, whoever parsed a file resolves what it imports: a walk.
-# With them, a wave at a time: a wave's texts are asked of the hooks, its files parsed, and their
-# imports are the next wave.
-fn parsed-ahead(paths: [Text]) -> Int = match hooked?() {
-  false => reach(roots, led-ahead)
-  true => len(parsed-waves(roots, {p: true for p in roots}))
-} where roots = [real-path(p) for p in paths if ahead?(p) distinct real-path(p)]
-
-# With hooks, which only this thread may call: a wave's texts are asked for here, its files parsed
-# at once, and the files their imports lead to that none has led to before are the next wave.
-fn parsed-waves(wave: [Text], seen: {Text:Bool}) -> [Parsed] = match wave {
-  [] => []
-  _ => done ++ parsed-waves(next, {p: true for ps in [keys(seen), next] for p in ps})
-    where texts = [hooked-text(p) for p in wave],
-          done = match len(texts) { _ => [parsed-hooked(p) for p in wave] },
-          next = [t for d in done for request in requests-of(d) if let some(t) = ahead-target(request, d.path) if ahead?(t) and not (t in seen) distinct t]
-}
+# Every file the entries can reach, loaded before the graph is made; how many.
+fn parsed-ahead(paths: [Text]) -> Int = reach([real-path(p) for p in paths distinct real-path(p)], led-ahead)
 
 # ---------------------------------------------------------------- the graph
 
@@ -1041,34 +1002,13 @@ record Lead { key: Text, effects: Bool }
 boxed record Loaded { path: Text, parsed: Parsed, tree0: Node, analysis: Analysis, scopes: sym.Table, specs: [Text], calls: [Text],
                 requests: [Request], leads: [Lead], whole: [Text] }
 
-fn loaded(path: Text) -> Loaded = match plain?(path) {
-  true => loaded-plain(path)
-  false => loaded-here(path)
-}
-
-# Whether a file's place in the graph is worked out with nothing to ask a hook or a spec's
-# transform, which only the thread that links may call: then whoever parses it works it out too
-# (see `led-ahead`).
-fn plain?(path: Text) -> Bool = ahead?(path) and not hooked?() and parsed-plain(path).analysed
-
-fn loaded-plain(path: Text) -> Loaded =
-  Loaded(path: path, parsed: p, tree0: p.tree, analysis: p.analysis, scopes: p.scopes, specs: specs, calls: p.calls,
-         requests: requests, leads: [unhooked-lead(request, path) for request in requests],
-         whole: [unhooked-lead(r, path).key for r in [require-request(s) for s in p.required]
-                   ++ [import-request(x) for st in p.tree.body.kids for x in wholly-imported(st)]])
-  where p = match parsed-plain(path) {
-          q if q.analysed => q
-          _ => panic "{} is not analysed where it is parsed: its place in the graph is worked out with the graph", path
-        },
-        specs = [spec for s in p.tree.body.kids if let some(spec) = import-spec-of(s)] ++ p.calls,
-        requests = requests-in(p.tree, p.required, [s for s in p.calls[len(p.required)..len(p.calls)]])
-
-fn loaded-here(path: Text) -> Loaded =
+fn loaded(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: tree0, analysis: a.analysis, scopes: a.scopes, specs: specs, calls: calls,
          requests: requests, leads: [lead-request(request, path) for request in requests],
          whole: [lead-request(r, path).key for r in [require-request(s) for s in required]
                    ++ [import-request(x) for st in tree0.body.kids for x in wholly-imported(st)]])
-  where p = parsed-for-graph(path),
+  where p = parsed-of(path),
+        # A spec's transform sees the tree before its scopes are analysed (see `analysed-file`).
         tree0 = match p.analysed {
           true => p.tree
           false => transformed(p.tree)
@@ -1089,28 +1029,6 @@ fn loaded-here(path: Text) -> Loaded =
         required = found.requires,
         specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls,
         requests = requests-in(tree0, required, [s for s in calls[len(required)..len(calls)]])
-
-# What loading made of a file, before the graph joins it to the others: what the walk ahead made of
-# it; with load hooks, the wave's parse of the text a hook gave; for a file the walk does not
-# reach, a parse here.
-fn parsed-for-graph(path: Text) -> Parsed = match ahead?(path), hooked?() {
-  true, false => parsed-plain(path)
-  true, true => parsed-hooked(path)
-  false, _ => parsed-alone(path)
-}
-
-fn hooked?() -> Bool = len(loading.on-load) + len(loading.on-resolve) > 0
-
-# A file nothing parsed ahead, parsed and analysed on the thread that links, once for as long as
-# its text stays the same.
-fn parsed-alone(path: Text) -> Parsed =
-  analysed-file(parsed-file(Pending(path: path, text: as-module(source-of(path), path), ready: true)))
-
-# With load hooks, which only the thread that links may call: the text a hook gives a file, asked
-# there, and its parse, which any thread may then make.
-fn hooked-text(path: Text) -> Text = module-text(source-of(path), path)
-
-fn parsed-hooked(path: Text) -> Parsed = parsed-file(Pending(path: path, text: hooked-text(path), ready: true))
 
 fn transformed(tree: Node) -> Node = transform(tree) where transform = loading.transform
 
@@ -1134,12 +1052,6 @@ fn lead(spec: Text, importer: Text) -> Lead = lead-request(import-request(spec),
 fn lead-request(request: Request, importer: Text) -> Lead = match stays-external?(request.spec, importer) {
   true => Lead(key: "external:" ++ aliased(request.spec), effects: false)
   false => Lead(key: r.path, effects: r.side-effects) where r = resolved-now(request, importer)
-}
-
-# The same, of a build with no resolve hooks to ask.
-fn unhooked-lead(request: Request, importer: Text) -> Lead = match unhooked-external?(request.spec, importer) {
-  true => Lead(key: "external:" ++ aliased(request.spec), effects: false)
-  false => Lead(key: r.path, effects: r.side-effects) where r = unhooked-resolved(request, importer)
 }
 
 # What a node of the graph leads to: an outside import, nothing.
