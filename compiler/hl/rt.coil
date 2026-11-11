@@ -12,7 +12,7 @@
 (import "coil.mem" :as mem)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
-(import "coil.hashmap" :use [HashMap MapIter KeyOps i64-keyops bytewise-hash])
+(import "coil.hashmap" :use [HashMap MapIter KeyOps Entry i64-keyops bytewise-hash])
 (import "coil.str" :as str)
 (import "coil.fs" :as fs)
 (import "coil.io" :as io)
@@ -930,6 +930,20 @@
 
 (defn map-capacity [K V] [(m (HashMap K V))] (-> i64)
   (.cap m))
+
+;;; A map whose keys and values are numbers and truths, copied whole into storage of `a`: its
+;;; slots as they are, so the copy answers as the first does and gives its keys in the same
+;;; order, with no key hashed or placed again.
+(defn map-copy-plain [K V] [(m (HashMap K V)) (a (dyn Allocator))] (-> (HashMap K V))
+  (let [(mut out) (HashMap::new [K V] a (.ops m))]
+    (when (> (.cap m) 0)
+      (HashMap::grow! (mut out) (.cap m))
+      (when (!= (.cap out) (.cap m))
+        (panic "a map's copy has room for {} where the map has {}" (.cap out) (.cap m)))
+      (mem/copy [(Entry K V)] (.slots out) (.slots m) (.cap m))
+      (set! (.len out) (.len m))
+      (set! (.tombs out) (.tombs m)))
+    out))
 
 (defn text-own-in [(from (ptr Region)) (s (slice u8))] (-> (slice u8))
   (if (and (> (len s) 0) (scratch-holds? from (primitive/cast i64 (data s))))
@@ -3002,6 +3016,14 @@
   (let [(mut changed) false
         q (load rows)
         n (/ (len q) 4)]
+    ;; Room in the table of rows for all that is queued, at once: grown a doubling at a time,
+    ;; every row it holds is placed again each time.
+    (when (and (> n 256) (> (.arity r) 1))
+      (let [need (* (+ (.count (.heads r)) n 1) 2)]
+        (when (> need (+ (.mask (.heads r)) 1))
+          (let [(mut cap) 64]
+            (while (< cap need) (set! cap (* cap 2)))
+            (rows-grow! (mut r) cap)))))
     (for i (range 0 n)
       (when (rel-add! (mut r)
                       (get q (* i 4))
@@ -3358,6 +3380,13 @@
     (push! (mut (.next path)) 0)
     0))
 
+;;; Where a text is and how long, as one number: the same for the same bytes in the same place,
+;;; and for no other text. 0 for an empty text and for one of 64 KB or more, which have none.
+(defn text-place :inline (Always) [(s (slice u8))] (-> i64)
+  (if (and (> (len s) 0) (< (len s) 65536))
+      (^ (primitive/cast i64 (data s)) (<< (len s) 48))
+      0))
+
 (defn depth-first [(roots (ArrayList (slice u8)))
                    (children (fnptr (cc/C) [(slice u8)] (ArrayList (slice u8))))]
   (-> Walk)
@@ -3371,6 +3400,10 @@
         ;; Every node's text is the walk's own (`pre`), for as long as this table is.
         (mut seen)
           (HashMap::new [(slice u8) i64] (value-allocator) (held-keyops))
+        ;; Where a text led, by where the text itself is: many nodes are named by one text many
+        ;; times over (what an import resolves to is worked out once for all that import it from
+        ;; one place), and such a name is found again without being read.
+        (mut by-place) (int-table-in 0 (value-allocator))
         (mut path)
           (WalkPath
             :at (ArrayList::new [i64] (value-allocator))
@@ -3387,19 +3420,28 @@
                       ks (get (.kids path) top)]
                   (if (< k (len ks))
                       (let [c (get ks k)
-                            from (get (.at path) top)]
+                            from (get (.at path) top)
+                            place (text-place c)
+                            known (if (!= place 0) (int-get (mut by-place) place) -1)]
                         (set! (mut (.next path)) top (+ k 1))
-                        (match (get seen c)
-                          (Some [at] (do (push! (elem (mut (.targets w)) from) at) 0))
-                          (None []
-                                (push! (elem (mut (.targets w)) from) (len (.pre w)))
-                                (walk-reach! (mut w)
-                                             (mut seen)
-                                             (mut path)
-                                             children
-                                             c
-                                             from
-                                             k))))
+                        (if (>= known 0)
+                            (do (push! (elem (mut (.targets w)) from) known) 0)
+                            (match (get seen c)
+                              (Some [at]
+                                    (do
+                                      (when (!= place 0) (int-put! (mut by-place) place at))
+                                      (push! (elem (mut (.targets w)) from) at)
+                                      0))
+                              (None []
+                                    (when (!= place 0) (int-put! (mut by-place) place (len (.pre w))))
+                                    (push! (elem (mut (.targets w)) from) (len (.pre w)))
+                                    (walk-reach! (mut w)
+                                                 (mut seen)
+                                                 (mut path)
+                                                 children
+                                                 c
+                                                 from
+                                                 k)))))
                       (do
                         (push! (mut (.post w)) (get (.at path) top))
                         (pop! (mut (.at path)))
@@ -3539,13 +3581,21 @@
 
 (defn places-new [] (-> Places)
   (Places
-    ;; Keyed by kept texts (see "kept texts"): a key is one text, here and in `keys`. A key is
-    ;; looked up once for its place among `keys`, where its block's start and size are.
-    :slot (HashMap::new [(slice u8) i64] (malloc-allocator) (kept-keyops))
+    ;; A key is one text, here and in `keys`, which holds it for as long as this does (see
+    ;; `place-key`). A key is looked up once for its place among `keys`, where its block's start
+    ;; and size are.
+    :slot (HashMap::new [(slice u8) i64] (malloc-allocator) (held-keyops))
     :starts (ArrayList::new [i64] (malloc-allocator))
     :sizes (ArrayList::new [i64] (malloc-allocator))
     :keys (ArrayList::new [(slice u8)] (malloc-allocator))
     :end 0))
+
+;;; A key as a table of places holds it: the text itself when it lives as long as the program
+;;; (a run that reclaims nothing, and a text not in scratch storage), else the program's own copy.
+(defn place-key [(key (slice u8))] (-> (slice u8))
+  (if (or (reclaiming?) (= (len key) 0) (scratch-space-holds? (primitive/cast i64 (data key))))
+      (kept-text key)
+      key))
 
 ;;; Where `key`'s block of `size` numbers starts: its block if it holds that many, else a new one.
 (defn place! [(p (mut Places)) (key (slice u8)) (size i64)] (-> i64)
@@ -3561,7 +3611,7 @@
     (None []
           (let [a (.end p)
                 i (len (.keys p))
-                kept (kept-text key)]
+                kept (place-key key)]
             (push! (mut (.keys p)) kept)
             (push! (mut (.starts p)) a)
             (push! (mut (.sizes p)) size)

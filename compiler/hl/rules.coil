@@ -5336,13 +5336,47 @@
           val (expr (mut k) (kid n 1) (if (map? want) (map-val want) ""))
           ty (cat4 "{" (.ty key) ":" (cat (.ty val) "}"))
           o (fresh (mut k) "out")
-          body
-            (clauses-code (mut k)
-                          (list-kids (kid n 2))
-                          opened
-                          `(set! (mut ~(sym o)) ~(.code key) ~(.code val)))]
-      (locals-reset! (mut k) mark)
-      (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~body ~(sym o)) ty))))
+          clauses (list-kids (kid n 2))
+          put `(set! (mut ~(sym o)) ~(.code key) ~(.code val))
+          ;; One loop over a list or a range, with nothing that skips an item: room for as many
+          ;; keys as it has items, at once. A map that grows as it fills leaves each smaller
+          ;; table behind it, and places every key again each time.
+          sized
+            (and (= (len clauses) 1)
+                 (or (= (.kind (get clauses 0)) (g/KInHead))
+                     (= (.kind (get clauses 0)) (g/KRangeHead)))
+                 (or (= (.wrap-kind (get opened 0)) 0)
+                     (= (.wrap-kind (get opened 0)) 3)))]
+      (if sized
+          (let [h (get opened 0)
+                seq (fresh (mut k) "seq")
+                hi (fresh (mut k) "hi")
+                count (fresh (mut k) "count")
+                (mut held) h]
+            (set! (.seq held) (sym seq))
+            (when (= (.wrap-kind h) 3) (set! (.hi held) (sym hi)))
+            (let [loop (head-wrap (mut k) held put)
+                  code
+                    `(let [~(sym seq) ~(.seq h)
+                           ~@(if (= (.wrap-kind h) 3)
+                                 (let [(mut more) (primitive/code-list-new)]
+                                   (push! (mut more) (sym hi))
+                                   (push! (mut more) (.hi h))
+                                   more)
+                                 (primitive/code-list-new))
+                           ~(sym count) ~(if (= (.wrap-kind h) 3)
+                                             `(- ~(sym hi) ~(sym seq))
+                                             `(len ~(sym seq)))
+                           (mut ~(sym o)) ~(new-map (mut k) ty)]
+                       (when (> ~(sym count) 5)
+                         (HashMap::grow! (mut ~(sym o)) (+ (/ (* ~(sym count) 4) 3) 2)))
+                       ~loop
+                       ~(sym o))]
+              (locals-reset! (mut k) mark)
+              (te code ty)))
+          (let [body (clauses-code (mut k) clauses opened put)]
+            (locals-reset! (mut k) mark)
+            (te `(let [(mut ~(sym o)) ~(new-map (mut k) ty)] ~body ~(sym o)) ty))))))
 
 ;;; `{k: v, …}`: typed by what is wanted, or else by its first entry.
 (defn map-literal [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
@@ -10444,12 +10478,21 @@
                            (let [seen (rt/own-seen (rt/map-storage v))]
                              (if (!= (primitive/cast i64 seen) 0)
                                  (load (primitive/cast (ptr ~ty) seen))
-                                 (let [(mut out) ~(new-map (mut k) t)]
-                                   (for key v
-                                     (match (get v key)
-                                       ;; A Text key is copied by the map that takes it.
-                                       (Some [x] (set! (mut out) key ~(own-in-code (mut k) (map-val t) `x `from)))
-                                       (None [] (panic "a map lost a key while it was copied"))))
+                                 (let [(mut out)
+                                         ~(if (and (own-in-plain? (map-key t)) (own-in-plain? (map-val t)))
+                                              ;; Nothing in it to copy but the map itself: its slots whole.
+                                              `(rt/map-copy-plain v (rt/value-allocator))
+                                              `(let [(mut made) ~(new-map (mut k) t)]
+                                                 ;; As much room as the first has, at once: a map
+                                                 ;; that grows leaves each smaller table behind.
+                                                 (when (> (rt/map-capacity v) 0)
+                                                   (HashMap::grow! (mut made) (rt/map-capacity v)))
+                                                 (for key v
+                                                   (match (get v key)
+                                                     ;; A Text key is copied by the map that takes it.
+                                                     (Some [x] (set! (mut made) key ~(own-in-code (mut k) (map-val t) `x `from)))
+                                                     (None [] (panic "a map lost a key while it was copied"))))
+                                                 made))]
                                    (rt/own-keep! (rt/map-storage v) (primitive/cast (ptr u8) (mut out)) (sizeof ~ty))
                                    out)))
                            v)
@@ -10509,6 +10552,7 @@
         part (sym (cat "MemoPart--" name))
         front-fn (sym (cat "memo-front--" name))
         settle (sym (cat "memo-settle--" name))
+        forgotten (sym (cat "memo-forgotten--" name))
         compute (cat "memo-compute--" name)
         ensure (sym (cat "memo-ensure--" name))
         ;; A function a strategy keeps is kept only in a run whose strategy does: `entry` is the
@@ -10569,6 +10613,8 @@
                (fronts (ArrayList (ptr ~part)))
                (fronts-made i64)
                (fronted i64)
+               ;; Whether its answers are to be forgotten before the next is looked for.
+               (stale i64)
                (args (HashMap ~(coil-type (mut k) (memo-key-type f)) ~args-ty))
                (node-ids (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
                ;; Answers the cache holds that this run has not read, by where their data is;
@@ -10690,21 +10736,41 @@
                                 (panic "memo fn {} has no arguments for {}"
                                        ~name
                                        text)))))))))
-    ;; Its answers forgotten, when a setting it reads is given again while nothing is tracked.
+    ;; Its answers forgotten, when a setting it reads is given again while nothing is tracked:
+    ;; said now (`stale`), and done when the store is next asked or read whole (`memo-forgotten--`),
+    ;; so a build's last answers, which nothing asks for again, are not emptied one by one as its
+    ;; settings are let go. A run that reclaims memory lets them go at once.
     (emit! (mut out)
            `(defn ~(sym (cat "memo-forget--" name)) [] (-> void)
-              (let [s (~whole-fn)
-                    word (cast (ptr i64) s)]
+              (let [s (~store-fn)]
+                (atomic/store (field s stale) 1)
+                (when (rt/reclaiming?) (~forgotten s)))
+              0))
+    (emit! (mut out)
+           `(defn ~forgotten [(s (ptr ~store))] (-> void)
+              (let [word (cast (ptr i64) s)]
                 (rt/spin-lock! word)
-                (for key (.regions s)
-                  (match (get (.regions s) key) (Some [r] (rt/region-release-id! r)) (None [] 0)))
-                (free! (mut (.regions s)))
-                (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type f)))
-                (free! (mut (.table (.main s))))
-                (set! (.table (.main s)) ~(memo-storage-new (mut k) f))
-                (free! (mut (.busy (.main s))))
-                (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type f)))
-                (set! (.gen s) (rt/next-pass!))
+                (when (!= (atomic/read (field s stale)) 0)
+                  (for key (.regions s)
+                    (match (get (.regions s) key) (Some [r] (rt/region-release-id! r)) (None [] 0)))
+                  (free! (mut (.regions s)))
+                  (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type f)))
+                  (free! (mut (.table (.main s))))
+                  (set! (.table (.main s)) ~(memo-storage-new (mut k) f))
+                  (free! (mut (.busy (.main s))))
+                  (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type f)))
+                  ;; The many parts' answers go with the rest, not into the one first.
+                  (when (!= (atomic/read (field s fronted)) 0)
+                    (for h (.fronts s)
+                      (rt/spin-lock! (cast (ptr i64) h))
+                      (free! (mut (.table h)))
+                      (set! (.table h) ~(memo-storage-new (mut k) f))
+                      (free! (mut (.busy h)))
+                      (set! (.busy h) ~(runtime-map (mut k) (memo-busy-type f)))
+                      (rt/spin-unlock! (cast (ptr i64) h)))
+                    (atomic/store (field s fronted) 0))
+                  (set! (.gen s) (rt/next-pass!))
+                  (atomic/store (field s stale) 0))
                 (rt/spin-unlock! word))
               0))
     ;; The part of the many that holds `key`'s answer: picked by bits of its hash the part's own
@@ -10751,6 +10817,7 @@
     (emit! (mut out)
            `(defn ~whole-fn [] (-> (ptr ~store))
               (let [s (~store-fn)]
+                (when (!= (atomic/read (field s stale)) 0) (~forgotten s))
                 (~settle s)
                 s)))
     (emit! (mut out)
@@ -10945,6 +11012,8 @@
                     word (cast (ptr i64) s)
                     reclaim (rt/reclaiming?)
                     ;; An answer the cache holds is read before anything looks for it.
+                    ;; Answers a setting's change said to forget go now, before any is looked for.
+                    fresh-store (if (!= (atomic/read (field s stale)) 0) (do (~forgotten s) 0) 0)
                     faulted (~(sym (cat "memo-fault--" name)) s key)
                     tracking (rt/dep-tracking?)
                     node
