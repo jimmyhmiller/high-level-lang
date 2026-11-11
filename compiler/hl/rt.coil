@@ -3114,6 +3114,34 @@
           -1)
       (rows-find (mut r) false a b c d)))
 
+;;; An aggregate being worked out (`count`, `sum`, `min`, `max` in a `.facts` rule's head): its groups
+;;; as rows of a relation of their columns, in the order first met, and each group's value so far.
+;;; `kind`: 1 count, 2 sum, 3 min, 4 max. A group of no columns is the one row 0.
+(defstruct Agg [(groups Rel) (values (ArrayList i64)) (kind i64)])
+
+(defn agg-new [(columns i64) (kind i64)] (-> Agg)
+  (Agg :groups (rel-new (if (> columns 0) columns 1))
+       :values (ArrayList::new [i64] (value-allocator))
+       :kind kind))
+
+;;; One more of the body's answers, in the group `a b c`, with `v` the aggregated column's value.
+(defn agg-step! [(g (mut Agg)) (a i64) (b i64) (c i64) (v i64)] (-> void)
+  (if (rel-add! (mut (.groups g)) a b c 0)
+      (push! (mut (.values g)) (if (= (.kind g) 1) 1 v))
+      (let [row (rel-find (mut (.groups g)) a b c 0)
+            old (get (.values g) row)]
+        (set! (mut (.values g))
+              row
+              (cond (= (.kind g) 1) (+ old 1)
+                    (= (.kind g) 2) (+ old v)
+                    (= (.kind g) 3) (if (< v old) v old)
+                    :else (if (> v old) v old)))))
+  0)
+
+(defn agg-count [(g (mut Agg))] (-> i64) (len (.values g)))
+(defn agg-group [(g (mut Agg)) (row i64) (col i64)] (-> i64) (rel-at (mut (.groups g)) row col))
+(defn agg-value [(g (mut Agg)) (row i64)] (-> i64) (get (.values g) row))
+
 ;;; Take out the row that holds these columns. True when one did. It stays where it is, passed by,
 ;;; until the relation is made again.
 (defn rel-kill! [(r (mut Rel)) (a i64) (b i64) (c i64) (d i64)] (-> bool)
@@ -4096,6 +4124,43 @@
   (match (fs/write-file (malloc-allocator) path bytes)
     (Ok [_] 0)
     (Err [_] (panic "cannot write {}" path))))
+
+;;; JSON written into one buffer (`json(x)` in `.rules`, whose code the rules compiler derives from
+;;; x's type): text quoted with what JSON escapes, numbers, and the rest as given.
+(defn json-buf [] (-> str/StrBuf) (str/StrBuf::new (value-allocator)))
+
+(defn json-raw! [(b (mut str/StrBuf)) (s (slice u8))] (-> void)
+  (push-str! (mut b) s)
+  0)
+
+(defn json-int! [(b (mut str/StrBuf)) (n i64)] (-> void)
+  (push-str! (mut b) (num-text n))
+  0)
+
+(defn json-text! [(b (mut str/StrBuf)) (s (slice u8))] (-> void)
+  (push-str! (mut b) "\"")
+  (let [(mut from) 0]
+    (for i (range 0 (len s))
+      (let [c (get s i)
+            escape (cond (= c #\") "\\\""
+                         (= c #\\) "\\\\"
+                         (= c #\newline) "\\n"
+                         (= c #\return) "\\r"
+                         (= c #\tab) "\\t"
+                         (< c 32) "\\u00"
+                         :else "")]
+        (when (> (len escape) 0)
+          (push-str! (mut b) (subslice s from i))
+          (push-str! (mut b) escape)
+          (when (= escape "\\u00")
+            (push-str! (mut b) (subslice "0123456789abcdef" (/ (cast i64 c) 16) (+ (/ (cast i64 c) 16) 1)))
+            (push-str! (mut b) (subslice "0123456789abcdef" (% (cast i64 c) 16) (+ (% (cast i64 c) 16) 1))))
+          (set! from (+ i 1)))))
+    (push-str! (mut b) (subslice s from (len s))))
+  (push-str! (mut b) "\"")
+  0)
+
+(defn json-done [(b (mut str/StrBuf))] (-> (slice u8)) (finish! (mut b)))
 
 (defn join [(a (slice u8)) (b (slice u8))] (-> (slice u8))
   (let [(mut sb) (str/StrBuf::new (value-allocator))]

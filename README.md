@@ -13,6 +13,8 @@ build.pipeline       stages, and plans of how many threads run them → plans, c
 ├── package.syntax   package.json, only the parts resolution reads  → a parser
 ├── js.scopes        which nodes open scopes, where bindings land   → resolver
 ├── link.facts       ES linking and tree shaking, as Datalog        → nested loops with indexes
+├── report.facts     what a build made, and why: Datalog with        → the same, and aggregates
+│                    count, sum, min and max, and !=
 ├── minify.rewrite   syntax minification rules                      → pattern matcher, peephole
 └── *.rules          the logic: resolution, loading, early errors,  → typed native code
                      analysis, emit, renaming, source maps, the build
@@ -329,11 +331,20 @@ of the same build without it.
   kept only for what they do as the module loads, with their lines. On three.js's math page,
   `three.module.js`'s 163 KB is used by nothing, and kept by 13 such statements (`ShaderLib = {…}`).
 
-It is read from what the build has: linking's database, the modules, and where each output passes
-from one module's code to the next. The emitter gives each statement its module, and the printer
-marks only where the module changes (`render-files`), not every token as a source map does. It costs
-2–6% more CPU (three.js, zod, rxjs, d3). `tools/analyze-check.py` checks the outputs are unchanged,
-every byte is attributed, and each route loads what its files import.
+The analysis is stated as rules, `src/bundle/report.facts`: what each output holds of each module
+is a sum over the stretches of its code the printer marked (`held(O, M, sum B) :- span(O, M, N, B)`),
+what a root loads is what its output imports, and on (`loads`), what is used of a module and by
+whom is a join over linking's parts (`used-by(M, R, S) :- …, M != R`), and what is kept for its
+effects is another. The report is records (`src/bundle/analyze.rules`), written as JSON by `json`,
+which the rules compiler derives from their types. The report's database is solved only with
+`--analyze`, from the outputs and from linking's relations.
+
+The emitter gives each statement, and a few levels inside it, its module, and the printer marks only
+where the output passes from one module's code to another's (`render-files`), not every token as a
+source map does. It costs 2–6% more CPU (three.js, zod, d3) and 11% on rxjs's many small modules.
+`tools/analyze-check.py` checks the outputs are unchanged, every byte is attributed, each route
+loads what its files import, and what each module holds agrees with the same build's source map,
+up to the output's own bytes (its imports and exports, which a map gives to the code beside them).
 
 ## Paired client/server builds
 

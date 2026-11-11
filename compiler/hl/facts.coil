@@ -41,8 +41,13 @@
    (tok rt/Tok)])
 
 ;;; A rule, and what its head does with a row: `db` and `minus` queue it there; `found` answers true
-;;; (whether the head's row is derived, its columns bound beforehand: see `rederive-code`).
-(defstruct Clause [(head Atom) (body (ArrayList Atom)) (sink (slice u8))])
+;;; (whether the head's row is derived, its columns bound beforehand: see `rederive-code`). A head may
+;;; aggregate (`agg`: 0 none, 1 count, 2 sum, 3 min, 4 max) the body's answers in column `agg-col`,
+;;; over each group of its other columns.
+(defstruct Clause [(head Atom) (body (ArrayList Atom)) (sink (slice u8)) (agg i64) (agg-col i64)])
+
+;;; `X != Y` in a body: a filter, once both are bound, not a relation.
+(defn differs? [(a Atom)] (-> bool) (= (.rel a) "!="))
 
 ;;; The database an atom reads. The relation as it was (`old`) is the one being brought up to date,
 ;;; read as it began (see `row-seen`): it changes in place, and nothing is copied for what it was.
@@ -110,9 +115,32 @@
       :tok (tok-of src name))))
 
 (defn body-atom-of [(src (slice u8)) (n g/Node)] (-> Atom)
-  (if (= (.kind n) (g/KNegated))
-      (atom-of src (get (.kids n) 0) true)
-      (atom-of src n false)))
+  (cond (= (.kind n) (g/KNegated)) (atom-of src (get (.kids n) 0) true)
+        (= (.kind n) (g/KDiffers))
+          (let [(mut args) (ArrayList::new [rt/Tok] (malloc-allocator))]
+            (push! (mut args) (tok-of src (get (.kids n) 0)))
+            (push! (mut args) (tok-of src (get (.kids n) 1)))
+            (Atom :rel "!=" :args args :negated false :delta false :src "db" :tok (tok-of src (get (.kids n) 0))))
+        :else (atom-of src n false)))
+
+;;; A head's column: its name, aggregated or not.
+(defn head-arg-node [(n g/Node)] (-> g/Node)
+  (if (or (= (.kind n) (g/KCount)) (= (.kind n) (g/KSum)) (= (.kind n) (g/KMin)) (= (.kind n) (g/KMax)))
+      (get (.kids n) 0)
+      n))
+
+(defn agg-kind [(n g/Node)] (-> i64)
+  (cond (= (.kind n) (g/KCount)) 1
+        (= (.kind n) (g/KSum)) 2
+        (= (.kind n) (g/KMin)) 3
+        (= (.kind n) (g/KMax)) 4
+        :else 0))
+
+(defn head-of [(src (slice u8)) (n g/Node)] (-> Atom)
+  (let [name (get (.kids n) 0)
+        (mut args) (ArrayList::new [rt/Tok] (malloc-allocator))]
+    (for arg (.kids (get (.kids n) 1)) (push! (mut args) (tok-of src (head-arg-node arg))))
+    (Atom :rel (.text name) :args args :negated false :delta false :src "db" :tok (tok-of src name))))
 
 (defn bound? [(bound (ArrayList (slice u8))) (n (slice u8))] (-> bool)
   (let [(mut hit) false]
@@ -129,10 +157,11 @@
     `(~@out)))
 
 (defn head-add [(c (mut dsl/Cur))
-                (a Atom)
+                (k Clause)
                 (bound (ArrayList (slice u8)))
                 (sink (slice u8))]
   (-> Code)
+  (let [a (.head k)]
   (for t (.args a)
     (unless (bound? bound (.text t))
       (dsl/die (mut c)
@@ -140,12 +169,48 @@
                (dsl/join3 "the head variable "
                           (.text t)
                           " is not bound by the body"))))
-  (cond (= sink "found") `(return-from :found true)
+  (cond (> (.agg k) 0)
+          ;; One more answer in its group: the head's other columns, then the aggregated one.
+          (let [(mut groups) (primitive/code-list-new)
+                (mut n) 0]
+            (for i (range 0 (len (.args a)))
+              (unless (= i (.agg-col k))
+                (push! (mut groups) (var-sym (.text (get (.args a) i))))
+                (set! n (+ n 1))))
+            (for _ (range n 3) (push! (mut groups) `0))
+            `(rt/agg-step! (mut agg) ~@groups ~(var-sym (.text (get (.args a) (.agg-col k))))))
+        (= sink "found") `(return-from :found true)
         ;; A rule run as a task of a round (see `stratum-rounds`) queues what it finds for itself.
         (= sink "rule-out") `(rt/row-queue! rule-out ~@(row-args a))
         :else
           `(rt/rel-queue! (mut (~(field-sym (.rel a)) ~(primitive/code-symbol sink)))
-                          ~@(row-args a))))
+                          ~@(row-args a)))))
+
+;;; A row going where `sink` says, its four columns given.
+(defn sink-code [(rel (slice u8)) (sink (slice u8)) (cols Code)] (-> Code)
+  (if (= sink "rule-out")
+      `(rt/row-queue! rule-out ~@cols)
+      `(rt/rel-queue! (mut (~(field-sym rel) ~(primitive/code-symbol sink))) ~@cols)))
+
+;;; A rule's code, its body's joins from nothing bound. An aggregate's answers are gathered by
+;;; group, and each group is then one row of its head: its columns, and the aggregate in its place.
+(defn rule-code [(c (mut dsl/Cur)) (k Clause)] (-> Code)
+  (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
+        joins (atoms-code (mut c) k 0 (mut bound))]
+    (if (= (.agg k) 0)
+        joins
+        (let [head (.head k)
+              arity (len (.args head))
+              (mut cols) (primitive/code-list-new)
+              (mut g) 0]
+          (for i (range 0 4)
+            (cond (>= i arity) (push! (mut cols) `0)
+                  (= i (.agg-col k)) (push! (mut cols) `(rt/agg-value (mut agg) group))
+                  :else (do (push! (mut cols) `(rt/agg-group (mut agg) group ~g)) (set! g (+ g 1)))))
+          `(let [(mut agg) (rt/agg-new ~(- arity 1) ~(.agg k))]
+             ~joins
+             (for group (range 0 (rt/agg-count (mut agg)))
+               ~(sink-code (.rel head) (.sink k) `(~@cols))))))))
 
 ;;; Test or bind column `col` of the row atom `i` holds, then continue.
 (defn columns-code [(c (mut dsl/Cur))
@@ -176,10 +241,17 @@
                   (i i64)
                   (bound (mut (ArrayList (slice u8))))] (-> Code)
   (if (>= i (len (.body k)))
-      (head-add (mut c) (.head k) bound (.sink k))
+      (head-add (mut c) k bound (.sink k))
       (let [a (get (.body k) i)
             rel (field-sym (.rel a))
             db (src-sym a)]
+        (if (differs? a)
+            (do
+              (for t (.args a)
+                (unless (bound? bound (.text t))
+                  (dsl/die (mut c) t (dsl/join3 "the variable " (.text t) " of != must be bound earlier in the body"))))
+              `(when (!= ~(var-sym (.text (get (.args a) 0))) ~(var-sym (.text (get (.args a) 1))))
+                 ~(atoms-code (mut c) k (+ i 1) (mut bound))))
         (if (.negated a)
             (do
               (for t (.args a)
@@ -233,7 +305,7 @@
                         `(for ~(row-sym i) (range 0 ~(if (old? a)
                                                           `(.start (~rel ~db))
                                                           `(.count (~rel ~db))))
-                           (when ~(row-seen a i) ~body)))))))))
+                           (when ~(row-seen a i) ~body))))))))))
 
 ;;; Does any rule add to this relation? One that none does never has a delta.
 (defn derived? [(clauses (ArrayList Clause)) (name (slice u8))] (-> bool)
@@ -270,9 +342,10 @@
             (let [a (get (.body k) i)
                   have (bound-columns a bound)
                   whole (= have (len (.args a)))
+                  filter (or (.negated a) (differs? a))
                   score
-                    (cond (and (.negated a) whole) 1000
-                          (.negated a) -2
+                    (cond (and filter whole) 1000
+                          filter -2
                           (and keep-first (= i 0)) 2000
                           :else have)]
               (when (> score best-score)
@@ -285,13 +358,15 @@
         (let [a (get (.body k) best)]
           (set! (mut used) best true)
           (push! (mut body) a)
-          (unless (.negated a)
+          (unless (or (.negated a) (differs? a))
             (for t (.args a)
               (unless (bound? bound (.text t)) (push! (mut bound) (.text t))))))))
     (Clause
       :head (.head k)
       :body body
-      :sink (.sink k))))
+      :sink (.sink k)
+      :agg (.agg k)
+      :agg-col (.agg-col k))))
 
 ;;; The clause with atom `at` moved first, and reading only that relation's delta. Everything
 ;;; else still reads the whole of its relation, which can find a row twice but never miss one.
@@ -311,7 +386,9 @@
     (planned (Clause
                :head (.head k)
                :body body
-               :sink (.sink k)))))
+               :sink (.sink k)
+               :agg (.agg k)
+               :agg-col (.agg-col k)))))
 
 ;;; Stratum of each relation: at least a body relation's, above a negated one's.
 (defn stratify! [(rels (mut (ArrayList Relation)))
@@ -326,14 +403,15 @@
         (let [head-at (rel-index rels (.rel (.head k)))
               (mut need) (.stratum (get rels head-at))]
           (for a (.body k)
-            (let [s (.stratum (get rels (rel-index rels (.rel a))))
-                  required (if (.negated a) (+ s 1) s)]
-              (when (> required need) (set! need required))))
+            (unless (differs? a)
+              (let [s (.stratum (get rels (rel-index rels (.rel a))))
+                    required (if (or (.negated a) (> (.agg k) 0)) (+ s 1) s)]
+                (when (> required need) (set! need required)))))
           (when (> need (.stratum (get rels head-at)))
             (when (> need limit)
               (dsl/die (mut c)
                        (.tok (.head k))
-                       "this rule depends on its own negation"))
+                       "this rule depends on its own negation, or aggregates what depends on it"))
             (let [r (get rels head-at)]
               (set! (mut rels)
                     head-at
@@ -388,7 +466,7 @@
                  (rule-timed k
                              "first"
                              `(do
-                                ~(atoms-code (mut c) (planned k) 0 (mut bound))
+                                ~(rule-code (mut c) (planned k))
                                 (rt/rel-flush! (mut (~flush db))))))
           (for i (range 0 (len (.body k)))
             (let [a (get (.body k) i)
@@ -417,7 +495,7 @@
 
 ;;; A rule with its head's rows going to the queue of whichever task runs it.
 (defn to-rule-out [(k Clause)] (-> Clause)
-  (Clause :head (.head k) :body (.body k) :sink "rule-out"))
+  (Clause :head (.head k) :body (.body k) :sink "rule-out" :agg (.agg k) :agg-col (.agg-col k)))
 
 ;;; A stratum solved in rounds whose rules run at once. Each rule, and each rule driven by the
 ;;; rows one of its atoms gained in the last round, is a task: it reads the relations as they
@@ -457,7 +535,7 @@
               head (field-sym (.rel (.head k)))]
           (push! (mut arms) `(= rule ~n))
           (push! (mut arms)
-                 (rule-timed k "first" (atoms-code (mut c) (to-rule-out (planned k)) 0 (mut bound))))
+                 (rule-timed k "first" (rule-code (mut c) (to-rule-out (planned k)))))
           (push! (mut firsts) `(set! (mut active) ~n true))
           (push! (mut driven) `(set! (mut active) ~n false))
           (push! (mut rule-heads) (.rel (.head k)))
@@ -551,7 +629,9 @@
     (planned (Clause
                :head (.head k)
                :body body
-               :sink sink))))
+               :sink sink
+               :agg (.agg k)
+               :agg-col (.agg-col k)))))
 
 (defn stratum-of [(rels (ArrayList Relation)) (n (slice u8))] (-> i64)
   (.stratum (get rels (rel-index rels n))))
@@ -647,6 +727,10 @@
 ;;; Whether rule `k` (the i-th) derives the row `a0`..`a3` of its head from `db` as it is: its head's
 ;;; variables bound to the row's columns, then its body, every atom reading `db`.
 (defn rederive-code [(c (mut dsl/Cur)) (k Clause) (i i64)] (-> Code)
+  (if (> (.agg k) 0)
+      ;; Its stratum is always solved afresh (see `update-stratum`).
+      `(defn ~(rederive-sym i) [(db (mut Db)) (a0 i64) (a1 i64) (a2 i64) (a3 i64)] (-> bool)
+         (panic "an aggregate's row is never derived again by itself"))
   (let [(mut bound) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut binds) (ArrayList::new [i64] (malloc-allocator))
         head (.head k)]
@@ -662,7 +746,9 @@
                         (planned-from (Clause
                                         :head head
                                         :body (.body k)
-                                        :sink "found")
+                                        :sink "found"
+                                        :agg 0
+                                        :agg-col -1)
                                       (texts-copy bound)
                                       false)
                         0
@@ -681,7 +767,7 @@
          (block :found
            (let [~@lets]
              (when (and true ~@checks) ~inner))
-           false)))))
+           false))))))
 
 ;;; Stratum `s` brought up to date from what changed below it, by deleting and deriving again: what
 ;;; a row taken out below, or one added to a relation read negated, derived in the old database is
@@ -714,10 +800,15 @@
     (for ci (range 0 (len clauses))
       (let [k (get clauses ci)
             h (.rel (.head k))]
-        (when (bound? group h)
+        (when (and (bound? group h) (> (.agg k) 0))
+          (for a (.body k)
+            (unless (or (differs? a) (bound? reads (.rel a))) (push! (mut reads) (.rel a)))))
+        (when (and (bound? group h) (= (.agg k) 0))
           (for i (range 0 (len (.body k)))
             (let [a (get (.body k) i)
                   l (.rel a)]
+              (if (differs? a)
+                  0
               (if (not (bound? group l))
                   (do
                     (unless (bound? reads l) (push! (mut reads) l))
@@ -803,7 +894,7 @@
                                                      false
                                                      "db"
                                                      "db"))
-                              ~(flush-of h "db"))))))))))
+                              ~(flush-of h "db")))))))))))
     (for l reads
       (push! (mut touched) `(> ~(count-of l "plus") 0))
       (push! (mut touched) `(> ~(count-of l "minus") 0)))
@@ -851,8 +942,16 @@
                                            (mut (~f plus)))
                   (rt/rel-diff-into! (mut (~f minus)) (mut (~f db)) (mut gone))
                   (set! (~f minus) gone)))))
-    (if (= (len mine) 0)
+    (cond (= (len mine) 0)
         `0
+        ;; An aggregate's group, whenever anything it reads changed, is worked out afresh.
+        (aggregate-group? clauses group)
+        `(when (or false ~@touched)
+           ~@empties
+           ~(stratum-code (mut c) rels clauses group)
+           ~@whole-finals
+           0)
+        :else
         ;; Taking out more than a quarter of the stratum's rows (a change reaching most of what it
         ;; derives, through its recursion), deriving them back one at a time costs more than solving
         ;; the stratum afresh from the strata below, as they now are; and so that is done.
@@ -887,6 +986,11 @@
                      ~@finals)
                    0)))))))
 
+(defn aggregate-group? [(clauses (ArrayList Clause)) (group (ArrayList (slice u8)))] (-> bool)
+  (let [(mut hit) false]
+    (for k clauses (when (and (> (.agg k) 0) (bound? group (.rel (.head k)))) (set! hit true)))
+    hit))
+
 (defn rel-index [(rels (ArrayList Relation)) (n (slice u8))] (-> i64)
   (let [(mut out) -1]
     (for i (range 0 (len rels))
@@ -918,19 +1022,40 @@
                      :name (.rel a)
                      :arity n
                      :stratum 0)))
-          (let [head (atom-of src (get (.kids item) 0) false)
-                (mut body) (ArrayList::new [Atom] (malloc-allocator))]
+          (let [head-node (get (.kids item) 0)
+                head (head-of src head-node)
+                (mut body) (ArrayList::new [Atom] (malloc-allocator))
+                (mut agg) 0
+                (mut agg-col) -1
+                args (.kids (get (.kids head-node) 1))]
+            (for i (range 0 (len args))
+              (let [kind (agg-kind (get args i))]
+                (when (> kind 0)
+                  (when (> agg 0)
+                    (dsl/die (mut c) (.tok head) "a rule aggregates one column of its head"))
+                  (set! agg kind)
+                  (set! agg-col i))))
             (for b (.kids (get (.kids item) 1))
               (push! (mut body) (body-atom-of src b)))
             (push! (mut clauses)
                    (Clause
                      :head head
                      :body body
-                     :sink "db")))))
+                     :sink "db"
+                     :agg agg
+                     :agg-col agg-col)))))
     ;; Checked after reading, so a rule may precede its relation's declaration.
     (for k clauses
       (arity-of rels (mut c) (.head k))
-      (for a (.body k) (arity-of rels (mut c) a)))
+      (for a (.body k) (unless (differs? a) (arity-of rels (mut c) a))))
+    ;; An aggregate is the one rule of its relation: what it counts is all the relation says.
+    (for ki (range 0 (len clauses))
+      (let [k (get clauses ki)]
+        (when (> (.agg k) 0)
+          (for ji (range 0 (len clauses))
+            (let [j (get clauses ji)]
+              (when (and (!= ji ki) (= (.rel (.head j)) (.rel (.head k))))
+                (dsl/die (mut c) (.tok (.head j)) (dsl/join2 "another rule for the aggregate " (.rel (.head k))))))))))
     (let [top (stratify! (mut rels) clauses (mut c))
           (mut fields) (primitive/code-list-new)
           (mut inits) (primitive/code-list-new)

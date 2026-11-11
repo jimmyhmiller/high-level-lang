@@ -3934,6 +3934,66 @@
         (None [] (None [TE])))))
 
 ;;; Calls the language itself understands, for any element type.
+;;; Code writing value `v` of type `ty` as JSON into buffer `jb`: a record as an object of its fields
+;;; (named as written), a list as an array, an option as its value or null, and Int, Text, Bool as
+;;; themselves. `within` are the records being written around it: one inside itself has no end.
+(defn json-write [(k (mut Comp))
+                  (n g/Node)
+                  (ty (slice u8))
+                  (v Code)
+                  (jb (slice u8))
+                  (within (ArrayList (slice u8)))] (-> Code)
+  (let [b `(mut ~(sym jb))]
+    (cond (= ty "Int") `(rt/json-int! ~b ~v)
+          (= ty "Text") `(rt/json-text! ~b ~v)
+          (= ty "Bool") `(rt/json-raw! ~b (if ~v "true" "false"))
+          (opt? ty)
+            (let [x (fresh (mut k) "x")]
+              `(match ~v
+                 (Some [~(sym x)] ~(json-write (mut k) n (opt-of ty) (sym x) jb within))
+                 (None [] (rt/json-raw! ~b "null"))))
+          (list? ty)
+            (let [xs (fresh (mut k) "xs")
+                  x (fresh (mut k) "x")
+                  first (fresh (mut k) "first")]
+              `(do
+                 (rt/json-raw! ~b "[")
+                 (let [~(sym xs) ~v
+                       (mut ~(sym first)) true]
+                   (for ~(sym x) ~(sym xs)
+                     (if ~(sym first) (set! ~(sym first) false) (rt/json-raw! ~b ","))
+                     ~(json-write (mut k) n (elem-of ty) (sym x) jb within)))
+                 (rt/json-raw! ~b "]")))
+          (record-type? (mut k) ty)
+            (do
+              (when (has-name? within ty)
+                (die (mut k) n (cat3 "json: " ty " holds itself, and has no end as JSON")))
+              (let [r (fresh (mut k) "r")
+                    (mut inner) (text-list)
+                    (mut parts) (primitive/code-list-new)]
+                (for x within (push! (mut inner) x))
+                (push! (mut inner) ty)
+                (match (find-rec (mod-at (mut k) (type-module ty)) (type-name ty))
+                  (Some [rd]
+                        (for i (range 0 (len (.fields rd)))
+                          (let [f (get (.fields rd) i)
+                                fty (field-type (mut k) n ty (.name f))]
+                            (push! (mut parts)
+                                   `(rt/json-raw! ~b ~(cat3 (if (= i 0) "" ",") (rt/quote-str (.name f)) ":")))
+                            (push! (mut parts)
+                                   (json-write (mut k) n fty `(~(primitive/code-symbol "." (.name f)) ~(sym r)) jb inner)))))
+                  (None [] (die (mut k) n (cat "json: no record named " ty))))
+                `(let [~(sym r) ~v]
+                   (rt/json-raw! ~b "{")
+                   ~@parts
+                   (rt/json-raw! ~b "}"))))
+          :else
+            (die (mut k)
+                 n
+                 (cat3 "json: "
+                       ty
+                       " has no JSON form here; records, lists, options, Int, Text and Bool do")))))
+
 (defn builtin-call [(k (mut Comp))
                     (n g/Node)
                     (name (slice u8))
@@ -3941,6 +4001,14 @@
   (let [count (len args)]
     (cond (and (= name "len") (= count 1))
             (Some (te `(len ~(.code (expr (mut k) (get args 0) ""))) "Int"))
+          ;; `json(x)`: x as JSON, written as its type says, into one buffer.
+          (and (= name "json") (= count 1))
+            (let [e (expr (mut k) (get args 0) "")
+                  jb (fresh (mut k) "json")]
+              (Some (te `(let [(mut ~(sym jb)) (rt/json-buf)]
+                           ~(json-write (mut k) n (.ty e) (.code e) jb (text-list))
+                           (rt/json-done (mut ~(sym jb))))
+                        "Text")))
           (and (= name "is-some") (= count 1))
             (Some (te `(match ~(.code (expr (mut k) (get args 0) ""))
                          (Some [_] true)
