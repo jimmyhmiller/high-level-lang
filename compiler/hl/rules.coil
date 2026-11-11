@@ -151,6 +151,8 @@
    ;; Modules read only for the signatures of those functions: not imported, since a strategy's
    ;; functions may read the module whose code they serve (see `rt/hook-cell`).
    (sig-only (ArrayList (slice u8)))
+   ;; The sizes the program's pipeline gives, as `module/name` (see `with-sizes`).
+   (sizes (ArrayList pl/Size))
    (staged (ArrayList (slice u8)))  ; every stage's own functions
    ;; The program's pipeline's stages, in order (see "a stage's work").
    (stages (ArrayList pl/Stage))
@@ -504,10 +506,64 @@
     ;; its answer to the caller's list (`with-accumulators`), which would go round the memo.
     (Ok [t]
         (with-accumulators (with-keeps (mut k)
-                                       (with-everywhere src path t)
+                                       (with-sizes (mut k) (with-everywhere src path t) src path)
                                        src
                                        path)))
     (Err [e] (dsl/fail-at path (.line e) (.col e) (cat "expected " (.want e))))))
+
+;; ---------------------------------------------------------------- sizes
+
+;;; How big a unit of work is is no part of the code that cuts the work: the rules declare a
+;;; constant with no value, `const piece-bytes: Int`, and the program's pipeline gives the number,
+;;; `size bundle.modules/piece-bytes 8192`. A module's tree with each such constant given its
+;;; number: a constant like any other from here on. One the pipeline gives no number, and a
+;;; number for a constant the module does not declare so, are errors.
+(defn with-sizes [(k (mut Comp)) (tree g/Node) (src (slice u8)) (path (slice u8))] (-> g/Node)
+  (if (and (!= (.kind tree) (g/KFile)) (!= (.kind tree) (g/KAttrsFile)))
+      tree
+      (let [module (.text (kid tree 0))
+            prefix (cat module "/")
+            (mut found) (text-list)
+            (mut decls) (ArrayList::new [g/Node] (malloc-allocator))]
+        (for d (list-kids (kid tree 2))
+          (if (= (.kind d) (g/KSized))
+              (let [name (.text (kid d 0))
+                    full (cat prefix name)
+                    (mut value) ""]
+                (for s (.sizes k) (when (= (.name s) full) (set! value (.value s))))
+                (when (= (len value) 0)
+                  (let [at (rt/line-col src (.lo d))]
+                    (dsl/fail-at path
+                                 (.line at)
+                                 (.col at)
+                                 (cat3 "the constant "
+                                       name
+                                       (cat3 " has no value: the program's pipeline gives it, `size "
+                                             full
+                                             " N`")))))
+                (push! (mut found) name)
+                (let [(mut kids) (g/new-kids)]
+                  (push! (mut kids) (kid d 0))
+                  (push! (mut kids) (kid d 1))
+                  (push! (mut kids) (g/leaf (g/KInt) value (.lo d) (.lo d)))
+                  (push! (mut decls) (g/mk (g/KConst) kids (.lo d) (.hi d)))))
+              (push! (mut decls) d)))
+        (for s (.sizes k)
+          (when (and (rt/starts-with (.name s) prefix)
+                     (not (has-text? found (subslice (.name s) (len prefix) (len (.name s))))))
+            (dsl/fail-at path
+                         1
+                         1
+                         (cat3 "a pipeline gives the size "
+                               (.name s)
+                               (cat3 ", which "
+                                     module
+                                     " does not declare as a constant with no value")))))
+        (let [(mut out) tree
+              (mut list) (kid tree 2)]
+          (set! (.kids list) decls)
+          (set! (mut (.kids out)) 2 list)
+          out))))
 
 ;; ---------------------------------------------------------------- what is kept
 
@@ -546,6 +602,7 @@
                              :role role
                              :fns hooks)))))))
           (for m made (push! (mut (.made k)) m))
+          (for s (pl/sizes-of tree) (push! (mut (.sizes k)) s))
           (let [stages (pl/stages-of tree)]
             (when (> (len stages) 0)
               (when (> (len (.stages k)) 0)
@@ -11597,6 +11654,7 @@
             :mutators (ArrayList::new [Mutator] (malloc-allocator))
             :hooks (ArrayList::new [Hooks] (malloc-allocator))
             :sig-only (text-list)
+            :sizes (ArrayList::new [pl/Size] (malloc-allocator))
             :staged (text-list)
             :stages (ArrayList::new [pl/Stage] (malloc-allocator))
             :checker
