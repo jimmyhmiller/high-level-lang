@@ -409,26 +409,47 @@ core took 76, 78, 24, 30, 42, 48 and 56 ms on those apps, and is faster still on
 
 ## Parallelism
 
-How the build divides its work is a language of its own. `src/app/build.pipeline` names the
-stages that work on one file, module or part at a time, the functions each runs, and plans:
+How the build divides its work is a language of its own, and the rules that do the work say
+nothing of it. `src/app/build.pipeline` names the stages that work on one file, module, unit or
+chunk at a time, the functions each runs, and plans:
 
 ```
-stage load     per file   bundle.modules/visit-file bundle.modules/next-files bundle.modules/first-files ...
-stage facts    per module bundle.analysis/on-demand-calls bundle.analysis/summaries-of
-stage emit     per module bundle.mangle/unit-usage bundle.emit/unit-emitted
-stage optimize per part   bundle.api/default-optimize bundle.finish/ascii-only
-stage print    per part   bundle.api/render-part
-stage link     whole      bundle.analysis/link
+stage load     per file bundle.modules/led-ahead bundle.modules/parsed-plain ...
+               reads by bundle.modules/file-read
+stage pieces   per piece bundle.modules/piece-of bundle.modules/walked-of
+stage resolve  per 64 requests bundle.modules/unhooked-target
+stage facts    per module bundle.analysis/summaries-of bundle.analysis/module-link ...
+stage gather   per module bundle.analysis/module-facts-at bundle.analysis/binding-facts-at
+               names by bundle.modules/name-id
+stage chunks   per chunk bundle.api/chunk-at
+               gives settings
+stage link     whole    bundle.analysis/link
 
 plan full
   threads auto
   load parallel
+  pieces parallel
   facts parallel
-  emit parallel
-  optimize parallel auto parts 48
-  print parallel auto parts 24
+  chunks parallel 6
 end
 ```
+
+Where the rules make a list of one of a `per` stage's functions' answers, that list is the
+stage's work:
+
+```
+fn link(symbols: Int) -> Linked = linked-of([module-link(id) for id in m.order], symbols)
+```
+
+The rules compiler has it made on as many threads as the run's plan gives the stage, the answers
+in the list's order. What each call is given is worked out first, by the thread that asks for the
+list; then each thread takes the next item it finds free. A stage also says what its work needs:
+`gives settings` (its functions give settings by `with`, so one runs at a time while answers are
+tracked), `names by F` (its functions meet names that get ids in the order met, so the list is
+made once to find the names, F is given them in order, and it is made again), `per N units` (its
+units are small: a thread takes N at a time, and a list of N or fewer is made by whoever asks),
+and `reads by F` (which file a name's work reads, to read files ahead). `HL_SHOW_STAGES=1` set
+while compiling prints every list that is a stage's work, and where it is.
 
 A plan that runs a stage in parallel compiles only if nothing those functions call, in any module,
 writes shared state. The checker infers each function's effects from the `.rules` sources and says
@@ -452,8 +473,12 @@ lock, so many threads can query at once.
 - `memo fn`: an answer computed once per build by whichever worker asks first, then shared. A
   worker that asks while another computes it waits. Directory listings, `package.json`, and a big
   file's pieces are memos.
-- `parallel-map`, and `parallel-walk`, which follows imports as workers find them. Its optional
-  `first` names follow-ups that carry on an item's own work, ahead of what is waiting.
+- `reach(roots, f)`: how many names can be reached from `roots`, where `f`, a stage's function,
+  says what each leads to. Each name is given to `f` once, on whichever of the stage's threads
+  takes it; a thread that finds work waiting never waits for a wave to finish. Loading is this:
+  `reach(roots, led-ahead)`.
+- A list inside a stage's work that is another stage's (a big file's pieces, a file's many
+  imports) is offered to the other threads, who take part before they take anything new.
 - `arrive!(key, n)`: of `n` items, the last to finish is told so and goes on, so no worker waits
   for the others.
 
@@ -461,10 +486,10 @@ The runtime has a pool of parked workers, and a work queue that idle workers sle
 
 **Big files.** A big plain-JavaScript file is parsed in pieces. A piece starts at a top-level
 declaration, found by a scan of the bytes; a wrong guess only means a piece is no program by
-itself, and then the file is parsed whole. The last piece to finish prepares the file. Each part is
-then walked for scopes in a table of its own, at the same time as early errors and comment scans.
-The last of those grafts the parts' tables back in order, giving the same symbol and scope ids a
-single walk would. A file with many imports resolves each as an item of its own.
+itself, and then the file is parsed whole. The pieces are a list, made on many threads; the file is prepared from them. Each part is
+then walked for scopes in a table of its own, another list, and the parts' tables are grafted back
+in order, giving the same symbol and scope ids a single walk would. A file's imports are resolved
+64 at a time.
 
 A library inside one function, as lodash is, has no top-level place to cut, so it is cut inside
 that function: the body holding most of the file is found by its indentation, the rest of the file
@@ -810,7 +835,7 @@ Everything written in the languages is under `src/`; everything in Coil under `c
 
 - `src/languages/`: the grammars of the languages themselves, and the `.rules` prelude.
 - `src/bundle/`: the bundler, in those languages.
-- `src/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map` gives the serial answer, in `.rules`.
+- `src/tools/`: the command-line `esb` and `jsparse`, and `ptest`, which checks that `parallel-map`, for a program with no pipeline, gives the serial answer, in `.rules`.
 - `src/app/`: a demo spec with six targets, a format, a loader and plugins; the program that offers
   it its steps (`build.rules`); and the pipeline.
 - `compiler/hl/`: the languages' compilers. `syntax`, `rules`, `rewrite`, `facts`, `scopes`,

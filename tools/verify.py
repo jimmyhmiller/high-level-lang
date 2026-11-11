@@ -356,6 +356,15 @@ check(code != 0 and f"{other}:5:25: no pass named nope" in out, f"a step the pro
 print("== the rules language")
 code, out = sh([os.path.join(os.path.dirname(ESB), "langtest")], 30)
 check(code == 0 and out.strip().endswith("all checks passed"), f"collection forms mean what they say: {out.strip().split(chr(10))[-1]}")
+# How the work is divided among threads is the pipeline's to say (src/app/build.pipeline): the
+# bundler's rules name no thread, no count of them and nothing that runs a list at once.
+threaded = []
+for path in sorted(glob.glob("../src/bundle/*.rules") + glob.glob("../src/bundle/*.attrs")):
+    for number, line in enumerate(open(path), 1):
+        code_part = re.sub(r'"(\\.|[^"\\])*"', '""', line).split("#", 1)[0]
+        if re.search(r"parallel-(map|walk)|[\w-]*threads?\b|\bcores\b", code_part):
+            threaded.append(f"{os.path.basename(path)}:{number}")
+check(not threaded, f"the bundler's rules say nothing of threads{': ' + ', '.join(threaded[:5]) if threaded else ''}")
 
 print("== paired client/server builds")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "boundary-check.py"), SPEC], 300)

@@ -4125,30 +4125,17 @@
                            ~(sym o))
                         (cat3 "[" (map-key (.ty e)) "]"))))
           ;; `parallel-map(xs, f, n)`: `f` of each element on `n` threads, results in the order of `xs`.
-          ;; Each thread takes the next index it finds free, so uneven work evens out.
-          ;; `parallel-map-own(xs, f, n)`: the same, for an `f` that gives settings by `with`: each
-          ;; call's are its own (see `settings-own-enter!`), and one call runs at a time while what
-          ;; answers were made from is tracked (`rt/own-threads`).
-          ;; `parallel-map-naming(xs, f, namer, n)`: the same, for an `f` whose work meets names that
-          ;; get ids in the order they are met (`intern!`). `f` runs over every element once only to
-          ;; say which names it needs; `namer` is given those, in the elements' order, as one thread
-          ;; would have met them; and `f` runs again, every name known (see `rt/names-record-begin!`).
-          (or (and (or (= name "parallel-map") (= name "parallel-map-own")) (= count 3))
-              (and (= name "parallel-map-naming") (= count 4)))
+          ;; Each thread takes the next index it finds free, so uneven work evens out. For a program
+          ;; with no pipeline: one with a pipeline makes a plain list of a stage's function's
+          ;; answers, and its plan says how many threads (see "a stage's work").
+          (and (= name "parallel-map") (= count 3))
             (let [xs (expr (mut k) (get args 0) "")
                   f (expr (mut k) (get args 1) "")
-                  naming (= name "parallel-map-naming")
-                  asked
-                    (expect (mut k)
-                            (get args (if naming 3 2))
-                            (expr (mut k) (get args (if naming 3 2)) "Int")
-                            "Int")
-                  ;; One call at a time while what answers were made from is tracked: a map that
-                  ;; gives settings, and one that meets names, which are then met in order.
                   threads
-                    (if (or naming (= name "parallel-map-own"))
-                        (te `(rt/own-threads ~(.code asked)) "Int")
-                        asked)]
+                    (expect (mut k)
+                            (get args 2)
+                            (expr (mut k) (get args 2) "Int")
+                            "Int")]
               (unless (list? (.ty xs))
                 (die (mut k) n "parallel-map needs a list"))
               (unless (fn? (.ty f))
@@ -4194,8 +4181,7 @@
                                         (set! (mut out) i (Some (f (get xs i)))))
                                       (set! go false))))
                               arg)))
-                  (Some (te (parallel-map-twice (mut k) n naming args xs
-                             `(let [~(sym xs-v) ~(.code xs)
+                  (Some (te `(let [~(sym xs-v) ~(.code xs)
                                    (mut ~(sym out-v))
                                      (ArrayList::new [(Option ~cr)]
                                                      (rt/value-allocator))]
@@ -4221,7 +4207,7 @@
                                                     ~(sym v-v)))
                                        (None []
                                              (panic "a parallel task left no result"))))
-                                   ~(sym res-v)))))
+                                   ~(sym res-v))))
                             (cat3 "[" r "]"))))))
           ;; `reach(roots, next)`: how many names can be reached from `roots`, where `next` of a name
           ;; says which names it leads to. `next` is a stage's function (see `stage` in the
@@ -8008,31 +7994,6 @@
 (defn compile-fn [(k (mut Comp)) (d g/Node)] (-> Code)
   (compile-fn-as (mut k) d (.text (kid d 0))))
 
-;;; A map's code as it is; or, for `parallel-map-naming`, run twice: once while names are only
-;;; noted, its answers dropped, the names then given to the namer in order, and once for good.
-(defn parallel-map-twice [(k (mut Comp))
-                          (n g/Node)
-                          (naming bool)
-                          (args (ArrayList g/Node))
-                          (xs TE)
-                          (once Code)] (-> Code)
-  (if (not naming)
-      once
-      (let [namer (expr (mut k) (get args 2) "")]
-        (unless (and (fn? (.ty namer))
-                     (= (len (fn-params (.ty namer))) 1)
-                     (= (get (fn-params (.ty namer)) 0) "Text")
-                     (= (fn-ret (.ty namer)) "Int"))
-          (die (mut k) n "parallel-map-naming's namer takes a Text and answers its Int"))
-        ;; While answers are tracked the map runs on one thread, and meets its names in order.
-        `(if (rt/dep-tracking?)
-             ~once
-             (do
-               (rt/names-record-begin!)
-               ~once
-               (rt/names-record-end! ~(.code namer) (len ~(.code xs)))
-               ~once)))))
-
 ;; ---------------------------------------------------------------- working apart
 
 ;;; A function's number among those some strategy has work apart; -1 for one none does.
@@ -8124,6 +8085,7 @@
             (Some [x] x)
             (None [] (die (mut k) d "this function was not collected")))
         (mut params) (primitive/code-list-new)
+        (mut args) (primitive/code-list-new)
         body-node (kid d 3)]
     (when (reserved-name? name)
       (die (mut k) (kid d 0) (cat3 "the name " name " is reserved")))
@@ -8132,6 +8094,7 @@
     (set! (.ret k) (.ret f))
     (for p (.params f)
       (let [local (bind-local! (mut k) (.name p) (.ty p) (.by-ref p))]
+        (push! (mut args) (sym local))
         (push! (mut params)
                (if (.by-ref p)
                    `(~(sym local) (mut ~(coil-type (mut k) (.ty p))))
@@ -8144,15 +8107,56 @@
                     (expr (mut k) body-node (.ret f))
                     (.ret f))
           inner (if (.returned k) `(block :fn ~(.code body)) (.code body))
-          code
+          worked
             (if (.task-used k)
                 `(let [rules-task-here (rules-task)] ~inner)
-                inner)]
+                inner)
+          code
+            (match (alone-answer (mut k) d f)
+              (Some [alone] `(if ~(.test alone) (~(.call alone) ~@args) ~worked))
+              (None [] worked))]
       (set! (.in-fn k) false)
       (when (and (!= (.ret f) "Void") (= (.ty body) "Void"))
         (die (mut k) body-node (cat "this function must answer " (.ret f))))
       `(defn ~(sym coil-name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
          ~code))))
+
+;;; A function that divides work into a stage's units, when the pipeline names another that gives
+;;; the same answer undivided (`alone F is G`): the test that the stage works on one thread, and
+;;; that function, which then answers for this one.
+(defstruct Alone [(test Code) (call Code)])
+
+(defn alone-answer [(k (mut Comp)) (d g/Node) (f Func)] (-> (Option Alone))
+  (let [full (cat3 (.self k) "/" (.name f))
+        (mut out) (None [Alone])]
+    (for i (range 0 (len (.stages k)))
+      (let [st (get (.stages k) i)]
+        (when (= (.divided st) full)
+          (let [slash (rt/name-end-at (.whole st) 47)
+                wm (subslice (.whole st) 0 slash)
+                wf (subslice (.whole st) (+ slash 1) (len (.whole st)))]
+            (unless (= wm (.self k))
+              (die (mut k)
+                   d
+                   (cat4 (.whole st) " answers for " full ", alone: they are functions of one module")))
+            (match (find-func (self-mod (mut k)) wf)
+              (None [] (die (mut k) d (cat4 (.self k) " has no function named " wf "")))
+              (Some [g]
+                    (unless (= (func-type g) (func-type f))
+                      (die (mut k)
+                           d
+                           (cat4 (.whole st)
+                                 " answers for "
+                                 full
+                                 (cat4 ", alone: it must take and give the same, " (func-type f) ", not " (func-type g)))))
+                    (for p (.params f)
+                      (when (.by-ref p)
+                        (die (mut k) d (cat full " changes what it is given: nothing else can answer for it"))))
+                    (set! out
+                          (Some (Alone
+                                  :test `(<= (rt/stage-threads ~i) 1)
+                                  :call (sym (.coil g)))))))))))
+    out))
 
 ;; ---------------------------------------------------------------- attribute grammars
 
