@@ -1247,7 +1247,7 @@ fn external?(key: Text) -> Bool = key is "external:" ++ _
 # one table in the order of their ids, and each module knows how far its own move.
 fn graph(runtime: Text, paths: [Text]) -> Graph =
   Graph(modules: updated([runtime-module(rt, lay)] ++ [blank-module(id, "", External, bundle-scope) for id in 1..top],
-                         {numbers[i]: module-at(w, i, ids, lay, parts, wholes) for i in 0..len(w.pre)}),
+                         {numbers[i]: made[i] for i in 0..len(w.pre)}),
         by-path: ids, order: [0] ++ [numbers[i] for i in post], ranks: {order-ids[k]: ranked[k] for k in 0..len(order-ids)},
         entries: [ids[p] ?? (panic "{} was not loaded", p) for p in paths],
         blocks: blocks, module-blocks: {0: blocks[0]} ++ {ids[files[k]] ?? (panic "{} has no id", files[k]): blocks[k + 1] for k in 0..len(files)},
@@ -1259,18 +1259,34 @@ fn graph(runtime: Text, paths: [Text]) -> Graph =
         post = [i for i in w.post if not external?(w.pre[i])],
         order-ids = [0] ++ [numbers[i] for i in post],
         ranked = rank!(order-ranks, ["<runtime>"] ++ [w.pre[i] for i in post]),
-        canonical-ids = {w.pre[i]: numbers[i] for i in 0..len(w.pre)},
-        ids = canonical-ids ++ {paths[i]: canonical-ids[roots[i]] ?? -1 for i in 0..len(paths)},
+        # Every node's id by its key, and every entry's by the path it was given as: one map, each
+        # key put in once.
+        root-ids = {w.pre[j]: numbers[j] for j in 0..len(w.pre) if w.parent[j] < 0},
+        keys = w.pre ++ paths,
+        key-ids = numbers ++ [root-ids[roots[i]] ?? -1 for i in 0..len(paths)],
+        ids = {keys[i]: key-ids[i] for i in 0..len(keys)},
         top = (fold t = 1 for n in numbers: max(t, n + 1)),
-        files = [key for key in w.pre if not external?(key)],
+        # Which of the walk's nodes are files, and which file each node is, counted from one.
+        file-at = [i for i in 0..len(w.pre) if not external?(w.pre[i])],
+        files = [w.pre[i] for i in file-at],
+        part-at = updated([0 for key in w.pre], {file-at[k]: k + 1 for k in 0..len(file-at)}),
         # The files something requires, or imports the default or namespace of.
         wholes = {key: true for f in files for key in whole-of(f)},
-        # Where each file's scopes are among the parts the table is made of: after the runtime's.
-        parts = {files[k]: k + 1 for k in 0..len(files)},
         rt = runtime-parsed(runtime).analysis,
         lay = placement(["<runtime>"] ++ files, [size-of(rt.table)] ++ [table-size(f) for f in files]),
+        # Each module, and each file's table at its place, is its own work: all are made at once.
+        made = parallel-map([Spot(w: w, i: i, numbers: numbers, lay: lay, part-at: part-at, wholes: wholes) for i in 0..len(w.pre)],
+                            module-spot, loading.load-threads),
         blocks = [runtime-block(runtime, lay.scope-shifts[0], lay.symbol-shifts[0])]
-                 ++ [file-block(files[k], lay.scope-shifts[k + 1], lay.symbol-shifts[k + 1]) for k in 0..len(files)]
+                 ++ parallel-map([Place(path: files[k], scope-shift: lay.scope-shifts[k + 1], symbol-shift: lay.symbol-shifts[k + 1])
+                                  for k in 0..len(files)], place-block, loading.load-threads)
+
+# One of the walk's nodes, with what its module is made from; and one file's table, with its place.
+record Spot { w: Walk, i: Int, numbers: [Int], lay: Placement, part-at: [Int], wholes: {Text:Bool} }
+record Place { path: Text, scope-shift: Int, symbol-shift: Int }
+
+fn module-spot(s: Spot) -> Module = module-at(s.w, s.i, s.numbers, s.lay, s.part-at, s.wholes)
+fn place-block(p: Place) -> sym.Block = file-block(p.path, p.scope-shift, p.symbol-shift)
 
 # A module's own table at its place among the build's, made once for as long as the table and the
 # place stay the same: the blocks the build's one table is joined from (see `an.linked-table`), so an
@@ -1309,11 +1325,14 @@ fn size-of(t: sym.Table) -> TableSize = TableSize(scopes: sym.scope-count(t), sy
 
 # The module the walk reached `i`th: an outside import, or a file, with side effects as the import
 # that first reached it says, or as an entry has them.
-fn module-at(w: Walk, i: Int, ids: {Text:Int}, lay: Placement, parts: {Text:Int}, wholes: {Text:Bool}) -> Module = match w.pre[i] {
-  "external:" ++ spec => blank-module(ids[w.pre[i]] ?? i + 1, spec, External, bundle-scope)
-  path => module-of(path, ids[path] ?? i + 1, effects, lay.scope-shifts[part], lay.symbol-shifts[part], path in wholes,
-                    [led(ids, x.key) for x in leads-of(path)])
-    where part = parts[path] ?? (panic "{} has no scopes", path),
+# `numbers`: each of the walk's nodes' ids; `part-at`: where each file's scopes are among the parts
+# the table is made of, after the runtime's. What a module leads to is where the walk found each
+# of its leads (`w.targets`), by number.
+fn module-at(w: Walk, i: Int, numbers: [Int], lay: Placement, part-at: [Int], wholes: {Text:Bool}) -> Module = match w.pre[i] {
+  "external:" ++ spec => blank-module(numbers[i], spec, External, bundle-scope)
+  path => module-of(path, numbers[i], effects, lay.scope-shifts[part], lay.symbol-shifts[part], path in wholes,
+                    [numbers[t] for t in w.targets[i]])
+    where part = part-at[i],
           effects = match w.parent[i] {
             p if p < 0 => true
             p => leads-of(w.pre[p])[w.slot[i]].effects
@@ -1365,8 +1384,6 @@ fn shown-path(path: Text) -> Text = match path {
   "/" ++ _ => relative-path(full-path("."), full-path(path))
   _ => path
 }
-
-fn led(ids: {Text:Int}, key: Text) -> Int = ids[key] ?? panic "the walk never reached {}", key
 
 fn public-url(local: Text) -> Text = match loading.public-path {
   "" => local

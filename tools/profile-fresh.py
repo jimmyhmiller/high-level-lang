@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """A fresh process profiled from its first instruction.
 
-usage: profile-fresh.py [--top=N] [--under=FUNCTION] [--runs=N] -- BINARY ARGS...   (run where the build runs)
+usage: profile-fresh.py [--top=N] [--under=FUNCTION] [--without=FUNCTION] [--callers=FUNCTION] [--runs=N] -- BINARY ARGS...
+(run where the build runs)
 
 `sample NAME -wait` attaches after a short build's first phase is over, so loading never shows.
 Here a library put into the process stops it before `main`; `sample` attaches, then it goes on.
 Prints thread time by function, inclusive and self, leaving out waiting. With --under, only
-the stacks that pass through that function. macOS only.
+the stacks that pass through that function; with --without, only those that do not: together,
+`--under=tools.esb.build --without=hl.rt.run-workers` is what one thread does alone. With --callers, that function's own time by the four
+frames that called it. macOS only.
 """
 import collections, os, re, signal, subprocess, sys, tempfile, time
 
@@ -59,7 +62,7 @@ def rows_of(text):
     return rows
 
 
-def add(rows, under, inclusive, own):
+def add(rows, under, inclusive, own, callers="", by_caller=None, without=""):
     stack, total = [], 0
     for i, (depth, count, name) in enumerate(rows):
         while stack and stack[-1][0] >= depth:
@@ -72,10 +75,12 @@ def add(rows, under, inclusive, own):
             j += 1
         here = count - children
         names = [frame[1] for frame in stack]
-        if here <= 0 or any(w in name for w in WAITING) or (under and under not in names):
+        if here <= 0 or any(w in name for w in WAITING) or (under and under not in names) or (without and without in names):
             continue
         total += here
         own[name] += here
+        if callers and name == callers:
+            by_caller[" < ".join(reversed(names[-5:-1]))] += here
         for frame in set(names[names.index(under):] if under else names):
             inclusive[frame] += here
     return total
@@ -88,12 +93,18 @@ def main():
     options = dict(o.lstrip("-").split("=", 1) for o in sys.argv[1:cut])
     command = sys.argv[cut + 1:]
     top, under, runs = int(options.get("top", 50)), options.get("under", ""), int(options.get("runs", 1))
-    inclusive, own, total = collections.Counter(), collections.Counter(), 0
+    callers = options.get("callers", "")
+    inclusive, own, by_caller, total = collections.Counter(), collections.Counter(), collections.Counter(), 0
     for _ in range(runs):
-        total += add(rows_of(sampled(command)), under, inclusive, own)
+        total += add(rows_of(sampled(command)), under, inclusive, own, callers, by_caller, options.get("without", ""))
     if total == 0:
         raise SystemExit("no samples: is the function name exact, and the run long enough?")
     print(f"{total / runs:.0f} ms of thread time per run, not waiting" + (f", under {under}" if under else ""))
+    if callers:
+        print(f"--- {callers}, its own ms per run, by who called it")
+        for name, count in by_caller.most_common(top):
+            print(f"{count / runs:8.1f}  {name[:230]}")
+        return
     print("--- inclusive, ms per run")
     for name, count in inclusive.most_common(top):
         print(f"{count / runs:8.1f} {100 * count / total:5.1f}%  {name[:110]}")

@@ -4141,8 +4141,10 @@
                             (get args (if naming 3 2))
                             (expr (mut k) (get args (if naming 3 2)) "Int")
                             "Int")
+                  ;; One call at a time while what answers were made from is tracked: a map that
+                  ;; gives settings, and one that meets names, which are then met in order.
                   threads
-                    (if (= name "parallel-map-own")
+                    (if (or naming (= name "parallel-map-own"))
                         (te `(rt/own-threads ~(.code asked)) "Int")
                         asked)]
               (unless (list? (.ty xs))
@@ -7794,7 +7796,9 @@
     (emit! (mut out) (compile-fn-as (mut k) d (cat "audited--" name)))
     (emit! (mut out)
            `(defn ~(sym name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
-              (if (rt/auditing?)
+              (if (and (rt/auditing?) (not (rt/names-recording?)))
+                  ;; Not the pass of a naming map that only notes names: it is run on purpose, and
+                  ;; nothing kept would have answered it.
                   ;; Its own time: from its start to its end, less what the audit of the calls it
                   ;; made took; the audit's own work, before and after, added to that.
                   (let [entered (rt/now-ns)
@@ -7836,11 +7840,14 @@
                      (= (get (fn-params (.ty namer)) 0) "Text")
                      (= (fn-ret (.ty namer)) "Int"))
           (die (mut k) n "parallel-map-naming's namer takes a Text and answers its Int"))
-        `(do
-           (rt/names-record-begin!)
-           ~once
-           (rt/names-record-end! ~(.code namer) (len ~(.code xs)))
-           ~once))))
+        ;; While answers are tracked the map runs on one thread, and meets its names in order.
+        `(if (rt/dep-tracking?)
+             ~once
+             (do
+               (rt/names-record-begin!)
+               ~once
+               (rt/names-record-end! ~(.code namer) (len ~(.code xs)))
+               ~once)))))
 
 ;; ---------------------------------------------------------------- working apart
 
@@ -10923,6 +10930,10 @@
                                               ;; storage, from the store's own copy too: the answer
                                               ;; outlives what asked.
                                               (let [apart-open (rt/lasting-enter!)
+                                                    ;; An answer made while names are only noted
+                                                    ;; (`rt/name-record!`) may hold a name's -1:
+                                                    ;; it is given to whoever asked and not kept.
+                                                    noted-before (rt/name-notes)
                                                     owned
                                                       (cond reclaim (~(sym (cat "memo-own--" name)) s key ~@args)
                                                             ;; Asked for by a computation working apart:
@@ -11047,7 +11058,8 @@
                                                                   (set! new-answer
                                                                         true)
                                                                   fresh))))
-                                                    apart-left (rt/lasting-leave! apart-open)]
+                                                    apart-left (rt/lasting-leave! apart-open)
+                                                    noted (!= (rt/name-notes) noted-before)]
                                                 (rt/spin-lock! word)
                                                 (when tracking
                                                   ;; Its arguments: the store's own copy already, while the run
@@ -11064,9 +11076,10 @@
                                                     (set! (mut (.dirty s))
                                                           key
                                                           1)))
-                                                (set! (mut (.table s))
-                                                      key
-                                                      made)
+                                                (unless noted
+                                                  (set! (mut (.table s))
+                                                        key
+                                                        made))
                                                 ;; The table holds the region its answer was made in: a new
                                                 ;; one's, the one it replaces let go; or, when the answer
                                                 ;; kept is the one it had, the new region let go.
@@ -11107,8 +11120,10 @@
                           (match answer
                             (Some [v]
                                   (do
-                                    (set! (mut (~near t)) key v)
-                                    (set! (mut (~near-regions t)) key answer-region)
+                                    ;; Not while names are only noted: see `noted` above.
+                                    (unless (rt/names-recording?)
+                                      (set! (mut (~near t)) key v)
+                                      (set! (mut (~near-regions t)) key answer-region))
                                     (rt/region-uses-id! answer-region)
                                     v))
                             (None [] (panic "memo fn {} lost its answer" ~name)))))))))
@@ -11122,7 +11137,7 @@
                                    `false))
                     (~entry ~@args)
                     ;; Not kept: counted, while auditing, by its arguments (see `rt/audit-call!`).
-                    (if (rt/auditing?)
+                    (if (and (rt/auditing?) (not (rt/names-recording?)))
                         (let [key ~(memo-key-code (mut k) f)
                               started (rt/now-us)
                               v (~(sym compute) ~@args)]

@@ -178,6 +178,14 @@
 ;;; A lock on one word that a structure holds, for work queues: spin, then let others run.
 (extern sched_yield :cc (cc/C) [] (-> i32))
 
+;;; How often a thread gave its core away: waiting for a lock taken whole, to read beside others, or
+;;; for an answer another thread is making. Counted always (a wait costs far more than counting it);
+;;; shown with HL_LOCK_TRACE set (see `lock-trace-report!`).
+(defstruct Yields [(whole i64) (beside i64) (answer i64)])
+
+(defn yields [] (-> (ptr Yields))
+  (primitive/alloc-static Yields))
+
 ;;; Taken only when it looks free: a thread that waits reads the word, which every waiter can do
 ;;; at once, and writes to it only to take it. Writing while it is held would pull the word from
 ;;; whoever holds it and from every other waiter, each time round.
@@ -187,6 +195,7 @@
       ;; Whoever holds it may have lost its core: after a while, let it have this one.
       (set! turns (+ turns 1))
       (when (> turns 200)
+        (atomic/add (field (yields) whole) 1)
         (sched_yield)
         (set! turns 0))))
   0)
@@ -208,6 +217,7 @@
             (do
               (set! turns (+ turns 1))
               (when (> turns 200)
+                (atomic/add (field (yields) beside) 1)
                 (sched_yield)
                 (set! turns 0)))))))
   0)
@@ -217,6 +227,7 @@
   0)
 
 (defn pause! [] (-> void)
+  (atomic/add (field (yields) answer) 1)
   (sched_yield)
   0)
 
@@ -510,7 +521,8 @@
                           ;; that thread's worker slot, plus one, whose own settings it reads.
                           (settings-view i64)
                           ;; Which element of a map this thread is working on now.
-                          (item i64)])
+                          (item i64)
+                          (name-notes i64)])
 
 ;;; The thread-specific key of the threads' region stacks, plus one, as each place that asks keeps
 ;;; it: the key never changes once made, so a place asks `workers` only the first time.
@@ -539,7 +551,7 @@
     (store! t (ThreadRegions :top (primitive/make-dyn Allocator c)
                              :region r
                              :stack (ArrayList::new [i64] (malloc-allocator)) :scratch 0 :apart 0
-                             :kept-last "" :in-job 0 :settings-view 0 :item 0))
+                             :kept-last "" :in-job 0 :settings-view 0 :item 0 :name-notes 0))
     (push! (mut (.stack t)) (primitive/cast i64 r))
     (push! (mut (.stack t)) (primitive/cast i64 c))
     (push! (mut (.stack t)) 0)
@@ -3265,7 +3277,10 @@
   [(pre (ArrayList (slice u8)))
    (post (ArrayList i64))
    (parent (ArrayList i64))
-   (slot (ArrayList i64))])
+   (slot (ArrayList i64))
+   ;; Where each of a node's children is in `pre`, in the order it gave them: whoever follows an
+   ;; edge has the node it leads to by number, with no name to look up.
+   (targets (ArrayList (ArrayList i64)))])
 
 ;;; Where a walk is: the nodes from a root down, each one's children, and the next of them to try.
 (defstruct WalkPath
@@ -3286,6 +3301,7 @@
     (push! (mut (.pre w)) node)
     (push! (mut (.parent w)) parent)
     (push! (mut (.slot w)) slot)
+    (push! (mut (.targets w)) (ArrayList::new [i64] (tree-allocator)))
     (push! (mut (.at path)) i)
     (push! (mut (.kids path)) (children node))
     (push! (mut (.next path)) 0)
@@ -3299,7 +3315,8 @@
             :pre (ArrayList::new [(slice u8)] (tree-allocator))
             :post (ArrayList::new [i64] (tree-allocator))
             :parent (ArrayList::new [i64] (tree-allocator))
-            :slot (ArrayList::new [i64] (tree-allocator)))
+            :slot (ArrayList::new [i64] (tree-allocator))
+            :targets (ArrayList::new [(ArrayList i64)] (tree-allocator)))
         (mut seen)
           (HashMap::new [(slice u8) i64] (value-allocator) (text-keyops))
         (mut path)
@@ -3317,17 +3334,19 @@
                       k (get (.next path) top)
                       ks (get (.kids path) top)]
                   (if (< k (len ks))
-                      (let [c (get ks k)]
+                      (let [c (get ks k)
+                            from (get (.at path) top)]
                         (set! (mut (.next path)) top (+ k 1))
                         (match (get seen c)
-                          (Some [_] 0)
+                          (Some [at] (do (push! (elem (mut (.targets w)) from) at) 0))
                           (None []
+                                (push! (elem (mut (.targets w)) from) (len (.pre w)))
                                 (walk-reach! (mut w)
                                              (mut seen)
                                              (mut path)
                                              children
                                              c
-                                             (get (.at path) top)
+                                             from
                                              k))))
                       (do
                         (push! (mut (.post w)) (get (.at path) top))
@@ -3389,10 +3408,17 @@
   0)
 
 (defn name-record! [(s (slice u8))] (-> i64)
-  (let [r (names-record)]
+  (let [r (names-record)
+        t (thread-regions)]
     (push! (elem (mut (.notes r)) (worker-slot))
-           (NameNote :item (.item (thread-regions)) :name (own-text s)))
+           (NameNote :item (.item t) :name (own-text s)))
+    (set! (.name-notes t) (+ (.name-notes t) 1))
     -1))
+
+;;; How many names this thread has noted so far: more after a computation than before it means
+;;; its answer may hold a name's -1.
+(defn name-notes :inline (Always) [] (-> i64)
+  (.name-notes (thread-regions)))
 
 (defn names-record-begin! [] (-> void)
   (let [r (names-record)]
@@ -3453,38 +3479,50 @@
 ;;; is big enough; a key whose block is too small, or that has none, gets a new one at the end. So a
 ;;; key that grows, or appears, moves nothing but itself. Numbers no key uses any more stay empty.
 (defstruct Places
-  [(at (HashMap (slice u8) i64))
-   (size (HashMap (slice u8) i64))
+  [(slot (HashMap (slice u8) i64))
+   (starts (ArrayList i64))
+   (sizes (ArrayList i64))
    (keys (ArrayList (slice u8)))
    (end i64)])
 
 (defn places-new [] (-> Places)
   (Places
-    ;; Keyed by kept texts (see "kept texts"): a key is one text, here and in `keys`.
-    :at (HashMap::new [(slice u8) i64] (malloc-allocator) (kept-keyops))
-    :size (HashMap::new [(slice u8) i64] (malloc-allocator) (kept-keyops))
+    ;; Keyed by kept texts (see "kept texts"): a key is one text, here and in `keys`. A key is
+    ;; looked up once for its place among `keys`, where its block's start and size are.
+    :slot (HashMap::new [(slice u8) i64] (malloc-allocator) (kept-keyops))
+    :starts (ArrayList::new [i64] (malloc-allocator))
+    :sizes (ArrayList::new [i64] (malloc-allocator))
     :keys (ArrayList::new [(slice u8)] (malloc-allocator))
     :end 0))
 
 ;;; Where `key`'s block of `size` numbers starts: its block if it holds that many, else a new one.
 (defn place! [(p (mut Places)) (key (slice u8)) (size i64)] (-> i64)
-  (let [fits (match (get (.size p) key) (Some [n] (>= n size)) (None [] false))]
-    (if fits
-        (match (get (.at p) key)
-          (Some [a] a)
-          (None [] (panic "place {} has a size and no start" key)))
-        (let [a (.end p)]
-          (match (get (.at p) key)
-            (Some [_] 0)
-            (None [] (do (push! (mut (.keys p)) (kept-text key)) 0)))
-          (set! (mut (.at p)) key a)
-          (set! (mut (.size p)) key size)
-          (set! (.end p) (+ a size))
-          a))))
+  (match (get (.slot p) key)
+    (Some [i]
+          (if (>= (get (.sizes p) i) size)
+              (get (.starts p) i)
+              (let [a (.end p)]
+                (set! (mut (.starts p)) i a)
+                (set! (mut (.sizes p)) i size)
+                (set! (.end p) (+ a size))
+                a)))
+    (None []
+          (let [a (.end p)
+                i (len (.keys p))
+                kept (kept-text key)]
+            (push! (mut (.keys p)) kept)
+            (push! (mut (.starts p)) a)
+            (push! (mut (.sizes p)) size)
+            (set! (mut (.slot p)) kept i)
+            (set! (.end p) (+ a size))
+            a))))
 
 ;;; Where `key`'s block starts, or -1 when it has none: a lookup that changes nothing.
 (defn place-of [(p Places) (key (slice u8))] (-> i64)
-  (match (get (.at p) key) (Some [a] a) (None [] -1)))
+  (match (get (.slot p) key) (Some [i] (get (.starts p) i)) (None [] -1)))
+
+(defn place-size [(p Places) (key (slice u8))] (-> i64)
+  (match (get (.slot p) key) (Some [i] (get (.sizes p) i)) (None [] -1)))
 
 ;;; The first number no block holds.
 (defn places-end [(p Places)] (-> i64)
@@ -3497,8 +3535,7 @@
        (block :same
          (for key (.keys a)
            (unless (and (= (place-of a key) (place-of b key))
-                        (= (match (get (.size a) key) (Some [n] n) (None [] -1))
-                           (match (get (.size b) key) (Some [n] n) (None [] -1))))
+                        (= (place-size a key) (place-size b key)))
              (return-from :same false)))
          true)))
 
@@ -7598,13 +7635,10 @@
 ;;; Blocks of numbers: each key with its block's start and size, and where they end.
 (defn persist-encode-Places [(w (ptr Writer)) (p Places)] (-> void)
   (put-varint! w (len (.keys p)))
-  (for key (.keys p)
-    (put-text! w key)
-    (put-int! w (place-of p key))
-    (put-int! w
-              (match (get (.size p) key)
-                (Some [n] n)
-                (None [] (panic "place {} has a start and no size" key)))))
+  (for i (range 0 (len (.keys p)))
+    (put-text! w (get (.keys p) i))
+    (put-int! w (get (.starts p) i))
+    (put-int! w (get (.sizes p) i)))
   (put-int! w (.end p)))
 
 (defn persist-encode-Ranks [(w (ptr Writer)) (x Ranks)] (-> void)
@@ -7629,12 +7663,13 @@
   (let [(mut out) (places-new)
         n (take-varint r)]
     (for _ (range 0 n)
-      (let [key (take-text r)
+      (let [key (kept-text (take-text r))
             a (take-int r)
             size (take-int r)]
+        (set! (mut (.slot out)) key (len (.keys out)))
         (push! (mut (.keys out)) key)
-        (set! (mut (.at out)) key a)
-        (set! (mut (.size out)) key size)))
+        (push! (mut (.starts out)) a)
+        (push! (mut (.sizes out)) size)))
     (set! (.end out) (take-int r))
     out))
 
@@ -8795,7 +8830,16 @@
 
 ;;; What the audit saw, most time spent on repeats first: each function, its calls, how many had
 ;;; arguments seen before, and the time those took (counting what they called).
+(defn lock-trace-report! [] (-> void)
+  (when (env-on? "HL_LOCK_TRACE")
+    (eprintln "[locks] gave a core away {} times for a lock taken whole, {} to read beside others, {} for an answer being made"
+              (atomic/read (field (yields) whole))
+              (atomic/read (field (yields) beside))
+              (atomic/read (field (yields) answer))))
+  0)
+
 (defn memo-audit-report! [] (-> void)
+  (lock-trace-report!)
   (when (auditing?)
     (let [a (audit-state)
           (mut order) (ArrayList::new [i64] (malloc-allocator))]
