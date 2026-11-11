@@ -224,19 +224,39 @@ def split_outputs(entries, flags):
     sh([E] + entries + ["--bundle", "--splitting", "--format=esm", f"--outdir={SCRATCH}/split-e", "--log-level=error"] + flags)
     listing = lambda d: sorted(re.sub(r"-[A-Z0-9]{8}\.js$", ".js", os.path.relpath(f, d)) for f in glob.glob(d + "/**/*.js", recursive=True))
     return listing(f"{SCRATCH}/split-o"), listing(f"{SCRATCH}/split-e")
-for label, entries, flags in [("fixture", ["apps/split/a.js", "apps/split/b.js"], []),
-                              ("fixture minified", ["apps/split/a.js", "apps/split/b.js"], ["--minify"]),
-                              ("nested directories", ["apps/split/a.js", "apps/split/sub/nested.js"], []),
-                              ("lodash-es, rxjs, d3 and import()", ["apps/split/real1.js", "apps/split/real2.js"], []),
-                              ("the same, minified", ["apps/split/real1.js", "apps/split/real2.js"], ["--minify"]),
-                              ("TypeScript", ["apps/split/ts-entry.ts"], [])]:
+# What an entry loads before it runs: its file and every chunk it imports, statically.
+def loaded_bytes(d, name):
+    seen, todo = set(), [name]
+    while todo:
+        f = os.path.normpath(todo.pop())
+        if f in seen: continue
+        seen.add(f)
+        text = open(f"{d}/{f}").read()
+        todo += [os.path.join(os.path.dirname(f), m) for m in re.findall(r'(?:^|[;}\n])\s*(?:import|export)\s*(?:[\w$*{},\s]*?\bfrom\s*)?"(\./[^"]+)"', text)]
+    return sum(os.path.getsize(f"{d}/{f}") for f in seen)
+# Where packages say they have no side effects (lodash-es, rxjs, d3), an entry loads only what it
+# uses of them, where esbuild gives every entry that imports a barrel each file the barrel's used
+# re-exports lead to: the same output, from fewer bytes loaded, in other files. Elsewhere the files
+# are esbuild's.
+for label, entries, flags, layout in [("fixture", ["apps/split/a.js", "apps/split/b.js"], [], "files"),
+                              ("fixture minified", ["apps/split/a.js", "apps/split/b.js"], ["--minify"], "files"),
+                              ("nested directories", ["apps/split/a.js", "apps/split/sub/nested.js"], [], "files"),
+                              ("lodash-es, rxjs, d3 and import()", ["apps/split/real1.js", "apps/split/real2.js"], [], "loads"),
+                              ("the same, minified", ["apps/split/real1.js", "apps/split/real2.js"], ["--minify"], "loads"),
+                              ("TypeScript", ["apps/split/ts-entry.ts"], [], "files")]:
     ours, theirs = split_outputs(entries, flags)
     same = True
+    loads = []
     for en in entries:
         name = re.sub(r"\.[a-z]+$", ".js", en.replace("apps/split/", ""))
         x, y = sh(["node", f"{SCRATCH}/split-o/{name}"], 30), sh(["node", f"{SCRATCH}/split-e/{name}"], 30)
         same = same and x[0] == 0 and x[1] and x[1] == y[1]
-    check(same and ours == theirs, f"{label}: same output as esbuild's, in the same {len(ours)} files")
+        loads.append((loaded_bytes(f"{SCRATCH}/split-o", name), loaded_bytes(f"{SCRATCH}/split-e", name)))
+    if layout == "files":
+        check(same and ours == theirs, f"{label}: same output as esbuild's, in the same {len(ours)} files")
+    else:
+        check(same and all(o <= e for o, e in loads),
+              f"{label}: same output as esbuild's, each entry loading no more (" + ", ".join(f"{o} vs {e} bytes" for o, e in loads) + ")")
 
 print("== lowering for older targets, against esbuild and acorn")
 def lowered_check(entry, year, flags, label):

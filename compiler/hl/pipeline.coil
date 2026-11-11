@@ -27,7 +27,8 @@
 ;;; this does not compile, and the error says what was written, and where.
 ;;;
 ;;; The output is `use-plan!(name)`, which gives each stage the threads that plan says,
-;;; `use-threads!(n)`, which gives every stage n, and `plan-names()`.
+;;; `use-threads!(n)`, which gives n to every stage that could be shown to share no state (and one
+;;; to any other), and `plan-names()`.
 (module hl.pipeline)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
@@ -1742,6 +1743,21 @@
       `(rt/cores)
       `~(rt/parse-int (.text n))))
 
+;;; Whether every function stage `s` names, and all they call, writes no shared state: what a plan
+;;; must show before it runs the stage on many threads.
+(defn stage-safe? [(chk (mut Checker)) (s Stage)] (-> bool)
+  (let [(mut safe) true]
+    (for full (.functions s)
+      (let [slash
+              (let [(mut cut) -1]
+                (for i (range 0 (len full))
+                  (when (= (get full i) #\/) (set! cut i)))
+                cut)
+            e (fun-effect (mut chk) (subslice full 0 slash) (subslice full (+ slash 1) (len full)))]
+        (when (or (> (len (.writes e)) 0) (> (len (.hooks e)) 0))
+          (set! safe false))))
+    safe))
+
 (defn check-stage! [(chk (mut Checker))
                     (c (mut dsl/Cur))
                     (src (slice u8))
@@ -1863,9 +1879,13 @@
                                         (dsl/join3 (.name (get stages j))
                                                    " and "
                                                    (.name (get stages i)))))))))))
+    ;; `--threads=N` gives N only to a stage shown to share no state, as a plan's `parallel` is
+    ;; checked; any other stage stays on one thread.
     (for i (range 0 (len stages))
       (unless (= (.unit (get stages i)) "whole")
-        (push! (mut every) `(rt/stage-threads! ~i n))))
+        (if (stage-safe? (mut chk) (get stages i))
+            (push! (mut every) `(rt/stage-threads! ~i n))
+            (push! (mut every) `(rt/stage-threads! ~i 1)))))
     (let [given (sizes-of tree)]
       (for i (range 0 (len given))
         (push! (mut size-arms) `(= name ~(.name (get given i))))

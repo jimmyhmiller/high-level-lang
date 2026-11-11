@@ -467,6 +467,22 @@ for policy, fragments in MODES:
     assert "UNUSED_INITIALIZER_ONLY" not in code and "UNUSED_NOISE_BARREL" not in code
 print("ok   conditional initializer calls retain used initialization without retaining unused side-effect-free barrel imports")
 
+# A side-effect-free package's module that computes something as it loads: only the entry that uses
+# it loads it, though both enter the barrel that re-exports it (date-fns's shape).
+root = fixture("side-effect-free-barrel-initialization", {
+    "package.json": '{"type":"module","sideEffects":false}',
+    "index.js": 'export * from "./x.js"; export * from "./y.js";\n',
+    "x.js": 'function make() { return { n: "ONLY_X_COMPUTES" }; }\nconst t = make();\nexport function x() { return t.n; }\n',
+    "y.js": 'export function y() { return "ONLY_Y"; }\n',
+    "a.js": 'import {x} from "./index.js"; export const result = x();\n',
+    "b.js": 'import {y} from "./index.js"; export const result = y();\n',
+})
+for policy, fragments in MODES:
+    output = build(root, ["a.js", "b.js"], policy, fragments)
+    assert execute(root, output, ["a.js", "b.js"], "[m0.result,m1.result]") == '["ONLY_X_COMPUTES","ONLY_Y"]'
+    assert "ONLY_X_COMPUTES" not in closure(output, "b.js")
+print("ok   a side-effect-free module that computes as it loads is loaded only by the entry using it")
+
 root=fixture("function-alias-order", {
     "library.js": 'export function fn(){return 1;} fn=()=>2; export const alias=fn; export function home(){return "HOME_ALIAS:"+alias();} export function admin(){return "ADMIN_ALIAS:"+alias();}\n',
     "a.js": 'import {home} from "./library.js"; export const result=home();\n',

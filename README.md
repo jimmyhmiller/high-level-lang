@@ -523,7 +523,7 @@ across 18 apps and 11 kinds of build.
 Every plan gives the same output, byte for byte, as the serial build. That holds for 12 apps,
 plain, minified, pretty and with source maps, and the verify suite passes under the `full` plan.
 Parts are cut by weight and only after declarations, which no minification rule merges across.
-`--pipeline=NAME` picks a plan, and `--threads=N` runs every stage on N threads.
+`--pipeline=NAME` picks a plan, and `--threads=N` runs on N threads every stage the pipeline checker shows writes no shared state (any other on one).
 
 `--minify`, ms, best of 15, every column measured side by side, 12-core (8 fast, 4 slow) M-series
 laptop shared with other work:
