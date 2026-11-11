@@ -1309,6 +1309,10 @@
       (param (mut f) "pretty" "Bool" false)
       (param (mut f) "tracking" "Bool" false)
       (push! (mut (.funcs m)) f))
+    (let [(mut f) (func-of "render-files" "hl.rt.Rendered")]
+      (param (mut f) "n" node false)
+      (param (mut f) "pretty" "Bool" false)
+      (push! (mut (.funcs m)) f))
     (let [(mut f) (func-of "opaque-spine?" "Bool")]
       (param (mut f) "n" node false)
       (push! (mut (.funcs m)) f))
@@ -2683,6 +2687,67 @@
         body (stmt (mut k) (kid n 0) want)]
     (locals-reset! (mut k) mark)
     (te `(let [~@lets] ~(.code body)) (.ty body))))
+
+;;; The order a module's state, contexts and constants are given their values in: each after those
+;;; its value reads, directly or through the module's functions it names, whatever order they are
+;;; written in. One whose value reads itself, or a circle of them, is an error: it would read a value
+;;; not given yet. Every other declaration keeps its place, after these.
+(defn state-order [(k (mut Comp)) (decls (ArrayList g/Node))] (-> (ArrayList g/Node))
+  (let [(mut globals) (ArrayList::new [g/Node] (malloc-allocator))
+        (mut others) (ArrayList::new [g/Node] (malloc-allocator))
+        (mut gnames) (text-list)
+        (mut fn-names) (text-list)
+        (mut fn-decls) (ArrayList::new [g/Node] (malloc-allocator))
+        (mut uses) (ArrayList::new [(ArrayList i64)] (malloc-allocator))
+        (mut done) (ArrayList::new [bool] (malloc-allocator))
+        (mut order) (ArrayList::new [g/Node] (malloc-allocator))]
+    (for d decls
+      (if (or (= (.kind d) (g/KState)) (= (.kind d) (g/KTaskState)) (= (.kind d) (g/KContext))
+              (= (.kind d) (g/KConst)) (= (.kind d) (g/KInh)) (= (.kind d) (g/KInput))
+              (= (.kind d) (g/KCollect)) (= (.kind d) (g/KGiven)) (= (.kind d) (g/KSetting)))
+          (do (push! (mut globals) d) (push! (mut gnames) (.text (kid d 0))) (push! (mut done) false))
+          (push! (mut others) d))
+      (when (= (.kind d) (g/KFn))
+        (push! (mut fn-names) (.text (kid d 0)))
+        (push! (mut fn-decls) d)))
+    ;; What each value reads: the names it mentions, and those of the functions it names, and so on.
+    (for g globals
+      (let [(mut reached) (text-list)
+            (mut i) 0
+            (mut idx) (ArrayList::new [i64] (malloc-allocator))]
+        (when (> (len (.kids g)) 2) (names-in! (kid g 2) (mut reached)))
+        (while (< i (len reached))
+          (let [nm (get reached i)]
+            (for j (range 0 (len fn-names))
+              (when (= (get fn-names j) nm)
+                (let [(mut inner) (text-list)]
+                  (names-in! (get fn-decls j) (mut inner))
+                  (for x inner (unless (has-name? reached x) (push! (mut reached) x)))))))
+          (set! i (+ i 1)))
+        (for j (range 0 (len gnames))
+          (when (has-name? reached (get gnames j)) (push! (mut idx) j)))
+        (push! (mut uses) idx)))
+    (while (< (len order) (len globals))
+      (let [(mut progressed) false]
+        (for j (range 0 (len globals))
+          (when (not (get done j))
+            (let [(mut ready) true]
+              (for u (get uses j)
+                (unless (and (!= u j) (get done u)) (set! ready false)))
+              (when ready
+                (set! (mut done) j true)
+                (push! (mut order) (get globals j))
+                (set! progressed true)))))
+        (unless progressed
+          (for j (range 0 (len globals))
+            (when (not (get done j))
+              (die (mut k)
+                   (get globals j)
+                   (cat3 "the value of `"
+                         (get gnames j)
+                         "` reads itself, or values that read it, before any of them is given one")))))))
+    (for d others (push! (mut order) d))
+    order))
 
 ;;; The order to work out equations in: each after the others it mentions. A circle stops.
 (defn where-order [(inits (ArrayList g/Node))] (-> (ArrayList i64))
@@ -11796,7 +11861,7 @@
         (for r (.recs self) (emit! (mut out) (compile-record (mut k) r)))
         (let [(mut task-fields) (primitive/code-list-new)
               (mut task-inits) (primitive/code-list-new)]
-          (for d decls
+          (for d (state-order (mut k) decls)
             (when (or (= (.kind d) (g/KState))
                       (= (.kind d) (g/KTaskState))
                       (= (.kind d) (g/KContext))

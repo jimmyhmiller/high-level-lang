@@ -313,6 +313,28 @@ Use `--baseline-fragments` when comparing against an older fragment-capable bina
 Use `--iterations 5` to amortize launch overhead and CPU timer resolution. Multi-output watch
 and disk caching retain their existing CLI restriction; single-output caching accepts fragments.
 
+## What a build says of itself
+
+`--analyze=DIR` writes what the build made, and why, beside its outputs, the data Turbopack's
+`next analyze` shows: `DIR/analysis.json`, and `DIR/analysis.jsonl`, one record a line for
+scripts. Keep a directory per build to compare them. The outputs themselves are byte for byte those
+of the same build without it.
+
+- **Outputs**: each file's size, the files it imports and loads with `import()`, and what of each
+  module it holds, to the byte; the rest is its own (imports, exports).
+- **Routes**: each entry and each `import()` root, the files it loads before it runs, and their
+  bytes.
+- **Modules**: size in the output and in the source; statements kept of all; what it imports; the
+  modules whose kept statements read what it declares, and the names they read; and the statements
+  kept only for what they do as the module loads, with their lines. On three.js's math page,
+  `three.module.js`'s 163 KB is used by nothing, and kept by 13 such statements (`ShaderLib = {…}`).
+
+It is read from what the build has: linking's database, the modules, and where each output passes
+from one module's code to the next. The emitter gives each statement its module, and the printer
+marks only where the module changes (`render-files`), not every token as a source map does. It costs
+2–6% more CPU (three.js, zod, rxjs, d3). `tools/analyze-check.py` checks the outputs are unchanged,
+every byte is attributed, and each route loads what its files import.
+
 ## Paired client/server builds
 
 A target with `client-outfile` builds one server entry and discovers browser entries from its

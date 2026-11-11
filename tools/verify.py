@@ -437,6 +437,11 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and out.strip().endswith("all chunk policies check out"), "chunk policies and fragments: "
       + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} checks" if code == 0 else out[-1800:]))
 
+print("== what a build says of itself")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyze-check.py"), ESB], 300)
+check(code == 0 and out.strip().endswith("all analysis checks passed"), "--analyze: "
+      + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} checks (outputs unchanged, bytes attributed, routes, viewer)" if code == 0 else out[-1800:]))
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "

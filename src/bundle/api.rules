@@ -24,6 +24,7 @@ use bundle.ascii as ascii
 use bundle.finish as fin
 use bundle.hmr as hmr
 use bundle.chunking as packing
+use bundle.analyze as analyze
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -89,6 +90,8 @@ boxed record Options {
   public-path: Text,
   tsconfig: Text,
   legal-comments: Text,
+  # `--analyze=DIR`: what the build made, and why, as JSON (see bundle.analyze).
+  analyze: Text,
   jsx: jsx.Options,
   target: Int,
   on-resolve: [Fn(Text,Text)->Text?],
@@ -110,7 +113,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           defines: [], main-fields: ["browser", "module", "main"], conditions: ["import", "browser"],
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
-          packages-external: false, public-path: "", tsconfig: "", legal-comments: "eof", jsx: jsx.options-new(), target: lower.no-lowering,
+          packages-external: false, public-path: "", tsconfig: "", legal-comments: "eof", analyze: "", jsx: jsx.options-new(), target: lower.no-lowering,
           on-resolve: [], on-load: [],
           transform: keep-as-is, optimize: default-optimize)
 
@@ -271,10 +274,18 @@ fn stable-runs(stmts: [Node]) -> [[Node]] = [stmts[ends[i]..ends[i + 1]] for i i
 fn program-of(hashbang: Node, stmts: [Node]) -> Node = Program(hashbang, List(stmts...))
 
 # How parts are printed, which the threads that print them read: set with the build's other settings.
-record Printing { pretty: Bool, maps: Bool, ascii: Bool }
+record Printing { pretty: Bool, maps: Bool, ascii: Bool, files: Bool }
 setting printing: Printing
 
-fn render-part(p: Node) -> Rendered = js.render-tracked(p, printing.pretty, printing.maps)
+fn render-part(p: Node) -> Rendered = printed(p, printing.pretty, printing.maps, printing.files)
+
+# Printed, with where each leaf landed for a source map; or, for an analysis, only where the text
+# passes from one module's code to another's.
+fn printed(p: Node, pretty: Bool, maps: Bool, files: Bool) -> Rendered = match maps, files {
+  true, _ => js.render-tracked(p, pretty, true)
+  false, true => js.render-files(p, pretty)
+  false, false => js.render-tracked(p, pretty, false)
+}
 
 # Texts printed apart, joined end to end, and every source map mark moved to where its text landed.
 # A text that ends where the printer dropped a `;` gets it back, as the printer would have written it
@@ -340,7 +351,7 @@ fn linking-of(o: Options, entry-namespace: Bool, splitting: Bool, f: Format) -> 
 
 fn emitting-of(o: Options, f: Format) -> e.Emitting =
   e.Emitting(void-undefined: o.minify-syntax, native-require: f.native-require,
-             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap)
+             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, files: len(o.analyze) > 0)
 
 # The names esbuild gives output files: the entry's path below the entries' common directory.
 fn common-dir(paths: [Text]) -> Text = fold dir = dir-of(paths[0]) for p in paths: enclosing(dir, p)
@@ -518,7 +529,7 @@ fn dev-graph-built(before: hmr.Dev, events: Text, g: m.Graph) -> DevStep =
 
 fn dev-step(before: hmr.Dev, now: hmr.Dev, entries: [Int]) -> DevStep = DevStep(dev: now, sent: hmr.update(before, now, entries))
 
-fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii)
+fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: o.sourcemap, ascii: o.charset-ascii, files: len(o.analyze) > 0)
 
 # A build once it is set up: load, link, name, and the rest.
 fn loaded-built(o: Options, f: Format) -> [Written] =
@@ -553,6 +564,10 @@ fn named-built(o: Options, f: Format) -> [Written] =
   beside(o.outfile ++ ".LEGAL.txt", notes.file) ++ with-map(o, o.outfile, full, full, len(head) + out0.base, out0.marks)
   ++ [sheet-written(css-out, b)... for b in css]
   ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
+  ++ analysis-written(o, [analyze.Output(path: o.outfile, kind: "js", text: full, base: len(head) + out0.base, marks: out0.marks, root: m.entry,
+                                         imports: [], dynamic: [])]
+                         ++ [analyze.Output(path: css-out, kind: "css", text: b.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for b in css],
+                      [m.entry])
   where out0 = match grouped?(o) {
           true => grouped-output(o, f)
           false => flat-output(o, f)
@@ -614,7 +629,7 @@ fn spec-optimized(o: Options, stmts: [Node]) -> [Node] = dropped-of(o, steps).bo
 fn run-printed(stmts: [Node]) -> Rendered = rendered-of(building.options, stmts)
 
 fn rendered-of(o: Options, stmts: [Node]) -> Rendered =
-  js.render-tracked(ascii-of(o, program-of(None(), stmts)), o.pretty, o.sourcemap)
+  printed(ascii-of(o, program-of(None(), stmts)), o.pretty, o.sourcemap, len(o.analyze) > 0)
 
 # With the bundler's own optimiser and nothing to lower, the output is made group by group (see
 # `e.groups`), each group's text from its own units alone, on many threads at once, and the texts
@@ -684,7 +699,7 @@ fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.
           false => fold.run(emission.tree)
         }),
         stmts = chunks.imports-of(c, all) ++ p.body.kids ++ chunk-root-statements(c) ++ chunks.exports-of(c, all),
-        r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
+        r = printed(Program(None(), List(stmts...)), o.pretty, o.sourcemap, len(o.analyze) > 0)
 
 # With the bundler's own optimiser and nothing to lower (see `grouped?`), a chunk's whole body is
 # its own work: the chunks are made at once, each giving the settings that say which chunk it is
@@ -703,7 +718,7 @@ fn chunk-own(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.Unit
           false => fold.run(emission.tree)
         })),
         stmts = chunks.imports-of(c, all) ++ p.body.kids ++ chunk-root-statements(c) ++ chunks.exports-of(c, all),
-        r = js.render-tracked(Program(None(), List(stmts...)), o.pretty, o.sourcemap)
+        r = printed(Program(None(), List(stmts...)), o.pretty, o.sourcemap, len(o.analyze) > 0)
 
 fn chunk-programs(o: Options, all: [chunks.Chunk], selected: [[e.Unit]]) -> [Printed] = match grouped?(o) {
   false => [chunk-program(o, all[i], all, selected[i]) for i in 0..len(all)]
@@ -794,6 +809,9 @@ fn root-stylesheet(o: Options, root: Int, sheets: [Text]) -> RootStylesheet =
 fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> [Written] =
   [w for ws in [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths, homes) for i in 0..len(all)] for w in ws]
   ++ [sheet-written(s.path, s.bundle)... for s in styles]
+  ++ analysis-written(o, [chunk-analyzed(all, i, printed[i], holes[i], paths) for i in 0..len(all)]
+                         ++ [analyze.Output(path: s.path, kind: "css", text: s.bundle.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for s in styles],
+                      m.entries ++ an.linked.dynamic-roots)
   ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
         printed = chunk-programs(o, all, [chunk-units(c, unit-index) for c in all]),
@@ -817,3 +835,22 @@ fn chunk-written(o: Options, c: chunks.Chunk, pr: Printed, holes: [chunks.Hole],
   beside(path ++ ".LEGAL.txt", notes.file) ++ with-map(o, path, done.text ++ notes.tail, done.text, pr.base, done.marks)
   where done = chunks.filled(pr.text, pr.base, pr.marks, holes, path, paths),
         notes = legal.placed(o.legal-comments, legal-of-modules(some(c), homes), path)
+
+# ---------------------------------------------------------------- what a build says of itself
+
+# A chunk as the analysis sees it: its text with every chunk's name in it, and where it passes from
+# one module's code to the next; what it imports, and what it loads with `import()`.
+fn chunk-analyzed(all: [chunks.Chunk], i: Int, pr: Printed, holes: [chunks.Hole], paths: [Text]) -> analyze.Output =
+  analyze.Output(path: paths[i], kind: "js", text: done.text, base: pr.base, marks: done.marks, root: c.root, imports: imports,
+                 dynamic: [h.chunk for h in holes if h.chunk < len(all) and h.chunk != i and not (h.chunk in imports) distinct h.chunk])
+  where c = all[i],
+        done = chunks.filled(pr.text, pr.base, pr.marks, holes, paths[i], paths),
+        imports = [other.id for other in all if other.id != c.id if other.id in c.needs or (c.root >= 0 and c.root in other.roots)]
+
+# With `--analyze=DIR`: the analysis as JSON, and as one record a line.
+fn analysis-written(o: Options, outputs: [analyze.Output], roots: [Int]) -> [Written] = match o.analyze {
+  "" => []
+  dir => [Written(path: dir ++ "/analysis.json", text: r.json, said: said-of(r.json, dir ++ "/analysis.json")),
+          Written(path: dir ++ "/analysis.jsonl", text: r.lines, said: said-of(r.lines, dir ++ "/analysis.jsonl"))]
+    where r = analyze.report(outputs, roots)
+}

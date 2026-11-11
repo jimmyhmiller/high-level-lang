@@ -1,0 +1,147 @@
+# What a build says of itself, for `--analyze=DIR`: each output and what of each module it holds;
+# what each root (an entry, or what an `import()` names) loads; and each module: what it imports,
+# who uses what it declares, and the statements it keeps for what they do. As JSON, and as one
+# record a line for scripts. Everything here is read from what the build
+# made: the outputs' texts and where each passes from one source to the next, the modules, and
+# linking's database.
+rules bundle.analyze over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.analysis as an
+use bundle.emit as e
+use bundle.sourcemap as map
+
+# One file the build wrote: its text, and where (from `base` on) it passes to each source's code;
+# the root it runs, if any (-1: none); the outputs it imports, and those it loads with `import()`.
+record Output { path: Text, kind: Text, text: Text, base: Int, marks: [Mark], root: Int, imports: [Int], dynamic: [Int] }
+
+record Span { module: Int, bytes: Int }
+
+# A module's share of an output: from each place the output passes to its code, to the next. What
+# comes before the first is the output's own: its imports and exports.
+fn spans(o: Output) -> [Span] =
+  [Span(module: map.mark-module(o.marks[i]), bytes: end - start)
+   for i in 0..len(o.marks) for start in [o.base + o.marks[i].out]
+   for end in [if i + 1 < len(o.marks) then o.base + o.marks[i + 1].out else len(o.text)]]
+
+fn shares(o: Output) -> {Int:Int} =
+  {id: sum s in found if s.module == id: s.bytes for id in [s.module for s in found distinct s.module]}
+  where found = spans(o)
+
+# What a root loads before it runs: its output and every output that one imports, and so on.
+fn loaded(outputs: [Output], start: Int) -> [Int] =
+  sort i in [i for i in 0..len(outputs) if reach[i]] by i
+  where reach = closure(outputs, [i == start for i in 0..len(outputs)], 0)
+
+fn closure(outputs: [Output], seen: [Bool], round: Int) -> [Bool] = match len([x for x in next if x]) == len([x for x in seen if x]) {
+  true => seen
+  false => closure(outputs, next, round + 1)
+} where next = [seen[i] or (any j in 0..len(outputs): seen[j] and i in outputs[j].imports) for i in 0..len(outputs)]
+
+fn package-of(path: Text) -> Text = match last-index-of(path, "node_modules/") {
+  none => ""
+  some(at) => match split(path[at + 13..len(path)], "/") {
+    [scope, name, ...] if starts-with(scope, "@") => scope ++ "/" ++ name
+    [name, ...] => name
+    _ => ""
+  }
+}
+
+# ---------------------------------------------------------------- JSON
+
+fn q(t: Text) -> Text = map.json-quoted(t)
+fn arr(items: [Text]) -> Text = "[" ++ join(items, ",") ++ "]"
+fn ints(xs: [Int]) -> Text = arr([int-text(x) for x in xs])
+fn kv(name: Text, value: Text) -> Text = q(name) ++ ":" ++ value
+fn obj(fields: [Text]) -> Text = "{" ++ join(fields, ",") ++ "}"
+
+# ---------------------------------------------------------------- the records
+
+record Report { json: Text, lines: Text }
+
+fn report(outputs: [Output], roots: [Int]) -> Report =
+  Report(json: obj([kv("version", "1"), kv("outputs", arr(output-records)), kv("roots", arr(root-records)),
+                    kv("modules", arr(module-records))]) ++ "\n",
+         lines: join([obj([kv("type", q("output"))] ++ [x]) for x in output-fields]
+                     ++ [obj([kv("type", q("root"))] ++ [x]) for x in root-fields]
+                     ++ [obj([kv("type", q("module"))] ++ [x]) for x in module-fields], "\n") ++ "\n")
+  where held = [shares(o) for o in outputs],
+        # The modules the outputs hold, numbered in the program's order.
+        modules = [id for id in m.order if any h in held: id in h],
+        index = {modules[i]: i for i in 0..len(modules)},
+        output-fields = [output-record(outputs[i], held[i], index) for i in 0..len(outputs)],
+        output-records = [obj([x]) for x in output-fields],
+        root-at = {outputs[i].root: i for i in 0..len(outputs) if outputs[i].root >= 0},
+        root-fields = [root-record(outputs, r, root-at, index) for r in roots if r in root-at],
+        root-records = [obj([x]) for x in root-fields],
+        module-fields = [module-record(id, index, [obj([kv("output", int-text(i)), kv("bytes", int-text(b))])
+                                                  for i in 0..len(outputs) for b in held[i][id]])
+                         for id in modules],
+        module-records = [obj([x]) for x in module-fields]
+
+fn output-record(o: Output, held: {Int:Int}, index: {Int:Int}) -> Text =
+  join([kv("path", q(o.path)), kv("kind", q(o.kind)), kv("bytes", int-text(len(o.text))),
+        kv("own", int-text(len(o.text) - (sum id in keys(held): held[id] ?? 0))),
+        kv("root", if o.root >= 0 then int-text(index[o.root] ?? -1) else "null"),
+        kv("imports", ints(o.imports)), kv("dynamic", ints(o.dynamic)),
+        kv("modules", arr([arr([int-text(i), int-text(held[id] ?? 0)]) for id in keys(held) for i in index[id]]))], ",")
+
+fn root-record(outputs: [Output], r: Int, root-at: {Int:Int}, index: {Int:Int}) -> Text =
+  join([kv("module", int-text(index[r] ?? -1)), kv("path", q(m.shown-path(m.modules[r].path))),
+        kv("kind", q(if r in m.entries then "entry" else "import()")),
+        kv("output", int-text(at)), kv("loads", ints(loads)),
+        kv("bytes", int-text(sum i in loads: len(outputs[i].text)))], ",")
+  where at = root-at[r] ?? -1, loads = loaded(outputs, at)
+
+fn module-record(id: Int, index: {Int:Int}, outputs: [Text]) -> Text =
+  join([kv("path", q(m.shown-path(mo.path))), kv("package", q(package-of(mo.path))), kv("kind", q(kind-name(mo))),
+        kv("source", int-text(len(text))), kv("statements", int-text(len(parts))),
+        kv("kept", int-text(len(live))), kv("outputs", arr(outputs)),
+        kv("imports", ints([i for d in imported for i in index[d]])),
+        kv("dynamic", ints([i for d in dynamic for i in index[d]])),
+        kv("usedBy", arr([obj([kv("module", int-text(i)), kv("names", arr([q(n) for n in names]))])
+                            for u in users for i in index[u.module] for names in [u.names]])),
+        kv("keptFor", arr([obj([kv("line", int-text(map.line-at(starts, at) + 1)), kv("text", q(snippet(text, at)))])
+                             for at in kept-for if at < len(text)]))], ",")
+  where mo = m.modules[id],
+        text = source-text(mo),
+        parts = e.parts-of(id),
+        live = [p for p in parts if e.live?(p)],
+        imported = [d for m.db.imports(id, ?d) distinct d],
+        dynamic = [d for r in an.linked.dynamic-roots for d in [r] if d != id and (any k in keys(mo.dep-ids): (mo.dep-ids[k] ?? -1) == d)
+                   and not (d in imported)],
+        users = users-of(id, live),
+        kept-for = [offset(an.stmt-of(id, p)) for p in live if m.db.effect(p)],
+        # Lines found once for the file, and only for a file with statements to show.
+        starts = if len(kept-for) > 0 then map.line-starts(text) else []
+
+fn kind-name(mo: m.Module) -> Text = match mo.kind {
+  m.Esm => "esm"
+  m.Cjs => "commonjs"
+  m.Runtime => "runtime"
+  _ => "other"
+}
+
+fn source-text(mo: m.Module) -> Text = match mo.kind {
+  m.External => ""
+  _ => m.body-of(mo.id).text
+}
+
+# Where a statement starts in its file's text: a position may carry its file's number above 2^32.
+fn offset(n: Node) -> Int = n.lo % map.module-unit
+
+fn snippet(text: Text, at: Int) -> Text = trim(text[at..end])
+  where line-end = (first i in index-of(text[at..len(text)], "\n"): at + i) ?? len(text),
+        end = min(line-end, at + 120)
+
+record User { module: Int, names: [Text] }
+
+# The other modules whose kept statements read what these statements declare, and the names they read.
+fn users-of(id: Int, live: [Int]) -> [User] =
+  [User(module: r, names: [n for x in found if x.module == r for n in [x.name] distinct n]) for r in [x.module for x in found distinct x.module]]
+  where found = [Use(module: r, name: sym.symbol-at(m.table, s).name)
+                 for p in live for m.db.declares(p, ?s)
+                 for reader in [x for m.db.mentions(?x, s)] ++ [x for m.db.uses(?x, s)] if e.live?(reader)
+                 for m.db.part-of(reader, ?r) if r != id]
+
+record Use { module: Int, name: Text }
