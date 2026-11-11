@@ -55,6 +55,16 @@ for name in ["fail", "early"]:
     m = re.match(r"parsed (\d+) failed (\d+)", tail)
     print(f"  info test262 {name}/: rejected {m.group(2)} of {int(m.group(1)) + int(m.group(2))}")
 
+# A big text parsed in pieces is the tree a parse of the whole gives: plain JavaScript, TypeScript
+# and JSX, over every big source file of the libraries.
+big = [l for l in subprocess.run("find node_modules/zod/src node_modules/rxjs/src node_modules/immer/src node_modules/three/build node_modules/three/src node_modules/d3-array node_modules/react-dom/cjs node_modules/lodash-es node_modules/date-fns -type f ( -name *.ts -o -name *.tsx -o -name *.jsx -o -name *.js -o -name *.mjs ) -size +16k".split(), capture_output=True, text=True).stdout.split("\n") if l and not l.endswith(".d.ts") and ".min." not in l]
+open(f"{SCRATCH}/big.list", "w").write("\n".join(big) + "\n")
+apart = subprocess.run([PARSE, "apart", f"{SCRATCH}/big.list"], env={**os.environ, "HL_ALONE": "never"}, capture_output=True, text=True, timeout=300)
+tail = apart.stdout.strip().split("\n")[-1] if apart.stdout.strip() else apart.stderr[-200:]
+found = re.match(r"cut (\d+) differ (\d+)", tail)
+check(apart.returncode == 0 and found is not None and int(found.group(1)) >= 20 and found.group(2) == "0",
+      f"big texts parsed in pieces give the whole's tree: {len(big)} files, {tail}")
+
 # A library inside one function is parsed in pieces of its body: put together, the same tree.
 code, out = sh([PARSE, "pieces", "node_modules/lodash/lodash.js"], 60)
 check(code == 0 and "inside the function body" in out and "the same tree as parsing it whole" in out,
@@ -381,6 +391,20 @@ for app in ["three", "all", "cjs", "react", "d3"]:
                 outs.append(open(target, "rb").read() if built.returncode == 0 else built.stderr[-200:])
         if any(o != outs[0] for o in outs): alone_bad.append(f"{app} {' '.join(flags)}")
 check(not alone_bad, f"work divided and undivided is the same work: 5 apps, plain and minified, one thread and many{': ' + ', '.join(alone_bad) if alone_bad else ''}")
+
+# How big the units are that work is cut into is the pipeline's to say, and a run may say
+# otherwise (`--size:NAME=N`): whatever the sizes, a build makes the same file.
+size_bad = []
+for app in ["three", "all"]:
+    for flags in [[], ["--minify"]]:
+        outs = []
+        for sizes in [[], ["--size:bundle.jspieces/piece-bytes=3000", "--size:bundle.emit/unit-parts=5", "--size:bundle.naming/buckets=7"],
+                      ["--size:bundle.jspieces/piece-bytes=70000", "--size:bundle.emit/unit-parts=1000", "--size:bundle.naming/buckets=1"]]:
+            target = f"{SCRATCH}/size-{app}.js"
+            built = subprocess.run([ESB, f"apps/{app}.js", f"--outfile={target}", "--pipeline=full"] + flags + sizes, capture_output=True, timeout=120)
+            outs.append(open(target, "rb").read() if built.returncode == 0 else built.stderr[-200:])
+        if any(o != outs[0] for o in outs): size_bad.append(f"{app} {' '.join(flags)}")
+check(not size_bad, f"the sizes work is cut by change nothing a build makes: 2 apps, plain and minified, three settings{': ' + ', '.join(size_bad) if size_bad else ''}")
 
 print("== paired client/server builds")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "boundary-check.py"), SPEC], 300)

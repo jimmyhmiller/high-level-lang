@@ -457,7 +457,9 @@ two ways to one answer, and on one thread the undivided one answers; the test su
 and compares), `inside M` (a language module, such as a scopes definition, divides what it is
 given itself, as this stage's work) and `also F` (functions its threads make on the way). A
 stage's work with no list anywhere in the rules does not compile. Sizes the rules cut work by are
-given beside the plans: `size bundle.jspieces/piece-bytes 8192`. `HL_SHOW_STAGES=1` set
+given beside the plans, `size bundle.jspieces/piece-bytes 8192`; a plan may give its own, and so
+may a run, `--size:bundle.jspieces/piece-bytes=16384`, with no rebuild. The suite checks that no
+size changes what a build makes. `HL_SHOW_STAGES=1` set
 while compiling prints every list that is a stage's work, and where it is.
 
 A plan that runs a stage in parallel compiles only if nothing those functions call, in any module,
