@@ -382,8 +382,11 @@ fn hook-answer(spec: Text, importer: Text) -> Text? = first hook in loading.on-r
 # Is this import left for the runtime? A hook's answer overrides that, as an alias does, and with
 # `--packages=external` so is every package.
 fn stays-external?(spec: Text, importer: Text) -> Bool =
-  is-none(hook-path(aliased(spec), importer))
-  and (res.external?(aliased(spec)) or (loading.packages-external and package-spec?(aliased(spec), importer)))
+  is-none(hook-path(aliased(spec), importer)) and unhooked-external?(spec, importer)
+
+# The same, of a build with no resolve hooks to ask.
+fn unhooked-external?(spec: Text, importer: Text) -> Bool =
+  res.external?(aliased(spec)) or (loading.packages-external and package-spec?(aliased(spec), importer))
 
 fn package-spec?(spec: Text, importer: Text) -> Bool =
   not (res.relative?(spec) or starts-with(spec, "/") or starts-with(spec, "#")) and is-none(configured-path(spec, importer))
@@ -400,16 +403,19 @@ fn configured-path(spec: Text, importer: Text) -> Text? = match spec {
 # that parsed the importer ahead may have found the answer already.
 fn resolve-import(spec: Text, importer: Text) -> res.Resolved = resolved-now(import-request(spec), importer)
 
-fn resolved-now(request: Request, importer: Text) -> res.Resolved = match hook-path(wanted, importer) {
+fn resolved-now(request: Request, importer: Text) -> res.Resolved = match hook-path(aliased(request.spec), importer) {
   some(p) => res.Resolved(path: p, side-effects: true)
-  none => match configured-path(wanted, importer) {
-    some(p) => res.Resolved(path: p, side-effects: res.side-effects-of(p))
-    # A relative alias is relative to where the build runs, not to the importing file.
-    none => res.resolve-kind(wanted, match wanted != spec and res.relative?(wanted) {
-      true => "alias"
-      false => importer
-    }, request.kind)
-  }
+  none => unhooked-resolved(request, importer)
+}
+
+# Where an import leads when no hook says: the project's paths, then the search.
+fn unhooked-resolved(request: Request, importer: Text) -> res.Resolved = match configured-path(wanted, importer) {
+  some(p) => res.Resolved(path: p, side-effects: res.side-effects-of(p))
+  # A relative alias is relative to where the build runs, not to the importing file.
+  none => res.resolve-kind(wanted, match wanted != spec and res.relative?(wanted) {
+    true => "alias"
+    false => importer
+  }, request.kind)
 } where spec = request.spec, wanted = aliased(spec)
 
 fn loader-of(path: Text) -> Text = (first l in loading.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
@@ -678,10 +684,17 @@ fn targets-of(p: Parsed) -> Parsed =
 # The files what a result imports lead to, visited after what waits already.
 # What the walk ahead needs of a visit: where it goes next, what carries on first, and what comes
 # after. Only this, not the parse, is what a visit gives the walk.
-record Step { next: [Text], first: [Text], after: [Text] }
+record Step { next: [Text], first: [Text], after: [Text], leads: Int }
 
-fn visit-step(item: Text) -> Step = Step(next: next-files(p), first: first-files(p), after: after-files(p))
+fn visit-step(item: Text) -> Step = Step(next: next-files(p), first: first-files(p), after: after-files(p), leads: leads-ahead(item, p))
   where p = visit-file(item)
+
+# A file visited whole and analysed: its place in the graph is worked out by whoever parsed it,
+# while the others parse, and the graph's walk finds it made.
+fn leads-ahead(item: Text, p: Parsed) -> Int = match p.role {
+  Whole if item == p.path and p.analysed => len(loaded-ahead(item).leads)
+  _ => 0
+}
 
 fn step-next(s: Step) -> [Text] = s.next
 fn step-first(s: Step) -> [Text] = s.first
@@ -1101,7 +1114,31 @@ record Lead { key: Text, effects: Bool }
 boxed record Loaded { path: Text, parsed: Parsed, tree0: Node, analysis: Analysis, scopes: sym.Table, specs: [Text], calls: [Text],
                 requests: [Request], leads: [Lead], whole: [Text] }
 
-fn loaded(path: Text) -> Loaded =
+fn loaded(path: Text) -> Loaded = match ahead-whole?(path) {
+  true => loaded-ahead(path)
+  false => loaded-here(path)
+}
+
+# Whether the walk ahead left this file whole and analysed, in a build with no hooks: then whoever
+# parsed it worked out its place in the graph too (see `visit-step`), with nothing to ask a hook.
+fn ahead-whole?(path: Text) -> Bool =
+  loading.load-threads > 1 and ahead?(path) and not hooked?() and walked-file(path).analysed
+
+fn loaded-ahead(path: Text) -> Loaded =
+  Loaded(path: path, parsed: p, tree0: p.tree, analysis: p.analysis, scopes: p.scopes, specs: specs, calls: p.calls,
+         requests: requests, leads: [unhooked-lead(request, path) for request in requests],
+         whole: [unhooked-lead(r, path).key for r in [require-request(s) for s in p.required]
+                   ++ [import-request(x) for st in p.tree.body.kids for x in wholly-imported(st)]])
+  where p = analysed-ahead(path),
+        specs = [spec for s in p.tree.body.kids if let some(spec) = import-spec-of(s)] ++ p.calls,
+        requests = requests-in(p.tree, p.required, [s for s in p.calls[len(p.required)..len(p.calls)]])
+
+fn analysed-ahead(path: Text) -> Parsed = match walked-file(path) {
+  p if p.analysed => p
+  _ => panic "{} was parsed ahead and not analysed: its place in the graph is worked out with the graph", path
+}
+
+fn loaded-here(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: tree0, analysis: a.analysis, scopes: a.scopes, specs: specs, calls: calls,
          requests: requests, leads: [lead-request(request, path) for request in requests],
          whole: [lead-request(r, path).key for r in [require-request(s) for s in required]
@@ -1181,6 +1218,12 @@ fn lead(spec: Text, importer: Text) -> Lead = lead-request(import-request(spec),
 fn lead-request(request: Request, importer: Text) -> Lead = match stays-external?(request.spec, importer) {
   true => Lead(key: "external:" ++ aliased(request.spec), effects: false)
   false => Lead(key: r.path, effects: r.side-effects) where r = resolved-now(request, importer)
+}
+
+# The same, of a build with no resolve hooks to ask.
+fn unhooked-lead(request: Request, importer: Text) -> Lead = match unhooked-external?(request.spec, importer) {
+  true => Lead(key: "external:" ++ aliased(request.spec), effects: false)
+  false => Lead(key: r.path, effects: r.side-effects) where r = unhooked-resolved(request, importer)
 }
 
 # What a node of the graph leads to: an outside import, nothing.
