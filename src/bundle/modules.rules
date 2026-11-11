@@ -3,7 +3,7 @@ rules bundle.modules over bundle.js
 use bundle.js as js
 use bundle.scopes as sc
 use bundle.link as link
-use bundle.coarse as co
+use bundle.jspieces as jsp
 use bundle.resolve as res
 use bundle.dce as dce
 use bundle.early as early
@@ -305,9 +305,24 @@ fn parse-file(src: Text, path: Text) -> Checked = match found.problem {
 } where loader = loader-of(path),
         syntax = sum flag in [x for x in ["jsx"] if loader == "jsx" or loader == "tsx"]
                              ++ [x for x in ["ts"] if loader == "ts" or loader == "tsx"]: js.flag-bit(flag),
-        tree = js.parse-tries(src, path, syntax, js.flag-bit("await")),
+        # Plain JavaScript may be parsed in pieces (see bundle.jspieces): the same tree.
+        tree = match syntax {
+          0 => jsp.parsed-apart(src, path) ?? js.parse-tries(src, path, syntax, js.flag-bit("await"))
+          _ => js.parse-tries(src, path, syntax, js.flag-bit("await"))
+        },
         is-module = early.program-has-module-syntax?(tree),
-        found = early.run(tree, is-module, not is-module, loader == "ts" or loader == "tsx", false, false, [])
+        found = found-in(tree, is-module, loader == "ts" or loader == "tsx")
+
+# What checking a program finds: the first early error, and what it loads. What concerns its
+# statements together is checked of the program; then each statement is checked by itself, in the
+# program's context.
+record Found { problem: early.Problem?, requires: [Text], imports: [Text] }
+
+fn found-in(tree: Node, is-module: Bool, typed: Bool) -> Found =
+  Found(problem: early.check-head(tree, is-module, not is-module, typed) ?? (first a in each for p in a.problem: p),
+        requires: [r for a in each for r in a.requires], imports: [r for a in each for r in a.imports])
+  where exportable = early.exportable-of(tree),
+        each = [early.part-found(tree, is-module, not is-module, typed, exportable, [s]) for s in tree.body.kids]
 
 # Lowering JSX or TypeScript makes another tree of a file's.
 fn lowered-loader?(loader: Text) -> Bool = loader == "jsx" or loader == "tsx" or loader == "ts"
@@ -628,12 +643,9 @@ fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
 
 fn imported-specs(tree: Node) -> [Text] = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)]
 
-# A file parsed: its text parsed and analysed and its imports resolved; a big file put together
-# from its pieces.
-fn parsed-of(path: Text) -> Parsed = match len(sp.starts) {
-  n if n > 1 => finished-file(path)
-  _ => targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true))))
-} where sp = split-source(path)
+# A file parsed: its text parsed and analysed and its imports resolved.
+fn parsed-of(path: Text) -> Parsed =
+  targets-of(analysed-file(parsed-file(Pending(path: path, text: as-module(source-of(path), path), ready: true))))
 
 # Where each of a file's imports leads, by what it asks for.
 fn targets-of(p: Parsed) -> Parsed =
@@ -644,291 +656,7 @@ fn targets-of(p: Parsed) -> Parsed =
 # The files a file's imports lead to: what loading follows from the entries.
 fn led-ahead(path: Text) -> [Text] = values-of(loaded(path).parsed.targets)
 
-# ---------------------------------------------------------------- big files, in pieces
-
-# A big file of plain JavaScript is parsed in pieces, on several threads. A piece starts on a line
-# that begins a declaration, outside every bracket, string, template, comment and regular
-# expression, as the coarse grammar (coarse.syntax) reads them. It can be wrong only one way that
-# matters: a piece before a wrong start is no program by itself, and then the file is parsed whole.
-const piece-bytes: Int
-
-# A file's text and where its pieces start. A library inside one function is cut inside that
-# function's body, from `open`, its `{`, up to `close`, its `}`; -1 when the file is cut at its
-# own top level.
-record Parts { src: Text, starts: [Int], open: Int, close: Int }
-
-# A file's text in pieces: at 0 alone unless it is big plain JavaScript.
-fn split-source(path: Text) -> Parts = match whole-source(path) {
-  w if loading.has-transform or loader-of(path) != "js" or len(w.src) < 2 * piece-bytes => w
-  w => parts-of-source(w.src)
-}
-
-# A file's text in one piece. A file parsed whole and a file put together from its pieces are the
-# same file (see `finished-file`).
-fn whole-source(path: Text) -> Parts = Parts(src: as-module(source-of(path), path), starts: [0], open: -1, close: -1)
-
-fn parts-of-source(src: Text) -> Parts = match top-cuts {
-  [_, ...] => whole with { starts: [0] ++ top-cuts }
-  [] => (first b in body-span(src, lines) for inner in [body-cuts(src, lines, b)] if len(inner) > 0:
-           Parts(src: src, starts: [b.open + 1] ++ inner, open: b.open, close: b.close))
-        ?? whole
-    where starts = line-starts(src),
-          lines = Lines(starts: starts, indents: line-indents(src, starts))
-} where whole = Parts(src: src, starts: [0], open: -1, close: -1),
-        # A file with no declaration at the start of a line has nowhere to cut at its top level.
-        top-cuts = match index-of-any(src, ["\n" ++ k for k in declaration-words]) {
-          some(_) => piece-starts(src)
-          none => []
-        }
-
-record Span { open: Int, close: Int }
-
-# A library inside one function is cut by how its code is laid out, which is how it was written:
-# the function's body is the lines inside it, the body's statements start at its indentation, and
-# a block in it runs from a line there that ends with `{` to the next there that starts with `}`.
-# A wrong guess is no function body, or a piece that is no program, and the file is parsed whole.
-
-# Where each line starts, and how far it is indented (-1 when it is blank).
-record Lines { starts: [Int], indents: [Int] }
-
-# The body of a function that is nearly all of the file: from the first line to end with `{` to
-# the last line to start with `}`. Then, as long as one block in it holds most of it, as a
-# library's own function inside the wrapper does, that block's.
-fn body-span(src: Text, lines: Lines) -> Span? =
-  first open in index-of(src, "{\n") for nl in last-index-of(src, "\n}") if nl > open and (nl + 1 - open) * 10 >= len(src) * 9:
-    innermost(src, lines, Span(open: open, close: nl + 1))
-
-fn innermost(src: Text, lines: Lines, s: Span) -> Span = match dominant-block(src, lines, s) {
-  some(inner) => innermost(src, lines, inner)
-  none => s
-}
-
-# The lines of a body at its own indentation, and that indentation.
-record Level { depth: Int, starts: [Int] }
-
-fn level-of(lines: Lines, s: Span) -> Level = Level(depth: depth, starts: [lines.starts[i] for i in from..to if lines.indents[i] == depth])
-  where from = bisect(lines.starts, s.open),
-        to = bisect(lines.starts, s.close - 1),
-        depth = (first i in from..to if lines.indents[i] >= 0: lines.indents[i]) ?? 0
-
-# The biggest block at a body's own indentation, when it is at least half the body.
-fn dominant-block(src: Text, lines: Lines, s: Span) -> Span? = match level-of(lines, s) {
-  level if level.depth <= 0 => none
-  level => first b in blocks if biggest * 2 >= s.close - s.open and b.close - b.open == biggest: b
-    where ls = level.starts,
-          blocks = [Span(open: end - 1, close: c + level.depth)
-                    for i in 0..len(ls) if let some(end) = line-end(lines, ls[i]) if at?(src, end - 1, "{")
-                    if let some(c) = (first j in i + 1..len(ls) if at?(src, ls[j] + level.depth, "}"): ls[j])],
-          biggest = fold best = -1 for b in blocks: max(best, b.close - b.open)
-}
-
-# Where the line starting at `at` ends: its line break.
-fn line-end(lines: Lines, at: Int) -> Int? =
-  first next in [bisect(lines.starts, at)] if next < len(lines.starts): lines.starts[next] - 1
-
-const declaration-words: [Text] = ["function ", "function*", "async function", "class ", "var ", "let ", "const "]
-
-# The body's statements that start a declaration, as cuts a piece's size apart.
-fn body-cuts(src: Text, lines: Lines, b: Span) -> [Int] = match level-of(lines, b) {
-  level if level.depth <= 0 => []
-  level => fold cuts = [] for l in level.starts if (any k in declaration-words: at?(src, l + level.depth, k))
-                          if b.close - (l + level.depth) >= piece-bytes:
-    cuts ++ [at for at in [l + level.depth] if at - ((last c in cuts: c) ?? b.open + 1) >= piece-bytes]
-}
-
-# Where piece `k` ends.
-fn piece-end(sp: Parts, k: Int) -> Int = match k + 1 {
-  next if next < len(sp.starts) => sp.starts[next]
-  _ if sp.open >= 0 => sp.close
-  _ => len(sp.src)
-}
-
-# A function's body put together from its pieces: the file parsed with only the body's line breaks
-# left of it, what follows moved back where it was, and the pieces' statements in the body. Nothing
-# when that is not exactly one empty function body, or a piece has import or export syntax, which
-# a function body cannot.
-fn assembled(sp: Parts, path: Text, pieces: [Node]) -> Node? = match pieces {
-  _ if any t in pieces: early.program-has-module-syntax?(t) => none
-  _ => first parsed in js.parse-opt(outer-src, path, 0) for outer in [moved(parsed, tail, sp.close - tail)]
-             if body-count(outer, sp.open, sp.close + 1) == 1:
-         filled-body(outer, sp.open, sp.close + 1, [s for t in pieces for s in t.body.kids], pieces)
-    where breaks = count-byte(sp.src, sp.open + 1, sp.close, '\n'),
-          tail = sp.open + 1 + breaks,
-          outer-src = sp.src[0..sp.open + 1] ++ repeated("\n", breaks) ++ sp.src[sp.close..len(sp.src)]
-}
-
-# Everything from `from` on moved `by`.
-fn moved(n: Node, from: Int, by: Int) -> Node = match n {
-  _ if n.hi < from => n
-  _ => n with { lo: match n.lo {
-                  lo if lo >= from => lo + by
-                  lo => lo
-                },
-                hi: n.hi + by, kids: [moved(k, from, by) for k in n.kids] }
-}
-
-# How many empty function bodies span exactly `lo` to `hi`.
-fn body-count(n: Node, lo: Int, hi: Int) -> Int = match n {
-  FuncBody(List()) if n.lo == lo and n.hi == hi => 1
-  _ => sum k in n.kids if k.lo <= lo and hi <= k.hi: body-count(k, lo, hi)
-}
-
-fn filled-body(n: Node, lo: Int, hi: Int, stmts: [Node], pieces: [Node]) -> Node = match n {
-  FuncBody(List()) if n.lo == lo and n.hi == hi => n with { stmts: n.stmts with { kids: stmts, lo: pieces[0].body.lo, hi: last(pieces).body.hi } }
-  _ if n.lo <= lo and hi <= n.hi and len(n.kids) > 0 => n with { kids: [filled-body(k, lo, hi, stmts, pieces) for k in n.kids] }
-  _ => n
-}
-
-boxed record PieceTree { tree: Node?, specs: [Text], targets: {Text:Text} }
-
-# One piece: its statements, parsed as a program of their own, and where what they import leads.
-fn piece-of(path: Text, k: Int) -> PieceTree = match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
-  none => PieceTree(tree: none, specs: [], targets: {})
-  some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {request-key(r): t for r in requests-in(tree, found.requires, found.imports) if let some(t) = target-of(r, path)})
-    where found = calls.run(tree),
-          specs = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)] ++ found.requires ++ found.imports
-} where sp = split-source(path)
-
-# A big file's pieces, each its own work.
-fn pieces-of(path: Text) -> [PieceTree] = [piece-of(path, k) for k in 0..len(split-source(path).starts)]
-
-# A big file put together from its pieces, ready for its parts to be analysed at once: the program as
-# parsed, the program as analysed (its top level normalised one piece at a time), and a table that
-# holds the program's own names. Not `whole` when a piece is no program by itself, or when a
-# statement at the top level is sequential: its scope holds the parts after it, which a walk of
-# their own would not be in.
-# `raw`: each piece's statements as parsed, which early errors are checked on.
-# `wrapper`: the scope of CommonJS's (exports, module) wrapper the program was declared under, when
-# a script names them and so is probably CommonJS; -1 when it was not.
-boxed record Prepared { whole: Bool, tree0: Node, tree: Node, parts: [[Node]], raw: [[Node]], scopes: sym.Table, root: Int,
-                  esm: Bool, mentions: Bool, exportable: [Text], wrapper: Int }
-
-fn prepared-of(path: Text) -> Prepared = match pieces {
-  # A function's body is put together and analysed whole.
-  _ if sp.open >= 0 or (any t in pieces: is-none(t))
-       or (any t in [t for some(t) in pieces]: any s in t.body.kids: sc.sequential?(s.kind)) =>
-    Prepared(whole: false, tree0: None(), tree: None(), parts: [], raw: [], scopes: sym.table-new(), root: -1,
-             esm: false, mentions: false, exportable: [], wrapper: -1)
-  _ => Prepared(whole: true, tree0: tree0, tree: tree, parts: parts, raw: [t.body.kids for t in trees], scopes: own.table, root: own.root,
-                esm: esm, mentions: mentions-define?(sp.src), exportable: early.exportable-of(tree0),
-                wrapper: match wrapped {
-                  true => sym.scope-at(own.table, own.root).parent
-                  false => -1
-                })
-    where trees = [t for some(t) in pieces],
-          head = trees[0],
-          tree0 = head with { body: head.body with { kids: [s for t in trees for s in t.body.kids], hi: last(trees).body.hi },
-                              hi: last(trees).hi },
-          parts = [normalized-tree(t, base-name(path)).body.kids for t in trees],
-          tree = Program(tree0.hashbang, List([s for part in parts for s in part]...)),
-          esm = early.program-has-module-syntax?(tree0) or module-extension?(path),
-          wrapped = wrapper-wanted?(esm),
-          own = sc.declarations(tree, [x for x in ["exports", "module"] if wrapped])
-} where sp = split-source(path),
-        pieces = [pc.tree for pc in pieces-of(path)]
-
-# One part's walk, in a table of its own under the program's scope.
-# `defined`: whether a define applies in the part, which only its own bindings can tell. Its
-# `require`s and `import()`s too, which the whole file's are made of.
-boxed record Walked { scopes: sym.Table, bindings: {Int:Int}, defined: Bool, requires: [Text], imports: [Text],
-                problem: early.Problem? }
-
-fn walked-of(path: Text, k: Int) -> Walked =
-  Walked(scopes: own.table, bindings: own.bindings, defined: pr.mentions and (any s in pr.parts[k]: defines-apply?(s, own.bindings)),
-         requires: found.requires, imports: found.imports, problem: found.problem)
-  where pr = prepared-of(path),
-        own = sc.part-analysis(pr.scopes, pr.root, [pr.tree.hashbang for x in [k] if x == 0] ++ pr.parts[k]),
-        # Checking the part finds what it loads, in its statements as parsed: normalising them
-        # keeps every call, in order.
-        found = early.part-found(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
-
-# What parsing a file whole checks of its statements together; the parts' walks check each part's.
-fn early-of(path: Text) -> early.Problem? = early.check-head(pr.tree0, pr.esm, not pr.esm, false) where pr = prepared-of(path)
-
-fn from-of(path: Text) -> Parsed =
-  parsed-with(path, split-source(path).src, prepared-of(path).tree0,
-              some([s for pc in pieces-of(path) for s in pc.specs]), none)
-
-# The big file, analysed: its parts' tables grafted in order, as one walk would have filled the
-# table, ids and all. CommonJS, and code a define changes, are analysed again whole, as
-# `analysis-of` does.
-# A library inside one function, its body parsed in pieces and put together, then checked as the
-# whole file would be.
-fn nested-file(path: Text) -> Parsed? = match sp.open {
-  open if open < 0 => none
-  _ => first pieces in [[pc.tree for pc in pieces-of(path)]]
-             if all t in pieces: is-some(t)
-             for tree in assembled(sp, path, [t for some(t) in pieces]):
-         nested-checked(path, sp.src, tree)
-} where sp = split-source(path)
-
-fn nested-checked(path: Text, src: Text, tree: Node) -> Parsed = match found.problem {
-  none => parsed-with(path, src, tree, none, some(Checked(tree: tree, requires: found.requires, imports: found.imports)))
-  some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
-} where found = early.run(tree, false, true, false, false, false, [])
-
-fn finished-file(path: Text) -> Parsed = match prepared-of(path) {
-  pr if not pr.whole =>
-    targets-of(analysed-file(nested-file(path) ?? parsed-file(Pending(path: path, text: split-source(path).src, ready: true))))
-  pr => joined-file(path, pr)
-}
-
-# A big file from its parts, as one walk would have made it. CommonJS names `module`, `exports` or
-# `require` without declaring them: free, or under the wrapper, the wrapper's. A file prepared for
-# the wrapper that turns out not to be CommonJS, or one prepared without it that is, is analysed
-# again whole, as is code a define changes.
-fn joined-file(path: Text, pr: Prepared) -> Parsed =
-  match early-of(path) ?? (first w in walks: w.problem), (cjs and pr.wrapper < 0) or p.jsx-imports or (any w in walks: w.defined) {
-    some(at), _ => panic "{}:{}:{}: {}", path, line-of(sp.src, at.at), col-of(sp.src, at.at), at.message
-    none, true => targets-of(analysed-file(p))
-    none, false => p with { analysed: true, scopes: own, analysis: a, calls: calls, required: [r for w in walks for r in w.requires], imports: [r for w in walks for r in w.imports],
-                            targets: targets }
-  }
-  where sp = split-source(path),
-        p = from-of(path),
-        found = [pc.targets for pc in pieces-of(path)],
-        targets = {spec: t for pt in found for spec in keys(pt) if let some(t) = pt[spec]},
-        walks = [walked-of(path, k) for k in 0..len(pr.parts)],
-        # A part's symbols move by how many the table holds before it is grafted.
-        ends = scan n = sym.symbol-count(pr.scopes) for w in walks: n + sym.symbol-count(w.scopes),
-        bindings = {key: rebound(v, ends[k] - sym.symbol-count(walks[k].scopes))
-                    for k in 0..len(walks) for key in keys(walks[k].bindings) if let some(v) = walks[k].bindings[key]},
-        own = sym.grafted(pr.scopes, [w.scopes for w in walks], pr.root),
-        cjs = commonjs-extension?(path) or (not pr.esm and names-module?(own, pr.wrapper)),
-        a = Analysis(tree: pr.tree, root: pr.root, bindings: bindings, free: [f for f in sym.free-names(own) if not (f in p.helpers)],
-                     cjs: cjs, script: not pr.esm and not cjs, wrapped: pr.wrapper >= 0, shift: 0, defined: false),
-        calls = [r for w in walks for r in w.requires] ++ [r for w in walks for r in w.imports]
-
-# A part's binding: a symbol of the part, moved by where the part lands, or one of the table it was
-# made under, as -(id + 1).
-fn rebound(v: Int, shift: Int) -> Int = match v {
-  _ if v < 0 => -1 - v
-  _ => v + shift
-}
-
-# Whether code reads `module` or `exports`: under the wrapper when there is one, else as free names.
-fn names-module?(own: sym.Table, wrapper: Int) -> Bool = match wrapper {
-  _ if wrapper >= 0 => wrapper-used?(own, wrapper, "module") or wrapper-used?(own, wrapper, "exports")
-  _ => sym.has-free?(own, "module") or sym.has-free?(own, "exports")
-}
-
 fn wrapper-used?(t: sym.Table, wrapper: Int, name: Text) -> Bool = any s in sym.scope-at(t, wrapper).names[name]: sym.symbol-at(t, s).uses > 0
-
-# Early errors, which `parse-file` checks of a file parsed whole.
-fn checked-early(tree: Node, src: Text, path: Text) -> Node = match early.check(tree, is-module, not is-module, false) {
-  none => tree
-  some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
-} where is-module = early.program-has-module-syntax?(tree)
-
-# Where a large file is cut: where the coarse grammar finds a declaration starting a line at the
-# top level, at least a piece's size from the last cut and from the end. A file the coarse grammar
-# cannot read is not cut.
-fn piece-starts(src: Text) -> [Int] = match co.parse-opt(src, "<coarse>", 0) {
-  some(co.Coarse(List(items...))) =>
-    fold cuts = [] for co.Cut(_) as line in items if len(src) - line.hi >= piece-bytes:
-      cuts ++ [at for at in [line.hi] if at - ((last c in cuts: c) ?? 0) >= piece-bytes]
-  _ => []
-}
 
 fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
 

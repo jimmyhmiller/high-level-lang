@@ -1,0 +1,173 @@
+# JavaScript parsed in pieces. A big text is cut where a top-level declaration starts a line, each
+# piece is parsed as a program of its own, and the pieces' statements are one program again: the
+# tree a parse of the whole text gives. Where the cuts go is what this file knows of how
+# JavaScript is written; that pieces are parsed by many threads, how big a piece is, and whether
+# a text is cut at all, are the pipeline's to say (its `pieces` stage, and the size it gives).
+rules bundle.jspieces over bundle.js
+use bundle.js as js
+use bundle.coarse as co
+use bundle.early as early
+
+# A program's tree from its pieces, as `js.parse` would give it; or nothing, when the text is not
+# cut, or a piece is no program by itself (a cut in the wrong place), and the whole is parsed.
+fn parsed-apart(src: Text, path: Text) -> Node? = match cut(src) {
+  sp if len(sp.starts) < 2 => none
+  sp => joined(sp, path, [piece(sp, path, k) for k in 0..len(sp.starts)])
+}
+
+# One piece: its statements, parsed as a program of their own.
+fn piece(sp: Parts, path: Text, k: Int) -> Node? = js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k])
+
+fn joined(sp: Parts, path: Text, pieces: [Node?]) -> Node? = match sp.open {
+  _ if any t in pieces: is-none(t) => none
+  open if open >= 0 => assembled(sp, path, [t for some(t) in pieces])
+  _ => some(as-one([t for some(t) in pieces]))
+}
+
+# Programs one after another, as one program.
+fn as-one(trees: [Node]) -> Node =
+  head with { body: head.body with { kids: [s for t in trees for s in t.body.kids], hi: last(trees).body.hi }, hi: last(trees).hi }
+  where head = trees[0]
+
+# Where a text is cut: at 0 alone unless it is big.
+fn cut(src: Text) -> Parts = match len(src) < 2 * piece-bytes {
+  true => uncut(src)
+  false => parts-of-source(src)
+}
+
+# A text in one piece.
+fn uncut(src: Text) -> Parts = Parts(src: src, starts: [0], open: -1, close: -1)
+
+
+# A piece starts on a line that begins a declaration, outside every bracket, string, template, comment and regular
+# expression, as the coarse grammar (coarse.syntax) reads them. It can be wrong only one way that
+# matters: a piece before a wrong start is no program by itself, and then the file is parsed whole.
+const piece-bytes: Int
+
+# A file's text and where its pieces start. A library inside one function is cut inside that
+# function's body, from `open`, its `{`, up to `close`, its `}`; -1 when the file is cut at its
+# own top level.
+record Parts { src: Text, starts: [Int], open: Int, close: Int }
+
+fn parts-of-source(src: Text) -> Parts = match top-cuts {
+  [_, ...] => whole with { starts: [0] ++ top-cuts }
+  [] => (first b in body-span(src, lines) for inner in [body-cuts(src, lines, b)] if len(inner) > 0:
+           Parts(src: src, starts: [b.open + 1] ++ inner, open: b.open, close: b.close))
+        ?? whole
+    where starts = line-starts(src),
+          lines = Lines(starts: starts, indents: line-indents(src, starts))
+} where whole = Parts(src: src, starts: [0], open: -1, close: -1),
+        # A file with no declaration at the start of a line has nowhere to cut at its top level.
+        top-cuts = match index-of-any(src, ["\n" ++ k for k in declaration-words]) {
+          some(_) => piece-starts(src)
+          none => []
+        }
+
+record Span { open: Int, close: Int }
+
+# A library inside one function is cut by how its code is laid out, which is how it was written:
+# the function's body is the lines inside it, the body's statements start at its indentation, and
+# a block in it runs from a line there that ends with `{` to the next there that starts with `}`.
+# A wrong guess is no function body, or a piece that is no program, and the file is parsed whole.
+
+# Where each line starts, and how far it is indented (-1 when it is blank).
+record Lines { starts: [Int], indents: [Int] }
+
+# The body of a function that is nearly all of the file: from the first line to end with `{` to
+# the last line to start with `}`. Then, as long as one block in it holds most of it, as a
+# library's own function inside the wrapper does, that block's.
+fn body-span(src: Text, lines: Lines) -> Span? =
+  first open in index-of(src, "{\n") for nl in last-index-of(src, "\n}") if nl > open and (nl + 1 - open) * 10 >= len(src) * 9:
+    innermost(src, lines, Span(open: open, close: nl + 1))
+
+fn innermost(src: Text, lines: Lines, s: Span) -> Span = match dominant-block(src, lines, s) {
+  some(inner) => innermost(src, lines, inner)
+  none => s
+}
+
+# The lines of a body at its own indentation, and that indentation.
+record Level { depth: Int, starts: [Int] }
+
+fn level-of(lines: Lines, s: Span) -> Level = Level(depth: depth, starts: [lines.starts[i] for i in from..to if lines.indents[i] == depth])
+  where from = bisect(lines.starts, s.open),
+        to = bisect(lines.starts, s.close - 1),
+        depth = (first i in from..to if lines.indents[i] >= 0: lines.indents[i]) ?? 0
+
+# The biggest block at a body's own indentation, when it is at least half the body.
+fn dominant-block(src: Text, lines: Lines, s: Span) -> Span? = match level-of(lines, s) {
+  level if level.depth <= 0 => none
+  level => first b in blocks if biggest * 2 >= s.close - s.open and b.close - b.open == biggest: b
+    where ls = level.starts,
+          blocks = [Span(open: end - 1, close: c + level.depth)
+                    for i in 0..len(ls) if let some(end) = line-end(lines, ls[i]) if at?(src, end - 1, "{")
+                    if let some(c) = (first j in i + 1..len(ls) if at?(src, ls[j] + level.depth, "}"): ls[j])],
+          biggest = fold best = -1 for b in blocks: max(best, b.close - b.open)
+}
+
+# Where the line starting at `at` ends: its line break.
+fn line-end(lines: Lines, at: Int) -> Int? =
+  first next in [bisect(lines.starts, at)] if next < len(lines.starts): lines.starts[next] - 1
+
+const declaration-words: [Text] = ["function ", "function*", "async function", "class ", "var ", "let ", "const "]
+
+# The body's statements that start a declaration, as cuts a piece's size apart.
+fn body-cuts(src: Text, lines: Lines, b: Span) -> [Int] = match level-of(lines, b) {
+  level if level.depth <= 0 => []
+  level => fold cuts = [] for l in level.starts if (any k in declaration-words: at?(src, l + level.depth, k))
+                          if b.close - (l + level.depth) >= piece-bytes:
+    cuts ++ [at for at in [l + level.depth] if at - ((last c in cuts: c) ?? b.open + 1) >= piece-bytes]
+}
+
+# Where piece `k` ends.
+fn piece-end(sp: Parts, k: Int) -> Int = match k + 1 {
+  next if next < len(sp.starts) => sp.starts[next]
+  _ if sp.open >= 0 => sp.close
+  _ => len(sp.src)
+}
+
+# A function's body put together from its pieces: the file parsed with only the body's line breaks
+# left of it, what follows moved back where it was, and the pieces' statements in the body. Nothing
+# when that is not exactly one empty function body, or a piece has import or export syntax, which
+# a function body cannot.
+fn assembled(sp: Parts, path: Text, pieces: [Node]) -> Node? = match pieces {
+  _ if any t in pieces: early.program-has-module-syntax?(t) => none
+  _ => first parsed in js.parse-opt(outer-src, path, 0) for outer in [moved(parsed, tail, sp.close - tail)]
+             if body-count(outer, sp.open, sp.close + 1) == 1:
+         filled-body(outer, sp.open, sp.close + 1, [s for t in pieces for s in t.body.kids], pieces)
+    where breaks = count-byte(sp.src, sp.open + 1, sp.close, '\n'),
+          tail = sp.open + 1 + breaks,
+          outer-src = sp.src[0..sp.open + 1] ++ repeated("\n", breaks) ++ sp.src[sp.close..len(sp.src)]
+}
+
+# Everything from `from` on moved `by`.
+fn moved(n: Node, from: Int, by: Int) -> Node = match n {
+  _ if n.hi < from => n
+  _ => n with { lo: match n.lo {
+                  lo if lo >= from => lo + by
+                  lo => lo
+                },
+                hi: n.hi + by, kids: [moved(k, from, by) for k in n.kids] }
+}
+
+# How many empty function bodies span exactly `lo` to `hi`.
+fn body-count(n: Node, lo: Int, hi: Int) -> Int = match n {
+  FuncBody(List()) if n.lo == lo and n.hi == hi => 1
+  _ => sum k in n.kids if k.lo <= lo and hi <= k.hi: body-count(k, lo, hi)
+}
+
+fn filled-body(n: Node, lo: Int, hi: Int, stmts: [Node], pieces: [Node]) -> Node = match n {
+  FuncBody(List()) if n.lo == lo and n.hi == hi => n with { stmts: n.stmts with { kids: stmts, lo: pieces[0].body.lo, hi: last(pieces).body.hi } }
+  _ if n.lo <= lo and hi <= n.hi and len(n.kids) > 0 => n with { kids: [filled-body(k, lo, hi, stmts, pieces) for k in n.kids] }
+  _ => n
+}
+
+
+# Where a large file is cut: where the coarse grammar finds a declaration starting a line at the
+# top level, at least a piece's size from the last cut and from the end. A file the coarse grammar
+# cannot read is not cut.
+fn piece-starts(src: Text) -> [Int] = match co.parse-opt(src, "<coarse>", 0) {
+  some(co.Coarse(List(items...))) =>
+    fold cuts = [] for co.Cut(_) as line in items if len(src) - line.hi >= piece-bytes:
+      cuts ++ [at for at in [line.hi] if at - ((last c in cuts: c) ?? 0) >= piece-bytes]
+  _ => []
+}

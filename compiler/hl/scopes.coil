@@ -37,6 +37,7 @@
 (import "hl.syntax" :as syntax)
 (import "coil.meta" :as meta)
 (import "hl.grammars.scopes" :as g)
+(import "hl.pipeline" :as pl)
 
 (reader-provider "hl.scopes" read-scopes)
 
@@ -189,6 +190,12 @@
                               (dsl/join2 "expected " (.want e)))))
         grammar (.text (get (.kids tree) 0))
         tables (.kids (get (.kids tree) 1))
+        ;; A stage of the program's pipeline that names this module (`inside`) has it divide a big
+        ;; program's analysis itself, in parts of about `part-bytes` of source.
+        manifest (meta/read-context-manifest context)
+        stage (pl/inside-stage manifest path)
+        part-bytes
+          (pl/size-given manifest (dsl/join2 (pl/module-named manifest path) "/part-bytes") 8192)
         kinds (grammar-kinds context src path (get (.kids tree) 0))
         (mut ref) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut bind) (ArrayList::new [(slice u8)] (malloc-allocator))
@@ -400,6 +407,7 @@
                      (import "coil.hashmap" :use [HashMap i64-keyops])
                      (import "coil.arraylist" :use [ArrayList])
                      (import "hl.rt" :as rt)
+                     (import "coil.atomic" :as atomic)
                      (import ~grammar :as syn)
 
                      (defn ref? [(k syn/Kind)] (-> bool)
@@ -572,9 +580,115 @@
                      (defn no-bindings [] (-> (HashMap i64 i64))
                        (HashMap::new [i64 i64] (rt/value-allocator) (i64-keyops)))
 
-                     ;;; A whole program analysed in a table of its own.
+                     ;;; A whole program analysed in a table of its own. A big one is analysed
+                     ;;; in parts (see `analysis-apart`), when a stage of the pipeline says so.
                      (defn analysis [(tree syn/Node)
                                      (outer (ArrayList (slice u8)))]
+                       (-> sym/Analysis)
+                       ~(if (< stage 0)
+                            `(analysis-whole tree outer)
+                            `(let [runs (apart-runs tree)]
+                               (if (< (len runs) 2)
+                                   (analysis-whole tree outer)
+                                   (analysis-apart tree outer runs)))))
+
+                     ;;; The runs of a program's parts that can be analysed apart: the items of
+                     ;;; its last child, a list, about `part-bytes` of source to a run, with its
+                     ;;; other children before the first. None when the stage works on one
+                     ;;; thread, when the program's own node does anything a walk would see, or
+                     ;;; when an item is sequential, its scope holding the items after it.
+                     (defn apart-runs [(tree syn/Node)] (-> (ArrayList (ArrayList syn/Node)))
+                       (let [(mut runs) (ArrayList::new [(ArrayList syn/Node)] (rt/tree-allocator))
+                             k (.kind tree)
+                             count (len (.kids tree))]
+                         (when (and (not (rt/alone? ~(if (< stage 0) 0 stage)))
+                                    (> count 0)
+                                    (not (or (ref? k) (bind? k) (opens? k) (dynamic? k))))
+                           (let [body (get (.kids tree) (- count 1))
+                                 bk (.kind body)
+                                 (mut ok)
+                                   (and (> (- (.hi body) (.lo body)) ~(* 2 part-bytes))
+                                        (not (or (ref? bk) (bind? bk) (opens? bk) (dynamic? bk))))]
+                             (when ok
+                               (for (ref item) (.kids body)
+                                 (when (sequential? (.kind item)) (set! ok false))))
+                             (when ok
+                               (let [(mut run) (ArrayList::new [syn/Node] (rt/tree-allocator))
+                                     (mut from) -1]
+                                 (for i (range 0 (- count 1)) (push! (mut run) (get (.kids tree) i)))
+                                 (for (ref item) (.kids body)
+                                   (when (< from 0) (set! from (.lo item)))
+                                   (push! (mut run) item)
+                                   (when (>= (- (.hi item) from) ~part-bytes)
+                                     (push! (mut runs) run)
+                                     (set! run (ArrayList::new [syn/Node] (rt/tree-allocator)))
+                                     (set! from -1)))
+                                 (when (> (len run) 0) (push! (mut runs) run))))))
+                         runs))
+
+                     (defstruct ApartJob
+                       [(next i64)
+                        (table sym/Table)
+                        (root i64)
+                        (runs (ArrayList (ArrayList syn/Node)))
+                        (out (ArrayList (Option sym/Analysis)))])
+
+                     (defn apart-body [(arg (ptr i8))] (-> (ptr i8))
+                       (let [j (cast (ptr ApartJob) arg)
+                             runs (.runs j)
+                             (mut out) (.out j)
+                             (mut go) true]
+                         (while go
+                           (let [i (atomic/add (cast (ptr i64) j) 1)]
+                             (if (< i (len runs))
+                                 (do
+                                   (rt/item-begin! i)
+                                   (set! (mut out) i (Some (part-analysis (.table j) (.root j) (get runs i)))))
+                                 (set! go false))))
+                         arg))
+
+                     ;;; A program analysed in parts: its own names declared first, each run of
+                     ;;; parts walked in a table of its own under them, on the stage's threads,
+                     ;;; and the tables grafted back in order. The table, the root and every
+                     ;;; binding are what one walk of the whole would have made, ids and all.
+                     (defn analysis-apart [(tree syn/Node)
+                                           (outer (ArrayList (slice u8)))
+                                           (runs (ArrayList (ArrayList syn/Node)))]
+                       (-> sym/Analysis)
+                       (let [d (declarations tree outer)
+                             (mut out) (ArrayList::new [(Option sym/Analysis)] (rt/value-allocator))]
+                         (for _ runs (push! (mut out) (None [sym/Analysis])))
+                         (let [(mut job) (ApartJob :next 0 :table (.table d) :root (.root d) :runs runs :out out)]
+                           (rt/run-map-workers (fnptr-of apart-body)
+                                               (cast (ptr i8) (mut job))
+                                               (rt/stage-threads ~(if (< stage 0) 0 stage)))
+                           (let [(mut tables) (ArrayList::new [sym/Table] (rt/tree-allocator))
+                                 (mut b) (no-bindings)
+                                 (mut shift) (sym/symbol-count (.table d))]
+                             (for o (.out job)
+                               (match o
+                                 (Some [a]
+                                       (let [(mut own) (.bindings a)]
+                                         ;; A part's symbols move by how many the table holds
+                                         ;; before it is grafted; one of the table it was made
+                                         ;; under is -(id + 1).
+                                         (for at own
+                                           (match (get own at)
+                                             (Some [v]
+                                                   (set! (mut b) at (if (< v 0) (- -1 v) (+ v shift))))
+                                             (None [] 0))))
+                                       (set! shift (+ shift (sym/symbol-count (.table a))))
+                                       (push! (mut tables) (.table a)))
+                                 (None [] (panic "a part of a program's analysis left no answer"))))
+                             (let [table (sym/grafted (.table d) tables (.root d))]
+                               (sym/Analysis
+                                 :table table
+                                 :root (.root d)
+                                 :bindings b
+                                 :free (sym/free-names table)))))))
+
+                     (defn analysis-whole [(tree syn/Node)
+                                           (outer (ArrayList (slice u8)))]
                        (-> sym/Analysis)
                        (let [(mut t) (sym/table-new)
                              scope (outer-scope! (mut t) outer)
