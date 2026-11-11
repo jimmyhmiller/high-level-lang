@@ -4223,377 +4223,212 @@
                                              (panic "a parallel task left no result"))))
                                    ~(sym res-v)))))
                             (cat3 "[" r "]"))))))
-          ;; `parallel-walk(roots, visit, next)`: a graph found as it is walked. `visit` is a stage's
-          ;; function (see `stage` in the pipeline language). Each name is visited once, on whichever
-          ;; of the stage's threads takes it, and `next` of its result names more, visited
-          ;; after what is waiting already. A thread that finds work waiting never waits for a whole
-          ;; wave to finish. Results come in the order they finish.
-          ;; `parallel-walk(roots, visit, next, first)`: `first` of a result names what goes on with
-          ;; that item's own work, visited before anything waiting.
-          ;; `parallel-walk(roots, visit, next, first, after)`: `after` of a result names what comes
-          ;; once everything new `first` named for it has been visited, ahead of anything waiting.
-          ;; `parallel-walk(roots, visit, next, first, after, file)`: `file` of a name `next` gave
-          ;; is the path of the file its visit will read, or "" for none. Such a file is read ahead
-          ;; by a few threads of their own (see "files read ahead" in hl.rt), and what `next` gave
-          ;; is visited in the order it was found, which is the order it is read in.
-          (and (= name "parallel-walk")
-               (or (= count 3) (= count 4) (= count 5) (= count 6)))
+          ;; `reach(roots, next)`: how many names can be reached from `roots`, where `next` of a name
+          ;; says which names it leads to. `next` is a stage's function (see `stage` in the
+          ;; pipeline language): each name is given to it once, on whichever of the stage's threads
+          ;; takes it, and a thread that finds work waiting never waits for a whole wave to finish.
+          ;; When the stage says which file a name's work reads (`reads by`), those files are read
+          ;; ahead by a few threads of their own (see "files read ahead" in hl.rt) and names are
+          ;; taken in the order they were found, which is the order they are read in; otherwise
+          ;; the name found last is taken first.
+          (and (= name "reach") (= count 2))
             (let [roots
                     (expect (mut k)
                             (get args 0)
                             (expr (mut k) (get args 0) "[Text]")
                             "[Text]")
-                  visit (expr (mut k) (get args 1) "")
-                  follow (expr (mut k) (get args 2) "")
-                  urgent (if (>= count 4) (expr (mut k) (get args 3) "") follow)
-                  has-urgent (>= count 4)
-                  later (if (>= count 5) (expr (mut k) (get args 4) "") follow)
-                  has-later (>= count 5)
-                  ahead (if (= count 6) (expr (mut k) (get args 5) "") follow)
-                  has-ahead (= count 6)
-                  ;; A visit is a stage's work: the walk runs on that stage's threads.
-                  threads
-                    (te (match (stage-fn (mut k) (get args 1))
-                          (Some [sc] `(rt/stage-threads ~(.number sc)))
-                          (None []
-                                (die (mut k)
-                                     (get args 1)
-                                     "parallel-walk visits with a stage's function: no stage of the pipeline names this one")))
-                        "Int")]
-              (unless (fn? (.ty visit))
-                (die (mut k) n "parallel-walk needs a function to visit with"))
-              (let [ps (fn-params (.ty visit))
-                    r (fn-ret (.ty visit))]
-                (unless (and (= (len ps) 1) (= (get ps 0) "Text"))
-                  (die (mut k)
-                       n
-                       "parallel-walk visits names: its function takes one Text"))
-                (unless (= (.ty follow) (cat3 "Fn(" r ")->[Text]"))
-                  (die (mut k)
-                       n
-                       (cat3 "parallel-walk's next must take a "
-                             r
-                             " and give [Text]")))
-                (unless (= (.ty urgent) (cat3 "Fn(" r ")->[Text]"))
-                  (die (mut k)
-                       n
-                       (cat3 "parallel-walk's first must take a "
-                             r
-                             " and give [Text]")))
-                (unless (= (.ty later) (cat3 "Fn(" r ")->[Text]"))
-                  (die (mut k)
-                       n
-                       (cat3 "parallel-walk's after must take a "
-                             r
-                             " and give [Text]")))
-                (when (and has-ahead (!= (.ty ahead) "Fn(Text)->Text"))
-                  (die (mut k) n "parallel-walk's file takes a Text and gives a Text"))
-                (let [cr (coil-type (mut k) r)
-                      job (fresh (mut k) "WJob")
-                      body (fresh (mut k) "wjob-body")
-                      job-v (fresh (mut k) "wjob")
-                      res-v (fresh (mut k) "wres")
-                      root-v (fresh (mut k) "wroot")]
-                  (push! (mut (.aux k))
-                         `(defstruct ~(sym job)
-                            [(gate (ptr rt/Gate))
-                             (head i64)
-                             (busy i64)
-                             (waiting i64)
-                             (done i64)
-                             ;; How many workers sleep at the gate, for whoever adds work to wake.
-                             (asleep i64)
-                             (lock i64)
-                             (queue (ArrayList (slice u8)))
-                             (found (ArrayList (slice u8)))
-                             ;; With files read ahead, what was found is taken first found first,
-                             ;; from here on; and which file each name's visit reads.
-                             (found-head i64)
-                             (ahead (fnptr (cc/C) [(slice u8)] (slice u8)))
-                             (has-ahead bool)
-                             (seen (HashMap (slice u8) bool))
-                             (results (ArrayList ~cr))
-                             (visit (fnptr (cc/C) [(slice u8)] ~cr))
-                             (follow (fnptr (cc/C) [~cr] (ArrayList (slice u8))))
-                             (urgent (fnptr (cc/C) [~cr] (ArrayList (slice u8))))
-                             (has-urgent bool)
-                             (later (fnptr (cc/C) [~cr] (ArrayList (slice u8))))
-                             (has-later bool)
-                             ;; Items waited for: which wait each ends a part of, how many each wait has
-                             ;; left, and what comes once it has none.
-                             (group-of (HashMap (slice u8) i64))
-                             (left (ArrayList i64))
-                             (thens (ArrayList (ArrayList (slice u8))))]))
-                  (push! (mut (.aux k))
-                         `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
-                            ;; A worker with nothing to do sleeps until another adds work or finishes
-                            ;; the last of it. The queue and all that goes with it are under a
-                            ;; lock held for a few instructions at a time (`lk`); the gate is
-                            ;; only for sleeping at, and is never asked for while that is held.
-                            (let [j (cast (ptr ~(sym job)) arg)
-                                  g (.gate j)
-                                  lk (field j lock)
-                                  visit (.visit j)
-                                  follow (.follow j)
-                                  urgent (.urgent j)
-                                  later (.later j)
-                                  ;; What a visit leads to (`found`) is taken last found first, and
-                                  ;; what carries on an item's own work (`queue`) in turn. Every
-                                  ;; other worker takes what was found first, the rest what carries
-                                  ;; on: a walk over files spends most of its time in the system
-                                  ;; opening them, one at a time whatever asks, so a file found is
-                                  ;; opened as soon as it is known, while the others go on finding.
-                                  found-first (= (% (rt/worker-slot) 2) 0)
-                                  (mut go) true]
-                              (rt/spin-lock! lk)
-                              (while go
-                                ;; A visit that makes a list of its own (a big file's pieces)
-                                ;; offers it to the others, who take part before anything new.
-                                (when (rt/help-wanted?)
-                                  (rt/spin-unlock! lk)
-                                  (rt/help-now!)
-                                  (rt/spin-lock! lk))
-                                (if (or (< (.head j) (len (.queue j))) (> (- (len (.found j)) (.found-head j)) 0))
-                                    (let [from-found
-                                            (if found-first
-                                                (> (- (len (.found j)) (.found-head j)) 0)
-                                                (>= (.head j) (len (.queue j))))
-                                          item
-                                            (if from-found
-                                                (if (.has-ahead j)
-                                                    (let [x (get (.found j) (.found-head j))]
-                                                      (set! (.found-head j) (+ (.found-head j) 1))
-                                                      x)
-                                                    (match (pop! (mut (.found j)))
-                                                      (Some [x] x)
-                                                      (None [] (panic "a walk's found items ran out under its lock"))))
-                                                (let [x (get (.queue j) (.head j))]
+                  sc
+                    (match (stage-fn (mut k) (get args 1))
+                      (Some [sc] sc)
+                      (None []
+                            (die (mut k)
+                                 (get args 1)
+                                 "reach follows a stage's function: no stage of the pipeline names this one")))
+                  f (.f sc)
+                  threads `(rt/stage-threads ~(.number sc))
+                  reads (.reads (.stage sc))
+                  has-ahead (> (len reads) 0)]
+              (unless (= (func-type f) "Fn(Text)->[Text]")
+                (die (mut k)
+                     (get args 1)
+                     "reach follows names: its function takes a Text and gives [Text]"))
+              (let [visit (sym (qualified (mut k) (.module sc) (.coil f)))
+                    ahead
+                      (if (not has-ahead)
+                          `""
+                          (let [slash (rt/name-end-at reads 47)
+                                rm (subslice reads 0 slash)
+                                rf (subslice reads (+ slash 1) (len reads))]
+                            (when (< (mod-index (mut k) rm) 0)
+                              (die (mut k)
+                                   n
+                                   (cat4 "this walk is the work of a stage whose files "
+                                         reads
+                                         " names: the module that asks for it must use "
+                                         rm)))
+                            (match (find-func (mod-at (mut k) rm) rf)
+                              (None [] (die (mut k) n (cat4 rm " has no function named " rf "")))
+                              (Some [g]
+                                    (unless (= (func-type g) "Fn(Text)->Text")
+                                      (die (mut k)
+                                           n
+                                           (cat reads " names the file a name's work reads: it takes a Text and gives a Text")))
+                                    `(~(sym (qualified (mut k) rm (.coil g))) x)))))
+                    job (fresh (mut k) "WJob")
+                    body (fresh (mut k) "wjob-body")
+                    job-v (fresh (mut k) "wjob")
+                    root-v (fresh (mut k) "wroot")]
+                (push! (mut (.aux k))
+                       `(defstruct ~(sym job)
+                          [(gate (ptr rt/Gate))
+                           ;; Names found and not yet taken are `found` from `head` on.
+                           (head i64)
+                           (busy i64)
+                           (waiting i64)
+                           (done i64)
+                           ;; How many workers sleep at the gate, for whoever adds work to wake.
+                           (asleep i64)
+                           (lock i64)
+                           (count i64)
+                           (found (ArrayList (slice u8)))
+                           (seen (HashMap (slice u8) bool))]))
+                (push! (mut (.aux k))
+                       `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
+                          ;; A worker with nothing to do sleeps until another adds work or finishes
+                          ;; the last of it. The names and all that goes with them are under a
+                          ;; lock held for a few instructions at a time (`lk`); the gate is
+                          ;; only for sleeping at, and is never asked for while that is held.
+                          (let [j (cast (ptr ~(sym job)) arg)
+                                g (.gate j)
+                                lk (field j lock)
+                                (mut go) true]
+                            (rt/spin-lock! lk)
+                            (while go
+                              ;; A name's work that makes a list of its own (a big file's
+                              ;; pieces) offers it to the others, who take part before
+                              ;; anything new.
+                              (when (rt/help-wanted?)
+                                (rt/spin-unlock! lk)
+                                (rt/help-now!)
+                                (rt/spin-lock! lk))
+                              (if (> (- (len (.found j)) (.head j)) 0)
+                                  (let [item
+                                          ~(if has-ahead
+                                               `(let [x (get (.found j) (.head j))]
                                                   (set! (.head j) (+ (.head j) 1))
-                                                  x))]
-                                      (set! (.busy j) (+ (.busy j) 1))
-                                      (rt/spin-unlock! lk)
-                                      (let [began (if (rt/walk-trace-on?) (rt/now-ns) 0)
-                                            r (visit item)
-                                            traced (if (rt/walk-trace-on?) (do (rt/walk-trace! item began) 0) 0)
-                                            more (follow r)
-                                            now
-                                              (if (.has-urgent j)
-                                                  (urgent r)
-                                                  (ArrayList::new [(slice u8)]
-                                                                  (rt/owned-allocator)))
-                                            then
-                                              (if (.has-later j)
-                                                  (later r)
-                                                  (ArrayList::new [(slice u8)]
-                                                                  (rt/owned-allocator)))
-                                            (mut added) false]
-                                        (rt/spin-lock! lk)
-                                        (push! (mut (.results j)) r)
-                                        ;; Ahead of what waits: into the places already taken, or a new queue.
-                                        (let [(mut fresh)
-                                                (ArrayList::new [(slice u8)]
-                                                                (rt/owned-allocator))]
-                                          (for x now
-                                            (unless (match (get (.seen j) x)
-                                                      (Some [_] true)
-                                                      (None [] false))
-                                              (set! (mut (.seen j)) x true)
-                                              (push! (mut fresh) x)))
-                                          ;; What comes after: once what is new above has been visited,
-                                          ;; or at once if nothing is.
-                                          (when (> (len then) 0)
-                                            (if (> (len fresh) 0)
-                                                (let [g (len (.left j))]
-                                                  (push! (mut (.left j))
-                                                         (len fresh))
-                                                  (push! (mut (.thens j)) then)
-                                                  (for x fresh
-                                                    (set! (mut (.group-of j))
-                                                          x
-                                                          g)))
-                                                (for x then
-                                                  (unless (match (get (.seen j)
-                                                                      x)
-                                                            (Some [_] true)
-                                                            (None [] false))
-                                                    (set! (mut (.seen j))
-                                                          x
-                                                          true)
-                                                    (push! (mut fresh) x)))))
-                                          ;; This item may be the last a wait was for.
-                                          (match (get (.group-of j) item)
-                                            (Some [g]
-                                                  (let [n
-                                                          (- (get (.left j) g)
-                                                             1)]
-                                                    (set! (mut (.left j)) g n)
-                                                    (when (= n 0)
-                                                      (for x (get (.thens j) g)
-                                                        (unless (match (get (.seen j)
-                                                                            x)
-                                                                  (Some [_]
-                                                                        true)
-                                                                  (None []
-                                                                        false))
-                                                          (set! (mut (.seen j))
-                                                                x
-                                                                true)
-                                                          (push! (mut fresh) x))))))
-                                            (None [] 0))
-                                          (when (> (len fresh) 0)
-                                            (set! added true)
-                                            (if (>= (.head j) (len fresh))
-                                                (let [start
-                                                        (- (.head j)
-                                                           (len fresh))]
-                                                  (for i (range 0 (len fresh))
-                                                    (set! (mut (.queue j))
-                                                          (+ start i)
-                                                          (get fresh i)))
-                                                  (set! (.head j) start))
-                                                (do
-                                                  (for i (range (.head j)
-                                                                (len (.queue j)))
-                                                    (push! (mut fresh)
-                                                           (get (.queue j) i)))
-                                                  (set! (.queue j) fresh)
-                                                  (set! (.head j) 0)))))
-                                        (for x more
-                                          (unless (match (get (.seen j) x)
-                                                    (Some [_] true)
-                                                    (None [] false))
-                                            (set! (mut (.seen j)) x true)
-                                            (push! (mut (.found j)) x)
-                                            (when (.has-ahead j)
-                                              (rt/read-ahead! (primitive/call-ptr (.ahead j) x)))
-                                            (set! added true)))
-                                        (set! (.busy j) (- (.busy j) 1))
-                                        (atomic/store (field j waiting)
-                                                      (+ (- (len (.found j)) (.found-head j))
-                                                         (- (len (.queue j)) (.head j))))
-                                        (when (= (.busy j) 0)
-                                          (atomic/store (field j done) 1))
-                                        ;; Whoever sleeps is woken: all of them when the walk is
-                                        ;; over, else one for each item that waits. A worker still
-                                        ;; looking for work finds it without being told.
-                                        (let [over (= (.busy j) 0)
-                                              waits (+ (- (len (.found j)) (.found-head j)) (- (len (.queue j)) (.head j)))]
-                                          (when (and (or over added) (> (atomic/read (field j asleep)) 0))
-                                            (rt/spin-unlock! lk)
-                                            (rt/gate-lock! g)
-                                            (if over
-                                                (rt/gate-wake-all! g)
-                                                (for _ (range 0 (min (atomic/read (field j asleep)) waits))
-                                                  (rt/gate-wake-one! g)))
-                                            (rt/gate-unlock! g)
-                                            (rt/spin-lock! lk)))))
-                                    (if (= (.busy j) 0)
-                                        (do
-                                          (atomic/store (field j done) 1)
-                                          (set! go false))
-                                        ;; A while looking for new work, then asleep until some comes.
-                                        (do
-                                          (atomic/store (field j waiting)
-                                                        (+ (- (len (.found j)) (.found-head j)) (- (len (.queue j)) (.head j))))
+                                                  x)
+                                               `(match (pop! (mut (.found j)))
+                                                  (Some [x] x)
+                                                  (None [] (panic "a walk's names ran out under its lock"))))]
+                                    (set! (.busy j) (+ (.busy j) 1))
+                                    (rt/spin-unlock! lk)
+                                    (let [began (if (rt/walk-trace-on?) (rt/now-ns) 0)
+                                          more (~visit item)
+                                          traced (if (rt/walk-trace-on?) (do (rt/walk-trace! item began) 0) 0)
+                                          (mut added) false]
+                                      (rt/spin-lock! lk)
+                                      (set! (.count j) (+ (.count j) 1))
+                                      (for x more
+                                        (unless (match (get (.seen j) x)
+                                                  (Some [_] true)
+                                                  (None [] false))
+                                          (set! (mut (.seen j)) x true)
+                                          (push! (mut (.found j)) x)
+                                          ~(if has-ahead `(rt/read-ahead! ~ahead) `0)
+                                          (set! added true)))
+                                      (set! (.busy j) (- (.busy j) 1))
+                                      (atomic/store (field j waiting)
+                                                    (- (len (.found j)) (.head j)))
+                                      (when (= (.busy j) 0)
+                                        (atomic/store (field j done) 1))
+                                      ;; Whoever sleeps is woken: all of them when the walk is
+                                      ;; over, else one for each name that waits. A worker still
+                                      ;; looking for work finds it without being told.
+                                      (let [over (= (.busy j) 0)
+                                            waits (- (len (.found j)) (.head j))]
+                                        (when (and (or over added) (> (atomic/read (field j asleep)) 0))
                                           (rt/spin-unlock! lk)
-                                          (let [(mut spins) 0]
-                                            (while (and (< spins 20000)
-                                                        (= (atomic/read (field j
-                                                                               waiting))
-                                                           0)
-                                                        (= (atomic/read (field j
-                                                                               done))
-                                                           0)
-                                                        (not (rt/help-wanted?)))
-                                              (set! spins (+ spins 1)))
-                                            ;; To sleep: say so, then look once more, at the gate. Work
-                                            ;; added before this said so is seen here; whoever adds
-                                            ;; after sees a sleeper, and wakes it from the gate.
-                                            (when (= spins 20000)
-                                              (rt/gate-lock! g)
-                                              (atomic/add (field j asleep) 1)
-                                              (rt/spin-lock! lk)
-                                              (let [idle (and (>= (.head j) (len (.queue j)))
-                                                              (= (- (len (.found j)) (.found-head j)) 0)
-                                                              (> (.busy j) 0)
-                                                              (not (rt/help-wanted?)))]
-                                                (rt/spin-unlock! lk)
-                                                (when idle (rt/gate-wait! g)))
-                                              (atomic/add (field j asleep) -1)
-                                              (rt/gate-unlock! g))
-                                            (rt/spin-lock! lk))))))
-                              (rt/spin-unlock! lk)
-                              arg)))
-                  (Some (te `(let [(mut ~(sym job-v))
-                                     (~(sym job)
-                                       :gate (rt/gate-new)
-                                       :head 0
-                                       :busy 0
-                                       :waiting 0
-                                       :done 0
-                                       :asleep 0
-                                       :lock 0
-                                       :queue
-                                         (ArrayList::new [(slice u8)]
-                                                         (rt/owned-allocator))
-                                       :found
-                                         (ArrayList::new [(slice u8)]
-                                                         (rt/owned-allocator))
-                                       :found-head 0
-                                       :ahead ~(if has-ahead
-                                                   (.code ahead)
-                                                   `(primitive/zeroed (fnptr (cc/C) [(slice u8)] (slice u8))))
-                                       :has-ahead ~(if has-ahead `true `false)
-                                       :seen
-                                         (HashMap::new [(slice u8) bool]
-                                                       (rt/owned-allocator)
-                                                       (rt/text-keyops))
-                                       :results
-                                         (ArrayList::new [~cr]
-                                                         (rt/owned-allocator))
-                                       :visit ~(.code visit)
-                                       :follow ~(.code follow)
-                                       :urgent ~(.code urgent)
-                                       :has-urgent ~(if has-urgent `true `false)
-                                       :later ~(.code later)
-                                       :has-later ~(if has-later `true `false)
-                                       :group-of
-                                         (HashMap::new [(slice u8) i64]
-                                                       (rt/owned-allocator)
-                                                       (rt/text-keyops))
-                                       :left
-                                         (ArrayList::new [i64]
-                                                         (rt/owned-allocator))
-                                       :thens
-                                         (ArrayList::new [(ArrayList (slice u8))]
-                                                         (rt/owned-allocator)))]
-                               (for ~(sym root-v) ~(.code roots)
-                                 (unless (match (get (.seen ~(sym job-v))
-                                                     ~(sym root-v))
-                                           (Some [_] true)
-                                           (None [] false))
-                                   (set! (mut (.seen ~(sym job-v)))
-                                         ~(sym root-v)
-                                         true)
-                                   (push! (mut (.queue ~(sym job-v)))
-                                          ~(sym root-v))))
-                               ;; What arrives where (`arrive!`) is counted afresh for each walk.
-                               (rt/arrivals-reset!)
-                               ~(if has-ahead `(rt/read-ahead-begin!) `0)
-                               (rt/idle-gate! (.gate ~(sym job-v)))
-                               (rt/run-workers (fnptr-of ~(sym body))
-                                               (cast (ptr i8)
-                                                     (mut ~(sym job-v)))
-                                               ~(.code threads))
-                               (rt/idle-gate! (primitive/cast (ptr rt/Gate) 0))
-                               ~(if has-ahead `(rt/read-ahead-end!) `0)
-                               (let [(mut ~(sym res-v))
-                                       (ArrayList::new [~cr]
-                                                       (rt/tree-allocator))]
-                                 (for x (.results ~(sym job-v))
-                                   (push! (mut ~(sym res-v)) x))
-                                 ~(sym res-v)))
-                            (cat3 "[" r "]"))))))
+                                          (rt/gate-lock! g)
+                                          (if over
+                                              (rt/gate-wake-all! g)
+                                              (for _ (range 0 (min (atomic/read (field j asleep)) waits))
+                                                (rt/gate-wake-one! g)))
+                                          (rt/gate-unlock! g)
+                                          (rt/spin-lock! lk)))))
+                                  (if (= (.busy j) 0)
+                                      (do
+                                        (atomic/store (field j done) 1)
+                                        (set! go false))
+                                      ;; A while looking for new work, then asleep until some comes.
+                                      (do
+                                        (atomic/store (field j waiting)
+                                                      (- (len (.found j)) (.head j)))
+                                        (rt/spin-unlock! lk)
+                                        (let [(mut spins) 0]
+                                          (while (and (< spins 20000)
+                                                      (= (atomic/read (field j waiting)) 0)
+                                                      (= (atomic/read (field j done)) 0)
+                                                      (not (rt/help-wanted?)))
+                                            (set! spins (+ spins 1)))
+                                          ;; To sleep: say so, then look once more, at the gate. Work
+                                          ;; added before this said so is seen here; whoever adds
+                                          ;; after sees a sleeper, and wakes it from the gate.
+                                          (when (= spins 20000)
+                                            (rt/gate-lock! g)
+                                            (atomic/add (field j asleep) 1)
+                                            (rt/spin-lock! lk)
+                                            (let [idle (and (= (- (len (.found j)) (.head j)) 0)
+                                                            (> (.busy j) 0)
+                                                            (not (rt/help-wanted?)))]
+                                              (rt/spin-unlock! lk)
+                                              (when idle (rt/gate-wait! g)))
+                                            (atomic/add (field j asleep) -1)
+                                            (rt/gate-unlock! g))
+                                          (rt/spin-lock! lk))))))
+                            (rt/spin-unlock! lk)
+                            arg)))
+                (Some (te `(let [(mut ~(sym job-v))
+                                   (~(sym job)
+                                     :gate (rt/gate-new)
+                                     :head 0
+                                     :busy 0
+                                     :waiting 0
+                                     :done 0
+                                     :asleep 0
+                                     :lock 0
+                                     :count 0
+                                     :found
+                                       (ArrayList::new [(slice u8)]
+                                                       (rt/owned-allocator))
+                                     :seen
+                                       (HashMap::new [(slice u8) bool]
+                                                     (rt/owned-allocator)
+                                                     (rt/text-keyops)))]
+                             ;; What arrives where (`arrive!`) is counted afresh for each walk.
+                             (rt/arrivals-reset!)
+                             ;; Files are read ahead for a walk on many threads; one thread reads
+                             ;; each as it comes to it.
+                             ~(if has-ahead `(when (> ~threads 1) (rt/read-ahead-begin!)) `0)
+                             (for ~(sym root-v) ~(.code roots)
+                               (unless (match (get (.seen ~(sym job-v))
+                                                   ~(sym root-v))
+                                         (Some [_] true)
+                                         (None [] false))
+                                 (set! (mut (.seen ~(sym job-v)))
+                                       ~(sym root-v)
+                                       true)
+                                 (push! (mut (.found ~(sym job-v)))
+                                        ~(sym root-v))
+                                 ~(if has-ahead `(let [x ~(sym root-v)] (rt/read-ahead! ~ahead) 0) `0)))
+                             (rt/idle-gate! (.gate ~(sym job-v)))
+                             (rt/run-workers (fnptr-of ~(sym body))
+                                             (cast (ptr i8)
+                                                   (mut ~(sym job-v)))
+                                             ~threads)
+                             (rt/idle-gate! (primitive/cast (ptr rt/Gate) 0))
+                             ~(if has-ahead `(rt/read-ahead-end!) `0)
+                             (.count ~(sym job-v)))
+                          "Int"))))
           ;; `timed(on, label, e)`: `e`, and when `on`, how long it has been since the last lap said.
           (and (= name "timed") (= count 3))
             (let [on

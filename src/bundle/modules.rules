@@ -352,7 +352,7 @@ fn body-made(mo: Module) -> Body = match mo.kind {
     where text = include-text("runtime.js"),
           rt = runtime-parsed(text)
   External => empty-body()
-  _ => file-body(entry-of(mo.path))
+  _ => file-body(loaded(mo.path))
 }
 
 fn file-body(l: Loaded) -> Body =
@@ -476,12 +476,8 @@ boxed record Parsed {
   required: [Text],     # with the analysis: what its final tree `require`s
   requires: [Text],     # what the tree as parsed `require`s, and `import()`s, when `found`
   imports: [Text],
-  found: Bool,
-  role: Role,           # in the walk: a whole file, a big file's pieces to come, a piece, or the
-  pieces: Int           # resolution of one of its imports
+  found: Bool
 }
-
-enum Role { Whole, Split, Piece, Resolved, Prepare }
 
 # A file's scope analysis: its tree once defines are applied, its root scope, which symbol each name
 # leaf is, the names it leaves free, and whether it is CommonJS.
@@ -589,7 +585,7 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
          legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: found.requires, imports: found.imports,
          found: is-none(known),
-         analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], required: [], role: Whole, pieces: 1)
+         analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], required: [])
   where loader = loader-of(path),
         config = tsc.for-file(path),
         file-jsx = configured-jsx(loading.jsx-options, config),
@@ -635,122 +631,33 @@ fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
 
 fn imported-specs(tree: Node) -> [Text] = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)]
 
-# What the walk does with one item: a file, parsed and its imports resolved; one piece of a big
-# file, parsed; a big file prepared once its pieces are, and put together once the rest of its work
-# is done; a part of that work; or the resolution of one of a file's many imports. The pieces and
-# parts are done at once, on any thread, and what each works out is kept in its memo, which putting
-# the file together reads.
-fn visit-file(item: Text) -> Parsed = match item {
-  path ++ "\n" ++ what => part-visited(path, item, what)
-  path => file-visited(path, split-source(path))
-}
+# A file as a build with no hooks parses it: its text parsed and analysed and its imports resolved;
+# a big file put together from its pieces.
+fn parsed-plain(path: Text) -> Parsed = match len(sp.starts) {
+  n if n > 1 => finished-file(path)
+  _ => targets-of(analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true))))
+} where sp = split-source(path)
 
-fn file-visited(path: Text, sp: Parts) -> Parsed = match len(sp.starts) {
-  n if n > 1 => blank-parsed(path) with { role: Split, pieces: n }
-  # Many imports are resolved as items of their own, at once.
-  _ => match len(p.specs) > resolve-alone {
-    true => p
-    false => targets-of(p)
-  } where p = analysed-file(parsed-file(Pending(path: path, text: sp.src, ready: true)))
-}
-
-fn part-visited(path: Text, item: Text, what: Text) -> Parsed = match what {
-  "prepare" => prepared-file(path, prepared-of(path))
-  "rest" => finished-file(path)
-  "early" => worked(item) where problem = early-of(path)
-  "from" => worked(item) where p = from-of(path)
-  "leads" => worked(item) where l = loaded-ahead(path)
-  "w" ++ _ => worked(item) where w = walked-of(item)
-  "?" ++ batch => blank-parsed(path) with { role: Resolved, targets: {request-key(r): t for r in asked if let some(t) = unhooked-target(r, path)} }
-    where requests = requests-of(visit-file(path)), from = parse-int(batch) * resolve-batch,
-          asked = requests[from..min(len(requests), from + resolve-batch)]
-  _ => worked(item) with { targets: piece-of(item).targets }
-}
-
-# A part of a big file's work, done.
-fn worked(item: Text) -> Parsed = blank-parsed(item) with { role: Piece }
-
-# A big file whose pieces are parsed: put together at once when they make one program inside one
-# function, or else with its parts' walks, its early errors and the rest still to do.
-fn prepared-file(path: Text, pr: Prepared) -> Parsed = match pr.whole {
-  false => finished-file(path)
-  true => blank-parsed(path) with { role: Prepare, pieces: len(pr.parts) }
-}
-
-const resolve-alone: Int = 16
-
-# A file with many imports has them resolved a batch at a time, each batch an item of the walk:
-# enough at once that an item's own cost is little beside them, few enough that many threads share
-# one big file's imports.
-const resolve-batch: Int = 64
-
+# Where each of a file's imports leads, by what it asks for.
 fn targets-of(p: Parsed) -> Parsed =
-  p with { targets: {request-key(r): t for r in requests-of(p) if let some(t) = unhooked-target(r, p.path)} }
+  p with { targets: {request-key(requests[i]): t for i in 0..len(requests) if let some(t) = found[i]} }
+  where requests = requests-of(p),
+        found = [unhooked-target(r, p.path) for r in requests]
 
-# The files what a result imports lead to, visited after what waits already.
-# What the walk ahead needs of a visit: where it goes next, what carries on first, and what comes
-# after. Only this, not the parse, is what a visit gives the walk.
-record Step { next: [Text], first: [Text], after: [Text], leads: Int }
-
-fn visit-step(item: Text) -> Step = Step(next: next-files(p), first: first-files(p), after: after-files(p), leads: leads-ahead(item, p))
-  where p = visit-file(item)
-
-# A file visited whole and analysed: its place in the graph is worked out by whoever parsed it,
-# while the others parse, and the graph's walk finds it made. One with many imports has them
-# resolved first, a batch at a time on many threads (`first-files`), and its place worked out
-# after (`after-files`): worked out here, it would resolve every import alone, with the batches
-# and all they lead to waiting for it.
-fn leads-ahead(item: Text, p: Parsed) -> Int = match p.role {
-  Whole if item == p.path and p.analysed and not batched?(p) => len(loaded-ahead(item).leads)
-  _ => 0
+# What a file leads to, for the walk that parses every file before the graph is made. Whoever
+# parses a file works out its place in the graph too, when it can (see `plain?`).
+fn led-ahead(path: Text) -> [Text] = match plain?(path) {
+  true => ahead-targets(loaded-plain(path).parsed)
+  false => ahead-targets(parsed-plain(path))
 }
 
-# Whether a file's imports are resolved as items of their own.
-fn batched?(p: Parsed) -> Bool = len(p.specs) > resolve-alone and len(keys(p.targets)) == 0
+fn ahead-targets(p: Parsed) -> [Text] = [t for t in values-of(p.targets) if ahead?(t)]
 
-# The file a visit of what the walk found will read, for reading it ahead (see `parallel-walk`): a
-# file's own path; nothing for a part of a file's work, and for a module left empty.
+# The file the walk reads for a name: its own path; nothing for a module left empty.
 fn file-read(item: Text) -> Text = match item {
-  _ ++ "\n" ++ _ => ""
   "disabled:" ++ _ => ""
   path => path
 }
-
-fn step-next(s: Step) -> [Text] = s.next
-fn step-first(s: Step) -> [Text] = s.first
-fn step-after(s: Step) -> [Text] = s.after
-
-fn next-files(p: Parsed) -> [Text] = match p.role {
-  Split => []
-  _ => [t for t in values-of(p.targets) if ahead?(t)]
-}
-
-# What carries on with an item's own work, ahead of everything waiting: a big file's pieces, each
-# taken by whoever comes first; its parts' walks, early errors and the rest; or the resolution of
-# each of a file's many imports.
-fn first-files(p: Parsed) -> [Text] = match p.role {
-  Split => [p.path ++ "\n" ++ int-text(k) for k in 0..p.pieces]
-  # Then its parts' walks, its early errors and the rest, at once.
-  Prepare => [p.path ++ "\nw" ++ int-text(k) for k in 0..p.pieces] ++ [p.path ++ "\nearly", p.path ++ "\nfrom"]
-  Whole => if batched?(p)
-           then [p.path ++ "\n?" ++ int-text(k) for k in 0..(len(requests-of(p)) + resolve-batch - 1) / resolve-batch] else []
-  _ => []
-}
-
-# What comes once all of that is done: a big file prepared once its pieces are parsed, and put
-# together once its parts are worked out.
-fn after-files(p: Parsed) -> [Text] = match p.role {
-  Split => [p.path ++ "\nprepare"]
-  Prepare => [p.path ++ "\nrest"]
-  # A file's place in the graph, once its many imports are resolved.
-  Whole if p.analysed and batched?(p) => [p.path ++ "\nleads"]
-  _ => []
-}
-
-fn blank-parsed(path: Text) -> Parsed =
-  Parsed(path: path, src: "", parsed: None(), tree: None(), pure-calls: {}, helpers: [], jsx-imports: false,
-         pure-at: {}, legal: [], specs: [], targets: {}, analysed: false, scopes: sym.table-new(),
-         analysis: no-analysis(), calls: [], required: [], requires: [], imports: [], found: false, role: Whole, pieces: 1)
 
 # ---------------------------------------------------------------- big files, in pieces
 
@@ -886,15 +793,15 @@ fn filled-body(n: Node, lo: Int, hi: Int, stmts: [Node], pieces: [Node]) -> Node
 boxed record PieceTree { tree: Node?, specs: [Text], targets: {Text:Text} }
 
 # One piece: its statements, parsed as a program of their own, and where what they import leads.
-fn piece-of(item: Text) -> PieceTree = match item {
-  path ++ "\n" ++ number => match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
-    none => PieceTree(tree: none, specs: [], targets: {})
-    some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {request-key(r): t for r in requests-in(tree, found.requires, found.imports) if let some(t) = unhooked-target(r, path)})
-      where found = calls.run(tree),
-            specs = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)] ++ found.requires ++ found.imports
-  } where k = parse-int(number),
-          sp = split-source(path)
-}
+fn piece-of(path: Text, k: Int) -> PieceTree = match js.parse-piece(sp.src[0..piece-end(sp, k)], path, 0, sp.starts[k]) {
+  none => PieceTree(tree: none, specs: [], targets: {})
+  some(tree) => PieceTree(tree: some(tree), specs: specs, targets: {request-key(r): t for r in requests-in(tree, found.requires, found.imports) if let some(t) = unhooked-target(r, path)})
+    where found = calls.run(tree),
+          specs = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)] ++ found.requires ++ found.imports
+} where sp = split-source(path)
+
+# A big file's pieces, each its own work.
+fn pieces-of(path: Text) -> [PieceTree] = [piece-of(path, k) for k in 0..len(split-source(path).starts)]
 
 # A big file put together from its pieces, ready for its parts to be analysed at once: the program as
 # parsed, the program as analysed (its top level normalised one piece at a time), and a table that
@@ -929,7 +836,7 @@ fn prepared-of(path: Text) -> Prepared = match pieces {
           wrapped = wrapper-wanted?(esm),
           own = sc.declarations(tree, [x for x in ["exports", "module"] if wrapped])
 } where sp = split-source(path),
-        pieces = [piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]
+        pieces = [pc.tree for pc in pieces-of(path)]
 
 # One part's walk, in a table of its own under the program's scope.
 # `defined`: whether a define applies in the part, which only its own bindings can tell. Its
@@ -937,17 +844,14 @@ fn prepared-of(path: Text) -> Prepared = match pieces {
 boxed record Walked { scopes: sym.Table, bindings: {Int:Int}, defined: Bool, requires: [Text], imports: [Text],
                 problem: early.Problem? }
 
-fn walked-of(item: Text) -> Walked = match item {
-  path ++ "\nw" ++ number =>
-    Walked(scopes: own.table, bindings: own.bindings, defined: pr.mentions and (any s in pr.parts[k]: defines-apply?(s, own.bindings)),
-           requires: found.requires, imports: found.imports, problem: found.problem)
-    where k = parse-int(number),
-          pr = prepared-of(path),
-          own = sc.part-analysis(pr.scopes, pr.root, [pr.tree.hashbang for x in [k] if x == 0] ++ pr.parts[k]),
-          # Checking the part finds what it loads, in its statements as parsed: normalising them
-          # keeps every call, in order.
-          found = early.part-found(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
-}
+fn walked-of(path: Text, k: Int) -> Walked =
+  Walked(scopes: own.table, bindings: own.bindings, defined: pr.mentions and (any s in pr.parts[k]: defines-apply?(s, own.bindings)),
+         requires: found.requires, imports: found.imports, problem: found.problem)
+  where pr = prepared-of(path),
+        own = sc.part-analysis(pr.scopes, pr.root, [pr.tree.hashbang for x in [k] if x == 0] ++ pr.parts[k]),
+        # Checking the part finds what it loads, in its statements as parsed: normalising them
+        # keeps every call, in order.
+        found = early.part-found(pr.tree0, pr.esm, not pr.esm, false, pr.exportable, pr.raw[k])
 
 # What parsing a file whole checks of its statements together, at once with the parts' walks,
 # which check each part's.
@@ -955,7 +859,7 @@ fn early-of(path: Text) -> early.Problem? = early.check-head(pr.tree0, pr.esm, n
 
 fn from-of(path: Text) -> Parsed =
   parsed-with(path, split-source(path).src, prepared-of(path).tree0,
-              some([s for k in 0..len(split-source(path).starts) for s in piece-of(path ++ "\n" ++ int-text(k)).specs]), none)
+              some([s for pc in pieces-of(path) for s in pc.specs]), none)
 
 # The big file, analysed: its parts' tables grafted in order, as one walk would have filled the
 # table, ids and all. CommonJS, and code a define changes, are analysed again whole, as
@@ -964,7 +868,7 @@ fn from-of(path: Text) -> Parsed =
 # whole file would be.
 fn nested-file(path: Text) -> Parsed? = match sp.open {
   open if open < 0 => none
-  _ => first pieces in [[piece-of(path ++ "\n" ++ int-text(k)).tree for k in 0..len(sp.starts)]]
+  _ => first pieces in [[pc.tree for pc in pieces-of(path)]]
              if all t in pieces: is-some(t)
              for tree in assembled(sp, path, [t for some(t) in pieces]):
          nested-checked(path, sp.src, tree)
@@ -994,9 +898,9 @@ fn joined-file(path: Text, pr: Prepared) -> Parsed =
   }
   where sp = split-source(path),
         p = from-of(path),
-        found = [piece-of(path ++ "\n" ++ int-text(k)).targets for k in 0..len(sp.starts)],
+        found = [pc.targets for pc in pieces-of(path)],
         targets = {spec: t for pt in found for spec in keys(pt) if let some(t) = pt[spec]},
-        walks = [walked-of(path ++ "\nw" ++ int-text(k)) for k in 0..len(pr.parts)],
+        walks = [walked-of(path, k) for k in 0..len(pr.parts)],
         # A part's symbols move by how many the table holds before it is grafted.
         ends = scan n = sym.symbol-count(pr.scopes) for w in walks: n + sym.symbol-count(w.scopes),
         bindings = {key: rebound(v, ends[k] - sym.symbol-count(walks[k].scopes))
@@ -1067,7 +971,7 @@ fn ahead-target(request: Request, importer: Text) -> Text? = match request.spec 
 # With them, a wave at a time: a wave's texts are asked of the hooks, its files parsed, and their
 # imports are the next wave.
 fn parsed-ahead(paths: [Text]) -> Int = match hooked?() {
-  false => len(parallel-walk(roots, visit-step, step-next, step-first, step-after, file-read))
+  false => reach(roots, led-ahead)
   true => len(parsed-waves(roots, {p: true for p in roots}))
 } where roots = [real-path(p) for p in paths if ahead?(p) distinct real-path(p)]
 
@@ -1134,29 +1038,27 @@ record Lead { key: Text, effects: Bool }
 boxed record Loaded { path: Text, parsed: Parsed, tree0: Node, analysis: Analysis, scopes: sym.Table, specs: [Text], calls: [Text],
                 requests: [Request], leads: [Lead], whole: [Text] }
 
-fn loaded(path: Text) -> Loaded = match ahead-whole?(path) {
-  true => loaded-ahead(path)
+fn loaded(path: Text) -> Loaded = match plain?(path) {
+  true => loaded-plain(path)
   false => loaded-here(path)
 }
 
-# Whether the walk ahead left this file whole and analysed, in a build with no hooks: then whoever
-# parsed it worked out its place in the graph too (see `visit-step`), with nothing to ask a hook.
-fn ahead-whole?(path: Text) -> Bool =
-  ahead?(path) and not hooked?() and walked-file(path).analysed
+# Whether a file's place in the graph is worked out with nothing to ask a hook or a spec's
+# transform, which only the thread that links may call: then whoever parses it works it out too
+# (see `led-ahead`).
+fn plain?(path: Text) -> Bool = ahead?(path) and not hooked?() and parsed-plain(path).analysed
 
-fn loaded-ahead(path: Text) -> Loaded =
+fn loaded-plain(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: p.tree, analysis: p.analysis, scopes: p.scopes, specs: specs, calls: p.calls,
          requests: requests, leads: [unhooked-lead(request, path) for request in requests],
          whole: [unhooked-lead(r, path).key for r in [require-request(s) for s in p.required]
                    ++ [import-request(x) for st in p.tree.body.kids for x in wholly-imported(st)]])
-  where p = analysed-ahead(path),
+  where p = match parsed-plain(path) {
+          q if q.analysed => q
+          _ => panic "{} is not analysed where it is parsed: its place in the graph is worked out with the graph", path
+        },
         specs = [spec for s in p.tree.body.kids if let some(spec) = import-spec-of(s)] ++ p.calls,
         requests = requests-in(p.tree, p.required, [s for s in p.calls[len(p.required)..len(p.calls)]])
-
-fn analysed-ahead(path: Text) -> Parsed = match walked-file(path) {
-  p if p.analysed => p
-  _ => panic "{} was parsed ahead and not analysed: its place in the graph is worked out with the graph", path
-}
 
 fn loaded-here(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: tree0, analysis: a.analysis, scopes: a.scopes, specs: specs, calls: calls,
@@ -1185,25 +1087,16 @@ fn loaded-here(path: Text) -> Loaded =
         specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls,
         requests = requests-in(tree0, required, [s for s in calls[len(required)..len(calls)]])
 
-# What loading made of a file, before the graph joins it to the others: on many threads, what the
-# walk ahead made of it, found again in the memos it filled (a big file put together from its
-# pieces once they are done); with load hooks, the wave's parse of the text a hook gave; on one
-# thread, a parse here.
+# What loading made of a file, before the graph joins it to the others: what the walk ahead made of
+# it; with load hooks, the wave's parse of the text a hook gave; for a file the walk does not
+# reach, a parse here.
 fn parsed-for-graph(path: Text) -> Parsed = match ahead?(path), hooked?() {
-  true, false => walked-file(path)
+  true, false => parsed-plain(path)
   true, true => parsed-hooked(path)
   false, _ => parsed-alone(path)
 }
 
 fn hooked?() -> Bool = len(loading.on-load) + len(loading.on-resolve) > 0
-
-fn walked-file(path: Text) -> Parsed = match visit-file(path) {
-  p if p.role is Split => match visit-file(path ++ "\nprepare") {
-    q if q.role is Prepare => visit-file(path ++ "\nrest")
-    q => q
-  }
-  p => p
-}
 
 # A file nothing parsed ahead, parsed and analysed on the thread that links, once for as long as
 # its text stays the same.
@@ -1315,17 +1208,9 @@ fn runtime-module(rt: sym.Analysis, lay: Placement) -> Module =
 # What the graph reads of a loaded file, each kept by itself: what it leads to, what it imports whole
 # or requires, and its scopes. While one file is edited the others' are read from what was kept,
 # not made again from all that loading them made.
-fn leads-of(path: Text) -> [Lead] = entry-of(path).leads
-fn whole-of(path: Text) -> [Text] = entry-of(path).whole
-fn scopes-of(path: Text) -> sym.Table = entry-of(path).scopes
-
-# A file as loading found it, for whoever reads it once the files are loaded: what the walk ahead
-# left for it when it worked out the file's place (see `visit-step`), read as it is; any other
-# file's, as `loaded` makes and keeps it.
-fn entry-of(path: Text) -> Loaded = match ahead-whole?(path) {
-  true => loaded-ahead(path)
-  false => loaded(path)
-}
+fn leads-of(path: Text) -> [Lead] = loaded(path).leads
+fn whole-of(path: Text) -> [Text] = loaded(path).whole
+fn scopes-of(path: Text) -> sym.Table = loaded(path).scopes
 
 # How many scopes and symbols a file's own table has: all that placing it needs, kept by itself so
 # a build that finds the file unchanged reads two numbers and not the table.
@@ -1353,7 +1238,7 @@ fn module-at(w: Walk, i: Int, numbers: [Int], lay: Placement, part-at: [Int], wh
 
 # A file's module, by everything it is made of: the same one while those stay the same.
 fn module-of(path: Text, id: Int, effects: Bool, scope-shift: Int, symbol-shift: Int, whole: Bool, deps: [Int]) -> Module =
-  file-module(id, entry-of(path), effects, scope-shift, symbol-shift, deps, whole)
+  file-module(id, loaded(path), effects, scope-shift, symbol-shift, deps, whole)
 
 # `deps`: the id each of its leads leads to, in order.
 fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift: Int, deps: [Int], whole: Bool) -> Module =
