@@ -9751,6 +9751,7 @@
 (defn memo-persist-code [(k (mut Comp)) (f Func) (name (slice u8))] (-> Code)
   (let [store (sym (cat "MemoStore--" name))
         store-fn (sym (cat "memo-store--" name))
+        whole-fn (sym (cat "memo-whole--" name))
         args-ty (sym (cat "MemoArgs--" name))
         save (sym (cat "memo-save--" name))
         load-index (sym (cat "memo-load--" name))
@@ -9789,16 +9790,16 @@
     `(do
        (defn ~save [(w (ptr rt/Writer)) (x (ptr rt/Writer)) (full bool)]
          (-> void)
-         (let [s (~store-fn)
+         (let [s (~whole-fn)
                (mut keys) (ArrayList::new [~keyty] (malloc-allocator))]
            (when (and full (or (> (len (.lazy s)) 0) (> (len (.pending s)) 0)))
              (panic "memo fn {} is written whole with answers still unread"
                     ~name))
            (cond (not ~disk) 0
-                 full (for key (.table s) (when ~stored (push! (mut keys) key)))
+                 full (for key (.table (.main s)) (when ~stored (push! (mut keys) key)))
                  :else
                    (for key (.dirty s)
-                     (match (get (.table s) key)
+                     (match (get (.table (.main s)) key)
                        (Some [_] (when ~stored (push! (mut keys) key)))
                        (None [] 0))))
            (rt/put-varint! x (len keys))
@@ -9822,7 +9823,7 @@
                                (panic "memo fn {} kept arguments with no node"
                                       ~name)))
                        ~@puts
-                       (match (get (.table s) key)
+                       (match (get (.table (.main s)) key)
                          (Some [answer] ~(enc-code (mut k) (.ret f) `answer))
                          (None []
                                (panic "memo fn {} kept arguments with no answer"
@@ -9835,7 +9836,7 @@
                    (and (.has-last s)
                         ~disk
                         ~(if tree `false `true)
-                        (match (get (.table s) (.last-key s))
+                        (match (get (.table (.main s)) (.last-key s))
                           (Some [_]
                                 ~(if (>= number 0)
                                      `(~(sym (cat "memo-stored?--" name)) s
@@ -9959,7 +9960,7 @@
                                    closed (rt/answer-region-close! answer-region)]
                                (rt/reader-return! r)
                                (rt/spin-lock! word)
-                               (set! (mut (.table s)) key answer)
+                               (set! (mut (.table (.main s))) key answer)
                                (when (!= answer-region 0)
                                  (match (get (.regions s) key) (Some [old] (rt/region-release-id! old)) (None [] 0))
                                  (set! (mut (.regions s)) key answer-region))
@@ -9978,7 +9979,7 @@
                                      ~(if (= (len (.params f)) 0)
                                           `(zeroed ~args-ty)
                                           `(~args-ty ~@inits)))
-                               (set! (mut (.table s)) key answer)
+                               (set! (mut (.table (.main s))) key answer)
                                (when (!= answer-region 0)
                                  (match (get (.regions s) key) (Some [old] (rt/region-release-id! old)) (None [] 0))
                                  (set! (mut (.regions s)) key answer-region))
@@ -9990,7 +9991,7 @@
          0)
        ;; Every answer the cache holds read, before the log is written whole.
        (defn ~force [] (-> void)
-         (let [s (~store-fn)
+         (let [s (~whole-fn)
                word (cast (ptr i64) s)]
            (~prepare s)
            (rt/spin-lock! word)
@@ -10453,6 +10454,10 @@
         mt (memo-map-type f)
         store (sym (cat "MemoStore--" name))
         store-fn (sym (cat "memo-store--" name))
+        whole-fn (sym (cat "memo-whole--" name))
+        part (sym (cat "MemoPart--" name))
+        front-fn (sym (cat "memo-front--" name))
+        settle (sym (cat "memo-settle--" name))
         compute (cat "memo-compute--" name)
         ensure (sym (cat "memo-ensure--" name))
         ;; A function a strategy keeps is kept only in a run whose strategy does: `entry` is the
@@ -10492,15 +10497,29 @@
     ;; The lock word comes first, so the store's address is the word's.
     (emit! (mut out)
            `(defstruct ~args-ty [~@arg-fields]))
+    ;; Answers and who is making which, under a lock of their own. A store has one such part for
+    ;; all of its answers (`main`, under the store's lock), and, in a run that only makes answers
+    ;; and reads them (see `simple` in the entry), many: each key's answer in the part its hash
+    ;; picks, so threads asking for different keys seldom wait for each other. Whatever reads a
+    ;; store whole first has the many put back into the one (`memo-settle--`).
+    (emit! (mut out)
+           `(defstruct ~part
+              [(lock i64)
+               (table ~(memo-storage-type (mut k) f))
+               (busy ~(coil-type (mut k) (memo-busy-type f)))]))
     (emit! (mut out)
            `(defstruct ~store
               [(lock i64)
                (ready bool)
                (gen i64)
-               (table ~(memo-storage-type (mut k) f))
+               (main ~part)
+               ;; The many parts; whether they are made (see `rt/once-mine?`); whether any holds
+               ;; an answer.
+               (fronts (ArrayList (ptr ~part)))
+               (fronts-made i64)
+               (fronted i64)
                (args (HashMap ~(coil-type (mut k) (memo-key-type f)) ~args-ty))
                (node-ids (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
-               (busy ~(coil-type (mut k) (memo-busy-type f)))
                ;; Answers the cache holds that this run has not read, by where their data is;
                ;; answers new since the last save; and, for a memo whose keys hold trees, the nodes
                ;; and data of answers whose keys are not made yet.
@@ -10561,7 +10580,7 @@
                       (do
                         (~(sym (cat "memo-fault--" name)) s key)
                         (rt/spin-lock! word)
-                        (let [found (get (.table s) key)]
+                        (let [found (get (.table (.main s)) key)]
                           (rt/spin-unlock! word)
                           found))
                       (None [~(coil-type (mut k) (.ret f))]))))))
@@ -10580,7 +10599,7 @@
     ;; its store keeps.
     (emit! (mut out)
            `(defn ~ensure [(id i64)] (-> i64)
-              (let [s (~store-fn)
+              (let [s (~whole-fn)
                     word (cast (ptr i64) s)
                     prepared (~(sym (cat "memo-prepare--" name)) s)
                     text (rt/dep-memo-key id)
@@ -10623,27 +10642,73 @@
     ;; Its answers forgotten, when a setting it reads is given again while nothing is tracked.
     (emit! (mut out)
            `(defn ~(sym (cat "memo-forget--" name)) [] (-> void)
-              (let [s (~store-fn)
+              (let [s (~whole-fn)
                     word (cast (ptr i64) s)]
                 (rt/spin-lock! word)
                 (for key (.regions s)
                   (match (get (.regions s) key) (Some [r] (rt/region-release-id! r)) (None [] 0)))
                 (free! (mut (.regions s)))
                 (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type f)))
-                (free! (mut (.table s)))
-                (set! (.table s) ~(memo-storage-new (mut k) f))
-                (free! (mut (.busy s)))
-                (set! (.busy s) ~(runtime-map (mut k) (memo-busy-type f)))
+                (free! (mut (.table (.main s))))
+                (set! (.table (.main s)) ~(memo-storage-new (mut k) f))
+                (free! (mut (.busy (.main s))))
+                (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type f)))
                 (set! (.gen s) (rt/next-pass!))
                 (rt/spin-unlock! word))
               0))
+    ;; The part of the many that holds `key`'s answer: picked by bits of its hash the part's own
+    ;; table does not place it by.
+    (emit! (mut out)
+           `(defn ~front-fn [(s (ptr ~store)) (key ~(coil-type (mut k) (memo-key-type f)))] (-> (ptr ~part))
+              (when (rt/once-mine? (field s fronts-made))
+                (let [(mut all) (ArrayList::new [(ptr ~part)] (malloc-allocator))]
+                  (for _ (range 0 (rt/memo-parts))
+                    (let [h (coil.alloc/unwrap-ptr (coil.alloc/create [~part] (malloc-allocator)))]
+                      (store! h
+                              (~part :lock 0
+                                     :table ~(memo-storage-new (mut k) f)
+                                     :busy ~(runtime-map (mut k) (memo-busy-type f))))
+                      (push! (mut all) h)))
+                  (set! (.fronts s) all))
+                (rt/once-made! (field s fronts-made)))
+              (get (.fronts s)
+                   (rt/memo-part-of ~(if (= (memo-key-type f) "Int")
+                                         `(rt/memo-hash key)
+                                         `(rt/text-hash key))))))
+    ;; The many parts' answers put into the one, and the many left empty: before anything reads the
+    ;; store whole, or makes answers in a way the many do not serve. Only while nothing asks.
+    (emit! (mut out)
+           `(defn ~settle [(s (ptr ~store))] (-> void)
+              (when (!= (atomic/read (field s fronted)) 0)
+                (let [word (cast (ptr i64) s)]
+                  (rt/spin-lock! word)
+                  (when (!= (atomic/read (field s fronted)) 0)
+                    (for h (.fronts s)
+                      (rt/spin-lock! (cast (ptr i64) h))
+                      (for key (.table h)
+                        (match (get (.table h) key)
+                          (Some [v] (do (set! (mut (.table (.main s))) key v) 0))
+                          (None [] 0)))
+                      (free! (mut (.table h)))
+                      (set! (.table h) ~(memo-storage-new (mut k) f))
+                      (free! (mut (.busy h)))
+                      (set! (.busy h) ~(runtime-map (mut k) (memo-busy-type f)))
+                      (rt/spin-unlock! (cast (ptr i64) h)))
+                    (atomic/store (field s fronted) 0))
+                  (rt/spin-unlock! word)))
+              0))
+    (emit! (mut out)
+           `(defn ~whole-fn [] (-> (ptr ~store))
+              (let [s (~store-fn)]
+                (~settle s)
+                s)))
     (emit! (mut out)
            `(defn ~store-fn [] (-> (ptr ~store))
               (let [s (primitive/alloc-static ~store)]
                 (unless (.ready s)
                   (rt/init-lock!)
                   (unless (.ready s)
-                    (set! (.table s) ~(memo-storage-new (mut k) f))
+                    (set! (.table (.main s)) ~(memo-storage-new (mut k) f))
                     (set! (.args s)
                           ~(if (= (memo-key-type f) "Int")
                                `(HashMap::new [i64 ~args-ty]
@@ -10660,7 +10725,7 @@
                                `(HashMap::new [(slice u8) i64]
                                               (malloc-allocator)
                                               (rt/memo-keyops))))
-                    (set! (.busy s) ~(runtime-map (mut k) (memo-busy-type f)))
+                    (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type f)))
                     (set! (.lazy s)
                           ~(runtime-map (mut k)
                                     (cat3 "{" (memo-key-type f) ":Int}")))
@@ -10726,7 +10791,7 @@
                       (ArrayList::new [~(coil-type (mut k) (memo-key-type f))]
                                       (malloc-allocator))
                     (mut stamps) (ArrayList::new [i64] (malloc-allocator))]
-                (for key (.table s)
+                (for key (.table (.main s))
                   (push! (mut keys) key)
                   (push! (mut stamps)
                          (match (get (.uses s) key) (Some [n] n) (None [] 0))))
@@ -10737,7 +10802,7 @@
                       (match (get (.regions s) key)
                         (Some [r] (do (rt/region-release-id! r) (HashMap::remove! (mut (.regions s)) key)))
                         (None [] 0))
-                      (rt/MemoMap::remove! (mut (.table s)) key)
+                      (rt/MemoMap::remove! (mut (.table (.main s))) key)
                       (HashMap::remove! (mut (.uses s)) key)))
                   ;; Every worker's table in front of this one forgets what it had.
                   (set! (.gen s) (rt/next-pass!))
@@ -10769,15 +10834,15 @@
                `(defn ~(sym (cat "memo-sweep--" name)) [] (-> i64)
                   (let [by (rt/kept-evict-by ~number)]
                     (when (>= by 0)
-                      (let [s (~store-fn)
+                      (let [s (~whole-fn)
                             word (cast (ptr i64) s)
                             (mut drop)
                               (ArrayList::new [~(coil-type (mut k)
                                                            (memo-key-type f))]
                                               (malloc-allocator))]
                         (rt/spin-lock! word)
-                        (let [kept (len (.table s))]
-                          (for key (.table s)
+                        (let [kept (len (.table (.main s)))]
+                          (for key (.table (.main s))
                             (let [idle
                                     (- (rt/builds-swept)
                                        (match (get (.uses s) key)
@@ -10791,7 +10856,7 @@
                             (match (get (.regions s) key)
                               (Some [r] (do (rt/region-release-id! r) (HashMap::remove! (mut (.regions s)) key)))
                               (None [] 0))
-                            (rt/MemoMap::remove! (mut (.table s)) key)
+                            (rt/MemoMap::remove! (mut (.table (.main s))) key)
                             (HashMap::remove! (mut (.uses s)) key))
                           (when (> (len drop) 0)
                             (set! (.gen s) (rt/next-pass!))
@@ -10873,19 +10938,43 @@
                               (mut answer) (None [~rt])
                               (mut answer-region) 0
                               (mut new-answer) false
-                              (mut go) true]
+                              (mut go) true
+                              ;; A run that only makes answers and reads them keeps each in the
+                              ;; part its key picks, under that part's lock: nothing of what the
+                              ;; store keeps for a tracked answer, a counted one, one read from
+                              ;; the cache, or one made from the last, is touched.
+                              simple
+                                (and (not tracking)
+                                     (not counted)
+                                     (not reclaim)
+                                     (< update 0)
+                                     (= (len (.lazy s)) 0)
+                                     (= (len (.pending s)) 0))
+                              h (if simple (~front-fn s key) (field s main))
+                              ;; The one part is under the store's lock, as all else of the store.
+                              hw (if simple (cast (ptr i64) h) word)]
+                          (unless simple (~settle s))
                           ;; An answer another thread made is read beside whoever else reads:
-                          ;; only making one, or checking one a run tracks, takes the store whole.
+                          ;; only making one, or checking one a run tracks, takes its part whole.
+                          ;; One the store's one part holds (read from the cache, or put back
+                          ;; there) is found there.
                           (unless (or tracking counted reclaim)
-                            (rt/read-lock! word)
-                            (let [early (get (.table s) key)]
-                              (rt/read-unlock! word)
+                            (rt/read-lock! hw)
+                            (let [early (get (.table h) key)]
+                              (rt/read-unlock! hw)
                               (match early
                                 (Some [_] (do (set! answer early) (set! go false)))
-                                (None [] 0))))
+                                (None [] 0)))
+                            (when (and go simple (> (len (.table (.main s))) 0))
+                              (rt/read-lock! word)
+                              (let [early (get (.table (.main s)) key)]
+                                (rt/read-unlock! word)
+                                (match early
+                                  (Some [_] (do (set! answer early) (set! go false)))
+                                  (None [] 0)))))
                           (while go
-                            (rt/spin-lock! word)
-                            (let [found (get (.table s) key)
+                            (rt/spin-lock! hw)
+                            (let [found (get (.table h) key)
                                   current
                                     (match found
                                       (Some [_]
@@ -10903,27 +10992,29 @@
                                                 (.clock s)
                                                 (rt/builds-swept))))
                                     (set! answer-region
-                                          (match (get (.regions s) key) (Some [r] r) (None [] 0)))
-                                    (rt/spin-unlock! word)
+                                          (if simple
+                                              0
+                                              (match (get (.regions s) key) (Some [r] r) (None [] 0))))
+                                    (rt/spin-unlock! hw)
                                     (set! answer found)
                                     (set! go false))
                                   (let [owner
-                                          (match (get (.busy s) key)
+                                          (match (get (.busy h) key)
                                             (Some [o] o)
                                             (None [] 0))]
                                     (cond (= owner me)
                                             (do
-                                              (rt/spin-unlock! word)
+                                              (rt/spin-unlock! hw)
                                               (panic "memo fn {} asks for its own answer"
                                                      ~name))
                                           (> owner 0)
                                             (do
-                                              (rt/spin-unlock! word)
+                                              (rt/spin-unlock! hw)
                                               (rt/pause!))
                                           :else
                                             (do
-                                              (set! (mut (.busy s)) key me)
-                                              (rt/spin-unlock! word)
+                                              (set! (mut (.busy h)) key me)
+                                              (rt/spin-unlock! hw)
                                               ;; Made from the store's own copy of the arguments, in a
                                               ;; region of its own, when the run reclaims memory. Asked
                                               ;; for by a computation working apart, made in lasting
@@ -11060,7 +11151,7 @@
                                                                   fresh))))
                                                     apart-left (rt/lasting-leave! apart-open)
                                                     noted (!= (rt/name-notes) noted-before)]
-                                                (rt/spin-lock! word)
+                                                (rt/spin-lock! hw)
                                                 (when tracking
                                                   ;; Its arguments: the store's own copy already, while the run
                                                   ;; reclaims memory (see `memo-own--`).
@@ -11077,7 +11168,7 @@
                                                           key
                                                           1)))
                                                 (unless noted
-                                                  (set! (mut (.table s))
+                                                  (set! (mut (.table h))
                                                         key
                                                         made))
                                                 ;; The table holds the region its answer was made in: a new
@@ -11091,11 +11182,17 @@
                                                         (do (set! (mut (.regions s)) key fresh-region)
                                                             (rt/region-release-id! had)
                                                             (set! answer-region fresh-region)))))
-                                                ~(if (= (memo-key-type f) "Text")
-                                                     `(rt/last-key-set! (field s last-key) key)
-                                                     `(set! (.last-key s) key))
-                                                (set! (.has-last s) true)
-                                                (set! (mut (.busy s)) key 0)
+                                                ;; The last answer made is for an `update by` function,
+                                                ;; which a simple run has none of.
+                                                (if simple
+                                                    (when (= (atomic/read (field s fronted)) 0)
+                                                      (atomic/store (field s fronted) 1))
+                                                    (do
+                                                      ~(if (= (memo-key-type f) "Text")
+                                                           `(rt/last-key-set! (field s last-key) key)
+                                                           `(set! (.last-key s) key))
+                                                      (set! (.has-last s) true)))
+                                                (set! (mut (.busy h)) key 0)
                                                 ;; At most `evict` answers: once there are a quarter more, those
                                                 ;; asked for longest ago let go.
                                                 (when counted
@@ -11107,14 +11204,14 @@
                                                             (.clock s)
                                                             (rt/builds-swept)))
                                                   (when (and (> evict 0)
-                                                             (> (len (.table s))
+                                                             (> (len (.table h))
                                                                 (+ evict
                                                                    (/ evict 4)
                                                                    1)))
                                                     (~(sym (cat "memo-evict--"
                                                                 name)) s
                                                        evict)))
-                                                (rt/spin-unlock! word)
+                                                (rt/spin-unlock! hw)
                                                 (set! answer (Some made))
                                                 (set! go false))))))))
                           (match answer
