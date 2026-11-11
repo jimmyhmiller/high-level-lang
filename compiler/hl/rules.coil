@@ -5281,10 +5281,25 @@
           res-v (fresh (mut k) "sres")
           o-v (fresh (mut k) "so")
           v-v (fresh (mut k) "sv")
-          single (= (len args) 1)
+          ;; What an argument is the same for every item of, it is worked out once for the list
+          ;; (when the list has any item), and kept with the job, not with each item: an
+          ;; argument that names nothing the list's clauses bind.
+          (mut bound) (text-list)
+          _ (for i (range mark (len (.locals k))) (push! (mut bound) (.name (get (.locals k) i))))
+          (mut varies) (ArrayList::new [bool] (malloc-allocator))
+          _ (for a args (push! (mut varies) (mentions-any? a bound)))
+          _ (let [(mut any) false]
+              (for v varies (when v (set! any true)))
+              (unless any (set! (mut varies) 0 true)))
+          varying (let [(mut c) 0] (for v varies (when v (set! c (+ c 1)))) c)
+          single (= varying 1)
           (mut fields) (primitive/code-list-new)
           (mut inits) (primitive/code-list-new)
           (mut reads) (primitive/code-list-new)
+          (mut same-fields) (primitive/code-list-new)
+          (mut same-lets) (primitive/code-list-new)
+          (mut same-inits) (primitive/code-list-new)
+          (mut first-type) `i64
           (mut first) `0]
       (for i (range 0 (len args))
         (let [p (get (.params f) i)
@@ -5297,17 +5312,27 @@
           (when (or (= (.kind a) (g/KNamed)) (= (.kind a) (g/KSpread)))
             (die (mut k) a "a stage's work is given plain arguments"))
           (let [x (expect (mut k) a (expr (mut k) a (.ty p)) (.ty p))]
-            (when (= i 0) (set! first (.code x)))
-            (push! (mut fields) `(~(sym field) ~(coil-type (mut k) (.ty p))))
-            (push! (mut inits) (primitive/code-symbol ":" field))
-            (push! (mut inits) (.code x))
-            (push! (mut reads) `(~(primitive/code-symbol "." field) t)))))
-      (let [ct (if single (coil-type (mut k) (.ty (get (.params f) 0))) (sym tuple))
+            (if (get varies i)
+                (do
+                  (set! first (.code x))
+                  (set! first-type (coil-type (mut k) (.ty p)))
+                  (push! (mut fields) `(~(sym field) ~(coil-type (mut k) (.ty p))))
+                  (push! (mut inits) (primitive/code-symbol ":" field))
+                  (push! (mut inits) (.code x))
+                  (push! (mut reads) (if single `t `(~(primitive/code-symbol "." field) t))))
+                (let [held (fresh (mut k) "ssame")]
+                  (push! (mut same-fields) `(~(sym field) ~(coil-type (mut k) (.ty p))))
+                  (push! (mut same-lets) (sym held))
+                  (push! (mut same-lets) (.code x))
+                  (push! (mut same-inits) (primitive/code-symbol ":" field))
+                  (push! (mut same-inits) (sym held))
+                  (push! (mut reads) `(~(primitive/code-symbol "." field) j)))))))
+      (let [ct (if single first-type (sym tuple))
             cr (coil-type (mut k) (.ret f))
             item (if single first `(~(sym tuple) ~@inits))
             fill (clauses-code (mut k) clauses opened `(push! (mut ~(sym items)) ~item))
             callee (sym (qualified (mut k) (.module sc) (.coil f)))
-            call (if single `(~callee t) `(~callee ~@reads))
+            call `(~callee ~@reads)
             asked `(rt/stage-threads ~(.number sc))
             naming (> (len (.namer (.stage sc))) 0)
             step (.run (.stage sc))
@@ -5318,7 +5343,7 @@
                  (reserve! (mut ~(sym out-v)) (len ~(sym items)))
                  (for _ ~(sym items) (push! (mut ~(sym out-v)) (None [~cr])))
                  (let [(mut ~(sym job-v))
-                         (~(sym job) :next 0 :xs ~(sym items) :out ~(sym out-v))]
+                         (~(sym job) :next 0 :xs ~(sym items) :out ~(sym out-v) ~@same-inits)]
                    (if (< (len ~(sym items)) ~(.least (.stage sc)))
                        (do (~(sym body) (cast (ptr i8) (mut ~(sym job-v)))) 0)
                        (do
@@ -5372,7 +5397,7 @@
         (unless single (push! (mut (.aux k)) `(defstruct ~(sym tuple) [~@fields])))
         (push! (mut (.aux k))
                `(defstruct ~(sym job)
-                  [(next i64) (xs (ArrayList ~ct)) (out (ArrayList (Option ~cr)))]))
+                  [(next i64) (xs (ArrayList ~ct)) (out (ArrayList (Option ~cr))) ~@same-fields]))
         (push! (mut (.aux k))
                `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
                   (let [j (cast (ptr ~(sym job)) arg)
@@ -5391,8 +5416,19 @@
                     arg)))
         (te `(let [(mut ~(sym items)) (ArrayList::new [~ct] (rt/tree-allocator))]
                ~fill
-               ~run)
+               ;; An empty list asks nothing: not even what every item would have been given.
+               (if (= (len ~(sym items)) 0)
+                   (ArrayList::new [~cr] (rt/tree-allocator))
+                   (let [~@same-lets] ~run)))
             (cat3 "[" (.ret f) "]"))))))
+
+;;; Whether an expression names any of `names`: a name its list's clauses bind.
+(defn mentions-any? [(n g/Node) (names (ArrayList (slice u8)))] (-> bool)
+  (if (and (= (.kind n) (g/KName)) (has-text? names (.text n)))
+      true
+      (let [(mut hit) false]
+        (for x (.kids n) (when (and (not hit) (mentions-any? x names)) (set! hit true)))
+        hit)))
 
 (defn comprehension [(k (mut Comp)) (n g/Node) (want (slice u8)) (spread bool)]
   (-> TE)

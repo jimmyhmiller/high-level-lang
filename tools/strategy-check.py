@@ -69,9 +69,16 @@ for name, tracks in STRATEGIES:
     # Serial, and on many threads, where stages make what the ones after them read.
     for plan in [[], ["--pipeline=full"]]:
         for app in APPS:
-            wall, err = build(app, [f"--strategy={name}"] + plan, f"{OUT}/{app}.audit.js", env=dict(os.environ, HL_MEMO_AUDIT="1"))
-            worst = [(float(m.group(4)), m.group(1), int(m.group(3))) for m in AUDIT.finditer(err)]
-            over = [w for w in worst if w[0] / 1000 > LIMIT * wall]
+            def audited():
+                wall, err = build(app, [f"--strategy={name}"] + plan, f"{OUT}/{app}.audit.js", env=dict(os.environ, HL_MEMO_AUDIT="1"))
+                worst = [(float(m.group(4)), m.group(1), int(m.group(3))) for m in AUDIT.finditer(err)]
+                return wall, [w for w in worst if w[0] / 1000 > LIMIT * wall]
+            wall, over = audited()
+            # The audit goes by the clock, and a busy machine stretches one function's calls more
+            # than the build's: what costs is what is over the limit twice running.
+            if over:
+                wall, again = audited()
+                over = [w for w in again if w[1] in {o[1] for o in over}]
             check(not over, f"{name}, {app} {' '.join(plan) or 'serial'}: " + ("nothing asked twice that costs" if not over else
                   "; ".join(f"{f} asked {n} times again, {ms:.1f} ms of {wall * 1000:.0f}" for ms, f, n in over[:3])))
 

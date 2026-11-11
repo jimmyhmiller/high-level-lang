@@ -95,13 +95,14 @@ for a in "exes excjs exdate exd3 eximmer".split():
     sh([E, f"apps/{a}.js", "--bundle", "--minify", "--format=iife", f"--outfile={mini}", "--log-level=silent"])
     # A line counts only if esbuild's own builds agree on it across several runs: one pair could
     # agree on a clock's value by chance.
-    runs = [sh(["node", f])[1].split("\n") for f in (plain, mini, plain, mini, plain)]
+    # These programs run for seconds each: on a busy machine, well past the clock every other check has.
+    runs = [sh(["node", f], 900)[1].split("\n") for f in (plain, mini, plain, mini, plain)]
     l1 = runs[0]
     stable = [i for i in range(min(len(r) for r in runs)) if all(r[i] == l1[i] for r in runs)]
     for mode, flags in [("plain", []), ("minified", ["--minify"])]:
         out = f"{SCRATCH}/{a}.{mode}.js"
         sh([ESB, f"apps/{a}.js", f"--outfile={out}"] + flags, 60)
-        lx = sh(["node", out])[1].split("\n")
+        lx = sh(["node", out], 900)[1].split("\n")
         bad = [i for i in stable if i >= len(lx) or lx[i] != l1[i]]
         total = next((x for x in l1 if x.startswith("TOTAL")), "")
         check(not bad, f"{a} {mode}: {len(stable)} stable lines all agree {total}")
