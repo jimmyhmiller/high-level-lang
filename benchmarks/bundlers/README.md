@@ -31,7 +31,7 @@ Use `--binary=PATH` to measure another explicitly built executable; its hash is
 recorded. Run comparisons sequentially; the harness enforces a lock.
 
 Raw measurements, exact commands, binary hashes, versions, build logs and browser
-checks are written under `out/bundler-comparison/`. The checked-in
+checks are written under `out/bundler-comparison.noindex/` (Spotlight skips it, so it does not index the outputs while builds are timed). The checked-in
 [results.json](results.json) preserves the measured results and samples; its
 absolute command paths identify the original machine and are not portable.
 
@@ -241,3 +241,20 @@ intermediate graphs and emitted trees. One-shot value arenas still retain much
 of that work until process exit. More aggressive function/constant propagation
 and inlining are needed to close the remaining output-size gaps. These are
 remaining engineering tasks, not completed optimizations or promises of wins.
+
+## Applications (2026-11-12)
+
+`python3 tools/compare-bundlers.py --runs=7 --cases=dashboard,three10,large --minified-only --tools=ours-exact-modules,ours-exact-fragments,esbuild,bun,rolldown,rspack,rollup,webpack,turbopack --report-name=apps`
+adds two application workloads and two more bundlers (Bun, from `bun` on the PATH, and Rspack,
+pinned here); results are in [apps-results.json](apps-results.json).
+
+- **dashboard:** `benchmarks/apps/dashboard`, a single-page app on real packages (React rendering
+  with `react-dom/server`, d3, date-fns, lodash-es, zod, immer, RxJS), five routes loaded with
+  `import()`, about 1,300 modules. Written without JSX so no bundler needs a transform plugin.
+- **three10:** esbuild's own JavaScript benchmark, ten copies of three.js's sources with every
+  namespace kept, about 7,600 modules.
+
+Every tool builds for production: minified, `process.env.NODE_ENV` defined as "production" (Rollup
+through `@rollup/plugin-replace`), code splitting, ES modules. Each sample records the one-minute
+load average when the build started; the machine is shared, so check it before reading wall times.
+CPU time (user + system over all threads and children) is recorded too.

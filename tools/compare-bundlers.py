@@ -30,11 +30,14 @@ parser.add_argument('--cases', default='large,real,mixed')
 parser.add_argument('--tools', default='')
 parser.add_argument('--report-name', default='results')
 parser.add_argument('--plain-only', action='store_true')
+parser.add_argument('--minified-only', action='store_true')
 parser.add_argument('--turbopack', default=str(ROOT/'out/bin/turbopack-cli-4ebb2b7'))
 parser.add_argument('--binary', default=str(ROOT/'out/bin/esb'), help='our executable; use an explicitly built release binary to compare optimization levels')
 args = parser.parse_args()
 assert args.runs > 0
-WORK = ROOT/'out/bundler-comparison'
+# `.noindex`: Spotlight skips it, so indexing the thousands of files a build writes does not load the
+# machine while the next build is timed.
+WORK = ROOT/'out/bundler-comparison.noindex'
 WORK.mkdir(parents=True, exist_ok=True)
 comparison_lock = (WORK/'.benchmark.lock').open('w')
 try: fcntl.flock(comparison_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -42,7 +45,7 @@ except BlockingIOError: raise SystemExit('Another comparison is running; timing 
 ADAPTER = ROOT/'benchmarks/bundlers/build.mjs'
 TP = Path(args.turbopack)
 BINARY = Path(args.binary).resolve()
-TOOLS = [f'ours-{policy}-{unit}' for policy in ['exact','package','balanced'] for unit in ['modules','fragments']] + ['esbuild','rolldown','rollup','webpack']
+TOOLS = [f'ours-{policy}-{unit}' for policy in ['exact','package','balanced'] for unit in ['modules','fragments']] + ['esbuild','bun','rolldown','rspack','rollup','webpack']
 if TP.exists(): TOOLS += ['turbopack']
 if args.tools: TOOLS = [tool for tool in TOOLS if tool in args.tools.split(',')]
 assert TOOLS
@@ -55,8 +58,9 @@ metadata = dict(runs=args.runs, node=subprocess.check_output(['node','--version'
                 layout='one bootstrap with independently invoked dynamic report roots')
 metadata['binary_sha256']={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in [BINARY,TP] if path.exists()}
 metadata['versions'] = {'esbuild': json.loads((ROOT/'tests/node_modules/esbuild/package.json').read_text())['version']}
-for package in ['rolldown','rollup','webpack','@rollup/plugin-node-resolve','@rollup/plugin-commonjs','@rollup/plugin-terser']:
+for package in ['rolldown','rollup','webpack','@rspack/core','@rollup/plugin-node-resolve','@rollup/plugin-commonjs','@rollup/plugin-terser','@rollup/plugin-replace']:
     metadata['versions'][package] = json.loads((ROOT/'benchmarks/bundlers/node_modules'/package/'package.json').read_text())['version']
+metadata['versions']['bun'] = subprocess.check_output(['bun','--version'],text=True).strip()
 
 
 def put(root, name, text):
@@ -84,6 +88,23 @@ def prepare(case):
         count=2
         for i,name in enumerate(['real1.js','real2.js']):
             put(root,f'driver-{i}.js',f'import "./{name}";import {{record}} from "./record.js";record({i},true);')
+    elif case=='three10':
+        # esbuild's JavaScript benchmark: ten copies of three.js's sources, every namespace kept.
+        for n in range(1,11):
+            shutil.copytree(ROOT/'tests/node_modules/three/src',root/f'three{n}',copy_function=os.link)
+        count=1
+        imports=''.join(f'import * as copy{n} from "./three{n}/Three.js";' for n in range(1,11))
+        values=','.join(f'[Object.keys(copy{n}).length,new copy{n}.Vector3(1,2,3).applyMatrix4(new copy{n}.Matrix4().makeRotationX({n}/10)).toArray().map((x)=>x.toFixed(6)).join(" ")]' for n in range(1,11))
+        put(root,'driver-0.js',imports+'import {record} from "./record.js";record(0,['+values+']);')
+    elif case=='dashboard':
+        # A single-page app on real packages: React rendering, d3, date-fns, lodash-es, zod, immer and
+        # RxJS, five routes each loaded with import().
+        shutil.copytree(ROOT/'tests/node_modules',root/'node_modules',copy_function=os.link)
+        shutil.copytree(ROOT/'benchmarks/apps/dashboard/src',root/'src')
+        routes=['overview','charts','calendar','tasks','reports']
+        count=len(routes)
+        for i,route in enumerate(routes):
+            put(root,f'driver-{i}.js',f'import {{{route}}} from "./src/routes/{route}.js";import {{record}} from "./record.js";record({i},{route}());')
     elif case=='mixed':
         count=2
         put(root,'library.js','globalThis.__mixed_init=(globalThis.__mixed_init||0)+1;\n'+'\n'.join(
@@ -105,9 +126,11 @@ def prepare(case):
 def command(tool, root, output, minify, config):
     if tool.startswith('ours-'):
         _,policy,unit=tool.split('-')
-        return [str(BINARY),'main.js','--splitting','--format=esm','--pipeline=full','--no-cache','--strategy=once',f'--chunk-policy={policy}',f'--fragments={str(unit=="fragments").lower()}',f'--outdir={output}',*(['--minify'] if minify else [])]
+        return [str(BINARY),'main.js','--splitting','--format=esm','--pipeline=full','--no-cache','--strategy=once',f'--chunk-policy={policy}',f'--fragments={str(unit=="fragments").lower()}','--define:process.env.NODE_ENV="production"',f'--outdir={output}',*(['--minify'] if minify else [])]
     if tool=='esbuild':
-        return [str(ROOT/'tests/node_modules/.bin/esbuild'),'main.js','--bundle','--splitting','--format=esm','--platform=browser','--target=esnext','--log-level=warning',f'--outdir={output}',*(['--minify'] if minify else [])]
+        return [str(ROOT/'tests/node_modules/.bin/esbuild'),'main.js','--bundle','--splitting','--format=esm','--platform=browser','--target=esnext','--log-level=warning','--define:process.env.NODE_ENV="production"',f'--outdir={output}',*(['--minify'] if minify else [])]
+    if tool=='bun':
+        return ['bun','build','./main.js','--splitting','--format=esm','--target=browser','--define','process.env.NODE_ENV="production"',f'--outdir={output}',*(['--minify'] if minify else [])]
     if tool=='turbopack':
         return [str(TP),'build','./main.js','--dir',str(root),'--target','browser','--no-sourcemap',*(['--no-minify'] if not minify else [])]
     config.write_text(json.dumps(dict(input={'main':str(root/'main.js')},output=str(output),minify=minify)))
@@ -117,6 +140,7 @@ def command(tool, root, output, minify, config):
 def measure(cmd,cwd):
     # communicate() waits for completion directly; the RSS sampler never inserts a polling delay
     # into wall time. /usr/bin/time captures even short-lived native process high-water RSS.
+    load=os.getloadavg()[0]
     start=time.perf_counter()
     proc=subprocess.Popen(['/usr/bin/time','-l',*cmd],cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
     stopped=threading.Event();peak=[0];killed=[None]
@@ -141,8 +165,10 @@ def measure(cmd,cwd):
     stopped.set();thread.join()
     match=re.search(r'(\d+)\s+maximum resident set size',stderr)
     highwater=int(match[1])/1024**2 if match else 0
+    times=re.search(r'([\d.]+) real\s+([\d.]+) user\s+([\d.]+) sys',stderr)
+    cpu=float(times[2])+float(times[3]) if times else 0.0
     if proc.returncode!=0 or killed[0]: raise RuntimeError(json.dumps(dict(code=proc.returncode,reason=killed[0],stdout=stdout[-2000:],stderr=stderr[-5000:])))
-    return dict(seconds=elapsed,peak_mib=max(peak[0],highwater),main_process_peak_mib=highwater),stdout,stderr
+    return dict(seconds=elapsed,cpu_seconds=cpu,peak_mib=max(peak[0],highwater),main_process_peak_mib=highwater,load=round(load,2)),stdout,stderr
 
 
 def size_of(output,files):
@@ -156,7 +182,7 @@ def save(): report.write_text(json.dumps(dict(metadata=metadata,results=rows,sam
 for case in args.cases.split(','):
     root,count,expected=prepare(case)
     print(json.dumps(dict(progress='fixture',case=case,roots=count)),flush=True)
-    for minify in ([False] if args.plain_only else [False,True]):
+    for minify in ([False] if args.plain_only else [True] if args.minified_only else [False,True]):
         modes={};failed={}
         for tool in TOOLS:
             output=root/'dist' if tool=='turbopack' else WORK/'outputs'/case/('minified' if minify else 'plain')/tool
@@ -187,6 +213,7 @@ for case in args.cases.split(','):
                 row.update(status='build-failed',error=failed[tool]);rows.append(row);save();continue
             measurements=[item for item in samples if item['case']==case and item['minify']==minify and item['tool']==tool]
             row.update(runs=len(measurements),median_seconds=round(statistics.median(item['seconds'] for item in measurements),4),
+                       median_cpu_seconds=round(statistics.median(item['cpu_seconds'] for item in measurements),4),
                        min_seconds=round(min(item['seconds'] for item in measurements),4),max_seconds=round(max(item['seconds'] for item in measurements),4),
                        median_peak_mib=round(statistics.median(item['peak_mib'] for item in measurements),1),max_peak_mib=round(max(item['peak_mib'] for item in measurements),1))
             try:
