@@ -13,6 +13,9 @@
   - a module loaded by `import()` without splitting is shaken as any is, yet what it reads through
     an `export *` barrel is initialised first, and a package with no side effects is not loaded
     for an import nothing reads;
+  - minified names reuse what a scope does not read from outside, as Terser's do, yet never where
+    the language or lowering forbids it: a catch body's declarations, a block's `var`, a name a
+    class's code means the class by;
   - a direct `eval`, called by name or in parentheses, sees its module's names as written, while
     `eval` read any other way does not stop minifying; and one module reading `eval` leaves the
     names linking makes (`init_x`) distinct.
@@ -213,6 +216,27 @@ for flags in ([], ['--minify']):
     ok(not any(x in text for x in ['UNUSED_IN_A', 'UNUSED_IN_B', 'UNUSED_IN_C', 'PKG_LOADED', 'UNUSED_LOCALE']),
        f'import() without splitting shakes what is loaded {flags}: {text!r}')
 print('ok   import() without splitting: shaken, and initialised through barrels', flush=True)
+
+# ---------------------------------------------------------------- minified names that may not shadow
+write({'shadow/m.js': '''export function caught(input) {
+  try { throw new Error(input); } catch (failure) { const message = failure.message; let length = message.length; return [message, length]; }
+}
+export function hoisted(flag) { var outer = 1; { let inner = 2; var later = inner + outer; } return later + (flag ? 1 : 0); }
+export class Counter {
+  static base = 10;
+  #count = Counter.base;
+  set #value(next) { this.#count = next; }
+  bump(amount) { this.#value = this.#count + amount; return this.#count; }
+  static make(start) { const made = new Counter(); made.bump(start); return made; }
+}
+console.log(JSON.stringify([caught("boom"), hoisted(true), Counter.make(5).bump(1)]));
+'''})
+want = run(['node', 'shadow/m.js']).stdout
+for flags in (['--minify'], ['--minify', '--target=es2015'], ['--minify', '--target=es2020']):
+    built = run([ESB, 'shadow/m.js', '--format=esm', '--outfile=shadow-out.mjs'] + flags)
+    got = run(['node', 'shadow-out.mjs'])
+    ok(built.returncode == 0 and got.stdout == want, f'minified names that may not shadow {flags}: {got.stdout!r}{got.stderr[-200:]!r} want {want!r}')
+print('ok   minified names never shadow where the language or lowering forbids it', flush=True)
 
 # ---------------------------------------------------------------- eval
 write({'ev/direct.js': 'const secretValue = 41;\nexport function viaDirect() { return eval("secretValue + 1"); }\n',

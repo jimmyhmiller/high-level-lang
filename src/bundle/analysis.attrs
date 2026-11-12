@@ -935,11 +935,11 @@ fn kept-reexported(mo: m.Module, part: Int, exported: Text) -> [link.Fact] =
 fn part-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact] = [link.fact-part-of(part, mo.id)] ++ statement-facts(mo, s, sm, part)
 
 fn statement-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact] = match s {
-  Import(clause, from) => imported(mo, part, t) ++ import-facts(mo, part, t, clause) where t = known-dep(mo, from)
-  ImportBare(from) => imported(mo, part, t) ++ bare-import-facts(mo, part, t) where t = known-dep(mo, from)
+  Import(clause, from) => imported(mo, part, t) ++ import-facts(mo, part, t, clause, s) where t = known-dep(mo, from)
+  ImportBare(from) => imported(mo, part, t) ++ held-by(mo, s, part, t, bare-import-facts(mo, part, t)) where t = known-dep(mo, from)
   ExportAll(from) => imported(mo, part, t) ++ star-facts(mo, part, t) where t = known-dep(mo, from)
-  ExportAllAs(name, from) => imported(mo, part, t) ++ star-as-facts(mo, part, t, m.module-name(name)) where t = known-dep(mo, from)
-  ExportFrom(List(specs...), from) => imported(mo, part, t) ++ export-from-facts(mo, part, t, specs) where t = known-dep(mo, from)
+  ExportAllAs(name, from) => imported(mo, part, t) ++ star-as-facts(mo, part, t, m.module-name(name), s) where t = known-dep(mo, from)
+  ExportFrom(List(specs...), from) => imported(mo, part, t) ++ export-from-facts(mo, part, t, specs, s) where t = known-dep(mo, from)
   ExportNamed(List(specs...)) => [export-local(mo, export-spec-names(spec), m.module-name(spec.local)) for spec in specs]
   # The runtime's statements are only ever live through a mention. A wrapped module's are shaken as
   # any module's are, as esbuild shakes them: its initialiser runs what is left, and its imports
@@ -950,12 +950,29 @@ fn statement-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact]
 
 # An import of an opaque module holds it in a variable, made an ES module. A kept one declares its
 # own names, and stays for what loading the module does, as esbuild keeps it.
-fn import-facts(mo: m.Module, part: Int, t: Int, clause: Node) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
-  true, _ => [link.fact-declares(part, known-import-var(mo, t))] ++ required(part, t)
+fn import-facts(mo: m.Module, part: Int, t: Int, clause: Node, s: Node) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
+  true, _ => held-by(mo, s, part, t, [link.fact-declares(part, known-import-var(mo, t))] ++ required(part, t)
+                                     ++ loading(part, m.modules[t]) ++ [link.fact-mentions(part, helper("__toESM"))])
              ++ [link.fact-cjs-binding(b.symbol, part) for b in clause-bindings(mo, t, clause)]
-             ++ loading(part, m.modules[t]) ++ [link.fact-mentions(part, helper("__toESM"))]
   _, true => [link.fact-declares(part, b.symbol) for b in clause-bindings(mo, t, clause)] ++ [link.fact-effect(part)]
   _, _ => []
+}
+
+# A module held in an import variable is held once: by the first statement of `mo` that imports it
+# so (`holder?`), which declares the variable and loads the module. Another reads that variable, so
+# what reads its names keeps the first; it writes nothing of its own.
+fn held-by(mo: m.Module, s: Node, part: Int, t: Int, facts: [link.Fact]) -> [link.Fact] = match holder?(mo, s, t) {
+  true => facts
+  false => [link.fact-mentions(part, known-import-var(mo, t))]
+}
+
+fn holder?(mo: m.Module, s: Node, t: Int) -> Bool = ((first x in m.body-of(mo.id).tree.body.kids if holds?(mo, x, t): x.lo) ?? -1) == s.lo
+
+# A statement that holds a module in an import variable when it is held: an import, a bare import,
+# or a re-export of names from it.
+fn holds?(mo: m.Module, s: Node, t: Int) -> Bool = match s {
+  Import(_, from) | ImportBare(from) | ExportFrom(_, from) | ExportAllAs(_, from) => known-dep(mo, from) == t
+  _ => false
 }
 
 # Holding a module in a variable runs it, which stays for what that does: unless its package says
@@ -983,14 +1000,14 @@ fn star-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match opaque?(m.
   false => [link.fact-star(mo.id, t)]
 }
 
-fn star-as-facts(mo: m.Module, part: Int, t: Int, exported: Text) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
-  true, _ => reexport-import(mo, part, t) ++ reexported(mo, part, exported)
+fn star-as-facts(mo: m.Module, part: Int, t: Int, exported: Text, s: Node) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
+  true, _ => held-by(mo, s, part, t, reexport-import(mo, part, t)) ++ reexported(mo, part, exported)
   _, true => [link.fact-effect(part)] ++ kept-reexported(mo, part, exported)
   _, _ => [link.fact-local-export(mo.id, m.name-id(exported), ns-sym(m.modules[t]))]
 }
 
-fn export-from-facts(mo: m.Module, part: Int, t: Int, specs: [Node]) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
-  true, _ => reexport-import(mo, part, t) ++ [reexported(mo, part, export-spec-names(spec))... for spec in specs]
+fn export-from-facts(mo: m.Module, part: Int, t: Int, specs: [Node], s: Node) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
+  true, _ => held-by(mo, s, part, t, reexport-import(mo, part, t)) ++ [reexported(mo, part, export-spec-names(spec))... for spec in specs]
   _, true => [link.fact-effect(part)] ++ [kept-reexported(mo, part, export-spec-names(spec))... for spec in specs]
   _, _ => [fact for spec in specs for name in [m.name-id(export-spec-names(spec))]
             for fact in [link.fact-reexport(mo.id, name, t, m.name-id(m.module-name(spec.local))),

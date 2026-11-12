@@ -27,7 +27,10 @@
    (names (HashMap (slice u8) i64))
    (symbols (ArrayList i64))
    (children (ArrayList i64))
-   (dynamic bool)])
+   (dynamic bool)
+   ;; The symbols of scopes around it that code in it, or in a scope inside it, refers to: what a
+   ;; name of its own must not hide (see `enclose!`).
+   (enclosed (ArrayList i64))])
 
 ;;; A module's own table at its place among the build's (see `placed`): scope i of the part as the
 ;;; joined table numbers it, `scope-start` + i - 1, and its symbol s as `symbol-start` + s, each
@@ -106,7 +109,8 @@
              :names names
              :symbols (ArrayList::new [i64] (rt/value-allocator))
              :children (ArrayList::new [i64] (rt/value-allocator))
-             :dynamic false))
+             :dynamic false
+             :enclosed (ArrayList::new [i64] (rt/value-allocator))))
     out))
 
 ;;; A copy that changes apart from `t`.
@@ -127,7 +131,8 @@
                  :names names
                  :symbols symbols
                  :children children
-                 :dynamic (.dynamic sc)))))
+                 :dynamic (.dynamic sc)
+                 :enclosed (ints-copy (.enclosed sc))))))
     (for sym (.symbols t) (push! (mut (.symbols out)) sym))
     (for k (.free t)
       (match (get (.free t) k)
@@ -144,7 +149,8 @@
              :names (names-map)
              :symbols (ArrayList::new [i64] (rt/value-allocator))
              :children (ArrayList::new [i64] (rt/value-allocator))
-             :dynamic false))
+             :dynamic false
+             :enclosed (ArrayList::new [i64] (rt/value-allocator))))
     (when (>= parent 0)
       (push! (mut (.children (elem (mut (.scopes t)) parent))) id))
     id))
@@ -189,6 +195,54 @@
         (match (get (.names sc) name)
           (Some [s] (set! out (Some s)) (set! at -1))
           (None [] (set! at (.parent sc))))))
+    out))
+
+;;; Code in `scope` refers to `s`: every scope from there out to the one declaring it encloses it,
+;;; so a name given in any of them cannot hide it. A symbol of a table around this one (as -(id + 1))
+;;; is declared somewhere in or around the scope 0 stands for: scope 0 keeps it too, and grafting
+;;; carries on from the scope it stood for (see `graft!`). Each scope keeps a symbol once in a run
+;;; of references to it; a later reference after others may list it again.
+(defn enclose! [(t (mut Table)) (scope i64) (s i64)] (-> void)
+  (let [declared (if (< s 0) -1 (.scope (get (.symbols t) s)))
+        (mut at) scope]
+    (while (and (>= at 0) (!= at declared))
+      (let [sc (get (.scopes t) at)
+            n (len (.enclosed sc))]
+        (if (and (> n 0) (= (get (.enclosed sc) (- n 1)) s))
+            (set! at -1)
+            (do
+              (push! (mut (.enclosed (elem (mut (.scopes t)) at))) s)
+              (set! at (.parent sc))))))
+    0))
+
+;;; Every scope from `first` on (those made inside one node) encloses `symbols`: none may hide them.
+(defn enclose-from! [(t (mut Table)) (first i64) (symbols (ArrayList i64))] (-> void)
+  (for at (range first (len (.scopes t)))
+    (for s symbols
+      (push! (mut (.enclosed (elem (mut (.scopes t)) at))) s)))
+  0)
+
+;;; A scope directly inside `scope` may not give the names of `scope`'s symbols to its own: each
+;;; encloses them, as if it referred to them.
+(defn enclose-children! [(t (mut Table)) (scope i64)] (-> void)
+  (let [sc (get (.scopes t) scope)]
+    (for c (.children sc)
+      (for s (.symbols sc)
+        (push! (mut (.enclosed (elem (mut (.scopes t)) c))) s))))
+  0)
+
+;;; Symbol ids of one table as another numbers them: its own moved by `shift`, and one of the table
+;;; around it, -(id + 1), as that table's id.
+(defn shifted-symbols [(xs (ArrayList i64)) (shift i64)] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (rt/value-allocator))]
+    (reserve! (mut out) (len xs))
+    (for x xs (push! (mut out) (if (< x 0) (- -1 x) (+ x shift))))
+    out))
+
+(defn ints-copy [(xs (ArrayList i64))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] (rt/value-allocator))]
+    (reserve! (mut out) (len xs))
+    (for x xs (push! (mut out) x))
     out))
 
 (defn add-use! [(t (mut Table)) (s i64)] (-> void)
@@ -240,10 +294,15 @@
                  :names names
                  :symbols symbols
                  :children children
-                 :dynamic (.dynamic sc)))))
+                 :dynamic (.dynamic sc)
+                 ;; One of `t`'s own, as -(id + 1) in `from`, or one of `from`'s, moved.
+                 :enclosed (shifted-symbols (.enclosed sc) symbol-shift)))))
     (for c (.children (get (.scopes from) 0))
       (push! (mut (.children (elem (mut (.scopes t)) parent)))
              (+ c scope-shift)))
+    ;; What code of `from` refers to of `t`'s is enclosed from `parent` out to where it is declared.
+    (for e (.enclosed (get (.scopes from) 0))
+      (when (< e 0) (enclose! (mut t) parent (- -1 e))))
     (for sym (.symbols from)
       (push! (mut (.symbols t))
              (Symbol
@@ -309,7 +368,8 @@
     :names (names-map)
     :symbols (ArrayList::new [i64] (rt/value-allocator))
     :children (ArrayList::new [i64] (rt/value-allocator))
-    :dynamic false))
+    :dynamic false
+    :enclosed (ArrayList::new [i64] (rt/value-allocator))))
 
 (defn symbol-count [(t Table)] (-> i64)
   (match (.joined t)
@@ -396,7 +456,8 @@
                  :names names
                  :symbols syms
                  :children children
-                 :dynamic (.dynamic sc)))))
+                 :dynamic (.dynamic sc)
+                 :enclosed (shifted-symbols (.enclosed sc) symbol-shift)))))
     (for c (.children (get (.scopes part) 0)) (push! (mut roots) (+ c scope-shift)))
     (for sym (.symbols part)
       (push! (mut symbols)
@@ -470,7 +531,8 @@
                :children children
                ;; What it holds is linking's, named by no code: no direct eval or `with` in a
                ;; block can reach it by name, so a dynamic block keeps its own names, not these.
-               :dynamic false))
+               :dynamic false
+               :enclosed (ArrayList::new [i64] (rt/value-allocator))))
       (Table
         :scopes own
         :symbols (ArrayList::new [Symbol] (rt/value-allocator))
@@ -579,7 +641,8 @@
                       :names (.names sc)
                       :symbols syms
                       :children (.children sc)
-                      :dynamic (.dynamic sc)))))))))
+                      :dynamic (.dynamic sc)
+                      :enclosed (.enclosed sc)))))))))
 
 ;;; Whether two blocks are the very same one, at the same place.
 (defn same-block? [(a Block) (b Block)] (-> bool)
@@ -989,7 +1052,8 @@
     (encode-names! w (.names sc))
     (rt/put-ints! w (.symbols sc))
     (rt/put-ints! w (.children sc))
-    (rt/put-bool! w (.dynamic sc)))
+    (rt/put-bool! w (.dynamic sc))
+    (rt/put-ints! w (.enclosed sc)))
   0)
 
 (defn encode-symbols! [(w (ptr rt/Writer)) (symbols (ArrayList Symbol))] (-> void)
@@ -1010,14 +1074,16 @@
             names (decode-names r)
             syms (rt/take-ints r)
             children (rt/take-ints r)
-            dynamic (rt/take-bool r)]
+            dynamic (rt/take-bool r)
+            enclosed (rt/take-ints r)]
         (push! (mut scopes)
                (Scope
                  :parent parent
                  :names names
                  :symbols syms
                  :children children
-                 :dynamic dynamic))))
+                 :dynamic dynamic
+                 :enclosed enclosed))))
     scopes))
 
 (defn decode-symbols [(r (ptr rt/Reader))] (-> (ArrayList Symbol))
@@ -1151,7 +1217,8 @@
     :names (names-own-in from (.names sc))
     :symbols (rt/ints-own-in from (.symbols sc))
     :children (rt/ints-own-in from (.children sc))
-    :dynamic (.dynamic sc)))
+    :dynamic (.dynamic sc)
+    :enclosed (rt/ints-own-in from (.enclosed sc))))
 
 (defn scopes-own-in [(from (ptr rt/Region)) (xs (ArrayList Scope))] (-> (ArrayList Scope))
   (if (rt/storage-in? from (rt/list-storage xs) (cap xs))

@@ -21,6 +21,13 @@
 ;;;                                     # (`let` in a block, where each one shadows the last)
 ;;;   dynamic With ;                    # names in and around this cannot be renamed
 ;;;   dynamic-name eval ;               # nor around a reference to this name
+;;;   unshadowed-within ClassExpr ClassDecl ;
+;;;                                     # no scope anywhere inside this node may give its own
+;;;                                     # name (its own scope's names, or the name it declares)
+;;;                                     # to a symbol (a class's name, which code is rewritten
+;;;                                     # to mean the class by spelling)
+;;;   unshadowed Catch ;                # a scope directly inside this one may not give its own
+;;;                                     # names to symbols of this one (a catch body, its parameter)
 ;;;   dynamic-name eval in Call through Paren ;
 ;;;                                     # or only around one that is a Call's first child,
 ;;;                                     # itself or inside any number of Parens
@@ -210,6 +217,8 @@
         (mut call-name) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut caller) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut callee-wrapper) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut unshadowed) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut unshadowed-within) (ArrayList::new [(slice u8)] (malloc-allocator))
         ;; Nodes that open a scope, and the kind of each; the kinds, in the order declared.
         (mut opener) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut opener-kind) (ArrayList::new [(slice u8)] (malloc-allocator))
@@ -287,6 +296,17 @@
                 (do
                   (for n (texts (get (.kids table) 0))
                     (push! (mut dynamic-name) n))
+                  0)
+              (= k (g/KUnshadowedWithin))
+                (do
+                  (check-nodes! kinds src path grammar (get (.kids table) 0))
+                  (for n (texts (get (.kids table) 0)) (push! (mut unshadowed-within) n))
+                  0)
+              (= k (g/KUnshadowed))
+                (do
+                  (check-nodes! kinds src path grammar (get (.kids table) 0))
+                  (check-opens! src path opener (get (.kids table) 0))
+                  (for n (texts (get (.kids table) 0)) (push! (mut unshadowed) n))
                   0)
               (= k (g/KDynamicCall))
                 (do
@@ -446,6 +466,10 @@
                        ~(kind-test dynamic))
                      (defn dynamic-name? [(name (slice u8))] (-> bool)
                        ~(name-test dynamic-name))
+                     (defn unshadowed? [(k syn/Kind)] (-> bool)
+                       ~(kind-test unshadowed))
+                     (defn unshadowed-within? [(k syn/Kind)] (-> bool)
+                       ~(kind-test unshadowed-within))
                      (defn caller? [(k syn/Kind)] (-> bool)
                        ~(kind-test caller))
                      (defn callee-wrapper? [(k syn/Kind)] (-> bool)
@@ -521,6 +545,7 @@
                                    (match (sym/resolve (mut t) scope (.text n))
                                      (Some [s]
                                            (sym/add-use! (mut t) s)
+                                           (sym/enclose! (mut t) scope s)
                                            (set! (mut b) (.lo n) s))
                                      (None [] (sym/add-free! (mut t) (.text n))))
                                    -1)
@@ -529,6 +554,9 @@
                                    (match (sym/resolve (mut t) scope (.text n))
                                      (Some [s]
                                            (sym/add-use! (mut t) s)
+                                           ;; A `var` in a block is the function's: the block must
+                                           ;; not give its name to one of its own.
+                                           (sym/enclose! (mut t) scope s)
                                            (set! (mut b) (.lo n) s))
                                      (None []
                                            (panic "binding {} was not declared by the scope tables"
@@ -557,12 +585,26 @@
                                            (if (inside? k i)
                                                (do (set! in opened) 0)
                                                (do (set! out opened) 0))))))
+                                   (when (unshadowed? k)
+                                     (sym/enclose-children! (mut t) inner))
+                                   (when (unshadowed-within? k)
+                                     (sym/enclose-from! (mut t) (+ inner 1) (.symbols (sym/scope-at t inner))))
                                    inner)
                                :else
                                  (do
                                    (when (or (dynamic? k) (dynamic-call? n))
                                      (sym/mark-dynamic! (mut t) scope))
-                                   (walk-all! n (mut t) scope (mut b))
+                                   (let [first-new (sym/scope-count t)]
+                                     (walk-all! n (mut t) scope (mut b))
+                                     ;; The name a node declares, which no scope inside it may hide.
+                                     (when (and (unshadowed-within? k) (> (len (.kids n)) 0)
+                                                (bind? (.kind (get (.kids n) 0))))
+                                       (match (sym/resolve (mut t) scope (.text (get (.kids n) 0)))
+                                         (Some [s]
+                                               (let [(mut named) (ArrayList::new [i64] (rt/value-allocator))]
+                                                 (push! (mut named) s)
+                                                 (sym/enclose-from! (mut t) first-new named)))
+                                         (None [] 0))))
                                    -1))))
 
                      ;;; Walk a node's children, or a program's parts, in turn from `scope`: a

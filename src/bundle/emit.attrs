@@ -18,7 +18,10 @@ quote exp at 1 0 0 ;
 # How the build emits: `undefined` as `void 0`, `require` native or not, the names a kept import binds
 # that nothing reads left out, and nodes stamped for a source map.
 # `private-names`: whether private names are minified (`privates`).
-record Emitting { void-undefined: Bool, native-require: Bool, drop-unused-imports: Bool, sourcemap: Bool, files: Bool, private-names: Bool }
+record Emitting { void-undefined: Bool, native-require: Bool, drop-unused-imports: Bool, sourcemap: Bool, files: Bool, private-names: Bool,
+                  # A function or class expression's own name, when nothing refers to it: gone, as
+                  # Terser drops it, when names are minified (which change `.name` already).
+                  drop-unused-names: Bool }
 
 setting emitting: Emitting
 # Code splitting: the statements of the chunk being printed, none when it is the whole program; and
@@ -185,6 +188,20 @@ on FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncE
   | AsyncFuncExpr(...) | AsyncGenExpr(...) | Method(...) | GenMethod(...) | AsyncMethod(...)
   | AsyncGenMethod(...) | Getter(...) | Setter(...) | StaticBlock(...) | ClassBody(...) { kids.depth = depth + 1 }
 
+rewrite FuncExpr(name, params, fbody) as n if emitting.drop-unused-names and unreferenced?(name) =>
+  FuncExpr(None(), params.out, fbody.out) with { lo: n.lo, hi: n.hi }
+rewrite GenExpr(name, params, fbody) as n if emitting.drop-unused-names and unreferenced?(name) =>
+  GenExpr(None(), params.out, fbody.out) with { lo: n.lo, hi: n.hi }
+rewrite AsyncFuncExpr(name, params, fbody) as n if emitting.drop-unused-names and unreferenced?(name) =>
+  AsyncFuncExpr(None(), params.out, fbody.out) with { lo: n.lo, hi: n.hi }
+rewrite AsyncGenExpr(name, params, fbody) as n if emitting.drop-unused-names and unreferenced?(name) =>
+  AsyncGenExpr(None(), params.out, fbody.out) with { lo: n.lo, hi: n.hi }
+# A declaration of names nothing reads, with nothing assigned (what a dead branch or tree shaking
+# leaves): gone, when names are minified; the statement too if nothing of it is left.
+rewrite VarDecl(List(...) as ds) as n if emitting.drop-unused-names and any d in ds.kids: bare-unused?(d) =>
+  kept-declarators(n, [d for d in ds.out.kids if not bare-unused?(d)])
+rewrite LetDecl(List(...) as ds) as n if emitting.drop-unused-names and any d in ds.kids: bare-unused?(d) =>
+  kept-declarators(n, [d for d in ds.out.kids if not bare-unused?(d)])
 rewrite Ident(x) as n => final-ident(n, x)
 rewrite BindName(_) as n => match m.symbol-in(body, here, n.lo) {
   some(s) => BindName(final-of(s)) with { lo: n.lo, hi: n.hi }
@@ -316,8 +333,23 @@ fn import-or-init(t: m.Module) -> Node? = match an.opaque?(t) {
   false => init-call(t)
 }
 
+fn bare-unused?(d: Node) -> Bool = match d {
+  Declarator(BindName(_) as name, None()) => unreferenced?(name)
+  _ => false
+}
+
+fn kept-declarators(n: Node, kept: [Node]) -> Node = match kept {
+  [] => Empty()
+  _ => n with { kids: [List(kept...)] }
+}
+
+fn held-elsewhere?(s: Node, from: Node) -> Bool = an.held?(t) and not an.holder?(here, s, t.id)
+  where t = m.modules[an.known-dep(here, from)]
+
 # The body statements of a part, ready to print. None for a part with no code.
 fn part-output(s: Node) -> Node? = match s {
+  # Another statement holds the module in its variable (see `analysis.held-by`).
+  ImportBare(from) | Import(_, from) | ExportFrom(_, from) | ExportAllAs(_, from) if held-elsewhere?(s, from) => none
   ImportBare(from) => match t.kind {
     Cjs => some(import-cjs-stmt(t))
     External if an.kept?(t) => some(ImportBare(path-of(t)))
@@ -866,21 +898,43 @@ fn declared-functions(id: Int) -> [Declared] = with here = m.modules[id], body =
    for s in m.symbol-in(body, here, name.lo)]
 }
 
+# A function a statement declares: `function f`, or one name bound to a function or arrow written
+# there, whose `this` and `arguments` are the module's and so never read in it.
 fn function-name(s: Node) -> Node? = match s {
   FuncDecl(BindName(_) as name, _, _) | ExportFunction(FuncDecl(BindName(_) as name, _, _)) => some(name)
+  VarDecl(List(Declarator(BindName(_) as name, value))) | LetDecl(List(Declarator(BindName(_) as name, value)))
+    | ConstDecl(List(Declarator(BindName(_) as name, value))) | ExportVar(List(Declarator(BindName(_) as name, value)))
+    if movable-function?(value) => some(name)
+  ExportLexical(d) => function-name(d)
   _ => none
+}
+
+fn movable-function?(v: Node) -> Bool = match v {
+  FuncExpr(...) | AsyncFuncExpr(...) => true
+  Arrow(...) | AsyncArrow(...) => not inline.lexical-this?(v)
+  _ => false
+}
+
+# A name declared and never referred to: its symbol's one use is where it is bound. A dynamic
+# scope's might be reached by name.
+fn unreferenced?(name: Node) -> Bool = match name {
+  BindName(_) => any s in m.symbol-in(body, here, name.lo):
+    sym.symbol-at(m.table, s).uses == 1 and not sym.scope-at(m.table, sym.symbol-at(m.table, s).scope).dynamic
+  _ => false
 }
 
 fn dynamic-module?(id: Int) -> Bool = sym.scope-at(m.table, m.modules[id].root).dynamic
 
 # The one live statement that reads a function, when there is one and it is an ES module's, and the
-# function is no export kept for an entry.
+# function is no export kept for an entry: its own, or one re-exporting it however far.
 fn single-reader(id: Int, x: Declared) -> [Candidate] =
   [Candidate(part: x.part, symbol: x.symbol, module: id, reader: q)
    for readers in [[q for q in [q for m.db.mentions(?q, x.symbol)] ++ [q for m.db.uses(?q, x.symbol)] if live?(q) distinct q]]
-   if len(readers) == 1 and readers[0] != x.part and not (m.db.keep-exports(id) and (any m.db.resolved(id, ?n, x.symbol): true))
+   if len(readers) == 1 and readers[0] != x.part and not entry-export?(x.symbol)
    for q in readers for mo in [first m.db.part-of(q, ?mo): mo] for r in mo
    if m.modules[r].kind == Esm and not dynamic-module?(r)]
+
+fn entry-export?(s: Int) -> Bool = any k in [k for m.db.resolved(?k, ?n, s)]: m.db.keep-exports(k)
 
 # How often a statement reads each symbol, by what it means (an import, what it imports), and how
 # often it calls each: as the analysed source has it, whose reads emission keeps one for one.
@@ -909,7 +963,7 @@ fn calling-back(at: Candidate?, c: Candidate, by-part: {Int:Candidate}, steps: I
 
 # The declaration as its own module emits it.
 fn emitted-declaration(c: Candidate) -> Node = with here = m.modules[c.module], body = m.body-of(c.module) {
-  first s in part-body(c.part) if s is FuncDecl(...): s
+  first s in part-body(c.part) if inline.function-declaration?(s): s
 } ?? panic "a function read once emitted no declaration"
 
 # Of the functions these names are, those this chunk writes in (both the declaration and its call

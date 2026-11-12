@@ -1,7 +1,10 @@
-# Identifier minification, after esbuild's minify renamer. Symbols in sibling scopes can share a
-# name, so nested symbols get a "slot" by depth; top-level symbols each get their own. Slots are
-# sorted by how often their symbols are used, and the commonest gets the shortest name, drawn from
-# an alphabet ordered by character frequency.
+# Identifier minification. A nested scope's symbols are named as Terser names them: each scope's,
+# in the order it declares them, take the first names of the alphabet that no symbol it encloses
+# (one of a scope around it that code in it refers to) has. So every function's parameters are
+# `e`, `t`, `n`… again unless it reads one of the same names from outside, which gzip compresses
+# far better than names that run on from the scope around. Top-level symbols, each the commonest
+# first, take the names no nested scope took, so a nested name never hides one, wherever a function
+# is written in (bundle.inline). Names are drawn from an alphabet ordered by character frequency.
 rules bundle.mangle over bundle.js
 use bundle.modules as m
 use bundle.emit as e
@@ -44,19 +47,53 @@ fn unit-usage(u: e.Unit) -> Usage = match nm.included?(u.module) {
 
 fn in-dynamic-scope?(s: Int) -> Bool = sym.scope-at(m.table, sym.symbol-at(m.table, s).scope).dynamic
 
-# A symbol's slot.
-record Slotted { symbol: Int, at: Int }
+# What naming nested scopes reads of the whole program: the alphabets, the names nothing may take,
+# and the symbols kept JSX tags name, which need a capital.
+setting alphabet: Alphabets
+setting kept: {Text:Int}
+setting tagged: {Int:Bool}
 
-# Nested symbols: each scope's symbols take slots from `from` on, and its children from where they
-# stopped, so siblings share.
-fn nested-slots(scope: Int, from: Int) -> [Slotted] = own ++ [nested-slots(child, from + len(own))... for child in now.children]
+# A scope's symbols named, and every scope's inside it. `outer`: the names of the symbols of the
+# scopes around it, by symbol. A dynamic scope keeps its names.
+fn scope-named(scope: Int, outer: {Int:Text}) -> [nm.Named] =
+  own ++ [scope-named(child, inner)... for child in now.children]
   where now = sym.scope-at(m.table, scope),
-        own = [Slotted(symbol: now.symbols[i], at: from + i) for i in 0..len(now.symbols) if not now.dynamic]
+        own = match now.dynamic {
+          true => [nm.Named(symbol: x, name: sym.symbol-at(m.table, x).name) for x in now.symbols]
+          false => own-named(now.symbols, {name: true for e in now.enclosed for name in enclosed-name(e, outer)})
+        },
+        inner = outer ++ {x.symbol: x.name for x in own}
 
-# A module's nested symbols: CommonJS is inside its wrapper's scope.
-fn module-slots(id: Int) -> [Slotted] = match m.modules[id].kind {
-  m.Cjs => nested-slots(root.parent, 0)
-  _ => [nested-slots(child, 0)... for child in root.children]
+# What a symbol a scope encloses is called where it is read: a name given a scope around it, or the
+# name a dynamic scope keeps. A top-level symbol's name is none a nested scope gives.
+fn enclosed-name(e: Int, outer: {Int:Text}) -> Text? = match outer[e] {
+  some(n) => some(n)
+  none => match sym.scope-at(m.table, sym.symbol-at(m.table, e).scope).dynamic {
+    true => some(sym.symbol-at(m.table, e).name)
+    false => none
+  }
+}
+
+# A scope's symbols, in order, each the next name of its alphabet that is not taken: kept, or the
+# name of a symbol the scope encloses. A kept JSX tag's symbol takes a capital.
+fn own-named(symbols: [Int], taken: {Text:Bool}) -> [nm.Named] =
+  (fold st = Naming(named: [], plain: 0, capital: 0) for x in symbols:
+     (st with { named: st.named ++ [nm.Named(symbol: x, name: name)],
+                plain: if caps then st.plain else i + 1,
+                capital: if caps then i + 1 else st.capital }
+      where caps = x in tagged,
+            letters = if caps then alphabet.capitals else alphabet.head,
+            i = first j in (if caps then st.capital else st.plain).. if free-name?(minified-name(letters, alphabet.tail, j), taken): j,
+            name = minified-name(letters, alphabet.tail, i))).named
+
+record Naming { named: [nm.Named], plain: Int, capital: Int }
+
+fn free-name?(name: Text, taken: {Text:Bool}) -> Bool = not (name in kept) and not (name in taken)
+
+# A module's nested symbols named: CommonJS's start with its wrapper's own scope.
+fn module-nested(id: Int) -> [nm.Named] = match m.modules[id].kind {
+  m.Cjs => scope-named(root.parent, {})
+  _ => [scope-named(child, {})... for child in root.children]
 } where root = sym.scope-at(m.table, m.modules[id].root)
 
 # Name characters, commonest first, so frequent symbols compress well.
@@ -74,41 +111,37 @@ fn name-rest(tail: [Int], i: Int) -> Text = match i {
 # The alphabets: what a name starts with, what follows, and the capitals a JSX tag's starts with.
 record Alphabets { head: [Int], tail: [Int], capitals: [Int] }
 
-# Which names are given, which of each alphabet comes next, and each slot's.
-record Slotting { given: {Text:Bool}, plain: Int, capital: Int, names: {Int:Text} }
+# Top-level symbols named, the commonest first: the next name of its alphabet that is neither kept
+# nor any nested scope's. A kept JSX tag's symbol takes a capital, or `<Foo/>` would become an
+# element called `a`.
+fn top-named(order: [Int], caps: {Int:Bool}, abc: Alphabets, taken: {Text:Bool}, reserved: {Text:Int}) -> [nm.Named] =
+  (fold st = Naming(named: [], plain: 0, capital: 0) for x in order:
+     (st with { named: st.named ++ [nm.Named(symbol: x, name: name)],
+                plain: if capital then st.plain else i + 1,
+                capital: if capital then i + 1 else st.capital }
+      where capital = x in caps,
+            letters = if capital then abc.capitals else abc.head,
+            i = first j in (if capital then st.capital else st.plain)..
+                  if not (minified-name(letters, abc.tail, j) in reserved) and not (minified-name(letters, abc.tail, j) in taken): j,
+            name = minified-name(letters, abc.tail, i))).named
 
-# Each slot's name, the commonest slot first: the next name of its alphabet that nothing has. A slot
-# holding a kept JSX tag's symbol gets a capital, or `<Foo/>` would become an element called `a`.
-fn slot-names(order: [Int], capital: {Int:Bool}, abc: Alphabets, reserved: {Text:Int}) -> {Int:Text} =
-  (fold st = Slotting(given: {}, plain: 0, capital: 0, names: {}) for at in order:
-     (st with { given: st.given ++ {name: true}, names: st.names ++ {at: name},
-                plain: match caps { true => st.plain  false => i + 1 },
-                capital: match caps { true => i + 1  false => st.capital } }
-      where caps = at in capital,
-            alphabet = match caps { true => abc.capitals  false => abc.head },
-            from = match caps { true => st.capital  false => st.plain },
-            i = first j in from.. if not (minified-name(alphabet, abc.tail, j) in reserved or minified-name(alphabet, abc.tail, j) in st.given): j,
-            name = minified-name(alphabet, abc.tail, i))).names
-
-# Every symbol's minified name: live code counted for uses and character frequency, nested slots
-# first, so top-level symbols never collide with them, each slotted symbol named by the last slot it
-# took; a dynamic scope's keep theirs.
-fn minified-names() -> [Text] =
-  nm.named-table([nm.Named(symbol: x.symbol, name: names[x.at] ?? panic "a slot with no name") for x in slotted])
+# Every symbol's minified name: live code counted for uses and character frequency; nested scopes
+# named module by module, and top-level symbols then from what they left; a dynamic scope's keep
+# theirs.
+fn minified-names() -> [Text] = nm.named-table(nested ++ top)
   where usages = [unit-usage(u) for u in e.units],
         uses = histogram(sym.symbol-count(m.table), [s for u in usages for s in u.used]),
-        tagged = {s: true for u in usages for s in u.tags},
+        caps = {s: true for u in usages for s in u.tags},
         freq = summed-lists([byte-counts("")] ++ [u.freq for u in usages]),
-        nested = [x for found in [module-slots(id) for id in m.order if nm.included?(id)] for x in found],
-        first-top = fold top = 0 for x in nested: max(top, x.at + 1),
-        toplevel = [s for u in usages for s in u.toplevel],
-        slotted = nested ++ [Slotted(symbol: toplevel[i], at: first-top + i) for i in 0..len(toplevel)],
-        slots = first-top + len(toplevel),
-        counts = histogram(slots, [x.at for x in slotted], [uses[x.symbol] for x in slotted]),
-        capital = {x.at: true for x in slotted if x.symbol in tagged},
         abc = Alphabets(head: sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$", freq),
                         tail: sorted-chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$0123456789", freq),
                         capitals: sorted-chars("ABCDEFGHIJKLMNOPQRSTUVWXYZ", freq)),
-        # Slot numbers, by descending use; ties keep slot order.
-        order = sort i in [i for i in 0..slots] by counts[i] desc,
-        names = slot-names(order, capital, abc, nm.reserved(nm.runtime-globals))
+        reserved = nm.reserved(nm.runtime-globals),
+        nested = with alphabet = abc, kept = reserved, tagged = caps {
+          [x for found in [module-nested(id) for id in m.order if nm.included?(id)] for x in found]
+        },
+        taken = {x.name: true for x in nested},
+        toplevel = [s for u in usages for s in u.toplevel],
+        # By descending use; ties keep declaration order.
+        order = sort i in [i for i in 0..len(toplevel)] by uses[toplevel[i]] desc,
+        top = top-named([toplevel[i] for i in order], caps, abc, taken, reserved)
