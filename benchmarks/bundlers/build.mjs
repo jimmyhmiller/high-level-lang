@@ -46,7 +46,7 @@ if (kind === 'rollup') {
       ...minifiers],
     onwarn(warning, warn) { if (warning.code !== 'CIRCULAR_DEPENDENCY') warn(warning); }
   });
-  try { await bundle.write({ dir: config.output, format: 'es', sourcemap: false,
+  try { await bundle.write({ dir: config.output, format: 'es', sourcemap: config.sourcemap ?? false,
     entryFileNames: '[name].js', chunkFileNames: '[name]-[hash].js' }); }
   finally { await bundle.close(); }
 } else if (kind === 'rolldown') {

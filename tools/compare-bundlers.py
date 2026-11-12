@@ -78,6 +78,36 @@ APPS = {
         files=['.svg'], root='root', wait='Monthly Revenue',
         steps=[['fill', 'input[name=username]', 'demo'], ['fill', 'input[name=password]', 'demo'], ['click', 'button[type=submit]']],
         statics=['node_modules/msw/lib/mockServiceWorker.js']),
+    # A generated application (benchmarks/realworld/README.md) on 57 packages, each used as code
+    # uses it, with seeded data: nine routes, each loaded with import(), visited in turn. Its data
+    # is the same from one load to the next, so every build must show the same text at every step.
+    'field-ops': dict(
+        dir=ROOT/'benchmarks/realworld', entry='src/index.tsx',
+        define={'process.env.NODE_ENV': '"production"'}, files=[], root='root', wait='Motion ready', same_text=True,
+        steps=[["wait", "Revenue by region"],
+               ["click", "a[href=\"/customers\"]"],
+               ["wait", "2000 customers match"],
+               ["fill", "input[name=search]", "lovelace"],
+               ["wait", "88 customers match"],
+               ["click", "a[href=\"/editor\"]"],
+               ["wait", "Version 2.4.1 ships"],
+               ["click", "a[href=\"/forms\"]"],
+               ["click", "button[name=contact-submit]"],
+               ["wait", "problems in the contact form"],
+               ["click", "a[href=\"/workflow\"]"],
+               ["wait", "State: draft"],
+               ["click", "button[name=submit]"],
+               ["wait", "State: review"],
+               ["click", "button[name=approve]"],
+               ["wait", "State: approved"],
+               ["click", "a[href=\"/graph\"]"],
+               ["wait", "Top accounts"],
+               ["click", "a[href=\"/viewer\"]"],
+               ["wait", "Scene ready"],
+               ["click", "a[href=\"/reports\"]"],
+               ["wait", "Report ready"],
+               ["click", "a[href=\"/motion\"]"]],
+        statics=[]),
 }
 
 
@@ -225,7 +255,19 @@ def app_checked(case, output):
     (WORK/f'{case}-{output.parent.name}-{output.name}-browser.json').write_text(json.dumps(browser,indent=2))
     assert browser['ok'] and not browser['failed'],json.dumps(dict(errors=browser['errors'],failed=browser['failed']))
     js=sorted(str(p.relative_to(output)) for p in output.rglob('*.js'))
-    return dict(total_js=size_of(output,js),first_route=size_of(output,browser['initial']),all_loaded=size_of(output,browser['loaded']))
+    return dict(total_js=size_of(output,js),first_route=size_of(output,browser['initial']),all_loaded=size_of(output,browser['loaded']),
+                snapshots=hashlib.sha256(json.dumps(browser['snapshots']+[browser['text']]).encode()).hexdigest())
+
+
+# An application whose data does not change must show the same text at every step, built by any
+# tool: a build that shows other text than most do is wrong.
+def same_text(rows_here):
+    shown=[row['snapshots'] for row in rows_here if row.get('status')=='correct']
+    if not shown: return
+    usual=max(set(shown),key=shown.count)
+    for row in rows_here:
+        if row.get('status')=='correct' and row['snapshots']!=usual:
+            row.update(status='incorrect-or-validation-failed',error='shows other text than most builds do')
 
 
 rows=[];samples=[]
@@ -282,5 +324,7 @@ for case in args.cases.split(','):
                 (WORK/f'{case}-{minify}-{tool}-browser.json').write_text(json.dumps(browser,indent=2))
             except Exception as error: row.update(status='incorrect-or-validation-failed',error=str(error))
             rows.append(row);save();print(json.dumps(row),flush=True)
+        if case in APPS and APPS[case].get('same_text'):
+            same_text([row for row in rows if row['case']==case and row['minify']==minify]);save()
 save()
 print('Comparison complete: '+str(report),flush=True)

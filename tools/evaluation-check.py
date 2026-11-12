@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Compare split-bundle module evaluation against native ESM, in either entry load order."""
+"""Compare split-bundle module evaluation against native ESM, in either entry load order, with
+--strict-execution-order: the order native modules keep, which the default, as esbuild, Bun, Rollup
+and Rolldown, does not promise."""
 from pathlib import Path
 import json
 import shutil
@@ -41,7 +43,7 @@ def check(name, files, extra='', max_initializers=None):
     for policy, fragments, minify in MODES:
         output = folder / f'{policy}-{fragments}-{minify}'
         flags = ['--minify', '--sourcemap', '--pipeline=full'] if minify else []
-        p = subprocess.run([str(ESB), 'a.js', 'b.js', '--splitting', '--format=esm', f'--outdir={output}',
+        p = subprocess.run([str(ESB), 'a.js', 'b.js', '--splitting', '--strict-execution-order', '--format=esm', f'--outdir={output}',
                             f'--chunk-policy={policy}', f'--fragments={str(fragments).lower()}', *flags],
                            cwd=folder, capture_output=True, text=True, timeout=120)
         assert p.returncode == 0, (name, policy, fragments, minify, p.stdout + p.stderr)
@@ -231,7 +233,7 @@ for failing in (False, True):
     expected=pending_cycle(folder)
     for policy,fragments,minify in MODES:
         output=folder/f'{policy}-{fragments}-{minify}'
-        result=subprocess.run([str(ESB),'a.js','b.js','--splitting','--format=esm',f'--outdir={output}',f'--chunk-policy={policy}',f'--fragments={str(fragments).lower()}',*(['--minify','--pipeline=full'] if minify else [])],cwd=folder,capture_output=True,text=True,timeout=120)
+        result=subprocess.run([str(ESB),'a.js','b.js','--splitting','--strict-execution-order','--format=esm',f'--outdir={output}',f'--chunk-policy={policy}',f'--fragments={str(fragments).lower()}',*(['--minify','--pipeline=full'] if minify else [])],cwd=folder,capture_output=True,text=True,timeout=120)
         assert result.returncode==0,result.stdout+result.stderr
         actual=pending_cycle(output)
         assert actual==expected,(failing,policy,fragments,minify,actual,expected)
@@ -253,7 +255,7 @@ folder=fixture('require-async-rejected', {
     'b.js':'export const value=2;',
 })
 for policy,fragments,minify in MODES:
-    result=subprocess.run([str(ESB),'a.js','b.js','--splitting','--format=esm',f'--outdir={folder / "built"}',f'--chunk-policy={policy}',f'--fragments={str(fragments).lower()}',*(['--minify'] if minify else [])],cwd=folder,capture_output=True,text=True,timeout=120)
+    result=subprocess.run([str(ESB),'a.js','b.js','--splitting','--strict-execution-order','--format=esm',f'--outdir={folder / "built"}',f'--chunk-policy={policy}',f'--fragments={str(fragments).lower()}',*(['--minify'] if minify else [])],cwd=folder,capture_output=True,text=True,timeout=120)
     assert result.returncode != 0 and 'cannot require async ES module' in result.stderr,result.stdout+result.stderr
 print('ok   synchronous require of an async graph is rejected explicitly')
 print('all evaluation checks passed')

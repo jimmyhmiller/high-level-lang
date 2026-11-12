@@ -5,7 +5,9 @@
 // builds of the same application by different bundlers can be compared.
 //   node app-check.mjs OUTDIR ENTRY_FILE_IN_OUTDIR ROOT_ID WAIT_TEXT [STATIC_FILE...]
 // APP_STEPS (JSON): what a person does first, as [["fill", selector, text] | ["click", selector] |
-// ["wait", text]...], such as signing in; WAIT_TEXT is then what the page must come to show.
+// ["wait", text]...], such as signing in; WAIT_TEXT is then what the page must come to show. What the
+// page shows once each wait is met is kept (`snapshots`): an application whose data does not change
+// from one load to the next must show the same, however it was built.
 import { chromium } from '../../tests/node_modules/playwright-core/index.mjs';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -32,21 +34,28 @@ const tab = await ctx.newPage();
 const errors = [], failed = [];
 tab.on('pageerror', (e) => errors.push(String(e.message)));
 tab.on('response', (r) => { if (r.status() >= 400) failed.push(r.status() + ' ' + new URL(r.url()).pathname); });
-let ok = true, initial = [];
+let ok = true, initial = [], step = 'loading the page';
+const snapshots = [];
+const shown = () => tab.evaluate(() => document.body.innerText);
 try {
   await tab.goto(`http://127.0.0.1:${server.address().port}/`);
   await tab.waitForLoadState('networkidle');
   initial = [...loaded];
   for (const [what, a, b] of JSON.parse(process.env.APP_STEPS || '[]')) {
+    step = `${what} ${a}`;
     if (what === 'fill') await tab.fill(a, b, { timeout: 30000 });
     else if (what === 'click') await tab.click(a, { timeout: 30000 });
-    else if (what === 'wait') await tab.waitForFunction((t) => document.body.innerText.includes(t), a, { timeout: 30000 });
+    else if (what === 'wait') {
+      await tab.waitForFunction((t) => document.body.innerText.includes(t), a, { timeout: 30000 });
+      snapshots.push(await shown());
+    }
   }
+  step = `wait ${waitText}`;
   await tab.waitForFunction((t) => document.body.innerText.includes(t), waitText, { timeout: 30000 });
   await tab.waitForLoadState('networkidle');
   await tab.waitForTimeout(1500);
-} catch (e) { ok = false; errors.push('did not show "' + waitText + '": ' + e.message.split('\n')[0]); }
-const text = await tab.evaluate(() => document.body.innerText);
-process.stdout.write(JSON.stringify({ ok: ok && errors.length === 0, errors, failed, initial, loaded, text }));
+} catch (e) { ok = false; errors.push(`at ${step}: ${e.message.split('\n')[0]}`); }
+const text = await shown();
+process.stdout.write(JSON.stringify({ ok: ok && errors.length === 0, errors, failed, initial, loaded, snapshots, text }));
 await browser.close();
 server.close();

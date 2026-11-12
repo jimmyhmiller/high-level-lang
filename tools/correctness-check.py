@@ -8,6 +8,11 @@
   - lowered class fields evaluate computed keys in the class's order, after its heritage;
   - with fragments, a value computed as its chunk loads is never computed later than its module
     was: not after an `import()`, nor by a second entry on the page;
+  - dead code a define decides is cut down to the `var`s it hoists, which still shadow what they
+    did, and nothing else (not a nested function's `var`s, nor a pattern's defaults);
+  - a module loaded by `import()` without splitting is shaken as any is, yet what it reads through
+    an `export *` barrel is initialised first, and a package with no side effects is not loaded
+    for an import nothing reads;
   - a direct `eval`, called by name or in parentheses, sees its module's names as written, while
     `eval` read any other way does not stop minifying; and one module reading `eval` leaves the
     names linking makes (`init_x`) distinct.
@@ -163,6 +168,51 @@ for flags in ([], ['--fragments'], ['--fragments', '--minify'], ['--fragments', 
     got = run(['node', 'frag-out/page.mjs'])
     ok(built.returncode == 0 and got.stdout == page_want, f'eager value, second entry {flags}: {got.stdout!r} want {page_want!r}')
 print('ok   fragments: a value computed as its chunk loads is never computed later than its module', flush=True)
+
+# ---------------------------------------------------------------- dead code that hoists
+write({'dead/m.js': '''var x = "outer", z = "outer z", inner = "outer inner";
+import { helper } from "./h.js";
+function shadowed() { if (process.env.NODE_ENV !== "production") { var x = helper(); } return typeof x; }
+function elsed() { if (process.env.NODE_ENV === "production") { return "kept"; } else { var y = helper(); } return y; }
+function loops() { if (process.env.NODE_ENV !== "production") { for (var k in { a: 1 }) helper(); for (var z of [1]) helper(); } return [typeof k, typeof z]; }
+function patterns() {
+  if (process.env.NODE_ENV !== "production") { var { a, b: [c = function () { var inner = 1; return inner; }] = [], ...d } = helper(); }
+  return [typeof a, typeof c, typeof d, inner];
+}
+function nested() { if (process.env.NODE_ENV !== "production") { (function* () { var inner = 2; })(); } return inner; }
+console.log(shadowed(), elsed(), loops().join(), patterns().join(), nested());
+''',
+       'dead/h.js': 'export function helper() { return { HELPER_BODY: 1 }; }\n'})
+want = run(['node', '--input-type=module', '-e', (WORK / 'dead/m.js').read_text().replace('import { helper } from "./h.js";', 'const helper = () => ({});').replace('process.env.NODE_ENV', '"production"')]).stdout
+for flags in ([], ['--minify']):
+    built = run([ESB, 'dead/m.js', '--format=esm', '--outfile=dead-out.mjs', '--define:process.env.NODE_ENV="production"'] + flags)
+    got = run(['node', 'dead-out.mjs'])
+    text = (WORK / 'dead-out.mjs').read_text() if built.returncode == 0 else ''
+    ok(built.returncode == 0 and got.stdout == want and 'HELPER_BODY' not in text,
+       f'dead code keeps only its vars {flags}: {got.stdout!r} want {want!r}, helper kept: {"HELPER_BODY" in text}')
+print('ok   dead code is cut down to the vars it hoists', flush=True)
+
+# ---------------------------------------------------------------- import() without splitting
+write({'lazy/main.js': 'const a = await import("./a.js");\nconsole.log(a.used, a.viaBarrel(), Object.keys(a).join());\n',
+       'lazy/a.js': 'import { x } from "./b.js";\nimport { clampWrapper } from "./barrel.js";\nimport { unusedLocale } from "pkg";\n'
+                    'const UNUSED_IN_A = "UNUSED_IN_A";\nexport const used = x + 1;\nexport function viaBarrel() { return clampWrapper(7); }\n',
+       'lazy/b.js': 'export * from "./c.js";\nexport const x = 1;\nexport const UNUSED_IN_B = "UNUSED_IN_B";\n',
+       'lazy/c.js': 'export const UNUSED_IN_C = "UNUSED_IN_C";\n',
+       'lazy/barrel.js': 'export * from "./inner-barrel.js";\n',
+       'lazy/inner-barrel.js': 'export * from "./color.js";\n',
+       'lazy/color.js': 'import clampDefault from "./clamp.js";\nexport function clampWrapper(v) { return clampDefault(v, 0, 5); }\n',
+       'lazy/clamp.js': 'function clamp(v, lo, hi) { return Math.max(lo, Math.min(v, hi)); }\nconst clampDefault = clamp;\nexport default clampDefault;\n',
+       'lazy/node_modules/pkg/package.json': '{"name":"pkg","type":"module","main":"index.js","sideEffects":false}',
+       'lazy/node_modules/pkg/index.js': 'globalThis.PKG_LOADED = "PKG_LOADED";\nexport const unusedLocale = "UNUSED_LOCALE";\n'})
+want = run(['node', 'lazy/main.js']).stdout
+for flags in ([], ['--minify']):
+    built = run([ESB, 'lazy/main.js', '--format=esm', '--outfile=lazy-out.mjs'] + flags)
+    got = run(['node', 'lazy-out.mjs'])
+    text = (WORK / 'lazy-out.mjs').read_text() if built.returncode == 0 else ''
+    ok(built.returncode == 0 and got.stdout == want, f'import() without splitting {flags}: {got.stdout!r} want {want!r}')
+    ok(not any(x in text for x in ['UNUSED_IN_A', 'UNUSED_IN_B', 'UNUSED_IN_C', 'PKG_LOADED', 'UNUSED_LOCALE']),
+       f'import() without splitting shakes what is loaded {flags}: {text!r}')
+print('ok   import() without splitting: shaken, and initialised through barrels', flush=True)
 
 # ---------------------------------------------------------------- eval
 write({'ev/direct.js': 'const secretValue = 41;\nexport function viaDirect() { return eval("secretValue + 1"); }\n',

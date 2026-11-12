@@ -17,6 +17,9 @@ record Linking {
   tree-shaking: Bool,
   # Code splitting: `import()` loads a chunk, so what it names runs when loaded, and needs no wrapper.
   splitting: Bool,
+  # With splitting, modules evaluate in native order: each that may be observed gets an initializer
+  # its importers call (`scheduling`). Otherwise a shared module runs as its chunk loads.
+  strict-order: Bool,
   # ES module output, where an import of an external module stays an import statement.
   esm-output: Bool,
   # Output whose runner has `require`; otherwise an external module is loaded with `__require`.
@@ -315,6 +318,8 @@ const known-global-properties: [Text] = [
 const known-collections: [Text] = ["Map", "Set", "WeakMap", "WeakSet"]
 
 fn annotated?(n: Node) -> Bool = m.pure-annotated?(body, n)
+fn namespace-import?(n: Node) -> Bool =
+  any s in m.symbol-in(body, here, n.lo): s in linked.ns-imports or (any c in linked.cjs-imports[s]: c.namespace)
 fn free-ident?(n: Node) -> Bool = n is Ident(_) and not bound?(n)
 fn known-collection?(callee: Node) -> Bool = free-ident?(callee) and callee.text in known-collections
 fn all-pure?(xs: [Node]) -> Bool = all x in xs: pure?(x)
@@ -353,6 +358,9 @@ fn pure?(n: Node) -> Bool = match n {
   CallExpr(...) => pure-call?(n)
   NewExpr(...) => pure-call?(n) or pure-new?(n)
   NewNoArgs(callee) => annotated?(n) or known-collection?(callee)
+  # `ns.x` of `import * as ns` reads an import, as esbuild has it, whether the module is linked by
+  # name or held in an import variable.
+  Member(Ident(_) as o, PropName(_)) if namespace-import?(o) => true
   Member(...) => match m.dotted-name(n, body.bindings) {
     some(name) => name in known-global-properties
     none => false
@@ -660,7 +668,7 @@ fn linked-of(links: [ModuleLink], first: Int) -> Linked =
         seeds = [l.target for l in loads if not (linking.splitting and l.by-import)],
         delayed = fold w = none-wrapped() for t in seeds: wrapping(t, w),
         asynchronous = if linking.splitting then checked-async(links, async-modules(links)) else {},
-        scheduled = if linking.splitting then scheduling(links, roots, asynchronous) else {},
+        scheduled = if linking.strict-order then scheduling(links, roots, asynchronous) else {},
         wrapped = delayed ++ scheduled,
         owners = initializer-owners(links, wrapped, scheduled, delayed, asynchronous),
         defining = {id: true for id in keys(wrapped) if (owners[id] ?? id) == id},
@@ -794,7 +802,8 @@ fn module-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] =
   [link.fact-module-effects(id) for id in [mo.id] if mo.side-effects]
   ++ [link.fact-script(id) for id in [mo.id] if mo.script]
   ++ [link.fact-typescript(id) for id in [mo.id] if m.loader-of(mo.path) == "ts" or m.loader-of(mo.path) == "tsx"]
-  ++ [link.fact-wrapped(mo.id) for id in [mo.id] if wrapped?(mo)] ++ parts-facts(mo, summaries, start)
+  ++ [link.fact-wrapped(mo.id) for id in [mo.id] if wrapped?(mo)]
+  ++ [link.fact-delayed(mo.id) for id in [mo.id] if wrapped?(mo) and not scheduled?(mo)] ++ parts-facts(mo, summaries, start)
 
 fn parts-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] = match mo.kind {
   Cjs => [link.fact-part-of(start, mo.id), link.fact-effect(start), link.fact-declares(start, require-sym(mo)),
@@ -897,7 +906,7 @@ fn imported(mo: m.Module, part: Int, t: Int) -> [link.Fact] = [link.fact-imports
 
 fn initialised(part: Int, mo: m.Module) -> [link.Fact] = match wrapped?(mo) {
   true if scheduled?(mo) => [link.fact-mentions(part, init-sym(mo)), link.fact-initializes(part, init-owner(mo))]
-  true => [link.fact-mentions(part, init-sym(mo)), link.fact-effect(part)]
+  true => [link.fact-mentions(part, init-sym(mo)), link.fact-inits(part, mo.id)]
           ++ [link.fact-initializes(part, mo.id) for id in [mo.id] if linking.splitting]
   false => []
 }
@@ -932,26 +941,33 @@ fn statement-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact]
   ExportAllAs(name, from) => imported(mo, part, t) ++ star-as-facts(mo, part, t, m.module-name(name)) where t = known-dep(mo, from)
   ExportFrom(List(specs...), from) => imported(mo, part, t) ++ export-from-facts(mo, part, t, specs) where t = known-dep(mo, from)
   ExportNamed(List(specs...)) => [export-local(mo, export-spec-names(spec), m.module-name(spec.local)) for spec in specs]
-  # The runtime's statements are only ever live through a mention, and every statement of a wrapped
-  # module runs when its initialiser does.
+  # The runtime's statements are only ever live through a mention. A wrapped module's are shaken as
+  # any module's are, as esbuild shakes them: its initialiser runs what is left, and its imports
+  # (`initialised`) still run what it imports first.
   _ => summary-facts(mo, part, sm) ++ exported-by(mo, s)
-       ++ [link.fact-effect(part) for p in [part] if (wrapped?(mo) and not scheduled?(mo)) or not (mo.kind == Runtime or sm.pure)]
+       ++ [link.fact-effect(part) for p in [part] if not (mo.kind == Runtime or sm.pure)]
 }
 
 # An import of an opaque module holds it in a variable, made an ES module. A kept one declares its
 # own names, and stays for what loading the module does, as esbuild keeps it.
 fn import-facts(mo: m.Module, part: Int, t: Int, clause: Node) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
   true, _ => [link.fact-declares(part, known-import-var(mo, t))] ++ required(part, t)
-             ++ [link.fact-effect(part), link.fact-mentions(part, helper("__toESM"))]
+             ++ [link.fact-cjs-binding(b.symbol, part) for b in clause-bindings(mo, t, clause)]
+             ++ loading(part, m.modules[t]) ++ [link.fact-mentions(part, helper("__toESM"))]
   _, true => [link.fact-declares(part, b.symbol) for b in clause-bindings(mo, t, clause)] ++ [link.fact-effect(part)]
   _, _ => []
 }
+
+# Holding a module in a variable runs it, which stays for what that does: unless its package says
+# it does nothing (`"sideEffects": false`), when the statement stays only if what it holds is read,
+# as esbuild drops an unused import of such a package.
+fn loading(part: Int, t: m.Module) -> [link.Fact] = [link.fact-effect(part) for x in [part] if t.side-effects]
 
 # `import "x"` of CommonJS, or of an outside module held in a variable, holds it in an import
 # variable too, as esbuild writes it.
 fn bare-import-facts(mo: m.Module, part: Int, t: Int) -> [link.Fact] = match held?(m.modules[t]), m.modules[t].kind {
   true, Cjs => [link.fact-declares(part, known-import-var(mo, t)), link.fact-mentions(part, helper("__toESM"))]
-               ++ required(part, t) ++ [link.fact-effect(part)]
+               ++ required(part, t) ++ loading(part, m.modules[t])
   true, _ => [link.fact-declares(part, known-import-var(mo, t))] ++ required(part, t) ++ [link.fact-effect(part)]
   # Kept as an import statement, it loads the module where it stands.
   false, _ => [link.fact-effect(part) for x in [t] if kept?(m.modules[t])]
