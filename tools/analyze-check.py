@@ -6,13 +6,16 @@
   source maps, minified, with fragments, split and single).
 - Each output's bytes are its own (imports, exports) and its modules' shares, to the byte.
 - What each route loads is its output and every output that imports, transitively, as the files
-  themselves say.
+  themselves say; and its modules' bytes and its files' own add up to it.
+- A module holds code, or passes names on to code that reads them through it.
 - analysis.json and analysis.jsonl hold the same records; every module index is a module.
 - What each module holds of each output agrees with the same build's source map, which marks every
-  token's source, up to the output's own bytes (its imports and exports, which a map gives to the
-  code beside them); a map leaves out the runtime's helpers.
+  token's source, up to what has no source: the output's own bytes (its imports and exports) and what
+  the bundler wrote for a module (its wrapper, its namespace object), which a map gives to the code
+  before them; a map leaves out the runtime's helpers.
 - The page (index.html) has no script; every link within it leads to a section of it, and there is a
-  section for each route and each module, each import chain leading from its route to its module."""
+  section for each route and each module, each import chain leading from its route to its module;
+  each treemap's boxes fill it, overlap nowhere, and are each as large as its bytes."""
 import json, os, re, shutil, subprocess, sys
 from html.parser import HTMLParser
 from pathlib import Path
@@ -77,13 +80,44 @@ def map_shares(js, mapfile):
     return shares
 
 
+VOID = {"meta", "br", "img", "input", "link", "hr"}
+
+
+def size_of(title):
+    """A size as a title gives it, and how far that may be from the bytes: B exact, KB to a tenth,
+    MB to a hundredth, each cut, not rounded."""
+    n, unit = title.rsplit(" · ", 1)[1].split(" ")
+    scale = {"B": 1, "KB": 1024, "MB": 1048576}[unit]
+    step = {"B": 0, "KB": 0.1, "MB": 0.01}[unit] * scale
+    return float(n) * scale + step / 2, step / 2
+
+
 class Page(HTMLParser):
+    """The page's ids, links, scripts and sections; and each treemap box (the map, or a group's
+    body) with the boxes in it, each its place (left, top, width, height in percent) and size."""
     def __init__(self):
         super().__init__()
         self.ids, self.links, self.scripts, self.sections = set(), [], 0, []
+        self.stack, self.boxes = [], []
+
+    def handle_endtag(self, tag):
+        if tag not in VOID:
+            self.stack.pop()
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        classes = a.get("class", "").split()
+        box = None
+        if "map" in classes or "gb" in classes:
+            box = []
+            self.boxes.append(box)
+        if ("g" in classes or "t" in classes) and self.stack:
+            # The box this one is in: the nearest map or group body around it.
+            outer = next(b for b in reversed(self.stack) if b is not None)
+            place = dict(kv.split(":") for kv in a["style"].split(";"))
+            outer.append(([float(place[k].rstrip("%")) for k in ("left", "top", "width", "height")], size_of(a["title"])))
+        if tag not in VOID:
+            self.stack.append(box)
         if "id" in a:
             self.ids.add(a["id"])
         if tag == "a" and a.get("href", "").startswith("#"):
@@ -102,6 +136,20 @@ def check_page(report, data, label):
     assert not missing, f"{label}: links to no section: {missing[:5]}"
     want = {f"r{i}" for i in range(len(data["roots"]))} | {f"m{i}" for i in range(len(data["modules"]))} | {"all"}
     assert want == set(page.sections), f"{label}: sections {sorted(set(page.sections) ^ want)[:5]} differ"
+    # A treemap's boxes fill it, overlap nowhere, and each is as large as its bytes, to rounding: places
+    # are to a hundredth of a percent, and the sizes in titles to a tenth of a unit.
+    for box in page.boxes:
+        if not box:
+            continue
+        total, slack = sum(size for _, (size, _) in box), sum(e for _, (_, e) in box)
+        assert abs(sum(w * h for (_, _, w, h), _ in box) - 10000) <= 2 * len(box) + 10, f"{label}: a treemap's boxes do not fill it"
+        for i, ((x, y, w, h), (size, e)) in enumerate(box):
+            assert x >= 0 and y >= 0 and x + w <= 100.01 and y + h <= 100.01, f"{label}: a treemap box is outside its box"
+            # How far the share may be off: the sizes' cuts, and the layout's whole units (0.2% a side).
+            off = 100 * (e / total + size * slack / total ** 2) + 0.5
+            assert abs(w * h / 100 - 100 * size / total) <= off, f"{label}: a treemap box's area is {w * h / 100:.2f}%, its bytes {100 * size / total:.2f}%"
+            for (x2, y2, w2, h2), _ in box[i + 1:]:
+                assert max(0, min(x + w, x2 + w2) - max(x, x2)) * max(0, min(y + h, y2 + h2) - max(y, y2)) <= 0.05, f"{label}: treemap boxes overlap"
     for m, mod in enumerate(data["modules"]):
         for c in mod["chains"]:
             assert c["modules"][0] == data["roots"][[r["module"] for r in data["roots"]].index(c["root"])]["module"] and c["modules"][-1] == m, \
@@ -161,7 +209,11 @@ for entries, label in SPLITS:
         for m in modules:
             assert all(0 <= i < len(modules) for i in m["imports"] + m["dynamic"])
             assert all(0 <= u["module"] < len(modules) and u["names"] for u in m["used-by"])
-            assert sum(o["bytes"] for o in m["outputs"]) > 0
+            # A module holds code, or holds none and passes names on to code that reads them through it.
+            assert sum(o["bytes"] for o in m["outputs"]) > 0 or m["passes"], f"{label} {mode}: {m['path']} holds nothing and passes nothing on"
+        for r in data["roots"]:
+            # What a route loads is its modules' code and its files' own bytes.
+            assert sum(h["bytes"] for h in r["modules"]) + sum(outputs[o]["own"] for o in r["loads"]) == r["bytes"], f"{label} {mode}: {r['path']} does not add up"
         count += 1
 print(f"ok   {count} split builds: outputs unchanged, every byte attributed, routes load what the files import")
 # What each module holds, against the source map of the same build.
@@ -182,9 +234,12 @@ for entries, label in SPLITS:
             ours = {"/".join(names[h["module"]].split("/")[-2:]): h["bytes"] for h in o["modules"] if names[h["module"]] != "<runtime>"}
             theirs = map_shares(mapped / name, mapped / (name + ".map"))
             apart = sum(abs(ours.get(k, 0) - theirs.get(k, 0)) for k in set(ours) | set(theirs))
-            assert apart <= 2 * o["own"], f"{label} {mode}: {name} differs from its source map by {apart} bytes, more than its own {o['own']}"
+            # A map gives what has no source (the output's own, and what the bundler wrote for a module) to
+            # the code before it.
+            sourceless = o["own"] + sum(w["written"] for m in data["modules"] for w in m["outputs"] if data["outputs"][w["output"]] is o)
+            assert apart <= 2 * sourceless, f"{label} {mode}: {name} differs from its source map by {apart} bytes, more than twice the {sourceless} with no source"
             compared += 1
-print(f"ok   {compared} outputs: what each module holds agrees with the source map, up to the output's own bytes")
+print(f"ok   {compared} outputs: what each module holds agrees with the source map, up to what has no source")
 
 
 # A single output: one root, the entry; the same attribution.

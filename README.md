@@ -318,47 +318,66 @@ and disk caching retain their existing CLI restriction; single-output caching ac
 
 ## What a build says of itself
 
-`--analyze=DIR` writes what the build made, and why, beside its outputs, what Turbopack's
-`next analyze` shows: `DIR/index.html`, a page to read it in; `DIR/analysis.json`; and
-`DIR/analysis.jsonl`, one record a line for scripts. Keep a directory per build to compare them.
-The outputs themselves are byte for byte those of the same build without it.
+`--analyze=DIR` (in a spec, `analyze "DIR"`) writes what the build made, and why, beside its
+outputs, what Turbopack's `next analyze` shows: `DIR/index.html`, a page to read it in;
+`DIR/analysis.json`; and `DIR/analysis.jsonl`, one record a line for scripts. Keep a directory per
+build to compare them. The outputs themselves are byte for byte those of the same build without it.
 
 - **Outputs**: each file's size, the files it imports and loads with `import()`, and what of each
-  module it holds, to the byte; the rest is its own (imports, exports).
-- **Routes**: each entry and each `import()` root, the files it loads before it runs, and their
-  bytes.
+  module it holds, to the byte, and of that what the bundler wrote for it (its CommonJS wrapper,
+  its namespace object); the rest is the file's own (imports, exports).
+- **Routes**: each entry and each `import()` root, the files it loads before it runs, their bytes,
+  and how much of each module that is.
 - **Modules**: size in the output and in the source; statements kept of all; what it imports; the
-  modules whose kept statements read what it declares, and the names they read; and the statements
-  kept only for what they do as the module loads, with their lines. On three.js's math page,
-  `three.module.js`'s 163 KB is used by nothing, and kept by 13 such statements (`ShaderLib = {…}`).
+  modules whose kept code reads what it declares, and the names they read; the names it only passes
+  on (a module with `export … from` and nothing else holds no code, but is how the code held is
+  reached); and the statements kept only for what they do as the module loads, with their lines. On
+  three.js's math page, `three.module.js`'s 163 KB is used by nothing, and kept by 13 such
+  statements (`ShaderLib = {…}`).
 
-The page has no script. Each route is a map of the files it loads, side by side as wide as their
-bytes, and in each its modules, one above another as tall as theirs, so every area is its bytes;
-each module is a link to its section: its sizes, the files it is in, how each route reaches it,
-what is used of it and by whom, and the statements kept for what they do as it loads, with a note
-when nothing it declares is used. The section shown is the one the address names (`:target`). It
-is HTML defined as a grammar (`src/bundle/html.syntax`), which gives its nodes, its printer and its
-templates, and views written as templates over the report's records (`src/bundle/view.rules`).
+The page has no script. Each route is a treemap of what it loads: packages, then their
+directories, then modules, every area its bytes, laid out squarified (Bruls, Huizing and van Wijk)
+by a function of the view, in whole hundredths of a percent; labels show where they fit (container
+queries). Beside it, the route's packages, largest first, each opening to its modules, and the files
+it loads, each said to be its own or shared. Each module is a link to its section: its sizes, the
+import chain from each route that loads it, who reads what of it, what it passes on, the statements
+kept for what they do as it loads, and what it imports. The section shown is the one the address
+names (`:target`); the tab of the route shown stands out by `:has`. It is HTML defined as a grammar
+(`src/bundle/html.syntax`), which gives its nodes, its printer and its templates, and views written
+as templates over the report's records (`src/bundle/view.rules`); a hole inside other text is an
+error, not printed as written.
+
+On Workbench (`examples/workbench.bundler` writes `out/workbench/analysis`) the page says why the app
+loads 448 KB of zod for its schemas, 259 KB of it every locale zod has: `model.js` reads
+`import { z } from "zod/v4"`, which is `classic/external.js`'s namespace object, whole, and that
+holds `locales`, the namespace object of `locales/index.js`, which holds each locale. Each locale's
+section shows the chain (`model.js → v4/index.js → external.js → locales/index.js → he.js`) and
+that the one reading it is the namespace object.
 
 The analysis is stated as rules, `src/bundle/report.facts`: what each output holds of each module
 is a sum over the stretches of its code the printer marked (`held(O, M, sum B) :- span(O, M, N, B)`),
 what a root loads is what its output imports, and on (`loads`), what is used of a module and by
-whom is a join over linking's parts (`used-by(M, R, S) :- …, M != R`), and what is kept for its
-effects is another. How a route reaches a module is the explanation of a row: `.facts` answers
+whom is a join over linking's parts (`used-by(M, R, S) :- …, M != R`), what a module passes on
+follows what live code reads through re-exports (`passes`), and what is kept for its effects is
+another. How a route reaches a module is the explanation of a row: `.facts` answers
 `why-REL(db, …)` with the row's derivation, each row explained only by rows derived before it, so
 in a recursion every step is one of the fewest; `why-reached(db, root, module)` is the chain of
-imports. The report is records (`src/bundle/analyze.rules`), written as JSON by `json`,
-which the rules compiler derives from their types. The report's database is solved only with
-`--analyze`, from the outputs and from linking's relations.
+imports between modules in the build. The report is records (`src/bundle/analyze.rules`), written
+as JSON by `json`, which the rules compiler derives from their types. The report's database is
+solved only with `--analyze`, from the outputs and from linking's relations.
 
-The emitter gives each statement, and a few levels inside it, its module, and the printer marks only
-where the output passes from one module's code to another's (`render-files`), not every token as a
-source map does. With the page it costs 2–5% more CPU (three.js, zod, d3), and 18% on rxjs, whose
-226 modules make a 551 KB page.
+The emitter gives each statement, and a few levels inside it, its module, and what it writes for a
+module (a wrapper, a namespace object) the module and no place in it, which a source map leaves out;
+the printer marks only where the output passes from one module's code to another's, or to what was
+written for it (`render-files`), not every token as a source map does. With the page it costs
+2–6% more CPU (three.js, zod, d3), and 20% on rxjs, whose 226 modules make a 734 KB page; a
+template makes each node's list of kids as long as it will be, which the page needs most.
 `tools/analyze-check.py` checks the outputs are unchanged, every byte is attributed, each route
-loads what its files import, and what each module holds agrees with the same build's source map,
-up to the output's own bytes (its imports and exports, which a map gives to the code beside them);
-and the page has no script, a section for each route and module, and every link leads to one.
+loads what its files import and its modules and files' own bytes add up to it, a module holds code
+or passes names on, and what each module holds agrees with the same build's source map, up to what
+has no source (a file's own bytes, and what the bundler wrote for a module, which a map gives to the
+code before it); and the page has no script, a section for each route and module, every link leads
+to one, and each treemap's boxes fill it, overlap nowhere and are each as large as their bytes.
 
 ## Paired client/server builds
 

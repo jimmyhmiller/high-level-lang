@@ -1,19 +1,27 @@
 # The analysis as one page (`--analyze=DIR` writes DIR/index.html): HTML made from templates over the
-# report's records, with no script. What a route loads is a map of its files, side by side as wide as
-# their bytes, and in each file its modules, one above another as tall as theirs; every module is a
-# link to its own section. The section shown is the one the address names (CSS `:target`): a route,
-# a module, or the list of all of them; with none named, the first route.
+# report's records, with no script. What a route loads is a treemap, laid out here (`squarified`):
+# packages, then their directories, then modules, each as large as its bytes; every module is a link
+# to its own section, which says why it is in the build. The section shown is the one the address
+# names (CSS `:target`): a route, a module, or the list of all of them; with none named, the first
+# route. Labels show where they fit (CSS container queries).
 rules bundle.view over bundle.html
 use bundle.html as h
 use bundle.analyze as a
 quote html at 1 0 ;
 
+# What every view reads: the analysis, each package's class (`k0`, `k1`…, which give it its hue),
+# and the directory the program's own modules share, which their labels leave out.
+record Ctx { r: a.Analysis, classes: {Text:Text}, prefix: Text }
+
 fn page(r: a.Analysis) -> Text = "<!doctype html>\n" ++ h.render(document, false) ++ "\n"
-  where style = join(css, "\n"),
-        nav = [route-link(r, i) for i in 0..len(r.roots)],
-        routes = [route-section(r, i) for i in 0..len(r.roots)],
-        modules = [module-section(r, i) for i in 0..len(r.modules)],
-        all = all-section(r),
+  where keys = package-keys(r),
+        c = Ctx(r: r, classes: {keys[i]: "k" ++ int-text(i) for i in 0..len(keys)}, prefix: common-dir([m.path for m in r.modules if m.package == "" and m.kind != "runtime"])),
+        style = join(css ++ tab-css(r) ++ [".k" ++ int-text(i) ++ " { --h: " ++ int-text(hue-of(keys, i)) ++ "; }" for i in 0..len(keys)], "\n"),
+        tabs = [route-tab(r, i) for i in 0..len(r.roots)],
+        many = text(int-text(len(r.modules))),
+        routes = [route-section(c, i) for i in 0..len(r.roots)],
+        modules = [module-section(c, i) for i in 0..len(r.modules)],
+        all = all-section(c),
         document = html`<html>
 <head>
 <meta charset="utf-8"/>
@@ -22,7 +30,7 @@ fn page(r: a.Analysis) -> Text = "<!doctype html>\n" ++ h.render(document, false
 <style>$style</style>
 </head>
 <body>
-<header><h1>Bundle analysis</h1><nav>$$nav<a href="#all">All modules</a></nav></header>
+<header><span class="brand">Bundle analysis</span><nav class="tabs">$$tabs<a class="tab" href="#all"><b>All modules</b> <i>$many</i></a></nav></header>
 <main>
 <div class="routes">$$routes</div>
 <div class="modules">$$modules</div>
@@ -31,125 +39,337 @@ fn page(r: a.Analysis) -> Text = "<!doctype html>\n" ++ h.render(document, false
 </body>
 </html>`
 
+fn route-tab(r: a.Analysis, i: Int) -> h.Node = html`<a class="tab" href=$href><b>$name</b> <i>$bytes</i></a>`
+  where href = attr("#r" ++ int-text(i)), name = text(path-base(r.roots[i].path)), bytes = text(size(r.roots[i].bytes))
+
+# The tab of the section shown stands out: the route named, or the first when none is.
+fn tab-css(r: a.Analysis) -> [Text] =
+  ["body:has(#r" ++ int-text(i) ++ ":target) .tab[href=\"#r" ++ int-text(i) ++ "\"] { " ++ active ++ " }" for i in 0..len(r.roots)]
+  ++ ["body:has(#all:target) .tab[href=\"#all\"] { " ++ active ++ " }",
+      "body:not(:has(:target)) .tab[href=\"#r0\"] { " ++ active ++ " }"]
+  where active = "background: var(--panel); color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent);"
+
+# ---------------------------------------------------------------- packages
+
+# A module's package, or the program's own code, or the bundler's runtime.
+fn package-key(m: a.ModuleReport) -> Text = match m.package, m.kind {
+  "", "runtime" => "(runtime)"
+  "", _ => "(app)"
+  p, _ => p
+}
+
+fn package-label(key: Text) -> Text = match key {
+  "(app)" => "your code"
+  "(runtime)" => "bundler runtime"
+  k => k
+}
+
+# The packages, the largest first, then the program's own code and the runtime: each its hue, the
+# same on every route; the program's own code is blue.
+fn package-keys(r: a.Analysis) -> [Text] =
+  (sort k in [package-key(m) for m in r.modules if m.package != "" distinct package-key(m)] by 0 - package-bytes(r, k)) ++ ["(app)", "(runtime)"]
+
+const palette: [Int] = [24, 150, 272, 338, 52, 182, 0, 96, 304, 124, 248, 70]
+
+fn hue-of(keys: [Text], i: Int) -> Int = match keys[i] {
+  "(app)" => 212
+  "(runtime)" => 60
+  _ => palette[i % len(palette)]
+}
+
+fn class-of(c: Ctx, key: Text) -> Text = c.classes[key] ?? panic "no class for the package {}", key
+
+fn package-bytes(r: a.Analysis, key: Text) -> Int = sum m in [m for m in r.modules if package-key(m) == key]: module-bytes(m)
+
+fn module-bytes(m: a.ModuleReport) -> Int = sum w in m.outputs: w.bytes
+
+# Where a module sits in its package, or in the program's own code.
+fn dir-in(c: Ctx, m: a.ModuleReport) -> Text = match m.package {
+  "" => trimmed-dir(dir-of(m.path)[min(len(c.prefix), len(dir-of(m.path)))..len(dir-of(m.path))])
+  p => match last-index-of(m.path, marker) {
+    some(at) => trimmed-dir(dir-of(m.path[at + len(marker)..len(m.path)]))
+    none => trimmed-dir(dir-of(m.path))
+  } where marker = "node_modules/" ++ p ++ "/"
+}
+
+fn trimmed-dir(d: Text) -> Text = match d {
+  "." | "/" => ""
+  "/" ++ rest => rest
+  _ => d
+}
+
+# The directory every path is in, with its `/`.
+fn common-dir(paths: [Text]) -> Text = match len(paths) {
+  0 => ""
+  _ => join(segments[0..shared], "/") ++ (if shared > 0 then "/" else "")
+} where segments = split(dir-of(paths[0]), "/"),
+        shared = (first k in 0..len(segments) if not (all p in paths: starts-with(p, join(segments[0..k + 1], "/") ++ "/")): k) ?? len(segments)
+
+# A module by its file's name, or with its directory's when the name says little (`index.js`).
+fn short-name(path: Text) -> Text = match path-stem(path) {
+  "index" => path-base(dir-of(path)) ++ "/" ++ path-base(path)
+  _ => path-base(path)
+}
+
+# ---------------------------------------------------------------- the treemap
+
+# A box of the map: a group (a package or a directory), a module, or the bytes between files.
+record Tile { kind: Text, label: Text, tip: Text, bytes: Int, module: Int, pk: Text, shade: Int, kids: [Tile] }
+
+fn route-tiles(c: Ctx, root: a.RootReport) -> [Tile] = sorted-tiles([package-tile(c, root, k) for k in keys] ++ glue)
+  where keys = [package-key(c.r.modules[x.module]) for x in root.modules distinct package-key(c.r.modules[x.module])],
+        between = sum o in root.loads: c.r.outputs[o].own,
+        glue = [Tile(kind: "glue", label: "between files", tip: "imports, exports and the like the bundler writes between files · " ++ size(between),
+                     bytes: between, module: -1, pk: "", shade: 0, kids: [])]
+
+fn package-tile(c: Ctx, root: a.RootReport, key: Text) -> Tile =
+  Tile(kind: "group", label: package-label(key), tip: package-label(key) ++ " · " ++ size(total), bytes: total, module: -1, pk: pk, shade: 0,
+       kids: match len(dirs) {
+         1 => module-tiles(c, members, pk, 0)
+         _ => sorted-tiles([dir-tile(c, members, dirs[i], pk, i % 2) for i in 0..len(dirs)])
+       })
+  where members = [x for x in root.modules if package-key(c.r.modules[x.module]) == key],
+        total = sum x in members: x.bytes,
+        pk = class-of(c, key),
+        dirs = [dir-in(c, c.r.modules[x.module]) for x in members if x.bytes > 0 distinct dir-in(c, c.r.modules[x.module])]
+
+fn dir-tile(c: Ctx, members: [a.Held], dir: Text, pk: Text, shade: Int) -> Tile =
+  Tile(kind: "group", label: label, tip: label ++ " · " ++ size(total), bytes: total, module: -1, pk: pk, shade: shade,
+       kids: module-tiles(c, mine, pk, shade))
+  where mine = [x for x in members if dir-in(c, c.r.modules[x.module]) == dir],
+        total = sum x in mine: x.bytes,
+        label = if dir == "" then "./" else dir ++ "/"
+
+fn module-tiles(c: Ctx, members: [a.Held], pk: Text, shade: Int) -> [Tile] =
+  sorted-tiles([Tile(kind: "module", label: short-name(m.path), tip: m.path ++ " · " ++ size(x.bytes), bytes: x.bytes, module: x.module,
+                     pk: pk, shade: shade, kids: []) for x in members for m in [c.r.modules[x.module]]])
+
+fn sorted-tiles(tiles: [Tile]) -> [Tile] = sort t in [t for t in tiles if t.bytes > 0] by 0 - t.bytes
+
+# Tiles in a box `w` by `h`, in units as long one way as the other: each, and its own tiles inside it
+# in a box of its shape, its longer side `units`.
+fn treemap(tiles: [Tile], w: Int, h: Int) -> [h.Node] = [tile-node(tiles[i], rects[i], w, h) for i in 0..len(tiles)]
+  where rects = squarified([t.bytes for t in tiles], w, h)
+
+fn tile-node(t: Tile, b: Rect, w: Int, h: Int) -> h.Node = match t.kind {
+  "group" => html`<div class=$gcls style=$look title=$tip><div class="gl"><b>$name</b> <i>$bytes</i></div><div class="gb">$$kids</div></div>`
+  "glue" => html`<div class="t glue" style=$look title=$tip><span class="lb"><b>$name</b> <i>$bytes</i></span></div>`
+  _ => html`<a class=$cls href=$href style=$look title=$tip><span class="lb"><b>$name</b> <i>$bytes</i></span></a>`
+} where look = attr(position(b, w, h)),
+        gcls = attr("g " ++ t.pk),
+        tip = attr(t.tip), name = text(t.label), bytes = text(size(t.bytes)),
+        cls = attr("t " ++ t.pk ++ (if t.shade == 1 then " alt" else "")),
+        href = attr("#m" ++ int-text(t.module)),
+        longer = max(1, max(b.w, b.h)),
+        kids = treemap(t.kids, max(1, b.w * units / longer), max(1, b.h * units / longer))
+
+fn position(b: Rect, w: Int, h: Int) -> Text =
+  "left:" ++ pct(b.x, w) ++ ";top:" ++ pct(b.y, h) ++ ";width:" ++ pct(b.w, w) ++ ";height:" ++ pct(b.h, h)
+
+fn pct(v: Int, total: Int) -> Text = int-text(t / 100) ++ "." ++ int-text(t / 10 % 10) ++ int-text(t % 10) ++ "%"
+  where t = v * 10000 / max(1, total)
+
+# ---------------------------------------------------------------- squarified layout
+
+# Boxes for sizes, the largest first, filling `w` by `h`, as near square as rows let them be (Bruls,
+# Huizing and van Wijk): each row along the shorter side takes boxes while that makes its worst box
+# no worse, and the rest fill what is left.
+record Rect { x: Int, y: Int, w: Int, h: Int }
+
+# A box's longer side, in the units its tiles are laid out in: a hundredth of a percent.
+const units: Int = 10000
+
+fn squarified(sizes: [Int], w: Int, h: Int) -> [Rect] = laid([s * w * h / total for s in sizes], Rect(x: 0, y: 0, w: w, h: h))
+  where total = max(1, sum s in sizes: s)
+
+fn laid(areas: [Int], b: Rect) -> [Rect] = match len(areas) {
+  0 => []
+  _ => placed(areas[0..n], b, across) ++ laid(areas[n..len(areas)], rest)
+} where tall = b.h > b.w,
+        side = max(1, if tall then b.w else b.h),
+        n = row-count(areas, side),
+        s = sum a in areas[0..n]: a,
+        # How thick the row is, to the nearest unit: the last takes all that is left.
+        across = if n == len(areas) then (if tall then b.h else b.w) else (s + side / 2) / side,
+        rest = if tall then Rect(x: b.x, y: b.y + across, w: b.w, h: b.h - across) else Rect(x: b.x + across, y: b.y, w: b.w - across, h: b.h)
+
+fn row-count(areas: [Int], side: Int) -> Int =
+  (first k in 1..len(areas) if worst(areas, k + 1, side) > worst(areas, k, side): k) ?? len(areas)
+
+# How far from square the first `k` boxes are, laid in a row along `side`: in hundredths. Areas are
+# at most `units` squared over 2, so no product passes 2^63.
+fn worst(areas: [Int], k: Int, side: Int) -> Int = max(side * side * areas[0] * 100 / max(1, s * s), s * s * 100 / max(1, side * side * areas[k - 1]))
+  where s = max(1, sum a in areas[0..k]: a)
+
+fn placed(row: [Int], b: Rect, across: Int) -> [Rect] = [cell(b, across, starts[i], starts[i + 1]) for i in 0..len(row)]
+  where tall = b.h > b.w,
+        length = if tall then b.w else b.h,
+        s = max(1, sum a in row: a),
+        starts = [0] ++ [(t * length + s / 2) / s for t in scan t = 0 for a in row: t + a]
+
+fn cell(b: Rect, across: Int, from: Int, to: Int) -> Rect = match b.h > b.w {
+  true => Rect(x: b.x + from, y: b.y, w: to - from, h: across)
+  false => Rect(x: b.x, y: b.y + from, w: across, h: to - from)
+}
+
 # ---------------------------------------------------------------- routes
 
-fn route-link(r: a.Analysis, i: Int) -> h.Node = html`<a href=$href>$name</a>`
-  where href = attr("#r" ++ int-text(i)), name = text(path-base(r.roots[i].path))
-
-fn route-section(r: a.Analysis, i: Int) -> h.Node = html`<section class="route" id=$id>
-<h2>$title</h2>
-<p class="muted">$summary</p>
-<div class="map">$$files</div>
+fn route-section(c: Ctx, i: Int) -> h.Node = html`<section class="route" id=$id>
+<div class="title"><h2>$name</h2><span class="badge">$kind</span></div>
+<p class="path">$path</p>
+<div class="cards">$$cards</div>
+<div class="map">$$tiles</div>
+<p class="hint">Each box is a module, as large as its bytes in what this route loads, grouped by package and then by directory. Select one to see why it is here.</p>
+<div class="cols">
+<div class="panel"><h3>Packages</h3><div class="rows">$$packages</div></div>
+<div class="panel"><h3>Files it loads</h3><div class="rows">$$files</div></div>
+</div>
 </section>`
-  where root = r.roots[i],
+  where root = c.r.roots[i],
         id = attr("r" ++ int-text(i)),
-        title = text(root.path ++ " · " ++ root.kind),
-        summary = text(size(root.bytes) ++ " loaded before it runs, in " ++ int-text(len(root.loads)) ++ " files"),
-        files = [file-box(r, o) for o in root.loads]
+        name = text(path-base(root.path)),
+        kind = text(if root.kind == "entry" then "entry" else "loaded by import()"),
+        path = text(root.path),
+        tiles-all = route-tiles(c, root),
+        tiles = treemap(tiles-all, units, units / 2),
+        largest = [t for t in tiles-all if t.kind == "group"],
+        cards = [card("Loads", size(root.bytes), "before it runs"),
+                 card("Files", int-text(len(root.loads)), int-text(count o in root.loads: (count x in c.r.roots: o in x.loads) > 1) ++ " shared with other routes"),
+                 card("Modules", int-text(len(root.modules)), "from " ++ int-text(count t in largest: t.label != "your code" and t.label != "bundler runtime") ++ " packages")]
+                ++ [card("Largest", t.label, size(t.bytes) ++ " · " ++ share(t.bytes, root.bytes)) for t in largest[0..min(1, len(largest))]],
+        packages = [package-row(c, root, t) for t in largest],
+        top = max(1, (first t in largest: t.bytes) ?? 1),
+        biggest-file = max(1, fold b = 1 for o in root.loads: max(b, c.r.outputs[o].bytes)),
+        files = [file-row(c, o, biggest-file) for o in sort o in root.loads by 0 - c.r.outputs[o].bytes]
 
-fn file-box(r: a.Analysis, o: Int) -> h.Node = html`<div class="file" style=$grow>
-<div class="name">$name</div>
-<div class="boxes">$$boxes</div>
-</div>`
-  where file = r.outputs[o],
-        grow = attr("flex-grow:" ++ int-text(file.bytes)),
-        name = text(path-base(file.path) ++ " · " ++ size(file.bytes)),
-        boxes = [module-box(r, held) for held in file.modules] ++ [own-box(file) for x in [file.own] if x > 0]
+fn card(label: Text, value: Text, note: Text) -> h.Node = html`<p><i>$k</i><b>$v</b><small>$n</small></p>`
+  where k = text(label), v = text(value), n = text(note)
 
-fn module-box(r: a.Analysis, held: a.Held) -> h.Node = html`<a class="box" href=$href style=$look title=$tip>$label</a>`
-  where m = r.modules[held.module],
-        href = attr("#m" ++ int-text(held.module)),
-        look = attr("flex-grow:" ++ int-text(held.bytes) ++ ";background:" ++ shade(m)),
-        tip = attr(m.path ++ " · " ++ size(held.bytes)),
-        label = text(path-base(m.path) ++ " " ++ size(held.bytes))
+fn share(part: Int, whole: Int) -> Text = int-text(part * 100 / max(1, whole)) ++ "% of it"
 
-fn own-box(file: a.OutputReport) -> h.Node = html`<span class="box own" style=$look title=$tip>$label</span>`
-  where look = attr("flex-grow:" ++ int-text(file.own)),
-        tip = attr("the file's own imports, exports and wrappers · " ++ size(file.own)),
-        label = text("own " ++ size(file.own))
+fn package-row(c: Ctx, root: a.RootReport, t: Tile) -> h.Node = html`<details class=$cls><summary><span class="sw"></span><span class="nm">$name</span><span class="bar"><span style=$fill></span></span><span class="n">$bytes</span><span class="n muted">$part</span></summary><div class="sub">$$modules</div></details>`
+  where cls = attr("row " ++ t.pk),
+        name = text(t.label),
+        fill = attr("width:" ++ pct(t.bytes, root.bytes)),
+        bytes = text(size(t.bytes)),
+        part = text(int-text(t.bytes * 100 / max(1, root.bytes)) ++ "%"),
+        members = sort x in [x for x in root.modules if package-label(package-key(c.r.modules[x.module])) == t.label] by 0 - x.bytes,
+        modules = [module-row(c, x.module, x.bytes) for x in members]
 
-# A module's colour: its package's, or the program's own.
-fn shade(m: a.ModuleReport) -> Text = "hsl(" ++ int-text(hue) ++ " 55% 74%)"
-  where key = if m.package == "" then m.kind else m.package,
-        hue = (sum c in code-points-of(key): c) * 37 % 360
+fn module-row(c: Ctx, i: Int, bytes: Int) -> h.Node = html`<div class="mrow"><span>$link</span><span class="dim">$place</span><span class="n">$amount</span></div>`
+  where link = module-link(c, i), place = text(dir-in(c, c.r.modules[i])), amount = text(size(bytes))
+
+fn file-row(c: Ctx, o: Int, biggest: Int) -> h.Node = html`<div class="frow"><span class="nm">$name</span><span class="tag">$tag</span><span class="bar"><span style=$fill></span></span><span class="n">$bytes</span></div>`
+  where file = c.r.outputs[o],
+        name = text(path-base(file.path)),
+        routes = count x in c.r.roots: o in x.loads,
+        tag = text(match routes {
+          1 => "this route only"
+          n => "shared by " ++ int-text(n) ++ " routes"
+        }),
+        fill = attr("width:" ++ pct(file.bytes, biggest)),
+        bytes = text(size(file.bytes))
 
 # ---------------------------------------------------------------- modules
 
-fn module-section(r: a.Analysis, i: Int) -> h.Node = html`<section class="module" id=$id>
-<h2>$path</h2>
-<p class="muted">$about</p>
-<table>
-<tr><td>In the output</td><td class="n">$output</td></tr>
-<tr><td>Source</td><td class="n">$source</td></tr>
-<tr><td>Statements kept</td><td class="n">$kept</td></tr>
-</table>
+fn module-section(c: Ctx, i: Int) -> h.Node = html`<section class="module" id=$id>
+<nav class="crumbs"><a href="#all">All modules</a><span>$package</span><span>$dir</span></nav>
+<div class="title"><h2>$name</h2><span class="badge">$kind</span></div>
+<p class="path">$path</p>
+<div class="cards">$$cards</div>
 <div>$note</div>
-<h3>In files</h3>
-<ul>$$files</ul>
-<h3>How each route reaches it</h3>
-<div>$$chains</div>
-<h3>What is used of it, and by whom</h3>
-<ul>$$users</ul>
-<h3>Kept for what they do as it loads</h3>
-<div>$$kept_for</div>
+<div class="cols">
+<div class="panel"><h3>Why it is here: the imports from each route</h3><div>$$chains</div></div>
+<div class="panel"><h3>Read by, and what</h3><div>$$users</div></div>
+</div>
+<div class="cols">
+<div class="panel"><h3>Kept for what it does as it loads</h3><div>$$effects</div></div>
+<div class="panel"><h3>It imports</h3><div class="chips">$$imports</div></div>
+</div>
 </section>`
-  where m = r.modules[i],
+  where m = c.r.modules[i],
         id = attr("m" ++ int-text(i)),
+        package = text(package-label(package-key(m))),
+        dir = text(dir-in(c, m)),
+        name = text(short-name(m.path)),
+        kind = text(m.kind),
         path = text(m.path),
-        about = text(if m.package == "" then m.kind else m.package ++ " · " ++ m.kind),
-        output = text(size(sum w in m.outputs: w.bytes)),
-        source = text(size(m.source)),
-        kept = text(int-text(m.kept) ++ " of " ++ int-text(m.statements)),
-        note = effects-only(r, i),
-        files = or-none([file-line(r, w) for w in m.outputs]),
-        chains = or-none-block([chain-list(r, c) for c in m.chains]),
-        users = or-none([user-line(r, u) for u in m.used-by]),
-        kept-for = or-none-block([kept-line(k) for k in m.kept-for])
+        routes = len([ch.root for ch in m.chains distinct ch.root]),
+        written = sum w in m.outputs: w.written,
+        cards = [card("In the output", size(module-bytes(m)), int-text(len(m.outputs)) ++ (if len(m.outputs) == 1 then " file" else " files")
+                      ++ (if written > 0 then " · " ++ size(written) ++ " written by the bundler" else "")),
+                 card("Source", size(m.source), m.kind),
+                 card("Statements kept", int-text(m.kept) ++ " of " ++ int-text(m.statements), share(m.kept, m.statements)),
+                 card("Loaded by", int-text(routes) ++ " of " ++ int-text(len(c.r.roots)), if len(c.r.roots) == 1 then "route" else "routes")],
+        note = module-note(c, i),
+        chains = or-none([chain-node(c, x) for x in m.chains]),
+        users = or-none([user-node(c, u) for u in m.used-by]),
+        effects = match m.kind {
+          "commonjs" => [html`<p class="muted">All of it: CommonJS runs whole, in its wrapper, when it is first required.</p>`]
+          _ => or-none([effect-node(k) for k in m.kept-for[0..min(shown-effects, len(m.kept-for))]]
+                       ++ [more-node(len(m.kept-for) - shown-effects) for x in [0] if len(m.kept-for) > shown-effects])
+        },
+        imports = or-none([module-link(c, d) for d in m.imports])
 
-# A module nothing reads, kept only for what some of its statements do as it loads.
-fn effects-only(r: a.Analysis, i: Int) -> h.Node = match len(m.used-by) == 0 and len(m.kept-for) > 0 and not (any x in r.roots: x.module == i) {
-  true => html`<p class="note">Nothing it declares is used: it is in the output only for what the statements below do as it loads.</p>`
-  false => html`<span></span>`
-} where m = r.modules[i]
+# What is unusual about a module: it holds no code and only passes names on, or nothing it declares
+# is read and it is here for what it does as it loads.
+fn module-note(c: Ctx, i: Int) -> h.Node = match module-bytes(m) == 0, len(m.used-by) == 0 and len(m.kept-for) > 0 and not root {
+  true, _ => html`<div class="note"><p>It holds no code of its own in the output. It passes these names on to the code that reads them through it:</p><div class="names">$$names</div></div>`
+    where names = [code-node(x) for x in m.passes]
+  false, true => html`<p class="note">Nothing it declares is read: it is in the output only for what the statements below do as it loads.</p>`
+  false, false => html`<span></span>`
+} where m = c.r.modules[i], root = any x in c.r.roots: x.module == i
 
-fn file-line(r: a.Analysis, w: a.Within) -> h.Node = html`<li><span>$name</span> <span class="muted">$bytes</span></li>`
-  where name = text(path-base(r.outputs[w.output].path)), bytes = text(size(w.bytes))
+fn chain-node(c: Ctx, ch: a.Chain) -> h.Node = html`<ol class="chain">$$steps</ol>`
+  where steps = [chain-step(c, m) for m in ch.modules]
 
-fn chain-list(r: a.Analysis, c: a.Chain) -> h.Node = html`<ol class="chain">$$steps</ol>`
-  where steps = [html-step(r, m) for m in c.modules]
+fn chain-step(c: Ctx, m: Int) -> h.Node = html`<li>$link</li>` where link = module-link(c, m)
 
-fn html-step(r: a.Analysis, m: Int) -> h.Node = html`<li>$link</li>` where link = module-link(r, m)
+fn user-node(c: Ctx, u: a.UsedBy) -> h.Node = html`<div class="user"><div>$link</div><div class="names">$$names</div></div>`
+  where link = module-link(c, u.module), names = [code-node(x) for x in u.names]
 
-fn user-line(r: a.Analysis, u: a.UsedBy) -> h.Node = html`<li><span>$link</span> <span class="muted">$names</span></li>`
-  where link = module-link(r, u.module), names = text(join(u.names, ", "))
+fn code-node(t: Text) -> h.Node = html`<code>$x</code>` where x = text(t)
 
-fn kept-line(k: a.KeptFor) -> h.Node = html`<pre class="stmt">$line</pre>`
-  where line = text(int-text(k.line) ++ ": " ++ k.text)
+# The statements a module's section shows; analysis.json has them all.
+const shown-effects: Int = 12
 
-# A module by its file's name; its section gives its path.
-fn module-link(r: a.Analysis, m: Int) -> h.Node = html`<a href=$href>$name</a>`
-  where href = attr("#m" ++ int-text(m)), name = text(path-base(r.modules[m].path))
+fn more-node(n: Int) -> h.Node = html`<p class="muted">$x</p>` where x = text("and " ++ int-text(n) ++ " more, in analysis.json")
+
+fn effect-node(k: a.KeptFor) -> h.Node = html`<pre class="stmt"><span class="ln">$line</span>$code</pre>`
+  where line = text(int-text(k.line)), code = text(k.text)
+
+fn module-link(c: Ctx, i: Int) -> h.Node = html`<a class=$cls href=$href>$name</a>`
+  where m = c.r.modules[i],
+        href = attr("#m" ++ int-text(i)),
+        cls = attr("mod " ++ class-of(c, package-key(m))),
+        name = text(short-name(m.path))
 
 fn or-none(items: [h.Node]) -> [h.Node] = match len(items) {
-  0 => [html`<li class="muted">none</li>`]
-  _ => items
-}
-
-fn or-none-block(items: [h.Node]) -> [h.Node] = match len(items) {
   0 => [html`<p class="muted">none</p>`]
   _ => items
 }
 
 # ---------------------------------------------------------------- every module
 
-fn all-section(r: a.Analysis) -> h.Node = html`<section class="list" id="all">
-<h2>All modules, largest first</h2>
-<table>$$rows</table>
+fn all-section(c: Ctx) -> h.Node = html`<section class="list" id="all">
+<div class="title"><h2>All modules</h2></div>
+<p class="lede">$about</p>
+<div class="panel"><div class="rows">$$packages</div></div>
 </section>`
-  where rows = [all-row(r, i) for i in sort i in [i for i in 0..len(r.modules)] by 0 - (sum w in r.modules[i].outputs: w.bytes)]
+  where keys = sort k in [package-key(m) for m in c.r.modules distinct package-key(m)] by 0 - package-bytes(c.r, k),
+        total = max(1, sum m in c.r.modules: module-bytes(m)),
+        about = text(int-text(len(c.r.modules)) ++ " modules in " ++ int-text(len(keys)) ++ " packages and groups, " ++ size(total) ++ " of code in all the outputs, largest first."),
+        packages = [all-package(c, k, total) for k in keys]
 
-fn all-row(r: a.Analysis, i: Int) -> h.Node = html`<tr><td>$link</td><td class="n">$bytes</td></tr>`
-  where link = module-link(r, i), bytes = text(size(sum w in r.modules[i].outputs: w.bytes))
+fn all-package(c: Ctx, key: Text, total: Int) -> h.Node = html`<details class=$cls><summary><span class="sw"></span><span class="nm">$name</span><span class="bar"><span style=$fill></span></span><span class="n">$bytes</span><span class="n muted">$many</span></summary><div class="sub">$$modules</div></details>`
+  where bytes-of = package-bytes(c.r, key),
+        cls = attr("row " ++ class-of(c, key)),
+        name = text(package-label(key)),
+        fill = attr("width:" ++ pct(bytes-of, total)),
+        bytes = text(size(bytes-of)),
+        many = text(int-text(len(members))),
+        members = sort i in [i for i in 0..len(c.r.modules) if package-key(c.r.modules[i]) == key] by 0 - module-bytes(c.r.modules[i]),
+        modules = [module-row(c, i, module-bytes(c.r.modules[i])) for i in members]
 
 # ---------------------------------------------------------------- text
 
@@ -164,27 +384,73 @@ fn size(bytes: Int) -> Text = match bytes {
 }
 
 const css: [Text] = [
-  ":root { --bg: #fbfbfa; --panel: #fff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e4e3df; --accent: #2f6fdb; --own: #d9d6cf; --note: #ffe08a; }",
-  "@media (prefers-color-scheme: dark) { :root { --bg: #161615; --panel: #1f1f1d; --ink: #ecebe7; --muted: #9c9a93; --line: #34332f; --accent: #7aa7ff; --own: #4a4843; --note: #7a5d00; } }",
-  "body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 system-ui, sans-serif; }",
-  "header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }",
-  "header h1 { font-size: 15px; margin: 0; }",
-  "nav { display: flex; flex-wrap: wrap; gap: 12px; }",
+  ":root { --bg: #f6f6f4; --panel: #ffffff; --ink: #1c1c1a; --muted: #6d6c66; --line: #e3e2dd; --accent: #2f6fdb; --note: #fff3c4; --tile-s: 62%; --tile-l: 78%; --tile-alt: 71%; --head-l: 90%; color-scheme: light dark; }",
+  "@media (prefers-color-scheme: dark) { :root { --bg: #141413; --panel: #1d1d1b; --ink: #ecebe6; --muted: #9a988f; --line: #33322e; --accent: #7aa7ff; --note: #4a3c0c; --tile-s: 48%; --tile-l: 33%; --tile-alt: 28%; --head-l: 19%; } }",
+  "* { box-sizing: border-box; }",
+  "body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; }",
   "a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }",
-  "main { padding: 12px 16px; }",
-  ".route, .module, .list { display: none; }",
+  "header { position: sticky; top: 0; z-index: 10; display: flex; align-items: stretch; gap: 20px; padding: 0 20px; background: var(--bg); border-bottom: 1px solid var(--line); }",
+  ".brand { font-weight: 650; align-self: center; white-space: nowrap; }",
+  ".tabs { display: flex; gap: 2px; overflow-x: auto; }",
+  ".tab { display: flex; gap: 6px; align-items: baseline; padding: 12px 12px 10px; color: var(--muted); white-space: nowrap; }",
+  ".tab:hover { color: var(--ink); text-decoration: none; } .tab b { font-weight: 600; } .tab i { font-style: normal; font-size: 12px; font-variant-numeric: tabular-nums; }",
+  "main { padding: 20px; max-width: 1400px; margin: 0 auto; }",
+  ".route, .module, .list { display: none; scroll-margin-top: 60px; }",
   ".route:target, .module:target, .list:target { display: block; }",
   "main:not(:has(:target)) .route:first-child { display: block; }",
-  ".map { display: flex; height: 72vh; gap: 4px; }",
-  ".file { display: flex; flex-direction: column; flex-basis: 0; min-width: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); }",
-  ".file .name { font-size: 11px; color: var(--muted); padding: 2px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
-  ".boxes { display: flex; flex-direction: column; flex: 1; min-height: 0; }",
-  ".box { display: block; flex-basis: 0; min-height: 0; overflow: hidden; padding: 1px 4px; font-size: 11px; color: #111; border-top: 1px solid var(--bg); white-space: nowrap; text-overflow: ellipsis; }",
-  ".box.own { background: var(--own); color: var(--muted); }",
+  ".title { display: flex; align-items: center; gap: 10px; } h2 { font-size: 20px; margin: 0; font-weight: 650; }",
+  ".lede { margin: 2px 0 16px; color: var(--muted); }",
+  ".badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: var(--line); color: var(--muted); }",
+  ".path { margin: 2px 0 16px; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }",
+  ".cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 16px; }",
+  ".cards > p { display: flex; flex-direction: column; margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }",
+  ".cards i { font-style: normal; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }",
+  ".cards b { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+  ".cards small { font-size: 12px; color: var(--muted); }",
+  ".map { position: relative; aspect-ratio: 2 / 1; background: var(--bg); border-radius: 8px; overflow: hidden; }",
+  ".g, .t { position: absolute; container-type: size; border: 1px solid var(--bg); overflow: hidden; }",
+  ".g { background: hsl(var(--h) var(--tile-s) var(--head-l)); border-width: 2px; }",
+  ".gl { height: 18px; padding: 1px 5px; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink); }",
+  ".gl i, .lb i { font-style: normal; opacity: .7; font-variant-numeric: tabular-nums; }",
+  ".gb { position: absolute; top: 18px; left: 0; right: 0; bottom: 0; }",
+  "@container (max-height: 46px) or (max-width: 64px) { .gl { display: none; } .gb { top: 0; } }",
+  ".t { display: block; background: hsl(var(--h) var(--tile-s) var(--tile-l)); color: var(--ink); text-decoration: none; }",
+  ".t.alt { background: hsl(var(--h) var(--tile-s) var(--tile-alt)); }",
+  ".t.glue { background: repeating-linear-gradient(45deg, var(--line), var(--line) 4px, var(--panel) 4px, var(--panel) 8px); }",
+  "a.t:hover { text-decoration: none; filter: brightness(1.08) saturate(1.2); outline: 2px solid var(--ink); outline-offset: -2px; z-index: 2; }",
+  ".lb { display: block; padding: 2px 5px; font-size: 11px; line-height: 1.3; overflow: hidden; }",
+  ".lb b { display: block; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  "@container (max-height: 30px) { .lb i { display: none; } }",
+  "@container (max-height: 15px) or (max-width: 40px) { .lb { display: none; } }",
+  "@container (min-height: 60px) and (min-width: 90px) { .lb { padding: 5px 7px; font-size: 12px; } }",
+  ".hint { color: var(--muted); font-size: 12px; margin: 8px 0 20px; }",
+  ".cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; margin-bottom: 16px; }",
+  ".panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }",
+  "h3 { font-size: 13px; margin: 0 0 6px; font-weight: 650; } .panel > p.muted { margin: 0 0 10px; font-size: 12px; }",
   ".muted { color: var(--muted); }",
-  "table { border-collapse: collapse; font-variant-numeric: tabular-nums; } td { padding: 2px 8px 2px 0; border-bottom: 1px solid var(--line); } td.n { text-align: right; }",
-  "h2 { font-size: 14px; word-break: break-all; } h3 { font-size: 13px; margin: 16px 0 4px; }",
-  "ul { padding-left: 18px; } ol.chain { padding-left: 22px; margin: 4px 0 10px; }",
-  "pre.stmt { margin: 2px 0; padding: 3px 6px; background: var(--panel); border-radius: 4px; white-space: pre-wrap; word-break: break-all; }",
-  ".note { background: var(--note); padding: 6px 8px; border-radius: 6px; }"
+  ".row summary, .frow { display: grid; grid-template-columns: 12px minmax(0, 1.4fr) minmax(60px, 2fr) 72px 48px; gap: 10px; align-items: center; padding: 5px 0; border-bottom: 1px solid var(--line); }",
+  ".frow { grid-template-columns: minmax(0, 1.4fr) 130px minmax(40px, 1fr) 72px; }",
+  ".row summary { cursor: pointer; list-style: none; } .row summary::-webkit-details-marker { display: none; }",
+  ".row[open] summary { border-bottom-color: transparent; }",
+  ".sw { width: 12px; height: 12px; border-radius: 3px; background: hsl(var(--h) var(--tile-s) var(--tile-l)); }",
+  ".nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }",
+  ".bar { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; } .bar span { display: block; height: 100%; background: hsl(var(--h, 212) var(--tile-s) var(--tile-alt)); }",
+  ".n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }",
+  ".tag { font-size: 11px; color: var(--muted); white-space: nowrap; }",
+  ".sub { padding: 2px 0 8px 22px; border-bottom: 1px solid var(--line); max-height: 320px; overflow: auto; }",
+  ".mrow { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 72px; gap: 10px; padding: 2px 0; }",
+  ".mrow > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .dim { color: var(--muted); font-size: 12px; }",
+  ".crumbs { display: flex; gap: 6px; font-size: 12px; color: var(--muted); margin-bottom: 6px; } .crumbs > * + *::before { content: '›'; margin-right: 6px; }",
+  ".crumbs span:empty { display: none; }",
+  ".note { background: var(--note); padding: 8px 12px; border-radius: 8px; margin: 0 0 16px; } .note p { margin: 0 0 6px; } .note p:last-child { margin: 0; }",
+  "ol.chain { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 0; list-style: none; padding: 0; margin: 0 0 10px; }",
+  "ol.chain li + li::before { content: '→'; color: var(--muted); margin: 0 6px; }",
+  "a.mod { display: inline-block; padding: 1px 7px; border-radius: 5px; background: hsl(var(--h) var(--tile-s) var(--head-l)); color: var(--ink); font-size: 12px; }",
+  "a.mod:hover { text-decoration: none; background: hsl(var(--h) var(--tile-s) var(--tile-l)); }",
+  ".user { display: grid; grid-template-columns: minmax(120px, auto) 1fr; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--line); }",
+  ".names { display: flex; flex-wrap: wrap; gap: 4px; } code { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); padding: 1px 5px; border-radius: 4px; }",
+  ".chips { display: flex; flex-wrap: wrap; gap: 4px; }",
+  "pre.stmt { margin: 0 0 4px; padding: 6px 8px; background: var(--bg); border-radius: 6px; white-space: pre-wrap; word-break: break-all; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }",
+  ".ln { color: var(--muted); margin-right: 10px; user-select: none; }",
+  "@media (max-width: 640px) { header { gap: 10px; padding: 0 12px; } main { padding: 12px 16px; } .cols { grid-template-columns: 1fr; } }"
 ]
