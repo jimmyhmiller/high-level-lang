@@ -525,7 +525,9 @@ minified), and redux toolkit resolved another file than esbuild (the `module` co
 exerciser's matrix, about 262,000 calls: ours prints what esbuild's prints, plain and minified.
 Writing in constants is a pass over each file of its own, where esbuild does it as it parses: it
 costs 2–6% more instructions on a minified build (three 5.8%, d3 4.2%, zod 2.5%, date-fns 1.8%),
-and nothing on one that is not.
+and nothing on one that is not. Checking every write against what the language forbids
+(`src/bundle/writes.rules`) is another pass over each file: 2–3% more instructions on any build
+(zod 2.0%, three 3.3%, d3 3.3%).
 
 Unminified, tree-shaken lodash-es and all of lodash-es are **byte-identical** to esbuild's
 output after normalising. That covers tree shaking, module order and renaming.
