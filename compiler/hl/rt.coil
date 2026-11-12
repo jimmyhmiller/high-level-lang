@@ -4161,7 +4161,7 @@
   0)
 
 (defn json-int! [(b (mut str/StrBuf)) (n i64)] (-> void)
-  (push-str! (mut b) (num-text n))
+  (push-i64! (mut b) n)
   0)
 
 (defn json-text! [(b (mut str/StrBuf)) (s (slice u8))] (-> void)
@@ -4188,6 +4188,188 @@
   0)
 
 (defn json-done [(b (mut str/StrBuf))] (-> (slice u8)) (finish! (mut b)))
+
+;;; JSON read back (`read-json`): a value, its kind 0 null, 1 false, 2 true, 3 a number, 4 a string,
+;;; 5 an array (its items), 6 an object (its keys beside its items). Numbers are integers, as `json`
+;;; writes them; anything else is an error, not a guess.
+(defstruct JVal [(kind i64) (num i64) (text (slice u8)) (items (ArrayList JVal)) (keys (ArrayList (slice u8)))])
+(defstruct JReader [(s (slice u8)) (at i64)])
+
+(defn jv-new [(kind i64)] (-> JVal)
+  (JVal :kind kind :num 0 :text ""
+        :items (ArrayList::new [JVal] (value-allocator))
+        :keys (ArrayList::new [(slice u8)] (value-allocator))))
+
+(defn jr-fail [(r (mut JReader)) (what (slice u8))] (-> never)
+  (panic "read-json: expected {} at byte {}" what (.at r)))
+
+(defn json-space? [(c u8)] (-> bool)
+  (or (= c #\space) (= c #\newline) (= c #\return) (= c #\tab)))
+
+(defn jr-peek [(r (mut JReader))] (-> u8)
+  (while (and (< (.at r) (len (.s r))) (json-space? (get (.s r) (.at r))))
+    (set! (.at r) (+ (.at r) 1)))
+  (if (< (.at r) (len (.s r))) (get (.s r) (.at r)) (cast u8 0)))
+
+(defn jr-expect! [(r (mut JReader)) (c u8) (what (slice u8))] (-> void)
+  (unless (= (jr-peek (mut r)) c) (jr-fail (mut r) what))
+  (set! (.at r) (+ (.at r) 1))
+  0)
+
+(defn jr-word! [(r (mut JReader)) (w (slice u8))] (-> void)
+  (unless (at? (.s r) (.at r) w) (jr-fail (mut r) w))
+  (set! (.at r) (+ (.at r) (len w)))
+  0)
+
+(defn hex-value [(c u8)] (-> i64)
+  (cond (digit? c) (- (cast i64 c) 48)
+        (and (>= c #\a) (<= c #\f)) (- (cast i64 c) 87)
+        (and (>= c #\A) (<= c #\F)) (- (cast i64 c) 55)
+        :else (panic "read-json: {} is not a hex digit" c)))
+
+(defn hex4 [(t (slice u8)) (i i64)] (-> i64)
+  (when (> (+ i 4) (len t)) (panic "read-json: a \\u escape is cut short"))
+  (+ (* 4096 (hex-value (get t i))) (+ (* 256 (hex-value (get t (+ i 1))))
+                                       (+ (* 16 (hex-value (get t (+ i 2)))) (hex-value (get t (+ i 3)))))))
+
+(defn push-utf8! [(b (mut str/StrBuf)) (cp i64)] (-> void)
+  (cond (< cp 128) (push! (mut (.bytes b)) (cast u8 cp))
+        (< cp 2048) (do (push! (mut (.bytes b)) (cast u8 (+ 192 (/ cp 64))))
+                        (push! (mut (.bytes b)) (cast u8 (+ 128 (% cp 64)))))
+        (< cp 65536) (do (push! (mut (.bytes b)) (cast u8 (+ 224 (/ cp 4096))))
+                         (push! (mut (.bytes b)) (cast u8 (+ 128 (% (/ cp 64) 64))))
+                         (push! (mut (.bytes b)) (cast u8 (+ 128 (% cp 64)))))
+        :else (do (push! (mut (.bytes b)) (cast u8 (+ 240 (/ cp 262144))))
+                  (push! (mut (.bytes b)) (cast u8 (+ 128 (% (/ cp 4096) 64))))
+                  (push! (mut (.bytes b)) (cast u8 (+ 128 (% (/ cp 64) 64))))
+                  (push! (mut (.bytes b)) (cast u8 (+ 128 (% cp 64))))))
+  0)
+
+;;; A string's text between its quotes, its escapes undone; a surrogate pair is one code point.
+(defn json-unescape [(t (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (value-allocator))
+        (mut i) 0]
+    (while (< i (len t))
+      (let [c (get t i)]
+        (if (!= c #\\)
+            (do (push! (mut (.bytes b)) c) (set! i (+ i 1)))
+            (let [e (get t (+ i 1))]
+              (cond (= e #\n) (do (push! (mut (.bytes b)) #\newline) (set! i (+ i 2)))
+                    (= e #\r) (do (push! (mut (.bytes b)) #\return) (set! i (+ i 2)))
+                    (= e #\t) (do (push! (mut (.bytes b)) #\tab) (set! i (+ i 2)))
+                    (= e #\b) (do (push! (mut (.bytes b)) (cast u8 8)) (set! i (+ i 2)))
+                    (= e #\f) (do (push! (mut (.bytes b)) (cast u8 12)) (set! i (+ i 2)))
+                    (= e #\u)
+                      (let [hi (hex4 t (+ i 2))]
+                        (if (and (>= hi 55296) (< hi 56320) (at? t (+ i 6) "\\u"))
+                            (do (push-utf8! (mut b) (+ 65536 (+ (* (- hi 55296) 1024) (- (hex4 t (+ i 8)) 56320))))
+                                (set! i (+ i 12)))
+                            (do (push-utf8! (mut b) hi) (set! i (+ i 6)))))
+                    :else (do (push! (mut (.bytes b)) e) (set! i (+ i 2))))))))
+    (finish! (mut b))))
+
+(defn jr-string! [(r (mut JReader))] (-> (slice u8))
+  (jr-expect! (mut r) #\" "a string")
+  (let [s (.s r)
+        start (.at r)
+        (mut i) start
+        (mut plain) true]
+    (while (and (< i (len s)) (!= (get s i) #\"))
+      (when (= (get s i) #\\) (set! plain false) (set! i (+ i 1)))
+      (set! i (+ i 1)))
+    (when (>= i (len s)) (jr-fail (mut r) "the end of a string"))
+    (set! (.at r) (+ i 1))
+    (if plain (subslice s start i) (json-unescape (subslice s start i)))))
+
+(defn jr-number! [(r (mut JReader))] (-> i64)
+  (let [s (.s r)
+        negative (= (get s (.at r)) #\-)
+        start (if negative (+ (.at r) 1) (.at r))
+        (mut i) start]
+    (while (and (< i (len s)) (digit? (get s i))) (set! i (+ i 1)))
+    (when (and (< i (len s)) (or (= (get s i) #\.) (= (get s i) #\e) (= (get s i) #\E)))
+      (jr-fail (mut r) "an integer, not a fraction or an exponent,"))
+    (set! (.at r) i)
+    (match (parse-num (subslice s start i))
+      (Some [v] (if negative (- 0 v) v))
+      (None [] (jr-fail (mut r) "an integer")))))
+
+(defn jr-value! [(r (mut JReader))] (-> JVal)
+  (let [c (jr-peek (mut r))]
+    (cond (= c #\{) (jr-object! (mut r))
+          (= c #\[) (jr-array! (mut r))
+          (= c #\") (let [(mut v) (jv-new 4)] (set! (.text v) (jr-string! (mut r))) v)
+          (= c #\t) (do (jr-word! (mut r) "true") (jv-new 2))
+          (= c #\f) (do (jr-word! (mut r) "false") (jv-new 1))
+          (= c #\n) (do (jr-word! (mut r) "null") (jv-new 0))
+          (or (= c #\-) (digit? c)) (let [(mut v) (jv-new 3)] (set! (.num v) (jr-number! (mut r))) v)
+          :else (jr-fail (mut r) "a value"))))
+
+(defn jr-array! [(r (mut JReader))] (-> JVal)
+  (let [(mut v) (jv-new 5)]
+    (jr-expect! (mut r) #\[ "[")
+    (if (= (jr-peek (mut r)) #\])
+        (set! (.at r) (+ (.at r) 1))
+        (do (push! (mut (.items v)) (jr-value! (mut r)))
+            (while (= (jr-peek (mut r)) #\,)
+              (set! (.at r) (+ (.at r) 1))
+              (push! (mut (.items v)) (jr-value! (mut r))))
+            (jr-expect! (mut r) #\] "] or ,")))
+    v))
+
+(defn jr-object! [(r (mut JReader))] (-> JVal)
+  (let [(mut v) (jv-new 6)]
+    (jr-expect! (mut r) #\{ "{")
+    (if (= (jr-peek (mut r)) #\})
+        (set! (.at r) (+ (.at r) 1))
+        (do (push! (mut (.keys v)) (jr-string! (mut r)))
+            (jr-expect! (mut r) #\: ":")
+            (push! (mut (.items v)) (jr-value! (mut r)))
+            (while (= (jr-peek (mut r)) #\,)
+              (set! (.at r) (+ (.at r) 1))
+              (push! (mut (.keys v)) (jr-string! (mut r)))
+              (jr-expect! (mut r) #\: ":")
+              (push! (mut (.items v)) (jr-value! (mut r))))
+            (jr-expect! (mut r) #\} "} or ,")))
+    v))
+
+;;; A whole text as one JSON value.
+(defn json-parsed [(s (slice u8))] (-> JVal)
+  (let [(mut r) (JReader :s s :at 0)
+        v (jr-value! (mut r))]
+    (when (!= (jr-peek (mut r)) (cast u8 0)) (jr-fail (mut r) "the end"))
+    v))
+
+(defn jv-kind-name [(v JVal)] (-> (slice u8))
+  (cond (= (.kind v) 0) "null" (= (.kind v) 1) "false" (= (.kind v) 2) "true" (= (.kind v) 3) "a number"
+        (= (.kind v) 4) "a string" (= (.kind v) 5) "an array" :else "an object"))
+
+(defn jv-int [(v JVal)] (-> i64)
+  (if (= (.kind v) 3) (.num v) (panic "read-json: expected an Int, got {}" (jv-kind-name v))))
+
+(defn jv-text [(v JVal)] (-> (slice u8))
+  (if (= (.kind v) 4) (.text v) (panic "read-json: expected a Text, got {}" (jv-kind-name v))))
+
+(defn jv-bool [(v JVal)] (-> bool)
+  (cond (= (.kind v) 2) true
+        (= (.kind v) 1) false
+        :else (panic "read-json: expected a Bool, got {}" (jv-kind-name v))))
+
+(defn jv-null? [(v JVal)] (-> bool) (= (.kind v) 0))
+
+(defn jv-items [(v JVal)] (-> (ArrayList JVal))
+  (if (= (.kind v) 5) (.items v) (panic "read-json: expected a list, got {}" (jv-kind-name v))))
+
+;;; An object's field: where `json` writes it, the i-th, or wherever it is.
+(defn jv-field [(v JVal) (i i64) (name (slice u8))] (-> JVal)
+  (unless (= (.kind v) 6) (panic "read-json: expected an object with {}, got {}" name (jv-kind-name v)))
+  (if (and (< i (len (.keys v))) (= (get (.keys v) i) name))
+      (get (.items v) i)
+      (let [(mut found) -1]
+        (for j (range 0 (len (.keys v)))
+          (when (= (get (.keys v) j) name) (set! found j)))
+        (when (< found 0) (panic "read-json: the object has no field {}" name))
+        (get (.items v) found))))
 
 (defn join [(a (slice u8)) (b (slice u8))] (-> (slice u8))
   (let [(mut sb) (str/StrBuf::new (value-allocator))]

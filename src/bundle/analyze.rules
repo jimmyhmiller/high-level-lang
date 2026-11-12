@@ -59,71 +59,78 @@ fn facts-of(outputs: [Output]) -> [rep.Fact] =
   ++ [rep.fact-star(d, t) for m.db.star(?d, ?t)]
   ++ [rep.fact-own-export(d, n) for m.db.own-export(?d, ?n)]
   ++ [rep.fact-default-name(n) for m.db.default-name(?n)]
+  ++ [rep.fact-ns-symbol(d, x) for m.db.ns-symbol(?d, ?x)]
+  ++ [rep.fact-runner(d, l.inits[d] ?? -1) for d in keys(l.inits)] ++ [rep.fact-runner(d, l.requires[d] ?? -1) for d in keys(l.requires)]
+  where l = an.linked
 
 # ---------------------------------------------------------------- the report
 
-# What is written: each a record, as JSON its type says (`json`). `about` names each kind in the file
-# of one record a line.
+# What is written: each a record, as JSON its type says (`json`).
 record Held { module: Int, bytes: Int }
 # `written`: of those bytes, what the bundler wrote for the module (its wrapper, its namespace object).
 record Within { output: Int, bytes: Int, written: Int }
-record OutputReport { about: Text, path: Text, kind: Text, bytes: Int, own: Int, root: Int?, imports: [Int], dynamic: [Int], modules: [Held] }
-record RootReport { about: Text, module: Int, path: Text, kind: Text, output: Int, loads: [Int], bytes: Int, modules: [Held] }
+record OutputReport { path: Text, kind: Text, bytes: Int, own: Int, root: Int?, imports: [Int], dynamic: [Int], modules: [Held] }
+record RootReport { module: Int, path: Text, kind: Text, output: Int, loads: [Int], bytes: Int, modules: [Held] }
 record UsedBy { module: Int, names: [Text] }
 record KeptFor { line: Int, text: Text }
-# How a root reaches a module: the modules from the root to it, each importing the next.
-record Chain { root: Int, modules: [Int] }
 record ModuleReport {
-  about: Text, path: Text, package: Text, kind: Text, source: Int, statements: Int, kept: Int, outputs: [Within],
-  imports: [Int], dynamic: [Int], used-by: [UsedBy], kept-for: [KeptFor], chains: [Chain], passes: [Text]
+  path: Text, package: Text, kind: Text, source: Int, statements: Int, kept: Int, outputs: [Within],
+  imports: [Int], dynamic: [Int], used-by: [UsedBy], kept-for: [KeptFor], passes: [Text]
 }
 record Analysis { version: Int, outputs: [OutputReport], roots: [RootReport], modules: [ModuleReport] }
 
-record Report { analysis: Analysis, json: Text, lines: Text }
+record Report { analysis: Analysis, json: Text }
+
+# An analysis read back from the JSON `report` writes.
+fn analysis-of(text: Text) -> Analysis = read-json(text)
 
 fn report(outputs: [Output], roots: [Int]) -> Report =
-  Report(analysis: analysis, json: json(analysis) ++ "\n",
-         lines: join([json(x) for x in output-reports] ++ [json(x) for x in root-reports] ++ [json(x) for x in module-reports], "\n") ++ "\n")
-  where analysis = Analysis(version: 2, outputs: output-reports, roots: root-reports, modules: module-reports),
+  Report(analysis: analysis, json: json(analysis) ++ "\n")
+  where analysis = Analysis(version: 4, outputs: output-reports, roots: root-reports, modules: module-reports),
         db = rep.solved(facts-of(outputs)),
         # The modules the outputs hold, numbered in the program's order.
         modules = [id for id in m.order if db.shown(id)],
         index = {modules[i]: i for i in 0..len(modules)},
         output-reports = [output-report(db, i, outputs[i], index) for i in 0..len(outputs)],
         root-reports = [root-report(db, r, index) for r in roots if is-some(first db.root(r, ?o): o)],
-        module-reports = [module-report(db, id, index) for id in modules]
+        roots-made = an.linked.dynamic-roots,
+        # Names that say what a read is, not the symbol's: made once, as a database is copied where passed.
+        labels = {s: "*" for db.ns-symbol(_, ?s)} ++ {s: "()" for db.runner(_, ?s)},
+        module-reports = [module-report(db, id, index, roots-made, labels) for id in modules]
 
 fn output-report(db: rep.Db, i: Int, o: Output, index: {Int:Int}) -> OutputReport =
-  OutputReport(about: "output", path: o.path, kind: o.kind, bytes: len(o.text),
+  OutputReport(path: o.path, kind: o.kind, bytes: len(o.text),
                own: len(o.text) - ((first db.modules-held(i, ?b): b) ?? 0),
                root: first r in [o.root] if r >= 0 for at in index[r]: at, imports: o.imports, dynamic: o.dynamic,
                modules: [Held(module: at, bytes: b) for db.held(i, ?mo, ?b) for at in index[mo]])
 
 fn root-report(db: rep.Db, r: Int, index: {Int:Int}) -> RootReport =
-  RootReport(about: "root", module: index[r] ?? -1, path: m.shown-path(m.modules[r].path),
+  RootReport(module: index[r] ?? -1, path: m.shown-path(m.modules[r].path),
              kind: if r in m.entries then "entry" else "import()", output: (first db.root(r, ?o): o) ?? -1,
              loads: sort o in [o for db.loads(r, ?o)] by o, bytes: (first db.root-bytes(r, ?b): b) ?? 0,
              modules: [Held(module: at, bytes: b) for db.route-held(r, ?mo, ?b) for at in index[mo]])
 
-fn module-report(db: rep.Db, id: Int, index: {Int:Int}) -> ModuleReport =
-  ModuleReport(about: "module", path: m.shown-path(mo.path), package: package-of(mo.path), kind: kind-name(mo), source: len(text),
+fn module-report(db: rep.Db, id: Int, index: {Int:Int}, roots-made: [Int], labels: {Int:Text}) -> ModuleReport =
+  ModuleReport(path: m.shown-path(mo.path), package: package-of(mo.path), kind: kind-name(mo), source: len(text),
                statements: (first db.statements(id, ?n): n) ?? 0, kept: (first db.kept(id, ?n): n) ?? 0,
                outputs: [Within(output: o, bytes: b, written: (first db.held-written(o, id, ?w): w) ?? 0) for db.held(?o, id, ?b)],
                imports: [i for d in imported for i in index[d]], dynamic: [i for d in dynamic for i in index[d]],
-               used-by: [UsedBy(module: i, names: [sym.symbol-at(m.table, s).name for db.used-by(id, r, ?s)])
+               used-by: [UsedBy(module: i, names: [read-name(labels, s) for db.used-by(id, r, ?s)])
                          for r in [r for db.used-by(id, ?r, _) distinct r] for i in index[r]],
                kept-for: [KeptFor(line: map.line-at(starts, at) + 1, text: snippet(text, at)) for at in kept-for if at < len(text)],
-               chains: [Chain(root: at, modules: [i for d in [r] ++ reversed([w.b for w in rep.why-reached(db, r, id) if w.relation == "step"]) for i in index[d]])
-                        for r in [r for db.reached(?r, id)] if is-some(first db.root(r, ?o): o) for at in index[r]],
                passes: sort n in [name-of(m.names, n) for db.passes-on(id, ?n) distinct n] by n)
   where mo = m.modules[id],
         text = source-text(mo),
         imported = [d for db.imports(id, ?d) distinct d],
-        dynamic = [d for r in an.linked.dynamic-roots for d in [r] if d != id and (any k in keys(mo.dep-ids): (mo.dep-ids[k] ?? -1) == d)
+        dynamic = [d for r in roots-made for d in [r] if d != id and (any k in keys(mo.dep-ids): (mo.dep-ids[k] ?? -1) == d)
                    and not (d in imported)],
         kept-for = [offset(an.stmt-of(id, p)) for db.kept-for(id, ?p)],
         # Lines found once for the file, and only for a file with statements to show.
         starts = if len(kept-for) > 0 then map.line-starts(text) else []
+
+# A name read from a module: the symbol's; `*` for a module's whole namespace object; `()` for what
+# runs a module, its initializer or its `require`.
+fn read-name(labels: {Int:Text}, s: Int) -> Text = labels[s] ?? sym.symbol-at(m.table, s).name
 
 fn kind-name(mo: m.Module) -> Text = match mo.kind {
   m.Esm => "esm"

@@ -8,13 +8,14 @@
 - What each route loads is its output and every output that imports, transitively, as the files
   themselves say; and its modules' bytes and its files' own add up to it.
 - A module holds code, or passes names on to code that reads them through it.
-- analysis.json and analysis.jsonl hold the same records; every module index is a module.
+- Every module index in analysis.json is a module.
 - What each module holds of each output agrees with the same build's source map, which marks every
   token's source, up to what has no source: the output's own bytes (its imports and exports) and what
   the bundler wrote for a module (its wrapper, its namespace object), which a map gives to the code
   before them; a map leaves out the runtime's helpers.
-- The page (index.html) has no script; every link within it leads to a section of it, and there is a
-  section for each route and each module, each import chain leading from its route to its module;
+- The page (index.html, made from the JSON by `esb --view=DIR`, not by the build) has no script; every link within it leads to a section of it and every button
+  opens a drawer; there is a section for each route and a drawer for each module, each import chain
+  leading from its route to its module;
   each treemap's boxes fill it, overlap nowhere, and are each as large as its bytes."""
 import json, os, re, shutil, subprocess, sys
 from html.parser import HTMLParser
@@ -98,9 +99,17 @@ class Page(HTMLParser):
     def __init__(self):
         super().__init__()
         self.ids, self.links, self.scripts, self.sections = set(), [], 0, []
+        self.targets, self.drawers = [], []
         self.stack, self.boxes = [], []
+        # Each chain in a drawer: the drawer, the modules its first step names (the routes), and the rest.
+        self.chains, self.drawer, self.chain, self.in_roots = [], None, None, False
 
     def handle_endtag(self, tag):
+        if tag == "ol" and self.chain is not None:
+            self.chains.append(self.chain)
+            self.chain = None
+        if tag == "li":
+            self.in_roots = False
         if tag not in VOID:
             self.stack.pop()
 
@@ -126,16 +135,32 @@ class Page(HTMLParser):
             self.scripts += 1
         if tag == "section":
             self.sections.append(a.get("id"))
+        if "popovertarget" in a:
+            self.targets.append(a["popovertarget"])
+            if self.chain is not None and tag == "button" and "mod" in classes:
+                (self.chain[1] if self.in_roots else self.chain[2]).append(a["popovertarget"])
+        if "popover" in a:
+            self.drawers.append(a.get("id"))
+            self.drawer = a.get("id")
+        if tag == "ol" and "chain" in classes:
+            self.chain = (self.drawer, [], [])
+        if tag == "li" and "roots" in classes:
+            self.in_roots = True
 
 
 def check_page(report, data, label):
+    # The page is made from the JSON, apart from the build (`esb --view=DIR`).
+    made = subprocess.run([str(ESB), f"--view={report}"], capture_output=True, text=True, timeout=120)
+    assert made.returncode == 0, f"{label}: --view failed\n{made.stdout}{made.stderr}"
     page = Page()
     page.feed((report / "index.html").read_text())
     assert page.scripts == 0, f"{label}: the page has a script"
     missing = [l for l in page.links if l not in page.ids]
     assert not missing, f"{label}: links to no section: {missing[:5]}"
-    want = {f"r{i}" for i in range(len(data["roots"]))} | {f"m{i}" for i in range(len(data["modules"]))} | {"all"}
-    assert want == set(page.sections), f"{label}: sections {sorted(set(page.sections) ^ want)[:5]} differ"
+    assert {f"r{i}" for i in range(len(data["roots"]))} == set(page.sections), f"{label}: a route has no section, or a section no route"
+    assert {f"m{i}" for i in range(len(data["modules"]))} == set(page.drawers), f"{label}: a module has no drawer, or a drawer no module"
+    opens = [t for t in page.targets if t not in page.drawers]
+    assert not opens, f"{label}: buttons open no drawer: {opens[:5]}"
     # A treemap's boxes fill it, overlap nowhere, and each is as large as its bytes, to rounding: places
     # are to a hundredth of a percent, and the sizes in titles to a tenth of a unit.
     for box in page.boxes:
@@ -150,10 +175,11 @@ def check_page(report, data, label):
             assert abs(w * h / 100 - 100 * size / total) <= off, f"{label}: a treemap box's area is {w * h / 100:.2f}%, its bytes {100 * size / total:.2f}%"
             for (x2, y2, w2, h2), _ in box[i + 1:]:
                 assert max(0, min(x + w, x2 + w2) - max(x, x2)) * max(0, min(y + h, y2 + h2) - max(y, y2)) <= 0.05, f"{label}: treemap boxes overlap"
-    for m, mod in enumerate(data["modules"]):
-        for c in mod["chains"]:
-            assert c["modules"][0] == data["roots"][[r["module"] for r in data["roots"]].index(c["root"])]["module"] and c["modules"][-1] == m, \
-                f"{label}: a chain of {mod['path']} does not lead from its route to it"
+    routes = {f"m{r['module']}" for r in data["roots"]}
+    assert page.chains, f"{label}: the page shows no chains"
+    for drawer, roots, rest in page.chains:
+        assert roots and set(roots) <= routes, f"{label}: a chain in {drawer} does not start at routes: {roots}"
+        assert (rest[-1] if rest else roots[-1]) == drawer, f"{label}: a chain in {drawer} does not lead to its module"
 
 
 def files(d):
@@ -188,10 +214,6 @@ for entries, label in SPLITS:
         build(args + [f"--outdir={out}"], out, report)
         assert files(plain) == files(out), f"{label} {mode}: --analyze changed the outputs"
         data = json.loads((report / "analysis.json").read_text())
-        lines = [json.loads(l) for l in (report / "analysis.jsonl").read_text().splitlines() if l]
-        assert [l for l in lines if l["about"] == "output"] == data["outputs"]
-        assert [l for l in lines if l["about"] == "module"] == data["modules"]
-        assert [l for l in lines if l["about"] == "root"] == data["roots"]
         check_page(report, data, f"{label} {mode}")
         modules, outputs = data["modules"], data["outputs"]
         names = [os.path.relpath(TESTS / o["path"], out) if not os.path.isabs(o["path"]) else os.path.relpath(o["path"], out) for o in outputs]

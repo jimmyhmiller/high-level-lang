@@ -102,6 +102,10 @@
 
 (defstruct Local
   [(name (slice u8)) (ty (slice u8)) (sym (slice u8)) (mutable bool)
+   ;; Held in a mutable place, though the program cannot give it another value: a facts database,
+   ;; which queries read through where it is (its indexes are made as they are first asked for),
+   ;; not through a copy of it each.
+   (place bool)
    ;; How many loops with a region of their own enclose it (see `scoped-loop?`).
    (depth i64)])
 
@@ -1889,7 +1893,16 @@
              :ty ty
              :sym s
              :mutable mutable
+             :place false
              :depth (len (.loop-marks k))))
+    s))
+
+;;; A local held in a mutable place it cannot be given another value in (see `Local`).
+(defn bind-place! [(k (mut Comp)) (name (slice u8)) (ty (slice u8))] (-> (slice u8))
+  (let [s (bind-local! (mut k) name ty false)
+        at (- (len (.locals k)) 1)
+        l (get (.locals k) at)]
+    (set! (mut (.locals k)) at (Local :name (.name l) :ty (.ty l) :sym (.sym l) :mutable false :place true :depth (.depth l)))
     s))
 
 (defn find-local [(k (mut Comp)) (name (slice u8))] (-> (Option Local))
@@ -2844,8 +2857,9 @@
         (for j order
           (let [i (get inits j)
                 v (expr (mut k) (kid i 1) "")
-                s (bind-local! (mut k) (get names j) (.ty v) false)]
-            (push! (mut lets) (sym s))
+                db (facts-db? (mut k) (.ty v))
+                s (if db (bind-place! (mut k) (get names j) (.ty v)) (bind-local! (mut k) (get names j) (.ty v) false))]
+            (push! (mut lets) (if db `(mut ~(sym s)) (sym s)))
             (push! (mut lets) (.code v))))
         `(~@lets)))))
 
@@ -4012,10 +4026,61 @@
                        ty
                        " has no JSON form here; records, lists, options, Int, Text and Bool do")))))
 
+;;; Code reading a value of type `ty` from parsed JSON `v` (an rt/JVal), as `json-write` writes it:
+;;; a record from an object's fields, a list from an array, an option from its value or null.
+(defn json-read [(k (mut Comp))
+                 (n g/Node)
+                 (ty (slice u8))
+                 (v Code)
+                 (within (ArrayList (slice u8)))] (-> Code)
+  (cond (= ty "Int") `(rt/jv-int ~v)
+        (= ty "Text") `(rt/jv-text ~v)
+        (= ty "Bool") `(rt/jv-bool ~v)
+        (opt? ty)
+          (let [x (fresh (mut k) "x")]
+            `(let [~(sym x) ~v]
+               (if (rt/jv-null? ~(sym x))
+                   (None [~(coil-type (mut k) (opt-of ty))])
+                   (Some ~(json-read (mut k) n (opt-of ty) (sym x) within)))))
+          (list? ty)
+            (let [out (fresh (mut k) "out")
+                  x (fresh (mut k) "x")]
+              `(let [(mut ~(sym out)) ~(new-list (mut k) (elem-of ty))]
+                 (for ~(sym x) (rt/jv-items ~v)
+                   (push! (mut ~(sym out)) ~(json-read (mut k) n (elem-of ty) (sym x) within)))
+                 ~(sym out)))
+          (record-type? (mut k) ty)
+            (do
+              (when (has-name? within ty)
+                (die (mut k) n (cat3 "read-json: " ty " holds itself, and has no end as JSON")))
+              (let [r (fresh (mut k) "r")
+                    (mut inner) (text-list)
+                    (mut inits) (primitive/code-list-new)]
+                (for x within (push! (mut inner) x))
+                (push! (mut inner) ty)
+                (match (find-rec (mod-at (mut k) (type-module ty)) (type-name ty))
+                  (Some [rd]
+                        (for i (range 0 (len (.fields rd)))
+                          (let [f (get (.fields rd) i)
+                                fty (field-type (mut k) n ty (.name f))]
+                            (push! (mut inits) (primitive/code-symbol ":" (.name f)))
+                            (push! (mut inits)
+                                   (json-read (mut k) n fty `(rt/jv-field ~(sym r) ~i ~(.name f)) inner)))))
+                  (None [] (die (mut k) n (cat "read-json: no record named " ty))))
+                `(let [~(sym r) ~v]
+                   ~(record-value (mut k) ty `(~(sym (qualified (mut k) (type-module ty) (type-name ty))) ~@inits)))))
+          :else
+            (die (mut k)
+                 n
+                 (cat3 "read-json: "
+                       ty
+                       " has no JSON form here; records, lists, options, Int, Text and Bool do"))))
+
 (defn builtin-call [(k (mut Comp))
                     (n g/Node)
                     (name (slice u8))
-                    (args (ArrayList g/Node))] (-> (Option TE))
+                    (args (ArrayList g/Node))
+                    (want (slice u8))] (-> (Option TE))
   (let [count (len args)]
     (cond (and (= name "len") (= count 1))
             (Some (te `(len ~(.code (expr (mut k) (get args 0) ""))) "Int"))
@@ -4027,6 +4092,17 @@
                            ~(json-write (mut k) n (.ty e) (.code e) jb (text-list))
                            (rt/json-done (mut ~(sym jb))))
                         "Text")))
+          ;; `read-json(text)`: a value of the type wanted where it is used, read back from the JSON
+          ;; `json` writes for that type.
+          (and (= name "read-json") (= count 1))
+            (do
+              (when (= (len want) 0)
+                (die (mut k) n "read-json reads the type wanted where it is used: give it one (a function's result, a binding's type)"))
+              (let [t (expect (mut k) (get args 0) (expr (mut k) (get args 0) "Text") "Text")
+                    v (fresh (mut k) "parsed")]
+                (Some (te `(let [~(sym v) (rt/json-parsed ~(.code t))]
+                             ~(json-read (mut k) n want (sym v) (text-list)))
+                          want))))
           (and (= name "is-some") (= count 1))
             (Some (te `(match ~(.code (expr (mut k) (get args 0) ""))
                          (Some [_] true)
@@ -4673,7 +4749,7 @@
                                 (cat4 name " is a " (.ty l) ", not a function")))
                          (fn-value-call (mut k) n (sym (.sym l)) (.ty l) args))
                    (None []
-                         (match (builtin-call (mut k) n name args)
+                         (match (builtin-call (mut k) n name args want)
                            ;; A built-in is called by its name before any function: a function of
                            ;; the module by that name would never be called, so it is an error.
                            (Some [b]
@@ -4784,7 +4860,7 @@
   (match (.kind e)
     (g/KName []
              (match (find-local (mut k) (.text e))
-               (Some [l] (.mutable l))
+               (Some [l] (or (.mutable l) (.place l)))
                (None [] true)))
     (g/KFieldE []
                (match (module-prefix (mut k) (kid e 0))
@@ -8098,12 +8174,16 @@
                         (if (or (not is-var) fresh-value)
                             (.code v)
                             (list-copy (mut k) v))
+                      db (and (not is-var) (facts-db? (mut k) (.ty v)))
                       local
-                        (bind-local! (mut k) (.text (kid b 0)) (.ty v) is-var)]
-                  (if is-var
-                      (do (push! (mut binds) `(mut ~(sym local)))
-                          (push! (mut var-syms) local))
-                      (push! (mut binds) (sym local)))
+                        (if db
+                            (bind-place! (mut k) (.text (kid b 0)) (.ty v))
+                            (bind-local! (mut k) (.text (kid b 0)) (.ty v) is-var))]
+                  (cond is-var
+                          (do (push! (mut binds) `(mut ~(sym local)))
+                              (push! (mut var-syms) local))
+                        db (push! (mut binds) `(mut ~(sym local)))
+                        :else (push! (mut binds) (sym local)))
                   (push! (mut binds) init))
                 (set! j (+ j 1)))
               (let [rest (block-from (mut k) stmts j want)
@@ -8368,13 +8448,22 @@
     (clear! (mut (.locals k)))
     (set! (.returned k) false)
     (set! (.ret k) (.ret f))
+    (let [(mut placed) (primitive/code-list-new)
+          (mut any-placed) false]
     (for p (.params f)
-      (let [local (bind-local! (mut k) (.name p) (.ty p) (.by-ref p))]
-        (push! (mut args) (sym local))
+      (let [db (and (not (.by-ref p)) (facts-db? (mut k) (.ty p)))
+            local (if db (bind-place! (mut k) (.name p) (.ty p)) (bind-local! (mut k) (.name p) (.ty p) (.by-ref p)))
+            given (if db (fresh (mut k) (cat "given-" (.name p))) local)]
+        (push! (mut args) (sym given))
+        ;; A database given is put in a place once, for the queries of the body to read through.
+        (when db
+          (set! any-placed true)
+          (push! (mut placed) `(mut ~(sym local)))
+          (push! (mut placed) (sym given)))
         (push! (mut params)
                (if (.by-ref p)
-                   `(~(sym local) (mut ~(coil-type (mut k) (.ty p))))
-                   `(~(sym local) ~(coil-type (mut k) (.ty p)))))))
+                   `(~(sym given) (mut ~(coil-type (mut k) (.ty p))))
+                   `(~(sym given) ~(coil-type (mut k) (.ty p)))))))
     (set! (.in-fn k) true)
     (set! (.task-used k) false)
     (let [body
@@ -8395,7 +8484,7 @@
       (when (and (!= (.ret f) "Void") (= (.ty body) "Void"))
         (die (mut k) body-node (cat "this function must answer " (.ret f))))
       `(defn ~(sym coil-name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
-         ~code))))
+         ~(if any-placed `(let [~@placed] ~code) code))))))
 
 ;;; A function that divides work into a stage's units, when the pipeline names another that gives
 ;;; the same answer undivided (`alone F is G`): the test that the stage works on one thread, and

@@ -13,6 +13,8 @@ parser.add_argument('--port', type=int, default=8000)
 args = parser.parse_args()
 subprocess.run([str(Path(args.spec).resolve()), '../examples/workbench.bundler'], cwd=ROOT / 'tests', check=True)
 shutil.copyfile(ROOT / 'examples/workbench.html', ROOT / 'out/workbench/public/index.html')
+# The build wrote its analysis (`analyze` in the spec); its page is made from that.
+subprocess.run([str(ROOT / 'out/bin/esb'), '--view=out/workbench/analysis'], cwd=ROOT, check=True)
 (ROOT / 'out/workbench/package.json').write_text('{"type":"module"}\n')
 print('Built out/workbench; run python3 tools/workbench.py --serve', flush=True)
 if args.serve:
