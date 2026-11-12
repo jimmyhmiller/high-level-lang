@@ -21,6 +21,9 @@
 ;;;                                     # (`let` in a block, where each one shadows the last)
 ;;;   dynamic With ;                    # names in and around this cannot be renamed
 ;;;   dynamic-name eval ;               # nor around a reference to this name
+;;;   dynamic-name eval in Call through Paren ;
+;;;                                     # or only around one that is a Call's first child,
+;;;                                     # itself or inside any number of Parens
 ;;;
 ;;; A scope's names are declared when it opens: the node's own (`in own`), then, for each set of
 ;;; kinds the placements name in the order they first do, those landing in it, in the order they
@@ -202,6 +205,11 @@
         (mut sequential) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut dynamic) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut dynamic-name) (ArrayList::new [(slice u8)] (malloc-allocator))
+        ;; Names dynamic only as what a call calls: the names, the calls, and what they may be
+        ;; wrapped in between.
+        (mut call-name) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut caller) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut callee-wrapper) (ArrayList::new [(slice u8)] (malloc-allocator))
         ;; Nodes that open a scope, and the kind of each; the kinds, in the order declared.
         (mut opener) (ArrayList::new [(slice u8)] (malloc-allocator))
         (mut opener-kind) (ArrayList::new [(slice u8)] (malloc-allocator))
@@ -279,6 +287,15 @@
                 (do
                   (for n (texts (get (.kids table) 0))
                     (push! (mut dynamic-name) n))
+                  0)
+              (= k (g/KDynamicCall))
+                (do
+                  (check-nodes! kinds src path grammar (get (.kids table) 1))
+                  (check-nodes! kinds src path grammar (get (.kids table) 2))
+                  (for n (texts (get (.kids table) 0)) (push! (mut call-name) n))
+                  (for n (texts (get (.kids table) 1)) (push! (mut caller) n))
+                  (for n (texts (get (.kids table) 2))
+                    (push! (mut callee-wrapper) n))
                   0)
               (= k (g/KOutside))
                 (do
@@ -429,6 +446,20 @@
                        ~(kind-test dynamic))
                      (defn dynamic-name? [(name (slice u8))] (-> bool)
                        ~(name-test dynamic-name))
+                     (defn caller? [(k syn/Kind)] (-> bool)
+                       ~(kind-test caller))
+                     (defn callee-wrapper? [(k syn/Kind)] (-> bool)
+                       ~(kind-test callee-wrapper))
+                     (defn call-name? [(name (slice u8))] (-> bool)
+                       ~(name-test call-name))
+                     ;;; Whether a call calls a name that makes it dynamic, through any wrappers.
+                     (defn dynamic-call? [(n syn/Node)] (-> bool)
+                       (and (caller? (.kind n))
+                            (> (len (.kids n)) 0)
+                            (let [(mut at) (get (.kids n) 0)]
+                              (while (and (callee-wrapper? (.kind at)) (> (len (.kids at)) 0))
+                                (set! at (get (.kids at) 0)))
+                              (and (ref? (.kind at)) (call-name? (.text at))))))
                      (defn own-first? [(k syn/Kind)] (-> bool)
                        ~(kind-test own-first))
                      (defn own-beneath? [(k syn/Kind)] (-> bool)
@@ -507,6 +538,8 @@
                                  (let [inner (sym/new-scope! (mut t) scope)]
                                    (when (dynamic? k)
                                      (sym/mark-dynamic! (mut t) inner))
+                                   (when (dynamic-call? n)
+                                     (sym/mark-dynamic! (mut t) scope))
                                    (scope-scan! n (mut t) inner)
                                    ;; A child outside the scope resolves in the scope around, and a
                                    ;; sequential child's scope holds the siblings after it, on its side.
@@ -527,7 +560,7 @@
                                    inner)
                                :else
                                  (do
-                                   (when (dynamic? k)
+                                   (when (or (dynamic? k) (dynamic-call? n))
                                      (sym/mark-dynamic! (mut t) scope))
                                    (walk-all! n (mut t) scope (mut b))
                                    -1))))
@@ -603,7 +636,7 @@
                              count (len (.kids tree))]
                          (when (and (not (rt/alone? ~(if (< stage 0) 0 stage)))
                                     (> count 0)
-                                    (not (or (ref? k) (bind? k) (opens? k) (dynamic? k))))
+                                    (not (or (ref? k) (bind? k) (opens? k) (dynamic? k) (dynamic-call? tree))))
                            (let [body (get (.kids tree) (- count 1))
                                  bk (.kind body)
                                  ;; How much source the items span: a list made by a rewrite has
@@ -615,7 +648,7 @@
                                      (when (> (.hi item) high) (set! high (.hi item))))
                                  (mut ok)
                                    (and (> (- high low) ~(* 2 part-bytes))
-                                        (not (or (ref? bk) (bind? bk) (opens? bk) (dynamic? bk))))]
+                                        (not (or (ref? bk) (bind? bk) (opens? bk) (dynamic? bk) (dynamic-call? body))))]
                              (when ok
                                (for (ref item) (.kids body)
                                  (when (sequential? (.kind item)) (set! ok false))))

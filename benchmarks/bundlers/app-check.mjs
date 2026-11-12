@@ -1,0 +1,52 @@
+// A real application's build, run in Chrome: an HTML page holding its root element loads the entry
+// script; any static files it needs are served beside the output (a service worker, say). Prints
+// what the page shows once it has settled, the errors it threw, the requests that failed, and the
+// output's JS files the first page asked for (`initial`, before any step) and in all (`loaded`), so
+// builds of the same application by different bundlers can be compared.
+//   node app-check.mjs OUTDIR ENTRY_FILE_IN_OUTDIR ROOT_ID WAIT_TEXT [STATIC_FILE...]
+// APP_STEPS (JSON): what a person does first, as [["fill", selector, text] | ["click", selector] |
+// ["wait", text]...], such as signing in; WAIT_TEXT is then what the page must come to show.
+import { chromium } from '../../tests/node_modules/playwright-core/index.mjs';
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { resolve, extname, basename } from 'node:path';
+const [outArg, entry, rootId, waitText, ...statics] = process.argv.slice(2);
+const output = resolve(outArg);
+const types = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.woff2': 'font/woff2' };
+const extra = Object.fromEntries(statics.map((p) => ['/' + basename(p), resolve(p)]));
+const page = `<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><body><div id="${rootId}"></div><script type="module" src="/${entry}"></script>`;
+const loaded = [];
+const server = createServer(async (req, res) => {
+  const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  if (/\.m?js$/.test(path) && !extra[path] && !loaded.includes(path.slice(1))) loaded.push(path.slice(1));
+  if (path === '/' || !extname(path)) { res.setHeader('Content-Type', 'text/html'); return res.end(page); }
+  const file = extra[path] ?? resolve(output, path.slice(1));
+  if (!extra[path] && !file.startsWith(output + '/')) { res.writeHead(403); return res.end(); }
+  try { const body = await readFile(file); res.setHeader('Content-Type', types[extname(file)] || 'application/octet-stream'); res.end(body); }
+  catch { res.writeHead(404); res.end(); }
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const browser = await chromium.launch({ executablePath: process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, timezoneId: 'UTC', locale: 'en-US' });
+const tab = await ctx.newPage();
+const errors = [], failed = [];
+tab.on('pageerror', (e) => errors.push(String(e.message)));
+tab.on('response', (r) => { if (r.status() >= 400) failed.push(r.status() + ' ' + new URL(r.url()).pathname); });
+let ok = true, initial = [];
+try {
+  await tab.goto(`http://127.0.0.1:${server.address().port}/`);
+  await tab.waitForLoadState('networkidle');
+  initial = [...loaded];
+  for (const [what, a, b] of JSON.parse(process.env.APP_STEPS || '[]')) {
+    if (what === 'fill') await tab.fill(a, b, { timeout: 30000 });
+    else if (what === 'click') await tab.click(a, { timeout: 30000 });
+    else if (what === 'wait') await tab.waitForFunction((t) => document.body.innerText.includes(t), a, { timeout: 30000 });
+  }
+  await tab.waitForFunction((t) => document.body.innerText.includes(t), waitText, { timeout: 30000 });
+  await tab.waitForLoadState('networkidle');
+  await tab.waitForTimeout(1500);
+} catch (e) { ok = false; errors.push('did not show "' + waitText + '": ' + e.message.split('\n')[0]); }
+const text = await tab.evaluate(() => document.body.innerText);
+process.stdout.write(JSON.stringify({ ok: ok && errors.length === 0, errors, failed, initial, loaded, text }));
+await browser.close();
+server.close();

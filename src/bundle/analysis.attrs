@@ -61,6 +61,9 @@ boxed record Linked {
   reexports: {Text:Int},
   cjs-imports: {Int:CjsImport},
   ns-imports: {Int:Int},
+  # Named imports of ES modules, by symbol: what `z.object` may read a member of, if `z` turns out
+  # to be a module's namespace object (`export * as z`, or `import * as z; export { z }`).
+  named-imports: {Int:Bool},
   any-dynamic: Bool,
   any-reexport: Bool
 }
@@ -129,10 +132,11 @@ fn init-helper(mo: m.Module) -> Text = if asynchronous?(mo) then "__esmAsync" el
 # What one statement says, found by walking it. The walk is most of what facts cost, and it reads
 # only its module and what is known already, so modules are walked at once; the facts are then
 # asserted from these, in the order the walk met them.
-enum Reach { Symbol, Member, Required, Whole, Chunk }
+enum Reach { Symbol, Member, ImportedMember, Required, Whole, Chunk }
 
-# A symbol named; `ns.x` of an `import * as ns` (the module, and `x`); a module `require`d, or
-# loaded whole by `import()`; a chunk `import()` loads.
+# A symbol named; `ns.x` of an `import * as ns` (the module, and `x`); `z.x` of a named import `z`
+# (its symbol, and `x`), which linking finds a member of a namespace or a read of `z`; a module
+# `require`d, or loaded whole by `import()`; a chunk `import()` loads.
 record Mention { reach: Reach, id: Int, name: Text }
 
 # `pure`: whether the statement can go when nothing uses it, which is a walk of it too.
@@ -162,6 +166,10 @@ on Member(object, property) if counting and namespace-of(body, here, object) is 
   mentions += Mention(reach: Member, id: target, name: property.text)
   object.counting = false
 }
+on Member(Ident(_) as object, PropName(_) as property) if counting and imported-name(body, here, object) is some(s) {
+  mentions += Mention(reach: ImportedMember, id: s, name: property.text)
+  object.counting = false
+}
 # `import()` of an outside module stays as it is, and needs nothing of the bundle.
 on ImportCall(...) as n if counting and imported-str(n) is some(from) and m.modules[known-dep(here, from)].kind != External {
   mentions += mentioned(match linking.splitting {
@@ -172,7 +180,7 @@ on ImportCall(...) as n if counting and imported-str(n) is some(from) and m.modu
 }
 # A direct eval in a retained declaration can read any visible module binding. Scope analysis
 # already preserves their spellings; liveness must retain their declarations as well.
-on CallExpr(Ident("eval"), _) if counting and sym.scope-at(m.table, here.root).dynamic {
+on CallExpr(callee, _) if counting and direct-eval?(callee) and sym.scope-at(m.table, here.root).dynamic {
   mentions ++= [mentioned(Symbol, s) for s in sym.scope-at(m.table, here.root).symbols]
 }
 on CallExpr(...) as n if counting and required-str(body, n) is some(from) {
@@ -184,6 +192,13 @@ on CallExpr(...) as n if counting and required-str(body, n) is some(from) {
 on _ as n if sc.opens?(n.kind) { kids.top = false }
 
 fn mentioned(reach: Reach, id: Int) -> Mention = Mention(reach: reach, id: id, name: "")
+
+# What a direct eval calls: the name `eval` itself, in parentheses or not (js.scopes).
+fn direct-eval?(callee: Node) -> Bool = match callee {
+  Ident("eval") => true
+  Paren(x) => direct-eval?(x)
+  _ => false
+}
 
 # What a name mentions: its symbol, or a runtime helper it names freely.
 fn name-mention(n: Node, x: Text) -> Mention? = match m.symbol-in(body, here, n.lo) {
@@ -219,6 +234,9 @@ fn walked?(s: Node) -> Bool = match s {
   Import(...) | ImportBare(_) | ExportAll(_) | ExportAllAs(...) | ExportFrom(...) | ExportNamed(_) => false
   _ => true
 }
+
+# The symbol of a named import of an ES module an identifier reads.
+fn imported-name(b: m.Body, mo: m.Module, n: Node) -> Int? = first s in m.symbol-in(b, mo, n.lo) if s in linked.named-imports: s
 
 # The module an identifier names when it is `import * as` of an ES module.
 fn namespace-of(b: m.Body, mo: m.Module, n: Node) -> Int? = match n {
@@ -633,6 +651,7 @@ fn linked-of(links: [ModuleLink], first: Int) -> Linked =
                           for i in 0..len(m.order) for mo in [m.modules[m.order[i]]] for r in links[i].reexports
                           if held?(m.modules[r.target])},
          ns-imports: {b.symbol: b.target for bs in bindings for b in bs if b.namespace and not opaque?(m.modules[b.target])},
+         named-imports: {b.symbol: true for bs in bindings for b in bs if not b.namespace and not opaque?(m.modules[b.target])},
          part-starts: {m.order[k]: starts[k] for k in 0..len(m.order)},
          any-dynamic: any l in links: l.dynamic,
          any-reexport: any x in made: x.purpose == ReexportName)
@@ -833,6 +852,7 @@ fn summary-facts(mo: m.Module, part: Int, sm: Summary) -> [link.Fact] =
 fn mention-facts(mo: m.Module, part: Int, x: Mention) -> [link.Fact] = match x.reach {
   Symbol => [link.fact-mentions(part, x.id)]
   Member => [link.fact-ns-member(part, x.id, m.name-id(x.name))]
+  ImportedMember => [link.fact-import-member(part, x.id, m.name-id(x.name))]
   Required => required-module(mo, part, m.modules[x.id])
   Whole => whole-module(mo, part, m.modules[x.id])
   # What `import()` of a chunk needs here: only the helper that makes CommonJS look like a module.

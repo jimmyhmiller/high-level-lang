@@ -10,6 +10,7 @@ use bundle.naming as nm
 use bundle.evaluation as ev
 use bundle.sourcemap as map
 use bundle.privates as privates
+use bundle.inline as inline
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -108,13 +109,19 @@ fn symbol-read(s: Int) -> Node = match an.linked.cjs-imports[t] {
 fn namespace-property(target: Int, name: Text) -> Node = Member(Ident(final-of(an.ns-sym(m.modules[target]))), PropName(name))
 
 # `ns.name` when `ns` is `import * as` of an ES module: the export itself.
-fn namespace-read(n: Node) -> Node? = match an.namespace-of(body, here, n.object) {
+fn namespace-read(n: Node) -> Node? = match an.namespace-of(body, here, n.object) ?? imported-namespace(n) {
   none => none
   some(target) => match exported(target, n.property.text) {
     some(s) => some(symbol-read(s))
     none if m.db.dynamic(target) => some(namespace-property(target, n.property.text))
     none => some(void-zero())
   }
+}
+
+# `z.x` of a named import that is a module's namespace object: that module.
+fn imported-namespace(n: Node) -> Int? = match n.object, n.property {
+  Ident(_), PropName(_) => first s in m.symbol-in(body, here, n.object.lo) for m.db.namespace-of-import(s, ?mo): mo
+  _, _ => none
 }
 
 # What a module exports under a name. A name never interned is in no fact, so nothing exports it.
@@ -203,7 +210,9 @@ rewrite ImportCall(...) as n => match an.known-import-call-target(here, n) {
   some(t) => import-call(m.modules[t])
   none => n.out
 }
-rewrite ImportMeta() => exp`({})`.expr
+# `import.meta` stays in ES module output, where it is the output file's, as esbuild leaves it; any
+# other format cannot hold it, and gets an empty object.
+rewrite ImportMeta() as n if not an.linking.esm-output => exp`({})`.expr
 # What a file that is not strict may hold and strict code cannot, spelt as what it means, as esbuild
 # prints it: the output may be an ES module.
 rewrite Num(t) as n if not strict-file?() and host.legacy-number?(t) => Num(host.decimal-number(t)) with { lo: n.lo, hi: n.hi }
@@ -829,3 +838,90 @@ fn program() -> Emission =
                                        for s in [Flag() for x in [k] if any j in 0..k: len(made[j]) > 0] ++ made[k]]...)))
   where emitted = [unit-emitted(u) for u in units],
         made = [group-stmts(r.namespace, emitted[r.from..r.to]) for r in ranges()]
+
+# ---------------------------------------------------------------- functions read once
+
+# A top-level function of an ES module that live code reads once, in a call, and nowhere else: no
+# other read, no namespace object, no export kept for an entry. `part` declares it, `reader` is the
+# one statement that calls it (of any ES module), and `decl` is its declaration as emitted, which a
+# minified build writes in at the call (bundle.inline). Not in a module with direct `eval`, which
+# may read any name. Two that call each other are neither.
+record Single { part: Int, reader: Int, decl: Node }
+
+record Candidate { part: Int, symbol: Int, module: Int, reader: Int }
+
+# By final name: the same in every chunk, as top-level names of a bundle are its own.
+fn single-use-functions() -> {Text:Single} =
+  {final-of(c.symbol): Single(part: c.part, reader: c.reader, decl: emitted-declaration(c)) for c in once if not cyclic?(c, by-part, len(once))}
+  where candidates = [c for id in m.order if included?(id) and m.modules[id].kind == Esm and not dynamic-module?(id)
+                        for x in declared-functions(id) for c in single-reader(id, x)],
+        counts = {q: reader-counts(q) for q in [c.reader for c in candidates distinct c.reader]},
+        once = [c for c in candidates for n in counts[c.reader] if (n.reads[c.symbol] ?? 0) == 1 and (n.calls[c.symbol] ?? 0) == 1],
+        by-part = {c.part: c for c in once}
+
+record Declared { part: Int, symbol: Int }
+
+fn declared-functions(id: Int) -> [Declared] = with here = m.modules[id], body = m.body-of(id) {
+  [Declared(part: p, symbol: s) for p in parts-of(id) if live?(p) for name in function-name(an.stmt-in(body, here, p))
+   for s in m.symbol-in(body, here, name.lo)]
+}
+
+fn function-name(s: Node) -> Node? = match s {
+  FuncDecl(BindName(_) as name, _, _) | ExportFunction(FuncDecl(BindName(_) as name, _, _)) => some(name)
+  _ => none
+}
+
+fn dynamic-module?(id: Int) -> Bool = sym.scope-at(m.table, m.modules[id].root).dynamic
+
+# The one live statement that reads a function, when there is one and it is an ES module's, and the
+# function is no export kept for an entry.
+fn single-reader(id: Int, x: Declared) -> [Candidate] =
+  [Candidate(part: x.part, symbol: x.symbol, module: id, reader: q)
+   for readers in [[q for q in [q for m.db.mentions(?q, x.symbol)] ++ [q for m.db.uses(?q, x.symbol)] if live?(q) distinct q]]
+   if len(readers) == 1 and readers[0] != x.part and not (m.db.keep-exports(id) and (any m.db.resolved(id, ?n, x.symbol): true))
+   for q in readers for mo in [first m.db.part-of(q, ?mo): mo] for r in mo
+   if m.modules[r].kind == Esm and not dynamic-module?(r)]
+
+# How often a statement reads each symbol, by what it means (an import, what it imports), and how
+# often it calls each: as the analysed source has it, whose reads emission keeps one for one.
+record Counts { reads: {Int:Int}, calls: {Int:Int} }
+
+fn reader-counts(q: Int) -> Counts = match first m.db.part-of(q, ?mo): mo {
+  none => Counts(reads: {}, calls: {})
+  some(mo) => with here = m.modules[mo], body = m.body-of(mo) {
+    Counts(reads: tally([target-of(s) for x in referenced(stmt) for s in m.symbol-in(body, here, x.lo)]),
+           calls: tally([target-of(s) for x in called(stmt) for s in m.symbol-in(body, here, x.lo)]))
+  } where stmt = an.stmt-in(m.body-of(mo), m.modules[mo], q)
+}
+
+everywhere fn referenced(n: Node) -> [Node] = match n { Ident(_) => [n] }
+everywhere fn called(n: Node) -> [Node] = match n { CallExpr(Ident(_) as f, args) => [f] ++ called(args) }
+
+# Whether following who calls whom, from the function `c` is called in, comes back to `c`.
+fn cyclic?(c: Candidate, by-part: {Int:Candidate}, steps: Int) -> Bool = calling-back(by-part[c.reader], c, by-part, steps)
+
+fn calling-back(at: Candidate?, c: Candidate, by-part: {Int:Candidate}, steps: Int) -> Bool = match at {
+  none => false
+  some(x) if x.part == c.part => true
+  some(x) if steps <= 0 => true
+  some(x) => calling-back(by-part[x.reader], c, by-part, steps - 1)
+}
+
+# The declaration as its own module emits it.
+fn emitted-declaration(c: Candidate) -> Node = with here = m.modules[c.module], body = m.body-of(c.module) {
+  first s in part-body(c.part) if s is FuncDecl(...): s
+} ?? panic "a function read once emitted no declaration"
+
+# Of the functions these names are, those this chunk writes in (both the declaration and its call
+# are printed in it), and those their bodies call that it writes in, and so on: what is written in
+# brings its own calls with it, whose declarations their own groups drop.
+fn written-in(names: [Text]) -> {Text:Node} = written-closure(found(names), single-use-functions())
+
+fn found(names: [Text]) -> {Text:Node} =
+  {name: x.decl for name in names for x in single[name] if in-this-chunk?(x.part) and in-this-chunk?(x.reader)}
+  where single = single-use-functions()
+
+fn written-closure(have: {Text:Node}, single: {Text:Single}) -> {Text:Node} = match len(more) {
+  0 => have
+  _ => written-closure(have ++ more, single)
+} where more = found([x for name in keys(have) for d in have[name] for x in inline.callees(d) if not (x in have)])

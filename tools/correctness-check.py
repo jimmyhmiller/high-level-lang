@@ -7,7 +7,10 @@
     module output;
   - lowered class fields evaluate computed keys in the class's order, after its heritage;
   - with fragments, a value computed as its chunk loads is never computed later than its module
-    was: not after an `import()`, nor by a second entry on the page.
+    was: not after an `import()`, nor by a second entry on the page;
+  - a direct `eval`, called by name or in parentheses, sees its module's names as written, while
+    `eval` read any other way does not stop minifying; and one module reading `eval` leaves the
+    names linking makes (`init_x`) distinct.
 Every built program is run under Node and compared with the unbundled one.
    usage: correctness-check.py [ESB]"""
 import json, os, shutil, subprocess, sys
@@ -160,6 +163,40 @@ for flags in ([], ['--fragments'], ['--fragments', '--minify'], ['--fragments', 
     got = run(['node', 'frag-out/page.mjs'])
     ok(built.returncode == 0 and got.stdout == page_want, f'eager value, second entry {flags}: {got.stdout!r} want {page_want!r}')
 print('ok   fragments: a value computed as its chunk loads is never computed later than its module', flush=True)
+
+# ---------------------------------------------------------------- eval
+write({'ev/direct.js': 'const secretValue = 41;\nexport function viaDirect() { return eval("secretValue + 1"); }\n',
+       'ev/paren.js': 'const otherValue = 7;\nexport function viaParen() { return (eval)("otherValue * 2"); }\n',
+       'ev/indirect.js': 'const thirdValue = 3;\nconst ev = eval;\nexport function viaIndirect() { return ev("typeof thirdValue"); }\nexport const total = thirdValue + 1;\n',
+       'ev/main.js': 'import { viaDirect } from "./direct.js"; import { viaParen } from "./paren.js"; import { viaIndirect, total } from "./indirect.js";\n'
+                     'console.log(viaDirect(), viaParen(), viaIndirect(), total);\n'})
+want = run(['node', 'ev/main.js']).stdout
+for flags in ([], ['--minify']):
+    built = run([ESB, 'ev/main.js', '--format=esm', '--outfile=ev-out.mjs'] + flags)
+    got = run(['node', 'ev-out.mjs'])
+    ok(built.returncode == 0 and got.stdout == want, f'direct and indirect eval {flags}: {got.stdout!r} want {want!r}')
+    if flags:
+        text = (WORK / 'ev-out.mjs').read_text()
+        ok('secretValue=' in text and 'otherValue=' in text and 'thirdValue=' not in text,
+           f'only the direct evals keep their modules\' names: {text!r}')
+# Two packages' own copies of one file, each wrapped (loaded with import()), so each has an init_y;
+# and a CommonJS module that reads `eval` without calling it.
+write({'evdup/node_modules/a/package.json': '{"name":"a","type":"module","main":"index.js"}',
+       'evdup/node_modules/a/index.js': 'import { y } from "x"; export const fromA = () => y();\n',
+       'evdup/node_modules/a/node_modules/x/package.json': '{"name":"x","type":"module","main":"y.js"}',
+       'evdup/node_modules/a/node_modules/x/y.js': 'export const y = () => "x for a";\n',
+       'evdup/node_modules/b/package.json': '{"name":"b","type":"module","main":"index.js"}',
+       'evdup/node_modules/b/index.js': 'import { y } from "x"; export const fromB = () => y();\n',
+       'evdup/node_modules/b/node_modules/x/package.json': '{"name":"x","type":"module","main":"y.js"}',
+       'evdup/node_modules/b/node_modules/x/y.js': 'export const y = () => "x for b";\n',
+       'evdup/intrinsics.cjs': 'module.exports = { "%eval%": eval };\n',
+       'evdup/main.js': 'import intrinsics from "./intrinsics.cjs";\nconst a = await import("a"); const b = await import("b");\n'
+                        'console.log(a.fromA(), b.fromB(), typeof intrinsics["%eval%"]);\n'})
+want = run(['node', 'evdup/main.js']).stdout
+built = run([ESB, 'evdup/main.js', '--format=esm', '--outfile=evdup-out.mjs'])
+got = run(['node', 'evdup-out.mjs'])
+ok(built.returncode == 0 and got.stdout == want, f'a module reading eval leaves made names distinct: {got.stdout!r} want {want!r}')
+print('ok   direct eval keeps its names; eval read otherwise, and made names, do not', flush=True)
 
 if failures:
     print(f'{len(failures)} of {checks} correctness checks failed')

@@ -1,0 +1,59 @@
+# A function that live code calls once, and refers to nowhere else, written in where it is called,
+# as Terser and SWC compress code: `function f(r){…}` and `…f(x)…` become `…function(r){…}(x)…`.
+#
+# A function expression called there is what calling the function was: the same `this`,
+# `arguments`, and order of evaluation; and nothing else can see the function, so neither its name
+# nor its being hoisted can be told apart. Its free names cannot be captured at the call: in
+# minified output a top-level name is never a nested scope's, and a global's name is reserved, so
+# the names mean at the call what they meant where it was declared, in any module of the output.
+# Hence only with names minified (--minify). Which functions qualify (read once, in a call, by any
+# ES module's statement, and not exported to anything kept) is the linking database's to say:
+# `emit.single-use-functions`.
+rules bundle.inline over bundle.js
+
+# A group's statements, each chosen function written in at its call and its declaration gone.
+# `chosen`: by final name, the declarations to write in (`emit.written-in`). Whether a call
+# and its declaration are in this group or two, each group does its half, so together they agree.
+fn inlined(stmts: [Node], chosen: {Text:Node}) -> [Node] = match len(chosen) {
+  0 => stmts
+  _ => [match any x in callees(s): x in chosen {
+          true => placed-in(s, chosen, s.lo)
+          false => s
+        } for s in stmts if not chosen-declaration?(s, chosen)]
+}
+
+# Where a statement passes from one module's code to another's is marked by its nodes' places
+# (`lo` above 2^32 says the module): what is written in keeps its own module's, and the call's
+# arguments, after it, take the nearest place of the module it is written into, so that what
+# follows the function is that module's again (an analysis marks only near a statement's top).
+fn placed-in(n: Node, chosen: {Text:Node}, owner: Int) -> Node = match n {
+  CallExpr(Ident(x) as callee, args) if x in chosen =>
+    CallExpr(as-expression(written(chosen[x] ?? Empty(), chosen), callee),
+             placed-in(args, chosen, here) with { lo: if args.lo >= 4294967296 then args.lo else here }) with { lo: n.lo, hi: n.hi }
+  _ if len(n.kids) == 0 => n
+  _ => n with { kids: [placed-in(k, chosen, here) for k in n.kids] }
+} where here = if n.lo >= 4294967296 then n.lo else owner
+
+# The names a group's statements declare as functions or call: all it can write in or drop.
+fn names-in(stmts: [Node]) -> [Text] = [x for s in stmts for x in declared-name(s)] ++ [x for s in stmts for x in callees(s)]
+
+everywhere fn callees(n: Node) -> [Text] = match n { CallExpr(Ident(x), args) => [x] ++ callees(args) }
+
+fn declared-name(s: Node) -> Text? = match s {
+  FuncDecl(BindName(x), _, _) => some(x)
+  _ => none
+}
+
+fn chosen-declaration?(s: Node, chosen: {Text:Node}) -> Bool = any x in declared-name(s): x in chosen
+
+# A chosen function as written in: its own calls of chosen functions written in too, all the way
+# down (no two call each other: `emit.single-use-functions`).
+fn written(d: Node, chosen: {Text:Node}) -> Node = match any x in callees(d): x in chosen {
+  true => placed-in(d, chosen, d.lo)
+  false => d
+}
+
+fn as-expression(d: Node, at: Node) -> Node = match d {
+  FuncDecl(_, params, body) => FuncExpr(None(), params, body) with { lo: at.lo, hi: at.hi }
+  _ => panic "only a function declaration is written in where it is called"
+}

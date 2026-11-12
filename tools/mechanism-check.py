@@ -141,9 +141,11 @@ def prepare(app):
     shutil.copytree(os.path.join(TESTS, "apps"), os.path.join(root, "apps"), symlinks=True)
     shutil.copytree(os.path.join(TESTS, "node_modules"), os.path.join(root, "node_modules"), symlinks=True)
     entry = next(os.path.join("apps", f) for f in sorted(os.listdir(os.path.join(root, "apps"))) if f.split(".")[0] == app)
-    mods = {"zod": "node_modules/zod/v4/locales/mk.js", "rx": "node_modules/rxjs/dist/esm5/internal/util/isAsyncIterable.js",
+    # A module the bundle holds, so an edit to it shows. (zod's locales are left out now that only
+    # what is read of its `z` namespace is kept.)
+    mods = {"zod": "node_modules/zod/v4/core/util.js", "rx": "node_modules/rxjs/dist/esm5/internal/util/isAsyncIterable.js",
             "datefns": "node_modules/date-fns/locale/en-US/_lib/formatLong.js"}
-    return root, entry, mods.get(app, "node_modules/zod/v4/locales/mk.js")
+    return root, entry, mods.get(app, "node_modules/zod/v4/core/util.js")
 
 for app in APPS:
     for strategy, trust in strategies():

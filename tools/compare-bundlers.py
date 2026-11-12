@@ -63,11 +63,33 @@ for package in ['rolldown','rollup','webpack','@rspack/core','@rollup/plugin-nod
 metadata['versions']['bun'] = subprocess.check_output(['bun','--version'],text=True).strip()
 
 
+# Real applications, built where they are, from their own sources and installed packages: the entry,
+# what each bundler must be told beyond resolving packages (constants to substitute, which imports
+# are files whose URL the code gets), and how Chrome checks the build: the element the app renders
+# into, what a person does first, what the page must then show, and static files served beside the
+# output. Turbopack's CLI takes no constants, so it builds none of them.
+APPS = {
+    # marmelab/react-admin's e-commerce demo (see benchmarks/react-admin-demo/README.md): React 19,
+    # MUI, react-query, react-router, Apollo/GraphQL, echarts, faker data and an msw service worker.
+    'react-admin': dict(
+        dir=ROOT/'benchmarks/react-admin-demo', entry='src/index.tsx',
+        define={'process.env.NODE_ENV': '"production"', 'process.env.REACT_APP_DATA_PROVIDER': '""',
+                'import.meta.env.MODE': '"production"'},
+        files=['.svg'], root='root', wait='Monthly Revenue',
+        steps=[['fill', 'input[name=username]', 'demo'], ['fill', 'input[name=password]', 'demo'], ['click', 'button[type=submit]']],
+        statics=['node_modules/msw/lib/mockServiceWorker.js']),
+}
+
+
 def put(root, name, text):
     path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(text)
 
 
 def prepare(case):
+    if case in APPS:
+        app=APPS[case]
+        assert (app['dir']/'node_modules').exists(), f'First run npm ci in {app["dir"]}'
+        return app['dir'],None,None
     root=WORK/'fixtures'/case
     shutil.rmtree(root,ignore_errors=True);root.mkdir(parents=True)
     put(root,'package.json','{"type":"module","private":true}')
@@ -123,6 +145,22 @@ def prepare(case):
     return root,count,expected
 
 
+def app_command(tool, app, output, minify, config):
+    defines=[f'--define:{k}={v}' for k,v in app['define'].items()]
+    loaders=[f'--loader:{x}=file' for x in app['files']]
+    if tool.startswith('ours-'):
+        _,policy,unit=tool.split('-')
+        return [str(BINARY),app['entry'],'--splitting','--format=esm','--pipeline=full','--no-cache','--strategy=once',f'--chunk-policy={policy}',f'--fragments={str(unit=="fragments").lower()}',*defines,*loaders,f'--outdir={output}',*(['--minify'] if minify else [])]
+    if tool=='esbuild':
+        return [str(ROOT/'tests/node_modules/.bin/esbuild'),app['entry'],'--bundle','--splitting','--format=esm','--platform=browser','--target=esnext','--log-level=warning',*defines,*loaders,f'--outdir={output}',*(['--minify'] if minify else [])]
+    if tool=='bun':
+        return ['bun','build','./'+app['entry'],'--splitting','--format=esm','--target=browser',*[x for k,v in app['define'].items() for x in ['--define',f'{k}={v}']],
+                *[x for e in app['files'] for x in ['--loader',f'{e}:file']],f'--outdir={output}',*(['--minify'] if minify else [])]
+    if tool=='turbopack': raise ValueError('turbopack-cli takes no defines')
+    config.write_text(json.dumps(dict(input={'index':str(app['dir']/app['entry'])},output=str(output),minify=minify,define=app['define'],files=app['files'],typescript=True)))
+    return ['node',str(ADAPTER),tool,str(config)]
+
+
 def command(tool, root, output, minify, config):
     if tool.startswith('ours-'):
         _,policy,unit=tool.split('-')
@@ -176,6 +214,20 @@ def size_of(output,files):
     return dict(bytes=sum(map(len,bodies)),gzip_bytes=sum(len(gzip.compress(body,mtime=0)) for body in bodies),files=len(bodies))
 
 
+# An application's build run in Chrome (benchmarks/bundlers/app-check.mjs): it must show what it
+# should, throw nothing and fail no request; the JS the first page loads, and all it loads.
+def app_checked(case, output):
+    app=APPS[case]
+    checked=subprocess.run(['node',str(ROOT/'benchmarks/bundlers/app-check.mjs'),str(output),'index.js',app['root'],app['wait'],*[str(app['dir']/x) for x in app['statics']]],
+                           capture_output=True,text=True,timeout=180,env={**os.environ,'APP_STEPS':json.dumps(app['steps'])})
+    assert checked.returncode==0,checked.stdout+checked.stderr
+    browser=json.loads(checked.stdout)
+    (WORK/f'{case}-{output.parent.name}-{output.name}-browser.json').write_text(json.dumps(browser,indent=2))
+    assert browser['ok'] and not browser['failed'],json.dumps(dict(errors=browser['errors'],failed=browser['failed']))
+    js=sorted(str(p.relative_to(output)) for p in output.rglob('*.js'))
+    return dict(total_js=size_of(output,js),first_route=size_of(output,browser['initial']),all_loaded=size_of(output,browser['loaded']))
+
+
 rows=[];samples=[]
 report=WORK/(args.report_name+'.json')
 def save(): report.write_text(json.dumps(dict(metadata=metadata,results=rows,samples=samples),indent=2)+'\n')
@@ -184,14 +236,15 @@ for case in args.cases.split(','):
     print(json.dumps(dict(progress='fixture',case=case,roots=count)),flush=True)
     for minify in ([False] if args.plain_only else [True] if args.minified_only else [False,True]):
         modes={};failed={}
-        for tool in TOOLS:
+        tools=[tool for tool in TOOLS if not (case in APPS and tool=='turbopack')]
+        for tool in tools:
             output=root/'dist' if tool=='turbopack' else WORK/'outputs'/case/('minified' if minify else 'plain')/tool
             config=WORK/f'{case}-{tool}-{minify}.json'
-            cmd=command(tool,root,output,minify,config)
+            cmd=app_command(tool,APPS[case],output,minify,config) if case in APPS else command(tool,root,output,minify,config)
             modes[tool]=(output,cmd)
         # Rotate tool order each repetition. Each invocation gets a fresh process and clean output.
         for repeat in range(args.runs):
-            ordered=TOOLS[repeat%len(TOOLS):]+TOOLS[:repeat%len(TOOLS)]
+            ordered=tools[repeat%len(tools):]+tools[:repeat%len(tools)]
             for tool in ordered:
                 if tool in failed: continue
                 output,cmd=modes[tool]
@@ -206,7 +259,7 @@ for case in args.cases.split(','):
                     failed[tool]=str(error)
                     print(json.dumps(dict(progress='build-failed',case=case,minify=minify,tool=tool,error=str(error))),flush=True)
             print(json.dumps(dict(progress='round',case=case,minify=minify,round=repeat+1)),flush=True)
-        for tool in TOOLS:
+        for tool in tools:
             output,cmd=modes[tool]
             row=dict(case=case,minify=minify,tool=tool,command=cmd)
             if tool in failed:
@@ -216,6 +269,10 @@ for case in args.cases.split(','):
                        median_cpu_seconds=round(statistics.median(item['cpu_seconds'] for item in measurements),4),
                        min_seconds=round(min(item['seconds'] for item in measurements),4),max_seconds=round(max(item['seconds'] for item in measurements),4),
                        median_peak_mib=round(statistics.median(item['peak_mib'] for item in measurements),1),max_peak_mib=round(max(item['peak_mib'] for item in measurements),1))
+            if case in APPS:
+                try: row.update(status='correct',**app_checked(case,output))
+                except Exception as error: row.update(status='incorrect-or-validation-failed',error=str(error))
+                rows.append(row);save();print(json.dumps(row),flush=True);continue
             try:
                 checked=subprocess.run(['node',str(ROOT/'benchmarks/bundlers/browser-check.mjs'),str(output),'turbopack' if tool=='turbopack' else 'esm',str(count),str(expected)],capture_output=True,text=True,timeout=120)
                 assert checked.returncode==0,checked.stdout+checked.stderr
