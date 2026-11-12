@@ -144,4 +144,29 @@ for platform in ('browser', 'node'):
         assert actual.returncode == 0 and actual.stdout == expected.stdout, (actual.stdout, actual.stderr, expected.stdout)
         checks += 1
 print('ok   browser dependency/file replacements, disabled modules, and Node isolation')
+
+# Conditions as esbuild has them, which Node does not: the platform's always; `module` unless the
+# build names conditions of its own, an empty list included.
+root = WORK / 'conditions'
+for exports, label in [({'module': './module.js', 'custom': './custom.js', 'default': './default.js'}, 'module first'),
+                       ({'custom': './custom.js', 'browser': './browser.js', 'node': './node.js', 'module': './module.js', 'default': './default.js'}, 'platform after custom')]:
+    shutil.rmtree(root, ignore_errors=True)
+    package = root / 'node_modules/subject'
+    package.mkdir(parents=True)
+    (root / 'package.json').write_text('{"type":"module"}')
+    (package / 'package.json').write_text(json.dumps({'type': 'module', 'exports': {'.': exports}}))
+    for name in ('module', 'custom', 'default', 'browser', 'node'):
+        (package / f'{name}.js').write_text(f'export default {json.dumps(name)};')
+    (root / 'entry.js').write_text('import value from "subject";console.log(value);')
+    for platform in ('browser', 'node'):
+        for flags in ([], ['--conditions=custom'], ['--conditions=']):
+            oracle = run([str(ROOT / 'tests/node_modules/.bin/esbuild'), 'entry.js', '--bundle', '--format=esm', f'--platform={platform}', *flags, '--outfile=oracle.mjs'], root)
+            assert oracle.returncode == 0, oracle.stderr
+            expected = run(['node', 'oracle.mjs'], root)
+            built = run([str(ESB), 'entry.js', '--format=esm', f'--platform={platform}', *flags, '--outfile=bundle.mjs'], root)
+            assert built.returncode == 0, built.stdout + built.stderr
+            actual = run(['node', 'bundle.mjs'], root)
+            assert actual.returncode == 0 and actual.stdout == expected.stdout, (label, platform, flags, actual.stdout, actual.stderr, expected.stdout)
+            checks += 1
+print('ok   conditions as esbuild has them: the platform\'s, and `module` unless the build names its own')
 print(f'ALL {checks} resolution checks passed')

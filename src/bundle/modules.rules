@@ -6,6 +6,7 @@ use bundle.link as link
 use bundle.jspieces as jsp
 use bundle.resolve as res
 use bundle.dce as dce
+use bundle.constants as consts
 use bundle.early as early
 use bundle.calls as calls
 use bundle.comments as cm
@@ -107,7 +108,9 @@ boxed record Loading {
   # Where the output goes, for the paths the file loader writes into modules.
   out-dir: Text,
   packages-external: Bool,
-  public-path: Text
+  public-path: Text,
+  # `--minify-syntax`: constants are written in where they are read (bundle.constants).
+  inline-constants: Bool
 }
 
 setting loading: Loading
@@ -497,7 +500,7 @@ boxed record Parsed {
 # leaf is, the names it leaves free, and whether it is CommonJS.
 # `shift`: how far the symbols `bindings` names moved when the file's own table joined the shared
 # one, which the bindings themselves catch up with once loading is done.
-# `defined`: whether a define changed the tree.
+# `defined`: whether a define, or a constant written in, changed the tree.
 # `script`: no module syntax, and no `module` or `exports`; `wrapped`: analysed inside CommonJS's
 # wrapper, as a script must be to become CommonJS.
 boxed record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs: Bool, script: Bool, wrapped: Bool, shift: Int,
@@ -510,8 +513,8 @@ fn no-analysis() -> Analysis =
 boxed record Analysed { analysis: Analysis, scopes: sym.Table }
 
 # What a file declares and uses, in a table of its own. Defines are substituted and the branches
-# they decide removed, then the result is analysed again, so what they kill is never seen by tree
-# shaking. A file with no module syntax is analysed inside CommonJS's (exports, module) wrapper:
+# they decide removed, and so, when minifying, are constants (bundle.constants), then the result is
+# analysed again, so what they kill is never seen by tree shaking. A file with no module syntax is analysed inside CommonJS's (exports, module) wrapper:
 # it is CommonJS when it names `module` or `exports`, and otherwise a script, which becomes
 # CommonJS only if it is required, or its default or namespace imported, as esbuild has it; which
 # the graph knows once every file is loaded. Not when a define is about `module` or `exports`,
@@ -519,7 +522,7 @@ boxed record Analysed { analysis: Analysis, scopes: sym.Table }
 # all. A name free in any of the analyses is free.
 fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed =
   Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
-                              script: not esm and not cjs, wrapped: wrapped or cjs, shift: 0, defined: defined),
+                              script: not esm and not cjs, wrapped: wrapped or cjs, shift: 0, defined: changed),
            scopes: final.table)
   where esm = early.program-has-module-syntax?(tree0) or module-extension?(path),
         tree = normalized-tree(tree0, base),
@@ -531,10 +534,18 @@ fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx
           false => not esm and ("module" in first.free or "exports" in first.free)
         }),
         defined = mentions-define?(src) and defines-apply?(tree, first.bindings),
-        final-tree = match defined {
+        defined-tree = match defined {
           true => dce.run(substitute(tree, first.bindings))
           false => tree
         },
+        constant-tree = match loading.inline-constants {
+          true => consts.inlined(defined-tree, tree0.body.kids, first.bindings, any i in 0..sym.scope-count(first.table): sym.scope-at(first.table, i).dynamic)
+          false => none
+        },
+        final-tree = (first c in constant-tree: c.tree) ?? defined-tree,
+        # What a constant decided may have removed a `require`: then what the file loads is found again.
+        changed = defined or (any c in constant-tree: c.decided),
+        # Constants written in remove reads and declare nothing: the bindings of what is left stand.
         final = match defined or (cjs and not wrapped) {
           true => sc.analysis(final-tree, [x for x in ["exports", "module"] if wrapped or cjs])
           false => first

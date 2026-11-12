@@ -9,13 +9,15 @@ use bundle.minhost as host
 use bundle.naming as nm
 use bundle.evaluation as ev
 use bundle.sourcemap as map
+use bundle.privates as privates
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
 # How the build emits: `undefined` as `void 0`, `require` native or not, the names a kept import binds
 # that nothing reads left out, and nodes stamped for a source map.
-record Emitting { void-undefined: Bool, native-require: Bool, drop-unused-imports: Bool, sourcemap: Bool, files: Bool }
+# `private-names`: whether private names are minified (`privates`).
+record Emitting { void-undefined: Bool, native-require: Bool, drop-unused-imports: Bool, sourcemap: Bool, files: Bool, private-names: Bool }
 
 setting emitting: Emitting
 # Code splitting: the statements of the chunk being printed, none when it is the whole program; and
@@ -45,7 +47,7 @@ fn target-of(s: Int) -> Int =
 fn import-target(s: Int, d: Int, n: Int) -> Int = match resolved-export(d, n) {
   some(t) => t
   none if m.db.dynamic(d) or m.modules[d].script => s
-  none => panic "No matching export in {} for import {}", m.modules[d].path, name-of(m.names, n)
+  none => panic "linking let through an import of {} from {}, which has no such export", name-of(m.names, n), m.modules[d].path
 }
 
 fn included?(id: Int) -> Bool = nm.included?(id)
@@ -208,7 +210,13 @@ rewrite List(...) as n => without-empty(n.out)
 fn without-empty(l: Node) -> Node = l with { kids: [k for k in l.kids if not (k is Empty())] }
 
 # A statement with its final names.
-fn rewritten(s: Node) -> Node = run(s).tree
+fn rewritten(s: Node) -> Node = match emitting.private-names and private-names?(s) {
+  true => privates.renamed(run(s).tree)
+  false => run(s).tree
+}
+
+# Whether a statement of this module's source has a private name in it, or might: a `#` in its text.
+fn private-names?(s: Node) -> Bool = s.lo >= 0 and s.hi > s.lo and count-byte(body.text, s.lo % 4294967296, s.hi % 4294967296, '#') > 0
 
 fn final-ident(n: Node, x: Text) -> Node = match cjs-import-of(n) {
   some(ci) => cjs-read(ci)
@@ -745,7 +753,27 @@ fn import-statement?(s: Node) -> Bool = s is Import(...) or s is ImportBare(...)
 # A part's statements: none for the namespace object's part. A part may stand for several, as a list.
 fn part-body(p: Int) -> [Node] = match an.stmt-in(body, here, p) {
   None() | Flag() => []
-  s => [stamped(x) for some(o) in [part-output(s)] for x in statements-of(o)]
+  s => [stamped(in-place-of(x, s)) for some(o) in [part-output(s)] for x in statements-of(o)]
+}
+
+# What the bundler writes in place of a statement (`var import_x = __toESM(require_x());` or
+# `init_x();` for an import) stands where the statement stood, for a source map, as esbuild maps
+# it: every made node near its top, as far down as an analysis marks what is written (`owned`), so
+# that the minifier joining it to another (`var a = …, import_x = …`) keeps its place. A statement
+# at the very start of its file is at offset 0, which `stamped` cannot tell from a made node's: it
+# is given its module here. Made nodes have no place (`lo` zero, or below for a template's).
+fn in-place-of(x: Node, s: Node) -> Node = match emitting.sourcemap or emitting.files {
+  false => x
+  true => placed-near(x, (here.id + 1) * map.module-unit + max(s.lo, 0), 4)
+}
+
+fn placed-near(n: Node, at: Int, depth: Int) -> Node = match n.lo, depth {
+  _, 0 => n
+  lo, _ if lo <= 0 => near with { lo: at }
+  _, _ => near
+} where near = match depth {
+  1 => n
+  _ => n with { kids: [placed-near(k, at, depth - 1) for k in n.kids] }
 }
 
 

@@ -450,7 +450,8 @@ fn wrapping(id: Int, wrapped: {Int:Bool}) -> {Int:Bool} = match m.modules[id] {
 fn none-wrapped() -> {Int:Bool} = {}
 
 # A name an import statement binds: its symbol, the module it is from, and its name there.
-record Bound { symbol: Int, target: Int, name: Text, namespace: Bool }
+# `importer`: the module the import is in; `at`: where in it the name it imports is written.
+record Bound { symbol: Int, target: Int, name: Text, namespace: Bool, importer: Int, at: Int }
 
 # Of the module `here` and its `body`.
 fn import-bindings(mo: m.Module) -> [Bound] = match mo.kind {
@@ -464,17 +465,18 @@ fn statement-bindings(mo: m.Module, s: Node) -> [Bound] = match s {
 }
 
 fn clause-bindings(mo: m.Module, t: Int, spec: Node) -> [Bound] = match spec {
-  ImportDefault(b) => [bound(mo, t, "default", b, false)]
-  ImportAs(name, b) => [bound(mo, t, m.module-name(name), b, false)]
-  ImportName(b) => [bound(mo, t, b.text, b, false)]
-  ImportNamespace(b) => [bound(mo, t, "*", b, true)]
-  ImportDefaultAnd(b, rest) => [bound(mo, t, "default", b, false)] ++ clause-bindings(mo, t, rest)
+  ImportDefault(b) => [bound(mo, t, "default", b, false, b.lo)]
+  ImportAs(name, b) => [bound(mo, t, m.module-name(name), b, false, name.lo)]
+  ImportName(b) => [bound(mo, t, b.text, b, false, b.lo)]
+  ImportNamespace(b) => [bound(mo, t, "*", b, true, b.lo)]
+  ImportDefaultAnd(b, rest) => [bound(mo, t, "default", b, false, b.lo)] ++ clause-bindings(mo, t, rest)
   ImportNamed(List(specs...)) => [x for s in specs for x in clause-bindings(mo, t, s)]
   _ => panic "{}: unexpected import form {}", mo.path, js.kind-name(spec.kind)
 }
 
-fn bound(mo: m.Module, t: Int, name: Text, b: Node, namespace: Bool) -> Bound =
-  Bound(symbol: m.symbol-in(body, mo, b.lo) ?? (panic "{}: no symbol for import {}", mo.path, b.text), target: t, name: name, namespace: namespace)
+fn bound(mo: m.Module, t: Int, name: Text, b: Node, namespace: Bool, at: Int) -> Bound =
+  Bound(symbol: m.symbol-in(body, mo, b.lo) ?? (panic "{}: no symbol for import {}", mo.path, b.text), target: t, name: name, namespace: namespace,
+        importer: mo.id, at: at % 4294967296)
 
 # A name a module re-exports from CommonJS: a property of its import variable.
 record Reexport { target: Int, name: Text, namespace: Bool, exported: Text }
@@ -762,7 +764,7 @@ fn chunk-root(r: Int) -> [link.Fact] = [link.fact-entry(r), link.fact-chunk-root
 fn binding-facts(b: Bound) -> [link.Fact] = match opaque?(m.modules[b.target]), b.namespace {
   true, _ => []
   false, true => [link.fact-ns-import(b.symbol, b.target)]
-  false, false => [link.fact-import-of(b.symbol, b.target, m.name-id(b.name))]
+  false, false => [link.fact-import-of(b.symbol, b.target, m.name-id(b.name)), link.fact-import-at(b.symbol, b.importer, b.at)]
 }
 
 fn facts-of(id: Int, summaries: [Summary], start: Int) -> [link.Fact] = module-facts(m.modules[id], summaries, start)
@@ -771,6 +773,8 @@ fn facts-of(id: Int, summaries: [Summary], start: Int) -> [link.Fact] = module-f
 # whose only symbol is its `require_x`; its dependencies are whatever it `require`s.
 fn module-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] =
   [link.fact-module-effects(id) for id in [mo.id] if mo.side-effects]
+  ++ [link.fact-script(id) for id in [mo.id] if mo.script]
+  ++ [link.fact-typescript(id) for id in [mo.id] if m.loader-of(mo.path) == "ts" or m.loader-of(mo.path) == "tsx"]
   ++ [link.fact-wrapped(mo.id) for id in [mo.id] if wrapped?(mo)] ++ parts-facts(mo, summaries, start)
 
 fn parts-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] = match mo.kind {
@@ -952,8 +956,9 @@ fn star-as-facts(mo: m.Module, part: Int, t: Int, exported: Text) -> [link.Fact]
 fn export-from-facts(mo: m.Module, part: Int, t: Int, specs: [Node]) -> [link.Fact] = match held?(m.modules[t]), kept?(m.modules[t]) {
   true, _ => reexport-import(mo, part, t) ++ [reexported(mo, part, export-spec-names(spec))... for spec in specs]
   _, true => [link.fact-effect(part)] ++ [kept-reexported(mo, part, export-spec-names(spec))... for spec in specs]
-  _, _ => [link.fact-reexport(mo.id, m.name-id(export-spec-names(spec)), t, m.name-id(m.module-name(spec.local)))
-            for spec in specs]
+  _, _ => [fact for spec in specs for name in [m.name-id(export-spec-names(spec))]
+            for fact in [link.fact-reexport(mo.id, name, t, m.name-id(m.module-name(spec.local))),
+                         link.fact-reexport-at(mo.id, name, spec.local.lo % 4294967296)]]
 }
 
 # ---------------------------------------------------------------- linking
@@ -968,4 +973,27 @@ fn linked-table(g: m.Graph) -> sym.Table =
   sym.joined-from(g.blocks, g.scopes, g.symbols, linked.made-ids, [x.scope for x in linked.made], [x.name for x in linked.made])
 
 # Every module's facts, once linking has worked out what it does, and what the rules derive from them.
-fn solved-facts() -> link.Db = match [summaries-of(id) for id in m.order] { _ => link.solved-blocks(fact-blocks()) }
+fn solved-facts() -> link.Db = match [summaries-of(id) for id in m.order] { _ => checked(link.solved-blocks(fact-blocks())) }
+
+# Linking's answers, once nothing imports what is not there: else the build stops, saying where.
+fn checked(db: link.Db) -> link.Db = match missing-exports(db) {
+  [] => db
+  errors => fail-build(join(errors, "\n"))
+}
+
+# Each import, and each `export … from`, of a name its module does not export, in the program's
+# order: where it is written, and what is missing from where.
+fn missing-exports(db: link.Db) -> [Text] =
+  [e.text for e in sort e in found by e.order]
+  where found = [Missing(order: ((m.ranks[mo] ?? mo) * 4294967296) + at, text: missing-text(mo, at, d, n)) for db.missing-import(?mo, ?at, ?d, ?n)]
+                ++ [Missing(order: ((m.ranks[mo] ?? mo) * 4294967296) + at, text: missing-text(mo, at, t, n)) for db.missing-reexport(?mo, ?at, ?t, ?n)]
+
+record Missing { order: Int, text: Text }
+
+fn missing-text(mo: Int, at: Int, target: Int, name: Int) -> Text =
+  m.shown-path(m.modules[mo].path) ++ ":" ++ int-text(line) ++ ":" ++ int-text(at - line-start + 1)
+  ++ ": No matching export in \"" ++ m.shown-path(m.modules[target].path) ++ "\" for import \"" ++ name-of(m.names, name) ++ "\""
+  where text = m.body-of(mo).text,
+        before = text[0..min(at, len(text))],
+        line = len(occurrences(before, ["\n"])) + 1,
+        line-start = (last-index-of(before, "\n") ?? -1) + 1

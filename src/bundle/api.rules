@@ -71,7 +71,8 @@ boxed record Options {
   sourcemap: Bool,
   defines: [DefineText],
   main-fields: [Text],
-  conditions: [Text],
+  # Conditions the build names besides the platform's (`--conditions`); none if it names none.
+  conditions: [Text]?,
   extensions: [Text],
   external: [Text],
   platform-node: Bool,
@@ -110,7 +111,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]", chunking: packing.options(),
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
-          defines: [], main-fields: ["browser", "module", "main"], conditions: ["import", "browser"],
+          defines: [], main-fields: ["browser", "module", "main"], conditions: none,
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
           packages-external: false, public-path: "", tsconfig: "", legal-comments: "eof", analyze: "", jsx: jsx.options-new(), target: lower.no-lowering,
@@ -118,7 +119,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           transform: keep-as-is, optimize: default-optimize)
 
 # Node's module system: builtins stay external, and packages resolve for node.
-fn on-node(o: Options) -> Options = o with { platform-node: true, main-fields: ["main", "module"], conditions: ["node", "require"] }
+fn on-node(o: Options) -> Options = o with { platform-node: true, main-fields: ["main", "module"] }
 
 fn with-define(o: Options, key: Text, value: Text) -> Options = o with { defines: o.defines ++ [DefineText(key: key, value: value)] }
 
@@ -342,7 +343,7 @@ fn loading-of(o: Options, out-dir: Text) -> m.Loading =
   m.Loading(defines: [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines], transform: o.transform,
             has-transform: o.has-transform, aliases: o.aliases, loaders: o.loaders, on-resolve: o.on-resolve,
             on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir,
-            packages-external: o.packages-external, public-path: o.public-path)
+            packages-external: o.packages-external, public-path: o.public-path, inline-constants: o.minify-syntax)
 
 fn linking-of(o: Options, entry-namespace: Bool, splitting: Bool, f: Format) -> an.Linking =
   an.Linking(entry-namespace: entry-namespace, tree-shaking: o.tree-shaking,
@@ -351,7 +352,9 @@ fn linking-of(o: Options, entry-namespace: Bool, splitting: Bool, f: Format) -> 
 
 fn emitting-of(o: Options, f: Format) -> e.Emitting =
   e.Emitting(void-undefined: o.minify-syntax, native-require: f.native-require,
-             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, files: len(o.analyze) > 0)
+             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, files: len(o.analyze) > 0,
+             # Lowered, a private name is a variable lowering names.
+             private-names: o.minify-identifiers and o.target >= 2022)
 
 # The names esbuild gives output files: the entry's path below the entries' common directory.
 fn common-dir(paths: [Text]) -> Text = fold dir = dir-of(paths[0]) for p in paths: enclosing(dir, p)
@@ -434,8 +437,14 @@ fn built(options: Options) -> [Written] = match options.splitting, options.outdi
 fn loader-map(o: Options) -> {Text:Text} = {l.key: l.value for l in o.loaders}
 
 fn resolve-options(o: Options) -> res.Options =
-  res.Options(main-fields: o.main-fields, conditions: o.conditions, extensions: o.extensions,
+  res.Options(main-fields: o.main-fields, conditions: resolution-conditions(o), extensions: o.extensions,
               external: o.external, node-builtins: o.platform-node)
+
+# The conditions a package's `exports` and `imports` are read with, as esbuild has them: the
+# platform's, and the build's own, or `module` (the ES module a CommonJS package offers to bundlers)
+# when it names none. `default` always holds, and `import` or `require` as the request is.
+fn resolution-conditions(o: Options) -> [Text] =
+  [if o.platform-node then "node" else "browser"] ++ (o.conditions ?? ["module"])
 
 fn with-extension(path: Text, ext: Text) -> Text = match dir-of(path) {
   "." if not starts-with(path, "./") => path-stem(path) ++ ext
@@ -561,10 +570,10 @@ fn final-names(o: Options) -> sym.Table = match o.minify-identifiers {
 # The rest of a build, once every symbol has its name: the program, its legal comments and its map;
 # the stylesheets it imports, beside it under its name; and the files those and its modules name.
 fn named-built(o: Options, f: Format) -> [Written] =
-  beside(o.outfile ++ ".LEGAL.txt", notes.file) ++ with-map(o, o.outfile, full, full, len(head) + out0.base, out0.marks)
+  beside(o.outfile ++ ".LEGAL.txt", notes.file) ++ js
   ++ [sheet-written(css-out, b)... for b in css]
   ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
-  ++ analysis-written(o, [analyze.Output(path: o.outfile, kind: "js", text: full, base: len(head) + out0.base, marks: out0.marks, root: m.entry,
+  ++ analysis-written(o, [analyze.Output(path: o.outfile, kind: "js", text: text-written(js, o.outfile), base: len(head) + out0.base, marks: out0.marks, root: m.entry,
                                          imports: [], dynamic: [])]
                          ++ [analyze.Output(path: css-out, kind: "css", text: b.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for b in css],
                       [m.entry])
@@ -577,6 +586,7 @@ fn named-built(o: Options, f: Format) -> [Written] =
         footer = match o.footer { "" => ""  t => t ++ "\n" },
         notes = legal.placed(o.legal-comments, legal-of-modules(none, {}), o.outfile),
         full = timed(o.timing, "print", head ++ out0.text ++ footer ++ notes.tail),
+        js = with-map(o, o.outfile, full, full, len(head) + out0.base, out0.marks),
         sheets = m.css-imports(),
         css-out = with-extension(o.outfile, ".css"),
         css = [cssb.bundle(sheets, css-out, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments)
@@ -587,7 +597,7 @@ fn named-built(o: Options, f: Format) -> [Written] =
 # crosses a group), the program they make lowered whole, and the lowered program made ASCII and
 # printed run by run (see `stable-runs`), on many threads at once.
 fn flat-output(o: Options, f: Format) -> Printed =
-  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
+  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks ++ [analyze.end-mark(len(all.text))])
   where groups = match o.has-optimize {
           true => [spec-optimized(o, e.group-made(g)) for g in e.groups()]
           false => [group-optimized(g) for g in e.groups()]
@@ -637,7 +647,7 @@ fn rendered-of(o: Options, stmts: [Node]) -> Rendered =
 fn grouped?(o: Options) -> Bool = not o.has-optimize and o.target >= lower.no-lowering
 
 fn grouped-output(o: Options, f: Format) -> Printed =
-  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks)
+  Printed(text: f.prefix ++ all.text ++ f.suffix, base: len(f.prefix), marks: all.marks ++ [analyze.end-mark(len(all.text))])
   where exports = export-statements(f),
         all = pieces-joined(o, [group-output(g) for g in e.groups()]
                                ++ [group-rendered(o, entry-calls(f))]
@@ -692,7 +702,7 @@ fn chunk-root-statements(c: chunks.Chunk) -> [Node] = match c.root {
 
 # The body of one chunk, as text with placeholders in it.
 fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.Unit]) -> Printed =
-  Printed(text: r.text ++ "\n", base: 0, marks: r.marks)
+  Printed(text: r.text ++ "\n", base: 0, marks: r.marks ++ [analyze.end-mark(len(r.text))])
   where emission = with e.units = selected, e.chunk-parts = some(c.parts), e.initializer-parts = c.initializers { e.program() },
         p = for-target(o, match o.minify-syntax {
           true => o.optimize(emission.tree)
@@ -711,7 +721,7 @@ setting chunk-options: Options
 fn chunk-at(i: Int) -> Printed = chunk-own(chunk-options, chunk-list[i], chunk-list, chunk-selected[i])
 
 fn chunk-own(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.Unit]) -> Printed =
-  Printed(text: r.text ++ "\n", base: 0, marks: r.marks)
+  Printed(text: r.text ++ "\n", base: 0, marks: r.marks ++ [analyze.end-mark(len(r.text))])
   where emission = with e.units = selected, e.chunk-parts = some(c.parts), e.initializer-parts = c.initializers { e.program() },
         p = ascii-of(o, dropped-of(o, match o.minify-syntax {
           true => default-optimize(emission.tree)
@@ -807,14 +817,15 @@ fn root-stylesheet(o: Options, root: Int, sheets: [Text]) -> RootStylesheet =
         }
 
 fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> [Written] =
-  [w for ws in [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths, homes) for i in 0..len(all)] for w in ws]
+  [w for ws in js for w in ws]
   ++ [sheet-written(s.path, s.bundle)... for s in styles]
-  ++ analysis-written(o, [chunk-analyzed(all, i, printed[i], holes[i], paths) for i in 0..len(all)]
+  ++ analysis-written(o, [chunk-analyzed(all, i, printed[i], holes[i], paths, text-written(js[i], paths[i])) for i in 0..len(all)]
                          ++ [analyze.Output(path: s.path, kind: "css", text: s.bundle.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for s in styles],
                       m.entries ++ an.linked.dynamic-roots)
   ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
         printed = chunk-programs(o, all, [chunk-units(c, unit-index) for c in all]),
+        js = [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths, homes) for i in 0..len(all)],
         texts = [p.text for p in printed] ++ [s.bundle.text for s in styles],
         holes = [chunks.holes-in(text) for text in texts],
         base = base-dir(o),
@@ -838,14 +849,17 @@ fn chunk-written(o: Options, c: chunks.Chunk, pr: Printed, holes: [chunks.Hole],
 
 # ---------------------------------------------------------------- what a build says of itself
 
-# A chunk as the analysis sees it: its text with every chunk's name in it, and where it passes from
+# A chunk as the analysis sees it: its text as written, every chunk's name in it, and where it passes from
 # one module's code to the next; what it imports, and what it loads with `import()`.
-fn chunk-analyzed(all: [chunks.Chunk], i: Int, pr: Printed, holes: [chunks.Hole], paths: [Text]) -> analyze.Output =
-  analyze.Output(path: paths[i], kind: "js", text: done.text, base: pr.base, marks: done.marks, root: c.root, imports: imports,
+fn chunk-analyzed(all: [chunks.Chunk], i: Int, pr: Printed, holes: [chunks.Hole], paths: [Text], text: Text) -> analyze.Output =
+  analyze.Output(path: paths[i], kind: "js", text: text, base: pr.base, marks: done.marks, root: c.root, imports: imports,
                  dynamic: [h.chunk for h in holes if h.chunk < len(all) and h.chunk != i and not (h.chunk in imports) distinct h.chunk])
   where c = all[i],
         done = chunks.filled(pr.text, pr.base, pr.marks, holes, paths[i], paths),
         imports = [other.id for other in all if other.id != c.id if other.id in c.needs or (c.root >= 0 and c.root in other.roots)]
+
+# The text written at `path`: what an analysis measures, the line naming the map included.
+fn text-written(ws: [Written], path: Text) -> Text = (first w in ws if w.path == path: w.text) ?? (panic "nothing written at {}", path)
 
 # With `--analyze=DIR`: the analysis as JSON. The page is made from the JSON
 # when asked (`esb --view=DIR`, bundle.view), not by the build.
