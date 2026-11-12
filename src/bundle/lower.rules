@@ -589,7 +589,7 @@ everywhere fn this-is(n: Node, ref: Node) -> Node = match n {
 fn own-this?(n: Node) -> Bool = sc.scope-kind(n.kind) == "function" and not (n is Arrow(...) | AsyncArrow(...))
 
 # A field's name is evaluated once, when the class is. So a computed one goes in a variable first,
-# set by a statement before the class.
+# set where the class would have evaluated it (see `keys-placed`).
 record Keyed { key: Node, setup: [Node] }
 
 fn field-key(k: Node) -> Keyed = match k {
@@ -665,10 +665,12 @@ fn set-holders(members: [Node], table: {Text:Private}, want-static: Bool) -> [Te
    distinct (table[name] ?? panic "lost a private name").holder]
 
 fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> ClassParts =
-  ClassParts(body: body with { kids: [List((made ++ [s for l in each for s in l.kept])...)] },
-             before: scanned.setup ++ [s for l in each for s in l.setup], after: [s for l in each for s in l.after],
+  ClassParts(body: body with { kids: [List((made ++ [s for k in placed.kept for s in k])...)] },
+             before: scanned.setup,
+             after: [ExprStmt(e) for e in placed.pending] ++ [s for l in each for s in l.after],
              statics: static-holders ++ [s for l in each for s in l.statics])
   where members = body.members.kids,
+        placed = keys-placed(each),
         scanned = scan-privates(members, privates),
         table = scanned.table,
         holders = [ExprStmt(helper-call("__privateAdd", [This(), Ident(h)])) for h in set-holders(members, table, false)],
@@ -677,6 +679,35 @@ fn lowered-class(body: Node, derived: Bool, inner-name: Text, ref: Node) -> Clas
         fields = holders ++ [s for l in each for s in l.fields],
         constructor = last l in each: l.constructor,
         made = [constructor-with-fields(constructor, fields, derived) for x in [fields] if len(x) > 0 or is-some(constructor)]
+
+# A class evaluates its members' names in order, before any static initializer runs. A field's,
+# once it is a variable set apart, is set where the class would have evaluated it, as esbuild does:
+# with the name of the next member the class keeps (`[(_a = k("f"), k("m"))]()`, a plain name made
+# computed), or, after the last, just after the class. A constructor keeps its name, and a private
+# method leaves the class, so neither takes them.
+record Placing { kept: [[Node]], pending: [Node] }
+
+fn keys-placed(each: [Lowered]) -> Placing =
+  fold p = Placing(kept: [], pending: []) for l in each: match l.kept {
+    [m, rest...] if len(p.pending) > 0 and is-some(keyed-first(m, p.pending)) =>
+      Placing(kept: p.kept ++ [[keyed-first(m, p.pending) ?? m] ++ rest], pending: l.setup)
+    _ => Placing(kept: p.kept ++ [l.kept], pending: p.pending ++ l.setup)
+  }
+
+# A member whose name first evaluates `first`, or none for one without a name to put it in.
+fn keyed-first(m: Node, first: [Node]) -> Node? = match m {
+  StaticMethod(inner) => first x in keyed-first(inner, first): StaticMethod(x) with { lo: m.lo, hi: m.hi }
+  Method(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...) | AsyncGenMethod(key, ...) | Getter(key, ...) | Setter(key, ...) =>
+    first k in computed-key(key, first): m with { kids: [k] ++ m.kids[1..len(m.kids)] }
+  _ => none
+}
+
+fn computed-key(key: Node, first: [Node]) -> Node? = match key {
+  Computed(e) => some(Computed(seq(first ++ [e])) with { lo: key.lo, hi: key.hi })
+  PropName(x) => some(Computed(seq(first ++ [string-of(x)])) with { lo: key.lo, hi: key.hi })
+  Str(_) | Num(_) => some(Computed(seq(first ++ [key])) with { lo: key.lo, hi: key.hi })
+  _ => none
+}
 
 # What one member becomes, wherever it goes: instance fields, static fields, statements after the
 # class, the members it keeps, its constructor, and statements before it all.

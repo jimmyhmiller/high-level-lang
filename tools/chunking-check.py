@@ -483,9 +483,11 @@ for policy, fragments in MODES:
     assert "ONLY_X_COMPUTES" not in closure(output, "b.js")
 print("ok   a side-effect-free module that computes as it loads is loaded only by the entry using it")
 
-# What runs as a library loads, placed apart from its initialization when nothing could tell:
-# `/*@__PURE__*/` values (three.js's scratch vectors), classes extending a name, static blocks that
-# mark a class, and writes to a class's own properties. Each entry loads only its own.
+# What runs as a library loads (`/*@__PURE__*/` values, three.js's scratch vectors among them;
+# classes extending a name; static blocks that mark a class; writes to a class's own properties) may
+# be placed apart from its initialization, but loads wherever the library is initialized: in a chunk
+# only its users load, it would be computed later than the library was, after code that may have
+# changed what it reads. What runs nothing as it is defined, a function, is its users' alone.
 def only_own(output, entry, own, other):
     text = closure(output, entry)
     return own in text and other not in text
@@ -506,22 +508,23 @@ export class Shape extends Base { area() { return "SHAPE_ONLY".length; } }
 export class Color { static NAMES = { red: 1 }; *[Symbol.iterator]() { yield "COLOR_ONLY"; } }
 const _white = /*@__PURE__*/ new Color();
 export function white() { return [..._white][0]; }
+export function helperA() { return "HELPER_A"; }
+export function helperB() { return "HELPER_B"; }
 """,
-    "a.js": 'import {Vec} from "./library.js"; export const result = [new Vec(1).add(new Vec(2)).x, new Vec().isVec, Vec.ZERO.x, globalThis.__inits];\n',
-    "b.js": 'import {Shape, white, late} from "./library.js"; export const result = [new Shape().area(), new Shape().isBase, new Shape().base(), white(), late(), globalThis.__inits];\n',
+    "a.js": 'import {Vec, helperA} from "./library.js"; export const result = [new Vec(1).add(new Vec(2)).x, new Vec().isVec, Vec.ZERO.x, helperA(), globalThis.__inits];\n',
+    "b.js": 'import {Shape, white, late, helperB} from "./library.js"; export const result = [new Shape().area(), new Shape().isBase, new Shape().base(), white(), late(), helperB(), globalThis.__inits];\n',
 })
 expected = original(root, "[m0.result,m1.result]")
 for policy, fragments in MODES:
     output = build(root, ["a.js", "b.js"], policy, fragments)
     assert execute(root, output, ["a.js", "b.js"], "[m0.result,m1.result]") == expected
     if fragments:
-        assert only_own(output, "a.js", "VEC_ONLY", "SHAPE_ONLY"), policy
-        assert only_own(output, "b.js", "SHAPE_ONLY", "VEC_ONLY"), policy
-        assert "COLOR_ONLY" not in closure(output, "a.js"), policy
-        # A write after something already made of the class stays in the initialization, and so does
-        # what was made: every importer constructs it as the library loads, as native ESM does.
-        assert "LATE_ONLY" in closure(output, "a.js"), policy
-print("ok   pure values, extended classes, static marks and own-class writes leave the island")
+        # Computed as the library loads, so loaded by every entry that initializes it.
+        for marker in ("VEC_ONLY", "SHAPE_ONLY", "COLOR_ONLY", "LATE_ONLY"):
+            assert marker in closure(output, "a.js") and marker in closure(output, "b.js"), (policy, marker)
+        assert only_own(output, "a.js", "HELPER_A", "HELPER_B"), policy
+        assert only_own(output, "b.js", "HELPER_B", "HELPER_A"), policy
+print("ok   what computes as a library loads loads wherever it is initialized; functions stay their users'")
 
 # What must not leave it: a value initialization changes before it is made; a value read before
 # it stands; a class property initialization reads before it is written; a function that assigns

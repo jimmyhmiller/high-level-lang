@@ -251,15 +251,23 @@ a method of, or hands on); an attached write's target is not run before the writ
 and the declarations of the names it assigns share a unit, since another chunk's import of a
 name cannot be assigned. These are decided for the whole program at once and grown to a fixed
 point. What a module that imports this one changes is not counted, as it ran after this module's
-statements. An eager value whose chunk loads only later, after an `import()`, would see such
-changes where the original saw none; that case is not checked. Placed apart, a fragment depends only on what it reads; an import of its module still runs
+statements; for that to hold, a unit that computes as its chunk loads (an eager value, an attached
+write) loads wherever its module is initialized, as well as where it is used, so it is never
+computed later than the module was: loaded only after an `import()`, or by a second entry on the
+page, it would see what ran in between change what it reads (`new W()` reading a global the first
+entry set). Placed apart, a fragment depends only on what it reads; an import of its module still runs
 that module's initializer. Consumers propagate through the resulting graph before packing.
 
-On three.js, three pages each using one part of it (math, a scene, loaders) load 292, 361 and
-485 KB minified, where whole modules load 485 KB for each (esbuild: 480 KB); each bundled alone
-is 271, 330 and 482 KB. An immer page using only `produce` loads 11.5 KB rather than 18.1, and a
-d3 page 39.3 KB rather than 44.9; zod, rxjs, date-fns and lodash-es are unchanged, as their pages
-need what they share. Placing statements apart costs 9–16% more CPU on these builds
+So what fragments move between pages is code that runs nothing as it is defined: functions and
+inert values. An immer page using only `produce` loads 11.5 KB rather than 18.1, a d3 page 43.0 KB
+rather than 44.9, and of the libraries in `benchmarks/heldout`, a redux toolkit page 26.7 KB rather
+than 43.8, a valibot page 3.5 KB rather than 5.1, a query-core page 3.1 KB rather than 4.8. On
+three.js, three pages each using one part of it (math, a scene, loaders) load 484, 485 and 484 KB
+minified, where whole modules load 485 KB for each (esbuild: 480 KB): what its pages do not share
+is mostly values made as it loads (`const _v = /*@__PURE__*/ new Vector3()`), which stay with its
+initialization. (They were placed with what uses them before 2026-11-12, for 292, 361 and 485 KB,
+which was not sound.) zod, rxjs, date-fns and lodash-es are unchanged, as their pages need what
+they share. Placing statements apart costs 9–16% more CPU on these builds
 (`tools/fragments-real.py` measures, and runs every output against the unbundled source).
 Dynamic scopes, `import.meta`, wrappers, duplicate declarations, module cycles and dependencies
 that cannot be analyzed retain a whole-module boundary. Dependency cycles are condensed and
@@ -981,13 +989,19 @@ Being explicit, because "everything esbuild does" is a lot:
   is printed compact: `--pretty` breaks lines, without esbuild's indentation, so compare sizes
   minified.
 
-Known semantic gaps remain outside the Workbench acceptance target: scope hoisting does not
-preserve imported aliases accessed only through direct `eval`, and class-field lowering can
-reorder computed field and method keys. An assignment to a top-level `const` is not rejected, as
-esbuild rejects it: the bundle's top level is `var`, so the assignment succeeds where the original
-throws. Local declarations read only by direct `eval` now retain
-both their liveness and spelling, but complete lexical-environment preservation needs further work.
-These are correctness bugs, not completed production guarantees.
+Known semantic gaps remain outside the Workbench acceptance target, all of which esbuild has too:
+scope hoisting does not preserve imported names read only through direct `eval` (`eval("y")` for
+`import { x as y }`; local declarations read only by direct `eval` keep their liveness and
+spelling). Code that is not strict, put in an ES module output, becomes strict: a
+duplicate parameter name or an assignment to an undeclared name then fails where the original did
+not. ES modules put in IIFE or CommonJS output are no longer strict (`this` in a plain call is the
+global object). These are correctness bugs, not completed production guarantees.
+
+What the language forbids and a bundle would let through is an error, as esbuild reports it: an
+assignment to a `const`, a class's own name inside it, an import or a namespace import's property
+(a bundle makes them `var`s in one scope, where the assignment would succeed); and, for ES module
+output, `delete x` and `with` in code that is not strict (`src/bundle/writes.rules`). Legacy octal
+numbers and escapes in such code are printed as what they mean (`010` as `8`).
 
 ## Layout
 

@@ -447,6 +447,11 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "
       + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} fixture groups across all policies, fragment modes, minification and entry orders" if code == 0 else out[-1800:]))
 
+print("== programs a bundle once got wrong")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "correctness-check.py"), ESB], 300)
+check(code == 0 and "correctness checks passed" in out, "forbidden writes, legacy octal, lowered computed keys, fragments' load time: "
+      + (out.strip().split("\n")[-1] if code == 0 else out[-1800:]))
+
 print("== package resolution and application assets")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "resolution-check.py"), ESB], 180)
 check(code == 0 and "resolution checks passed" in out, "package maps, request kinds, workspace identity and browser mappings: " + out.strip().split("\n")[-1])

@@ -7,6 +7,7 @@ use bundle.jspieces as jsp
 use bundle.resolve as res
 use bundle.dce as dce
 use bundle.constants as consts
+use bundle.writes as writes
 use bundle.early as early
 use bundle.calls as calls
 use bundle.comments as cm
@@ -61,7 +62,9 @@ boxed record Module {
   calls: Bool,
   # A script nothing requires or imports whole: it exports nothing, and a name imported from it is
   # undefined, as esbuild has it.
-  script: Bool
+  script: Bool,
+  # What it writes that the language forbids (bundle.writes), which linking reports.
+  forbidden: [writes.Forbidden]
 }
 
 record TextPair { key: Text, value: Text }
@@ -356,7 +359,7 @@ fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-
 fn blank-module(id: Int, path: Text, kind: ModuleKind, root: Int) -> Module =
   Module(id: id, path: path, kind: kind, root: root, side-effects: true,
          deps: [], dep-ids: {}, require-ids: {}, symbol-shift: 0, base: base-name(path), free: [],
-         legal: [], helpers: [], calls: true, script: false)
+         legal: [], helpers: [], calls: true, script: false, forbidden: [])
 
 # What a module is made of: its tree; the symbol each name leaf is, by where it starts, as its own
 # table numbers them; its statements as written; its source; and where it marks calls pure.
@@ -503,11 +506,12 @@ boxed record Parsed {
 # `defined`: whether a define, or a constant written in, changed the tree.
 # `script`: no module syntax, and no `module` or `exports`; `wrapped`: analysed inside CommonJS's
 # wrapper, as a script must be to become CommonJS.
+# `forbidden`: what it writes that the language forbids (bundle.writes).
 boxed record Analysis { tree: Node, root: Int, bindings: {Int:Int}, free: [Text], cjs: Bool, script: Bool, wrapped: Bool, shift: Int,
-                  defined: Bool }
+                  defined: Bool, forbidden: [writes.Forbidden] }
 
 fn no-analysis() -> Analysis =
-  Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, script: false, wrapped: false, shift: 0, defined: false)
+  Analysis(tree: None(), root: -1, bindings: {}, free: [], cjs: false, script: false, wrapped: false, shift: 0, defined: false, forbidden: [])
 
 # A file's scopes, and the table they are in.
 boxed record Analysed { analysis: Analysis, scopes: sym.Table }
@@ -522,7 +526,8 @@ boxed record Analysed { analysis: Analysis, scopes: sym.Table }
 # all. A name free in any of the analyses is free.
 fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed =
   Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
-                              script: not esm and not cjs, wrapped: wrapped or cjs, shift: 0, defined: changed),
+                              script: not esm and not cjs, wrapped: wrapped or cjs, shift: 0, defined: changed,
+                              forbidden: writes.forbidden(final-tree, tree0.body.kids, final.bindings, esm)),
            scopes: final.table)
   where esm = early.program-has-module-syntax?(tree0) or module-extension?(path),
         tree = normalized-tree(tree0, base),
@@ -907,7 +912,7 @@ fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift
     legal: l.parsed.legal, helpers: l.parsed.helpers, deps: deps,
     dep-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].kind == res.Import},
     require-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].kind == res.Require}, calls: len(l.calls) > 0,
-    script: l.analysis.script and kind == Esm
+    script: l.analysis.script and kind == Esm, forbidden: l.analysis.forbidden
   } where kind = match l.analysis.cjs, l.analysis.script and whole {
     true, _ => Cjs
     false, true if not l.analysis.wrapped =>

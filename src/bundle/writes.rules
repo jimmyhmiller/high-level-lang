@@ -1,0 +1,130 @@
+# Writes the language forbids, which a bundle would let through, reported as esbuild reports them,
+# where written:
+#
+# - an assignment to a `const`, or to a class's own name inside the class: the program throws when
+#   it runs; a bundle makes the top level `var`, where it would not;
+# - an assignment to an import, or to a property of a namespace import: a module's exports are
+#   read-only to whoever imports them; joined into one scope, they would not be;
+# - in a file that is not strict (a script, or CommonJS), `delete x` of a name and `with`, which
+#   output that is an ES module, always strict, cannot hold.
+#
+# Found in one walk of a file, as marks by place; which symbol each place is joins them.
+rules bundle.writes over bundle.js
+
+# Something the language forbids: where, what, and whether only an ES module output forbids it.
+record Forbidden { at: Int, message: Text, strict: Bool }
+
+enum MarkKind { Constant, Imported, Namespace, Written, NamespaceWritten, DeletedName, WithStatement, ClassName }
+
+# A place: a declaration of a constant, an import or a class name (`to`: where its class body ends,
+# inside which its name is constant), a write of a name, of a namespace import's property (`name`),
+# a `delete` of a name, a `with`.
+record Mark { kind: MarkKind, at: Int, name: Text, to: Int }
+
+fn mark(kind: MarkKind, n: Node) -> Mark = Mark(kind: kind, at: n.lo, name: n.text, to: 0)
+
+# What a file forbids. `top`: the program's statements as written, before its top level became
+# `var`s (which says which were `const`s); `b`: which symbol each name leaf is; `strict`: whether
+# the file is an ES module, where `delete x` and `with` are errors already.
+fn forbidden(tree: Node, top: [Node], b: {Int:Int}, strict: Bool) -> [Forbidden] =
+  [Forbidden(at: w.at, message: "Cannot assign to \"" ++ w.name ++ "\" because it is a constant", strict: false)
+   for w in written if (b[w.at] ?? -1) in constants]
+  ++ [Forbidden(at: w.at, message: "Cannot assign to \"" ++ c.name ++ "\" because it is a constant", strict: false)
+      for w in written for c in first c in classes if w.at > c.at and w.at < c.to and (b[w.at] ?? -1) == (b[c.at] ?? -2): c]
+  ++ [Forbidden(at: w.at, message: "Cannot assign to import \"" ++ w.name ++ "\"", strict: false)
+      for w in written if (b[w.at] ?? -1) in imported]
+  ++ [Forbidden(at: w.at, message: "Cannot assign to import \"" ++ w.name ++ "\"", strict: false)
+      for w in marks if w.kind == NamespaceWritten and (b[w.to] ?? -1) in namespaces]
+  ++ [Forbidden(at: x.at, message: "Delete of a bare identifier cannot be used with the \"esm\" output format due to strict mode", strict: true)
+      for x in marks if x.kind == DeletedName and not strict]
+  ++ [Forbidden(at: x.at, message: "With statements cannot be used with the \"esm\" output format due to strict mode", strict: true)
+      for x in marks if x.kind == WithStatement and not strict]
+  where marks = marks-in(tree) ++ [x for st in top for x in top-constants(st)],
+        written = [w for w in marks if w.kind == Written],
+        constants = {s: true for x in marks if x.kind == Constant for s in b[x.at]},
+        imported = {s: true for x in marks if x.kind == Imported or x.kind == Namespace for s in b[x.at]},
+        namespaces = {s: true for x in marks if x.kind == Namespace for s in b[x.at]},
+        classes = [x for x in marks if x.kind == ClassName]
+
+# The names a top-level `const` declares, as written.
+fn top-constants(s: Node) -> [Mark] = match s {
+  ConstDecl(List(ds...)) | ExportLexical(ConstDecl(List(ds...))) => [x for d in ds for x in names-of(d.target)]
+  _ => []
+}
+
+fn names-of(t: Node) -> [Mark] = match t {
+  BindName(_) => [mark(Constant, t)]
+  ArrayPattern(List(slots...)) | ObjectPattern(List(slots...)) => [names-of(x)... for x in slots]
+  PatItem(e) | PatLast(e) | PatRest(e) | PatPropRest(e) => names-of(e)
+  BindElement(target, _) | PatProp(_, target) => names-of(target)
+  PatShort(name, _) => [mark(Constant, name)]
+  _ => []
+}
+
+# A class's name, as the program wrote it: a class at the top level is a `var` holding a class
+# whose own name inside it, made with no width where the class starts, is the name with `_`.
+fn class-name(c: Node, name: Node) -> Text = match name.text {
+  "_" ++ own if name.lo == c.lo and name.hi == name.lo => own
+  x => x
+}
+
+everywhere fn marks-in(n: Node) -> [Mark] = match n {
+  ConstDecl(List(ds...)) | ConstInit(List(ds...)) =>
+    [x for d in ds for x in declared(d.target)] ++ [marks-in(d.init)... for d in ds]
+  ConstLeft(t) => declared(t)
+  ClassDecl(BindName(_) as name, heritage, body) | ClassExpr(BindName(_) as name, heritage, body) =>
+    [Mark(kind: ClassName, at: name.lo, name: class-name(n, name), to: body.hi)] ++ marks-in(heritage) ++ marks-in(body)
+  ImportDefault(b) | ImportName(b) | ImportAs(_, b) => [mark(Imported, b)]
+  ImportNamespace(b) => [mark(Namespace, b)]
+  ImportDefaultAnd(b, rest) => [mark(Imported, b)] ++ marks-in(rest)
+  Assignment(target, op, value) => match op.text {
+    "=" => targets(target) ++ marks-in(value)
+    _ => target-marks(target) ++ marks-in(value)
+  }
+  PreInc(t) | PreDec(t) | PostInc(t) | PostDec(t) => target-marks(t)
+  ForIn(left, right, body) => left-marks(left) ++ marks-in(right) ++ marks-in(body)
+  ForOf(_, left, right, body) => left-marks(left) ++ marks-in(right) ++ marks-in(body)
+  Delete(Ident(_) as x) => [mark(DeletedName, x)]
+  Delete(Paren(Ident(_) as x)) => [mark(DeletedName, x)]
+  With(object, body) as w => [Mark(kind: WithStatement, at: w.lo, name: "", to: 0)] ++ marks-in(object) ++ marks-in(body)
+}
+
+# The names a binding pattern declares, and what its defaults and computed keys hold.
+fn declared(t: Node) -> [Mark] = match t {
+  BindName(_) => [mark(Constant, t)]
+  ArrayPattern(List(slots...)) => [declared(s)... for s in slots]
+  ObjectPattern(List(props...)) => [declared(p)... for p in props]
+  PatItem(e) | PatLast(e) | PatRest(e) | PatPropRest(e) => declared(e)
+  BindElement(target, init) => declared(target) ++ marks-in(init)
+  PatProp(key, value) => marks-in(key) ++ declared(value)
+  PatShort(name, init) => [mark(Constant, name)] ++ marks-in(init)
+  _ => marks-in(t)
+}
+
+# A `for … in`/`of` head: a declaration (`const x` among them), or a target written each turn.
+fn left-marks(left: Node) -> [Mark] = match left {
+  VarLeft(...) | VarLeftInit(...) | LetLeft(...) | ConstLeft(...) => marks-in(left)
+  _ => targets(left)
+}
+
+# What an assignment's target writes: a name, a namespace's property, or names inside a pattern
+# (`[a, { b }] = …`), with what its defaults and keys hold.
+fn targets(t: Node) -> [Mark] = match t {
+  ArrayLit(List(slots...)) => [targets(s)... for s in slots]
+  ObjectLit(List(props...)) => [targets(p)... for p in props]
+  Elem(v) | ElemLast(v) | Spread(v) | SpreadProp(v) => targets(v)
+  Prop(key, value) => marks-in(key) ++ targets(value)
+  Shorthand(Ident(_) as name) => [mark(Written, name)]
+  CoverInit(Ident(_) as name, value) => [mark(Written, name)] ++ marks-in(value)
+  Assignment(target, _, value) => targets(target) ++ marks-in(value)
+  _ => target-marks(t)
+}
+
+# A simple target: a name, a namespace import's property, or anything else, whose parts may write.
+fn target-marks(t: Node) -> [Mark] = match t {
+  Ident(_) => [mark(Written, t)]
+  Paren(x) => target-marks(x)
+  Member(Ident(_) as ns, property) => [Mark(kind: NamespaceWritten, at: property.lo, name: property.text, to: ns.lo)]
+  Index(Ident(_) as ns, Str(raw)) => [Mark(kind: NamespaceWritten, at: ns.lo, name: unquote(raw), to: ns.lo)] ++ marks-in(t)
+  _ => marks-in(t)
+}
