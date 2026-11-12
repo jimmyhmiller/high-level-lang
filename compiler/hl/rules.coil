@@ -320,7 +320,9 @@
                     ~(coil-type (mut k) (map-val t)))
         (fn? t)
           (let [(mut ps) (primitive/code-list-new)]
-            (for p (fn-params t) (push! (mut ps) (coil-type (mut k) p)))
+            ;; A facts database is passed by reference, as the program's functions take one.
+            (for p (fn-params t)
+              (push! (mut ps) (if (facts-db? (mut k) p) `(mut ~(coil-type (mut k) p)) (coil-type (mut k) p))))
             `(fnptr (cc/C) [~@ps] ~(coil-type (mut k) (fn-ret t))))
         :else
           (let [native (sym (qualified (mut k) (type-module t) (type-name t)))]
@@ -3634,7 +3636,8 @@
                  (n g/Node)
                  (module (slice u8))
                  (f Func)
-                 (args (ArrayList g/Node))]
+                 (args (ArrayList g/Node))
+                 (binds (mut CodeBuilder))]
   (-> Code)
   (unless (= (len args) (len (.params f)))
     (die (mut k)
@@ -3647,11 +3650,14 @@
     (for i (range 0 (len args))
       (let [p (get (.params f) i)
             a (get args i)]
-        (if (.by-ref p)
+        (cond (.by-ref p)
             (let [x (place (mut k) a)]
               (unless (= (.ty x) (.ty p))
                 (die (mut k) a (cat4 "expected " (.ty p) ", found " (.ty x))))
               (push! (mut out) `(mut ~(.code x))))
+          (shared-param? (mut k) module f p)
+            (push! (mut out) (shared-arg (mut k) a (.ty p) (mut binds)))
+          :else
             (match (narrowed-arg (mut k) a module f i)
               (Some [x] (push! (mut out) x))
               (None []
@@ -3706,9 +3712,31 @@
           (match (mutated-setting (mut k) n module f args)
             (Some [t] t)
             (None []
-                  (let [cs (args-code (mut k) n module f args)]
-                    (te `(~(sym (qualified (mut k) module (.coil f))) ~@cs)
+                  (let [(mut binds) (primitive/code-list-new)
+                        cs (args-code (mut k) n module f args (mut binds))]
+                    (te `(let [~@binds] (~(sym (qualified (mut k) module (.coil f))) ~@cs))
                         (.ret f))))))))
+
+;;; A facts database passed by reference (see `shared-param?`): a local that holds one is passed
+;;; where it is; anything else (a setting, which notes that it was read; a field; a call's answer) is
+;;; put in a place of its own first, in `binds`.
+(defn shared-arg [(k (mut Comp)) (a g/Node) (ty (slice u8)) (binds (mut CodeBuilder))] (-> Code)
+  (let [local (if (= (.kind a) (g/KName))
+                  (match (find-local (mut k) (.text a))
+                    (Some [l] (if (or (.mutable l) (.place l)) (Some l) (None [Local])))
+                    (None [] (None [Local])))
+                  (None [Local]))]
+    (match local
+      (Some [l]
+            (do (unless (= (.ty l) ty)
+                  (die (mut k) a (cat4 "expected " ty ", found " (.ty l))))
+                `(mut ~(sym (.sym l)))))
+      (None []
+            (let [x (expect (mut k) a (expr (mut k) a ty) ty)
+                  t (fresh (mut k) "shared")]
+              (push! (mut binds) `(mut ~(sym t)))
+              (push! (mut binds) (.code x))
+              `(mut ~(sym t)))))))
 
 ;;; A foreign function that changes a setting in place, one whose declaration says what it may
 ;;; change (`changes`): each of those read before and after, and what is not the same changed, as a
@@ -4889,21 +4917,24 @@
                      (ty (slice u8))
                      (args (ArrayList g/Node))] (-> TE)
   (let [ps (fn-params ty)
-        (mut out) (primitive/code-list-new)]
+        (mut out) (primitive/code-list-new)
+        (mut binds) (primitive/code-list-new)]
     (unless (= (len ps) (len args))
       (die (mut k)
            n
            (cat "wrong number of arguments for a function of type " ty)))
     (for i (range 0 (len args))
-      (let [x
-              (expect (mut k)
-                      (get args i)
-                      (expr (mut k) (get args i) (get ps i))
-                      (get ps i))]
-        (push! (mut out) (.code x))))
+      (if (facts-db? (mut k) (get ps i))
+          (push! (mut out) (shared-arg (mut k) (get args i) (get ps i) (mut binds)))
+          (let [x
+                  (expect (mut k)
+                          (get args i)
+                          (expr (mut k) (get args i) (get ps i))
+                          (get ps i))]
+            (push! (mut out) (.code x)))))
     ;; A call's head must be a name.
     (let [t (fresh (mut k) "f")]
-      (te `(let [~(sym t) ~f] (~(sym t) ~@out)) (fn-ret ty)))))
+      (te `(let [~(sym t) ~f ~@binds] (~(sym t) ~@out)) (fn-ret ty)))))
 
 ;;; `db.rel(a, b)` as a question: is there such a row? `_` matches anything.
 (defn relation-test [(k (mut Comp))
@@ -6346,6 +6377,25 @@
        (> (mod-index (mut k) (type-module t)) -1)
        (= (.sort (mod-at (mut k) (type-module t))) (SFacts))
        (= (type-name t) "Db")))
+
+;;; A facts database a function is given, not to change: passed by reference, as nothing in the
+;;; program changes it but the indexes its queries make as they are first asked for. The program's
+;;; own functions take one so, and `why-REL`; the facts compiler's others take it as they say.
+(defn shared-param? [(k (mut Comp)) (module (slice u8)) (f Func) (p Param)] (-> bool)
+  (and (not (.by-ref p))
+       (facts-db? (mut k) (.ty p))
+       (or (!= (.sort (mod-at (mut k) module)) (SFacts))
+           (rt/at? (.name f) 0 "why-"))))
+
+;;; A parameter as the function's Coil definition declares it, and an argument of the function's own
+;;; parameter passed on to a function that takes the same.
+(defn param-decl [(k (mut Comp)) (module (slice u8)) (f Func) (p Param) (s Code)] (-> Code)
+  (if (or (.by-ref p) (shared-param? (mut k) module f p))
+      `(~s (mut ~(coil-type (mut k) (.ty p))))
+      `(~s ~(coil-type (mut k) (.ty p)))))
+
+(defn param-pass [(k (mut Comp)) (module (slice u8)) (f Func) (p Param) (s Code)] (-> Code)
+  (if (or (.by-ref p) (shared-param? (mut k) module f p)) `(mut ~s) s))
 
 (defn setting-changed-code [(k (mut Comp))
                             (module (slice u8))
@@ -8299,9 +8349,8 @@
         (mut params) (primitive/code-list-new)
         (mut args) (primitive/code-list-new)]
     (for i (range 0 (len (.params f)))
-      (push! (mut params)
-             `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
-      (push! (mut args) (memo-arg i)))
+      (push! (mut params) (param-decl (mut k) (.self k) f (get (.params f) i) (memo-arg i)))
+      (push! (mut args) (param-pass (mut k) (.self k) f (get (.params f) i) (memo-arg i))))
     (emit! (mut out) (compile-fn-as (mut k) d (cat "audited--" name)))
     (emit! (mut out)
            `(defn ~(sym name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
@@ -8384,9 +8433,8 @@
     (for i (range 0 (len (.params f)))
       (when (.by-ref (get (.params f) i))
         (die (mut k) d "a function that works apart takes nothing by reference: what it changed would be let go"))
-      (push! (mut params)
-             `(~(memo-arg i) ~(coil-type (mut k) (.ty (get (.params f) i)))))
-      (push! (mut args) (memo-arg i)))
+      (push! (mut params) (param-decl (mut k) (.self k) f (get (.params f) i) (memo-arg i)))
+      (push! (mut args) (param-pass (mut k) (.self k) f (get (.params f) i) (memo-arg i))))
     (emit! (mut out) (compile-fn-as (mut k) d working))
     (emit! (mut out)
            `(defn ~(sym coil-name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
@@ -8448,22 +8496,11 @@
     (clear! (mut (.locals k)))
     (set! (.returned k) false)
     (set! (.ret k) (.ret f))
-    (let [(mut placed) (primitive/code-list-new)
-          (mut any-placed) false]
     (for p (.params f)
-      (let [db (and (not (.by-ref p)) (facts-db? (mut k) (.ty p)))
-            local (if db (bind-place! (mut k) (.name p) (.ty p)) (bind-local! (mut k) (.name p) (.ty p) (.by-ref p)))
-            given (if db (fresh (mut k) (cat "given-" (.name p))) local)]
-        (push! (mut args) (sym given))
-        ;; A database given is put in a place once, for the queries of the body to read through.
-        (when db
-          (set! any-placed true)
-          (push! (mut placed) `(mut ~(sym local)))
-          (push! (mut placed) (sym given)))
-        (push! (mut params)
-               (if (.by-ref p)
-                   `(~(sym given) (mut ~(coil-type (mut k) (.ty p))))
-                   `(~(sym given) ~(coil-type (mut k) (.ty p)))))))
+      (let [shared (shared-param? (mut k) (.self k) f p)
+            local (if shared (bind-place! (mut k) (.name p) (.ty p)) (bind-local! (mut k) (.name p) (.ty p) (.by-ref p)))]
+        (push! (mut args) (param-pass (mut k) (.self k) f p (sym local)))
+        (push! (mut params) (param-decl (mut k) (.self k) f p (sym local)))))
     (set! (.in-fn k) true)
     (set! (.task-used k) false)
     (let [body
@@ -8484,7 +8521,7 @@
       (when (and (!= (.ret f) "Void") (= (.ty body) "Void"))
         (die (mut k) body-node (cat "this function must answer " (.ret f))))
       `(defn ~(sym coil-name) [~@params] (-> ~(coil-type (mut k) (.ret f)))
-         ~(if any-placed `(let [~@placed] ~code) code))))))
+         ~code))))
 
 ;;; A function that divides work into a stage's units, when the pipeline names another that gives
 ;;; the same answer undivided (`alone F is G`): the test that the stage works on one thread, and
@@ -10781,15 +10818,29 @@
                      (cat ": it takes " (rt/joined want ", "))
                      (cat ", for " full))))
         (push! (mut arms) `(= ~sel ~(+ base i)))
-        (push! (mut arms)
-               (if (= module (.self k))
-                   `(~(sym (.coil g)) ~@args)
-                   ;; Through its registered value: its module is not imported (see `sig-only`).
-                   `(let [hook-fn
-                            (load (cast (ptr ~(coil-type (mut k) (func-type g)))
-                                        (rt/hook-cell ~hook
-                                                      (primitive/alloc-static i64))))]
-                      (hook-fn ~@args))))))
+        ;; A facts database it takes is passed by reference (see `shared-param?`), from a place of its own.
+        (let [(mut binds) (primitive/code-list-new)
+              (mut passed) (primitive/code-list-new)
+              (mut j) 0
+              listed `(~@args)]
+          (for a listed
+            (if (shared-param? (mut k) module g (get (.params g) j))
+                (let [t (fresh (mut k) "hooked")]
+                  (push! (mut binds) `(mut ~(sym t)))
+                  (push! (mut binds) a)
+                  (push! (mut passed) `(mut ~(sym t))))
+                (push! (mut passed) a))
+            (set! j (+ j 1)))
+          (push! (mut arms)
+                 (if (= module (.self k))
+                     `(let [~@binds] (~(sym (.coil g)) ~@passed))
+                     ;; Through its registered value: its module is not imported (see `sig-only`).
+                     `(let [hook-fn
+                              (load (cast (ptr ~(coil-type (mut k) (func-type g)))
+                                          (rt/hook-cell ~hook
+                                                        (primitive/alloc-static i64))))
+                            ~@binds]
+                        (hook-fn ~@passed)))))))
     arms))
 
 ;;; `register-hooks!`: each function of this module a strategy names for a kept function (`… by F`)

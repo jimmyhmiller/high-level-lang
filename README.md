@@ -376,9 +376,9 @@ the printer marks only where the output passes from one module's code to another
 written for it (`render-files`), not every token as a source map does. The build pays only for the
 data: `--analyze` costs 1.6–3.4% more CPU on zod, d3 and three.js, and 4.8% on rxjs, whose 226
 CommonJS modules are a lot of analysis for a 50 ms build; the rest is the report's rules (about 1%),
-copying linking's relations in, and the JSON. The page is made when it is looked at. A rules
-function given a facts database holds it in one place, which its queries read through, not a copy
-each.
+copying linking's relations in, and the JSON. The page is made when it is looked at. A facts
+database is passed to a function by reference, and its queries read it where it is: nothing copies
+one but a binding that gives it a place of its own.
 `tools/analyze-check.py` checks the outputs are unchanged, every byte is attributed, each route
 loads what its files import and its modules and files' own bytes add up to it, a module holds code
 or passes names on, and what each module holds agrees with the same build's source map, up to what
