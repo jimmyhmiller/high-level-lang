@@ -31,7 +31,9 @@ parser.add_argument('--tools', default='')
 parser.add_argument('--report-name', default='results')
 parser.add_argument('--plain-only', action='store_true')
 parser.add_argument('--minified-only', action='store_true')
-parser.add_argument('--turbopack', default=str(ROOT/'out/bin/turbopack-cli-4ebb2b7'))
+# The pinned CLI with one addition, `--define`, which feeds Turbopack's own compile-time defines as
+# Next.js does (benchmarks/bundlers/README.md): the applications need constants.
+parser.add_argument('--turbopack', default=str(ROOT/'out/bin/turbopack-cli-4ebb2b7-define'))
 parser.add_argument('--binary', default=str(ROOT/'out/bin/esb'), help='our executable; use an explicitly built release binary to compare optimization levels')
 args = parser.parse_args()
 assert args.runs > 0
@@ -45,7 +47,7 @@ except BlockingIOError: raise SystemExit('Another comparison is running; timing 
 ADAPTER = ROOT/'benchmarks/bundlers/build.mjs'
 TP = Path(args.turbopack)
 BINARY = Path(args.binary).resolve()
-TOOLS = [f'ours-{policy}-{unit}' for policy in ['exact','package','balanced'] for unit in ['modules','fragments']] + ['esbuild','bun','rolldown','rspack','rollup','webpack']
+TOOLS = [f'ours-{policy}-{unit}' for policy in ['exact','package','balanced'] for unit in ['modules','fragments']] + ['esbuild','bun','rolldown','vite','rspack','rollup','webpack']
 if TP.exists(): TOOLS += ['turbopack']
 if args.tools: TOOLS = [tool for tool in TOOLS if tool in args.tools.split(',')]
 assert TOOLS
@@ -58,7 +60,7 @@ metadata = dict(runs=args.runs, node=subprocess.check_output(['node','--version'
                 layout='one bootstrap with independently invoked dynamic report roots')
 metadata['binary_sha256']={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in [BINARY,TP] if path.exists()}
 metadata['versions'] = {'esbuild': json.loads((ROOT/'tests/node_modules/esbuild/package.json').read_text())['version']}
-for package in ['rolldown','rollup','webpack','@rspack/core','@rollup/plugin-node-resolve','@rollup/plugin-commonjs','@rollup/plugin-terser','@rollup/plugin-replace']:
+for package in ['rolldown','rollup','webpack','@rspack/core','vite','@vitejs/plugin-react','@rollup/plugin-node-resolve','@rollup/plugin-commonjs','@rollup/plugin-terser','@rollup/plugin-replace']:
     metadata['versions'][package] = json.loads((ROOT/'benchmarks/bundlers/node_modules'/package/'package.json').read_text())['version']
 metadata['versions']['bun'] = subprocess.check_output(['bun','--version'],text=True).strip()
 
@@ -67,7 +69,7 @@ metadata['versions']['bun'] = subprocess.check_output(['bun','--version'],text=T
 # what each bundler must be told beyond resolving packages (constants to substitute, which imports
 # are files whose URL the code gets), and how Chrome checks the build: the element the app renders
 # into, what a person does first, what the page must then show, and static files served beside the
-# output. Turbopack's CLI takes no constants, so it builds none of them.
+# output.
 APPS = {
     # marmelab/react-admin's e-commerce demo (see benchmarks/react-admin-demo/README.md): React 19,
     # MUI, react-query, react-router, Apollo/GraphQL, echarts, faker data and an msw service worker.
@@ -186,7 +188,9 @@ def app_command(tool, app, output, minify, config):
     if tool=='bun':
         return ['bun','build','./'+app['entry'],'--splitting','--format=esm','--target=browser',*[x for k,v in app['define'].items() for x in ['--define',f'{k}={v}']],
                 *[x for e in app['files'] for x in ['--loader',f'{e}:file']],f'--outdir={output}',*(['--minify'] if minify else [])]
-    if tool=='turbopack': raise ValueError('turbopack-cli takes no defines')
+    if tool=='turbopack':
+        return [str(TP),'build','./'+app['entry'],'--dir',str(app['dir']),'--target','browser','--no-sourcemap',
+                *[f'--define={k}={v}' for k,v in app['define'].items()],*(['--no-minify'] if not minify else [])]
     config.write_text(json.dumps(dict(input={'index':str(app['dir']/app['entry'])},output=str(output),minify=minify,define=app['define'],files=app['files'],typescript=True)))
     return ['node',str(ADAPTER),tool,str(config)]
 
@@ -246,9 +250,10 @@ def size_of(output,files):
 
 # An application's build run in Chrome (benchmarks/bundlers/app-check.mjs): it must show what it
 # should, throw nothing and fail no request; the JS the first page loads, and all it loads.
-def app_checked(case, output):
+def app_checked(case, output, tool):
     app=APPS[case]
-    checked=subprocess.run(['node',str(ROOT/'benchmarks/bundlers/app-check.mjs'),str(output),'index.js',app['root'],app['wait'],*[str(app['dir']/x) for x in app['statics']]],
+    checked=subprocess.run(['node',str(ROOT/'benchmarks/bundlers/app-check.mjs'),str(output),'turbopack' if tool=='turbopack' else 'index.js',
+                            app['root'],app['wait'],*[str(app['dir']/x) for x in app['statics']]],
                            capture_output=True,text=True,timeout=180,env={**os.environ,'APP_STEPS':json.dumps(app['steps'])})
     assert checked.returncode==0,checked.stdout+checked.stderr
     browser=json.loads(checked.stdout)
@@ -278,7 +283,7 @@ for case in args.cases.split(','):
     print(json.dumps(dict(progress='fixture',case=case,roots=count)),flush=True)
     for minify in ([False] if args.plain_only else [True] if args.minified_only else [False,True]):
         modes={};failed={}
-        tools=[tool for tool in TOOLS if not (case in APPS and tool=='turbopack')]
+        tools=TOOLS
         for tool in tools:
             output=root/'dist' if tool=='turbopack' else WORK/'outputs'/case/('minified' if minify else 'plain')/tool
             config=WORK/f'{case}-{tool}-{minify}.json'
@@ -312,7 +317,7 @@ for case in args.cases.split(','):
                        min_seconds=round(min(item['seconds'] for item in measurements),4),max_seconds=round(max(item['seconds'] for item in measurements),4),
                        median_peak_mib=round(statistics.median(item['peak_mib'] for item in measurements),1),max_peak_mib=round(max(item['peak_mib'] for item in measurements),1))
             if case in APPS:
-                try: row.update(status='correct',**app_checked(case,output))
+                try: row.update(status='correct',**app_checked(case,output,tool))
                 except Exception as error: row.update(status='incorrect-or-validation-failed',error=str(error))
                 rows.append(row);save();print(json.dumps(row),flush=True);continue
             try:

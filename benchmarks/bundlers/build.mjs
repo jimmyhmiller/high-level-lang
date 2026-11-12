@@ -102,4 +102,19 @@ if (kind === 'rollup') {
       });
     });
   });
+} else if (kind === 'vite') {
+  // Vite as an application uses it: its own build, which bundles with Rolldown and minifies with
+  // Oxc; React's plugin for the applications, as their own Vite configs have. Vite defines
+  // `import.meta.env` itself (MODE is "production").
+  const { build } = await import('vite');
+  const plugins = config.typescript ? [(await import('@vitejs/plugin-react')).default()] : [];
+  const define = Object.fromEntries(Object.entries(NODE_ENV).filter(([k]) => !k.startsWith('import.meta.env.')));
+  await build({
+    configFile: false, logLevel: 'warn', mode: 'production', root: process.cwd(), base: './', define, plugins,
+    build: {
+      outDir: config.output, emptyOutDir: true, minify: config.minify, sourcemap: false, target: 'esnext',
+      assetsInlineLimit: 0, reportCompressedSize: false, copyPublicDir: false,
+      rolldownOptions: { input: config.input, output: { format: 'es', entryFileNames: '[name].js', chunkFileNames: '[name]-[hash].js' } }
+    }
+  });
 } else throw new Error('Unknown adapter: ' + kind);

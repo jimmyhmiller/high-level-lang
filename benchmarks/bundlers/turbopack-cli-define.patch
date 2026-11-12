@@ -1,0 +1,213 @@
+diff --git a/turbopack/crates/turbopack-cli/Cargo.toml b/turbopack/crates/turbopack-cli/Cargo.toml
+index f2dc86577b..3651200312 100644
+--- a/turbopack/crates/turbopack-cli/Cargo.toml
++++ b/turbopack/crates/turbopack-cli/Cargo.toml
+@@ -45,6 +45,7 @@ futures = { workspace = true }
+ owo-colors = { workspace = true }
+ rustc-hash = { workspace = true }
+ serde = { workspace = true }
++serde_json = { workspace = true }
+ swc_core = { workspace = true }
+ tokio = { workspace = true, features = ["full"] }
+ tracing = { workspace = true }
+diff --git a/turbopack/crates/turbopack-cli/src/arguments.rs b/turbopack/crates/turbopack-cli/src/arguments.rs
+index a63ae48c0e..949685ca79 100644
+--- a/turbopack/crates/turbopack-cli/src/arguments.rs
++++ b/turbopack/crates/turbopack-cli/src/arguments.rs
+@@ -133,12 +133,36 @@ pub struct DevArguments {
+     pub allow_retry: bool,
+ }
+ 
++/// A compile-time constant: `KEY=VALUE`, where the value is JSON (a string is `'"text"'`) or else an
++/// expression, as Next.js's `defines` reads its env map.
++#[turbo_tasks::task_input]
++#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
++pub struct Define {
++    pub key: turbo_rcstr::RcStr,
++    pub value: turbo_rcstr::RcStr,
++}
++
++fn parse_define(s: &str) -> anyhow::Result<Define> {
++    let (key, value) = s
++        .split_once('=')
++        .ok_or_else(|| anyhow!("a define is KEY=VALUE, not {s}"))?;
++    Ok(Define {
++        key: key.into(),
++        value: value.into(),
++    })
++}
++
+ #[derive(Debug, Args)]
+ #[clap(author, version, about, long_about = None)]
+ pub struct BuildArguments {
+     #[clap(flatten)]
+     pub common: CommonArguments,
+ 
++    /// Replace a global expression with a constant: `--define process.env.X='"value"'`. May be
++    /// given more than once.
++    #[clap(long = "define", value_parser = parse_define)]
++    pub defines: Vec<Define>,
++
+     /// Don't generate sourcemaps.
+     #[clap(long)]
+     pub no_sourcemap: bool,
+diff --git a/turbopack/crates/turbopack-cli/src/build/mod.rs b/turbopack/crates/turbopack-cli/src/build/mod.rs
+index adc23de0d7..f8abb23caa 100644
+--- a/turbopack/crates/turbopack-cli/src/build/mod.rs
++++ b/turbopack/crates/turbopack-cli/src/build/mod.rs
+@@ -53,7 +53,7 @@ use turbopack_node::{child_process_backend, execution_context::ExecutionContext}
+ use turbopack_nodejs::NodeJsChunkingContext;
+ 
+ use crate::{
+-    arguments::{BuildArguments, Target},
++    arguments::{BuildArguments, Define, Target},
+     contexts::{NodeEnv, get_client_asset_context, get_client_compile_time_info},
+     util::{
+         EntryRequest, NormalizedDirs, normalize_dirs, normalize_entries, output_fs, project_fs,
+@@ -75,6 +75,7 @@ pub struct TurbopackBuildBuilder {
+     minify_type: MinifyType,
+     target: Target,
+     scope_hoist: bool,
++    defines: Vec<Define>,
+ }
+ 
+ impl TurbopackBuildBuilder {
+@@ -96,6 +97,7 @@ impl TurbopackBuildBuilder {
+             },
+             target: Target::Node,
+             scope_hoist: true,
++            defines: vec![],
+         }
+     }
+ 
+@@ -144,6 +146,11 @@ impl TurbopackBuildBuilder {
+         self
+     }
+ 
++    pub fn defines(mut self, defines: Vec<Define>) -> Self {
++        self.defines = defines;
++        self
++    }
++
+     pub async fn build(self) -> Result<()> {
+         self.turbo_tasks
+             .run_once(async move {
+@@ -156,6 +163,7 @@ impl TurbopackBuildBuilder {
+                     self.minify_type,
+                     self.target,
+                     self.scope_hoist,
++                    self.defines.clone(),
+                 ));
+ 
+                 read_strongly_consistent_and_apply_effects(wrapper_op, |e| e).await?;
+@@ -193,6 +201,7 @@ async fn build_internal(
+     minify_type: MinifyType,
+     target: Target,
+     scope_hoist: bool,
++    defines: Vec<Define>,
+ ) -> Result<()> {
+     let output_fs = output_fs(project_dir.clone());
+     const OUTPUT_DIR: &str = "dist";
+@@ -226,7 +235,7 @@ async fn build_internal(
+     };
+ 
+     let compile_time_info =
+-        get_client_compile_time_info(browserslist_query.clone(), node_env, false);
++        get_client_compile_time_info(browserslist_query.clone(), node_env, false, defines);
+     let node_backend = child_process_backend();
+     let execution_context = ExecutionContext::new(
+         root_path.clone(),
+@@ -611,6 +620,7 @@ pub async fn build(args: &BuildArguments) -> Result<()> {
+         })
+         .scope_hoist(!args.no_scope_hoist)
+         .target(args.common.target.unwrap_or(Target::Node))
++        .defines(args.defines.clone())
+         .show_all(args.common.show_all);
+ 
+     for entry in normalize_entries(&args.common.entries) {
+diff --git a/turbopack/crates/turbopack-cli/src/contexts.rs b/turbopack/crates/turbopack-cli/src/contexts.rs
+index dce7a8f98b..5f11765a20 100644
+--- a/turbopack/crates/turbopack-cli/src/contexts.rs
++++ b/turbopack/crates/turbopack-cli/src/contexts.rs
+@@ -15,7 +15,7 @@ use turbopack_browser::react_refresh::assert_can_resolve_react_refresh;
+ use turbopack_core::{
+     chunk::SourceMapsType,
+     compile_time_defines,
+-    compile_time_info::{CompileTimeDefines, CompileTimeInfo},
++    compile_time_info::{CompileTimeDefineValue, CompileTimeDefines, CompileTimeInfo, DefinableNameSegment},
+     condition::ContextCondition,
+     context::AssetContext,
+     environment::{BrowserEnvironment, Environment, ExecutionEnvironment},
+@@ -28,6 +28,8 @@ use turbopack_node::{
+ };
+ use turbopack_resolve::resolve_options_context::ResolveOptionsContext;
+ 
++use crate::arguments::Define;
++
+ #[turbo_tasks::value(shared)]
+ pub enum NodeEnv {
+     Development,
+@@ -171,12 +173,27 @@ pub fn get_client_asset_context(
+     asset_context
+ }
+ 
+-fn client_defines(node_env: &NodeEnv) -> CompileTimeDefines {
+-    compile_time_defines!(
++fn client_defines(node_env: &NodeEnv, extra: &[Define]) -> CompileTimeDefines {
++    let mut defines = compile_time_defines!(
+         process.turbopack = true,
+         process.env.TURBOPACK = "1",
+         process.env.NODE_ENV = node_env.to_string()
+-    )
++    );
++    // As next-core's `defines` reads an env map: a JSON value, or else an expression to evaluate.
++    for d in extra {
++        let value = match serde_json::from_str::<serde_json::Value>(&d.value) {
++            Ok(v) => v.into(),
++            Err(_) => CompileTimeDefineValue::Evaluate(d.value.clone()),
++        };
++        defines.0.insert(
++            d.key
++                .split('.')
++                .map(|s| DefinableNameSegment::Name(s.into()))
++                .collect::<Vec<_>>(),
++            value,
++        );
++    }
++    defines
+ }
+ 
+ #[turbo_tasks::function]
+@@ -184,6 +201,7 @@ pub async fn get_client_compile_time_info(
+     browserslist_query: RcStr,
+     node_env: Vc<NodeEnv>,
+     hot_module_replacement_enabled: bool,
++    defines: Vec<Define>,
+ ) -> Result<Vc<CompileTimeInfo>> {
+     let node_env = node_env.await?;
+     CompileTimeInfo::builder(
+@@ -199,9 +217,9 @@ pub async fn get_client_compile_time_info(
+         .to_resolved()
+         .await?,
+     )
+-    .defines(client_defines(&node_env).resolved_cell())
++    .defines(client_defines(&node_env, &defines).resolved_cell())
+     .free_var_references(
+-        free_var_references!(..client_defines(&node_env).into_iter()).resolved_cell(),
++        free_var_references!(..client_defines(&node_env, &defines).into_iter()).resolved_cell(),
+     )
+     .hot_module_replacement_enabled(hot_module_replacement_enabled)
+     .cell()
+diff --git a/turbopack/crates/turbopack-cli/src/dev/web_entry_source.rs b/turbopack/crates/turbopack-cli/src/dev/web_entry_source.rs
+index 87664327c9..636958435f 100644
+--- a/turbopack/crates/turbopack-cli/src/dev/web_entry_source.rs
++++ b/turbopack/crates/turbopack-cli/src/dev/web_entry_source.rs
+@@ -117,7 +117,7 @@ pub async fn create_web_entry_source(
+     source_maps_type: SourceMapsType,
+     browserslist_query: RcStr,
+ ) -> Result<Vc<Box<dyn ContentSource>>> {
+-    let compile_time_info = get_client_compile_time_info(browserslist_query, node_env, true);
++    let compile_time_info = get_client_compile_time_info(browserslist_query, node_env, true, vec![]);
+     let asset_context = get_client_asset_context(
+         root_path.clone(),
+         execution_context,

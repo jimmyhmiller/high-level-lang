@@ -77,7 +77,13 @@ network latency or browser execution cost.
 ## Turbopack qualification
 
 This is the pinned experimental standalone CLI labelled `4ebb2b7a5b`, not a
-current Next.js application build. The adjacent source checkout has local
+current Next.js application build. The harness uses `out/bin/turbopack-cli-4ebb2b7-define`, the
+same source with one addition: a repeatable `--define KEY=VALUE` option
+(`turbopack-cli-define.patch`, applied to that checkout), whose values are
+parsed as Next.js's `defines` parses its env map and added to the CLI's own `CompileTimeDefines`
+and free-variable references, beside `process.env.NODE_ENV`. The applications need constants
+(react-admin reads `process.env.REACT_APP_DATA_PROVIDER` and `import.meta.env.MODE`), and the
+CLI had no way to give them. The adjacent source checkout has local
 modifications; executable hashes are recorded rather than assuming a clean
 upstream build. Its browser host loads the bootstrap's declared initial chunks
 and sets `TURBOPACK_CHUNK_BASE_PATH="/"`; emitted code is not modified. A separate
@@ -253,6 +259,10 @@ pinned here); results are in [apps-results.json](apps-results.json).
   `import()`, about 1,300 modules. Written without JSX so no bundler needs a transform plugin.
 - **three10:** esbuild's own JavaScript benchmark, ten copies of three.js's sources with every
   namespace kept, about 7,600 modules.
+
+**Vite** (8.3.8, which bundles with Rolldown 1.2 and minifies with Oxc) builds through its own
+`build()` API with the entries as Rollup-style inputs, `@vitejs/plugin-react` for the TypeScript
+applications as their own configs have it, `base: "./"`, and Vite's own `import.meta.env`.
 
 Every tool builds for production: minified, `process.env.NODE_ENV` defined as "production" (Rollup
 through `@rollup/plugin-replace`), code splitting, ES modules. Each sample records the one-minute
