@@ -53,20 +53,53 @@ setting alphabet: Alphabets
 setting kept: {Text:Int}
 setting tagged: {Int:Bool}
 
-# A scope's symbols named, and every scope's inside it. `outer`: the names of the symbols of the
-# scopes around it, by symbol. A dynamic scope keeps its names.
-fn scope-named(scope: Int, outer: {Int:Text}) -> [nm.Named] =
-  own ++ [scope-named(child, inner)... for child in now.children]
-  where now = sym.scope-at(m.table, scope),
-        own = match now.dynamic {
-          true => [nm.Named(symbol: x, name: sym.symbol-at(m.table, x).name) for x in now.symbols]
-          false => own-named(now.symbols, {name: true for e in now.enclosed for name in enclosed-name(e, outer)})
-        },
-        inner = outer ++ {x.symbol: x.name for x in own}
+# A module's nested symbols named, scope by scope, each scope after the scopes around it: its
+# symbols, in order, each take the next name of its alphabet that is neither kept nor the name of a
+# symbol it encloses, which a scope around it has named already. A kept JSX tag's symbol takes a
+# capital. A dynamic scope keeps its names. One map of what is named so far serves every scope, as
+# a scope reads only the names of scopes around it. CommonJS's start with its wrapper's own scope.
+fn module-nested(id: Int) -> [nm.Named] {
+  let root = sym.scope-at(m.table, m.modules[id].root)
+  var pending: [Int] = match m.modules[id].kind {
+    m.Cjs => [root.parent]
+    _ => reversed(root.children)
+  }
+  var names: {Int:Text} = {}
+  var out: [nm.Named] = []
+  while len(pending) > 0 {
+    let at = pending[len(pending) - 1]
+    pending = pending[0..len(pending) - 1]
+    let now = sym.scope-at(m.table, at)
+    if now.dynamic {
+      for x in now.symbols {
+        names[x] = sym.symbol-at(m.table, x).name
+        out ++= [nm.Named(symbol: x, name: names[x] ?? "")]
+      }
+    } else {
+      var taken: {Text:Bool} = {}
+      for e in now.enclosed {
+        for n in enclosed-name(e, names) { taken[n] = true }
+      }
+      var plain = 0
+      var capital = 0
+      for x in now.symbols {
+        let caps = x in tagged
+        let letters = if caps then alphabet.capitals else alphabet.head
+        let i = first j in (if caps then capital else plain).. if free-name?(minified-name(letters, alphabet.tail, j), taken): j
+        let name = minified-name(letters, alphabet.tail, i)
+        if caps { capital = i + 1 } else { plain = i + 1 }
+        names[x] = name
+        out ++= [nm.Named(symbol: x, name: name)]
+      }
+    }
+    pending ++= reversed(now.children)
+  }
+  out
+}
 
-# What a symbol a scope encloses is called where it is read: a name given a scope around it, or the
-# name a dynamic scope keeps. A top-level symbol's name is none a nested scope gives.
-fn enclosed-name(e: Int, outer: {Int:Text}) -> Text? = match outer[e] {
+# What a symbol a scope encloses is called where it is read: a name a scope around it was given,
+# or the name a dynamic scope keeps. A top-level symbol's name is none a nested scope gives.
+fn enclosed-name(e: Int, names: {Int:Text}) -> Text? = match names[e] {
   some(n) => some(n)
   none => match sym.scope-at(m.table, sym.symbol-at(m.table, e).scope).dynamic {
     true => some(sym.symbol-at(m.table, e).name)
@@ -74,27 +107,7 @@ fn enclosed-name(e: Int, outer: {Int:Text}) -> Text? = match outer[e] {
   }
 }
 
-# A scope's symbols, in order, each the next name of its alphabet that is not taken: kept, or the
-# name of a symbol the scope encloses. A kept JSX tag's symbol takes a capital.
-fn own-named(symbols: [Int], taken: {Text:Bool}) -> [nm.Named] =
-  (fold st = Naming(named: [], plain: 0, capital: 0) for x in symbols:
-     (st with { named: st.named ++ [nm.Named(symbol: x, name: name)],
-                plain: if caps then st.plain else i + 1,
-                capital: if caps then i + 1 else st.capital }
-      where caps = x in tagged,
-            letters = if caps then alphabet.capitals else alphabet.head,
-            i = first j in (if caps then st.capital else st.plain).. if free-name?(minified-name(letters, alphabet.tail, j), taken): j,
-            name = minified-name(letters, alphabet.tail, i))).named
-
-record Naming { named: [nm.Named], plain: Int, capital: Int }
-
 fn free-name?(name: Text, taken: {Text:Bool}) -> Bool = not (name in kept) and not (name in taken)
-
-# A module's nested symbols named: CommonJS's start with its wrapper's own scope.
-fn module-nested(id: Int) -> [nm.Named] = match m.modules[id].kind {
-  m.Cjs => scope-named(root.parent, {})
-  _ => [scope-named(child, {})... for child in root.children]
-} where root = sym.scope-at(m.table, m.modules[id].root)
 
 # Name characters, commonest first, so frequent symbols compress well.
 fn sorted-chars(candidates: Text, freq: [Int]) -> [Int] = sort c in [c for c in candidates] by freq[c] desc
@@ -114,16 +127,20 @@ record Alphabets { head: [Int], tail: [Int], capitals: [Int] }
 # Top-level symbols named, the commonest first: the next name of its alphabet that is neither kept
 # nor any nested scope's. A kept JSX tag's symbol takes a capital, or `<Foo/>` would become an
 # element called `a`.
-fn top-named(order: [Int], caps: {Int:Bool}, abc: Alphabets, taken: {Text:Bool}, reserved: {Text:Int}) -> [nm.Named] =
-  (fold st = Naming(named: [], plain: 0, capital: 0) for x in order:
-     (st with { named: st.named ++ [nm.Named(symbol: x, name: name)],
-                plain: if capital then st.plain else i + 1,
-                capital: if capital then i + 1 else st.capital }
-      where capital = x in caps,
-            letters = if capital then abc.capitals else abc.head,
-            i = first j in (if capital then st.capital else st.plain)..
-                  if not (minified-name(letters, abc.tail, j) in reserved) and not (minified-name(letters, abc.tail, j) in taken): j,
-            name = minified-name(letters, abc.tail, i))).named
+fn top-named(order: [Int], caps: {Int:Bool}, abc: Alphabets, taken: {Text:Bool}, reserved: {Text:Int}) -> [nm.Named] {
+  var out: [nm.Named] = []
+  var plain = 0
+  var capital = 0
+  for x in order {
+    let capitalized = x in caps
+    let letters = if capitalized then abc.capitals else abc.head
+    let i = first j in (if capitalized then capital else plain)..
+              if not (minified-name(letters, abc.tail, j) in reserved) and not (minified-name(letters, abc.tail, j) in taken): j
+    if capitalized { capital = i + 1 } else { plain = i + 1 }
+    out ++= [nm.Named(symbol: x, name: minified-name(letters, abc.tail, i))]
+  }
+  out
+}
 
 # Every symbol's minified name: live code counted for uses and character frequency; nested scopes
 # named module by module, and top-level symbols then from what they left; a dynamic scope's keep

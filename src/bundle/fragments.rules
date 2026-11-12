@@ -41,19 +41,28 @@ fn candidate(id: Int) -> Bool = with here = m.modules[id], body = m.body-of(id) 
 fn unique-declarations?(id: Int) -> Bool = len(declared) == len([s for s in declared distinct s])
   where declared = [s for sm in an.summaries-of(id) for s in sm.declares]
 
-# Modules arrive dependency-first. A cycle has an as-yet-unvisited dependency, so neither the
-# cycle nor code depending on opaque/complex evaluation is considered freely movable.
+# Which modules' statements may leave their islands, by module. `movable`: a module that is itself
+# a candidate. What runs only when it is called (a function, a class with nothing to compute) needs
+# no more: whatever it reads is there by then, as chunks load what they import first. `safe`: a
+# movable module whose static dependencies are all safe too. Only then may a statement that
+# computes as its chunk loads leave: what it reads must not be made by opaque or complex
+# evaluation it could now run before. Modules arrive dependency-first, so a cycle has an
+# as-yet-unvisited dependency and is never safe.
 # Whether a module could move on its own, and what it imports, are each module's own question,
 # asked of all at once; the order then says which of them rest on something that cannot.
-fn eligibility() -> [Bool] {
+record Eligibility { movable: [Bool], safe: [Bool] }
+
+fn eligibility() -> Eligibility {
   let ids = [id for id in m.order if id != 0 and emit.included?(id)]
   let candidates = [candidate(id) for id in ids]
   let imported = [static-deps(id) for id in ids]
+  var movable = [false for mo in m.modules]
   var safe = [false for mo in m.modules]
   for i in 0..len(ids) {
+    movable[ids[i]] = candidates[i]
     safe[ids[i]] = candidates[i] and all dep in imported[i]: safe[dep]
   }
-  safe
+  Eligibility(movable: movable, safe: safe)
 }
 
 fn module-roots(id: Int) -> [Int] = sort r in [r for m.db.module-consumer(?r, id)] by r
@@ -83,21 +92,22 @@ fn movable(part: Int) -> Bool =
 
 
 # A module's units are its own work.
-fn raw-units(split: Bool, eligible: [Bool], placed: {Int:Int}) -> [Unit] =
-  [u for units in [module-units(id, split, eligible[id], placed) for id in m.order if emit.included?(id)] for u in units]
+fn raw-units(split: Bool, eligible: Eligibility, placed: Placed) -> [Unit] =
+  [u for units in [module-units(id, split, eligible.safe[id], eligible.movable[id], placed) for id in m.order if emit.included?(id)] for u in units]
 
 # Placed apart (fragments on, an eligible module), a module's island is what does not move (see
 # `placed-apart`), and each other unit is the parts placed together; otherwise the module is one unit.
-fn module-units(id: Int, split: Bool, eligible: Bool, placed: {Int:Int}) -> [Unit] = match split and eligible {
+fn module-units(id: Int, split: Bool, eligible: Bool, may-move: Bool, apart: Placed) -> [Unit] = match split and may-move {
   true => [Unit(id: 0, module: id, modules: [id], path: m.modules[id].path, parts: group, roots: roots,
                 bytes: bytes-of(group, id), portable: not evaluating, evaluation: evaluating)
+           for placed in [apart.together]
            for parts in [[p for p in emit.parts-of(id) if emit.live?(p)]] if len(parts) > 0
            for group in [island for island in [[p for p in parts if not (p in placed)]] if len(island) > 0]
                         ++ [[p for p in parts if (placed[p] ?? -1) == first] for first in [f for p in parts for f in placed[p] distinct f]]
            for evaluating in [not (group[0] in placed)]
            for roots in [if evaluating then module-roots(id)
                          else sort r in [r for r in [r for p in group for r in part-roots(p, module-roots(id))]
-                                                    ++ [r for r in module-roots(id) if computes-as-loaded?(id, group)] distinct r] by r]]
+                                                    ++ [r for r in module-roots(id) if any p in group: p in apart.loaded-now] distinct r] by r]]
   false => [Unit(id: 0, module: id, modules: [id], path: m.modules[id].path, parts: group, roots: module-roots(id),
                  bytes: bytes-of(group, id), portable: eligible and not evaluating, evaluation: evaluating)
             for parts in [[p for p in emit.parts-of(id) if emit.live?(p)]] if len(parts) > 0
@@ -106,13 +116,23 @@ fn module-units(id: Int, split: Bool, eligible: Bool, placed: {Int:Int}) -> [Uni
             for evaluating in [any p in group: not (moving[p] ?? false) or (not eligible and m.db.effect(p))]]
 }
 
-# Whether a unit placed apart computes as its chunk loads (an eager value, an attached write): then
-# its chunk loads wherever its module is initialized, as well as where it is used, so that it is
-# never computed later than the module was. Loaded only by what uses it, after an `import()` or by
-# a second entry on the page, it would see what code that ran in between changed, as `new W()`
-# reading a global the first entry set.
-fn computes-as-loaded?(id: Int, group: [Int]) -> Bool =
-  with here = m.modules[id], body = m.body-of(id) { any p in group: placement(p) == Eager or placement(p) == Attached }
+# Whether a statement placed apart computes as its chunk loads (an eager value, an attached write)
+# and could compute something else later: then its chunk loads wherever its module is initialized,
+# as well as where it is used, so that it is never computed later than the module was. Loaded only
+# by what uses it, after an `import()` or by a second entry on the page, it would see what code
+# that ran in between changed, as `new W()` reading a global the first entry set. One that is
+# independent (`independence`) computes the same whenever it runs, and loads only where it is used.
+fn computes-now?(g: Placing, independent: [Bool], i: Int) -> Bool =
+  (g.stmts[i].placement == Eager or g.stmts[i].placement == Attached) and not independent[i]
+
+# Whether a statement may compute whenever its chunk loads: nothing it runs, through what it reads
+# and calls, reads a global the language does not fix, nor runs opaque code. What it reads of the
+# program's own state may differ by then (a counter another construction moved on): an eager value
+# is one its author marked pure (`/*@__PURE__*/`) or a class, names and constants, which every
+# bundler and minifier drops when unused, effects and all; moving it is no more than that.
+fn independence(g: Placing) -> [Bool] = [not g.stmts[i].frees[0] and (all x in g.edges[i]: steady[x]) for i in 0..g.n]
+  where n = g.n,
+        steady = graph.closed-safe(g.edges, [not g.stmts[k % n].frees[k / n] for k in 0..3 * n])
 
 # `uses` already contains resolved ES imports and namespace reads. Resolving those names again
 # for every mention would repeat export resolution in a large module. Only opaque CJS bindings
@@ -157,8 +177,8 @@ fn effect-units(units: [Unit]) -> {Int:[Int]} {
 
 fn model(split: Bool) -> Model = collapsed(numbered, dependencies(numbered, split, placed.before))
   where eligible = eligibility(),
-        placed = if split then placed-apart(eligible) else Placed(together: {}, before: {}),
-        raw = raw-units(split, eligible, placed.together), numbered = [raw[i] with { id: i } for i in 0..len(raw)]
+        placed = if split then placed-apart(eligible) else Placed(together: {}, before: {}, loaded-now: {}),
+        raw = raw-units(split, eligible, placed), numbered = [raw[i] with { id: i } for i in 0..len(raw)]
 
 # Dependency cycles form one semantic unit. Cycles cannot acquire different initializers or
 # separate instances merely because a packing policy wants smaller chunks.
@@ -492,7 +512,11 @@ fn pattern-names(t: Node) -> [Node] = match t {
 # declarations of the names it assigns; and, for an attached write, what it writes to (-1: none).
 record Statement {
   part: Int, module: Int, placement: Placement, hoisted: Bool, code: Bool, attached: Int,
-  runs: [Ref], run-writes: [Int], calls: [Ref], call-writes: [Int], anything: [Ref], anything-writes: [Int], binds: [Int]
+  runs: [Ref], run-writes: [Int], calls: [Ref], call-writes: [Int], anything: [Ref], anything-writes: [Int], binds: [Int],
+  # Whether defining it, calling what it declares, or running any of its code reads a name no
+  # module declares and the language does not fix (`intrinsics`): what may differ from one moment
+  # to the next.
+  frees: [Bool]
 }
 
 # A module's statements, each its own question.
@@ -506,14 +530,36 @@ fn statement(part: Int) -> Statement =
   Statement(part: part, module: here.id, placement: placement(part), hoisted: hoisted?(s), code: code-declaration?(s),
             attached: attached-to(s) ?? -1, runs: refs-in(s, false), run-writes: writes-in(s, false),
             calls: called-refs(s), call-writes: writes-in(s, true), anything: refs-in(s, true), anything-writes: writes-in(s, true),
-            binds: [d for t in assigned-names(s) for d in declaration-of(t)])
+            binds: [d for t in assigned-names(s) for d in declaration-of(t)],
+            frees: [free-reads?(s, false), free-reads?(s, true), free-reads?(s, true)])
   where s = an.stmt-in(body, here, part)
+
+# Globals the language itself defines, whose meaning no program state changes: reading one now or
+# later is the same. Not the clock (`Date`), nor what a host gives (`window`, `document`).
+const intrinsics: [Text] = [
+  "Array", "Boolean", "Function", "Math", "Number", "Object", "RegExp", "String", "Symbol", "Reflect", "JSON",
+  "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "Promise", "Proxy", "ArrayBuffer", "DataView", "BigInt",
+  "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "AggregateError",
+  "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
+  "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array", "Float16Array",
+  "Infinity", "NaN", "undefined", "isNaN", "isFinite", "parseFloat", "parseInt"]
+
+# Whether code reads a free name the language does not fix; `deep` as for `refs-in`.
+fn free-reads?(n: Node, deep: Bool) -> Bool = match n {
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncExpr(...) | GenExpr(...)
+    | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) if not deep => false
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...)
+    | AsyncGenMethod(key, ...) | Field(key, _) if not deep => free-reads?(key, false)
+  Ident(_) => free-name?(n) and not (n.text in intrinsics)
+  _ => any k in n.kids: free-reads?(k, deep)
+}
 
 # A statement of a runtime's helpers, there before anything runs, or of CommonJS: what it reads is
 # all it runs.
 fn opaque-statement(id: Int, part: Int, placement: Placement, hoisted: Bool) -> Statement =
   Statement(part: part, module: id, placement: placement, hoisted: hoisted, code: false, attached: -1,
-            runs: refs, run-writes: [], calls: refs, call-writes: [], anything: refs, anything-writes: [], binds: [])
+            runs: refs, run-writes: [], calls: refs, call-writes: [], anything: refs, anything-writes: [], binds: [],
+            frees: [true, true, true])
   where refs = [Ref(part: d, how: 0) for s in reads([part]) for m.db.declares(?d, s)]
 
 # The program's statements as a graph of three nodes each: defining it (i), calling what it
@@ -522,15 +568,19 @@ fn opaque-statement(id: Int, part: Int, placement: Placement, hoisted: Bool) -> 
 # reaches itself only within itself (its dependencies have no cycle back), so what stands before
 # what is asked of `local`, the edges within a module.
 record Placing {
-  stmts: [Statement], n: Int, edges: [[Int]], reverse: [[Int]], local-reverse: [[Int]], writes: [[Int]], split: [Bool], wrapped: [Bool],
+  stmts: [Statement], n: Int, edges: [[Int]], reverse: [[Int]], local-reverse: [[Int]], writes: [[Int]], split: [Bool], safe: [Bool], wrapped: [Bool],
+  # For each statement, the nodes whose code writes what it declares.
+  written-by: [[Int]],
   # For each module, as bits, it and the modules whose evaluation an ES import of it puts after it.
   forward: [Bool], early: [Bool], dependents: [[Int]]
 }
 
 fn ref-node(r: Ref, at: {Int:Int}, n: Int) -> [Int] = [r.how * n + i for i in at[r.part]]
 
-fn placing(eligible: [Bool]) -> Placing =
-  Placing(stmts: stmts, n: n, edges: edges, reverse: reverse-edges(edges), local-reverse: reverse-edges(local), writes: writes, split: split, wrapped: wrapped,
+fn placing(eligible: Eligibility) -> Placing =
+  Placing(stmts: stmts, n: n, edges: edges, reverse: reverse-edges(edges), local-reverse: reverse-edges(local), writes: writes, split: split,
+          safe: [eligible.safe[s.module] for s in stmts], wrapped: wrapped,
+          written-by: graph.adjacency(3 * n, [x for k in 0..3 * n for x in writes[k]], [k for k in 0..3 * n for x in writes[k]]),
           dependents: graph.reached-bits(reverse-edges([es-imports(id) for id in 0..len(m.modules)]),
                                          [graph.bits-of([id], graph.bit-words(len(m.modules))) for id in 0..len(m.modules)]),
           forward: [later[i] < 0 - stmts[i].part for i in 0..n],
@@ -542,7 +592,7 @@ fn placing(eligible: [Bool]) -> Placing =
         edges = [[x for r in refs[k] for x in ref-node(r, at, n)] ++ [k - n for x in [k] if k >= n] for k in 0..3 * n],
         local = [[x for x in edges[k] if stmts[x % n].module == stmts[k % n].module] for k in 0..3 * n],
         writes = [[i for d in w for i in at[d]] for w in [s.run-writes for s in stmts] ++ [s.call-writes for s in stmts] ++ [s.anything-writes for s in stmts]],
-        split = [eligible[s.module] for s in stmts],
+        split = [eligible.movable[s.module] for s in stmts],
         wrapped = [an.wrapped?(m.modules[s.module]) for s in stmts],
         # The last statement, not a hoisted function, each one's definition reaches: past itself, it
         # would read what is not there yet where it stands.
@@ -571,25 +621,31 @@ const no-part: Int = 4611686018427387904
 # not there stays in its module's island); and `before`, for a module, the parts placed apart that
 # its initialization may change what they read as they ran: they load before it, as they ran before
 # it.
-record Placed { together: {Int:Int}, before: {Int:[Int]} }
+record Placed { together: {Int:Int}, before: {Int:[Int]}, loaded-now: {Int:Bool} }
 
-fn placed-apart(eligible: [Bool]) -> Placed =
+fn placed-apart(eligible: Eligibility) -> Placed =
   Placed(together: {g.stmts[i].part: g.stmts[together[i]].part for i in 0..g.n if not island[i]},
+         loaded-now: {g.stmts[i].part: true for i in 0..g.n if not island[i] and computes-now?(g, independent, i)},
          before: {module: [g.stmts[i].part for i in later] for module in modules
-                  for later in [[i for i in 0..g.n if not island[i] and changed-later?(g, c, i, module)]] if len(later) > 0})
+                  for later in [[i for i in running if changed-later?(g, c, i, module, at)]] if len(later) > 0})
   where g = placing(eligible),
-        island = settled(g, [not g.split[i] or g.stmts[i].placement == Effect for i in 0..g.n]),
+        independent = independence(g),
+        # A statement that computes as it loads leaves only a safe module's island.
+        island = settled(g, independent, [not g.split[i] or g.stmts[i].placement == Effect or (not g.safe[i] and g.stmts[i].placement != Deferred)
+                                          for i in 0..g.n]),
         together = graph.components(joined(g, island)),
-        c = changes(g, island),
-        modules = [module for i in 0..g.n if not island[i] for module in graph.bits-list(c.changers[i]) ++ attached-changers(g, c, i) distinct module]
+        at = {g.stmts[i].part: i for i in 0..g.n},
+        running = [i for i in 0..g.n if not island[i] and (g.stmts[i].placement == Eager or g.stmts[i].placement == Attached)],
+        c = changes(g, island, running ++ [k for i in running for t in [g.stmts[i].attached] if t >= 0 for k in at[t]]),
+        modules = [module for i in running for module in graph.bits-list(c.changers[i] ?? []) ++ attached-changers(g, c, i, at) distinct module]
 
-fn attached-changers(g: Placing, c: Changes, i: Int) -> [Int] =
-  [x for t in [g.stmts[i].attached] if t >= 0 for k in 0..g.n if g.stmts[k].part == t for x in graph.bits-list(c.changed[k])]
+fn attached-changers(g: Placing, c: Changes, i: Int, at: {Int:Int}) -> [Int] =
+  [x for t in [g.stmts[i].attached] if t >= 0 for k in at[t] for x in graph.bits-list(c.changed[k] ?? [])]
 
 # Whether module `changer`, one that imports statement `i`'s, may change what `i` reads as it runs.
-fn changed-later?(g: Placing, c: Changes, i: Int, changer: Int) -> Bool =
+fn changed-later?(g: Placing, c: Changes, i: Int, changer: Int, at: {Int:Int}) -> Bool =
   (g.stmts[i].placement == Eager or g.stmts[i].placement == Attached) and changer != g.stmts[i].module
-  and (graph.bits-has?(c.changers[i], changer) or changer in attached-changers(g, c, i))
+  and (graph.bits-has?(c.changers[i] ?? [], changer) or changer in attached-changers(g, c, i, at))
 
 # Parts that must share a unit: an attached write that leaves the island and what it writes to; a
 # statement and the declarations of what it assigns.
@@ -601,10 +657,10 @@ fn joined(g: Placing, island: [Bool]) -> [[Int]] =
         together = graph.adjacency(g.n, [p[0] for p in pairs] ++ [p[1] for p in pairs], [p[1] for p in pairs] ++ [p[0] for p in pairs])
 
 # The island, grown until nothing more has to join it.
-fn settled(g: Placing, island: [Bool]) -> [Bool] = match len([x for x in next if x]) == len([x for x in island if x]) {
+fn settled(g: Placing, independent: [Bool], island: [Bool]) -> [Bool] = match len([x for x in next if x]) == len([x for x in island if x]) {
   true => island
-  false => settled(g, next)
-} where next = grown(g, island)
+  false => settled(g, independent, next)
+} where next = grown(g, independent, island)
 
 # Whether module `changer`'s initialization may run before module `own`'s statements: unless it
 # imports `own`, it may. One that imports it runs after it, and what is placed apart loads before
@@ -613,20 +669,67 @@ fn earlier?(g: Placing, changer: Int, own: Int) -> Bool = changer == own or not 
 
 # What initialization may change, by the modules whose initialization it is (`changed`): what it
 # reaches that is not code, and what what it runs writes; and who may change anything each node
-# reaches (`changers`). Sets of modules, as bits.
-record Changes { changed: [[Int]], changers: [[Int]] }
+# reaches (`changers`). Sets of modules, as bits, for the statements `asked` about alone: few
+# statements compute as they load, and nothing else asks. So only what they reach (`reach`), and
+# what writes to that, is looked at; and only what can reach either is asked which initialization
+# reaches it. Each graph a question is asked of is closed under it, so the answers are what the
+# whole graph's would be.
+record Changes { changed: {Int:[Int]}, changers: {Int:[Int]} }
 
-fn changes(g: Placing, island: [Bool]) -> Changes = Changes(changed: changed, changers: graph.reached-bits(g.edges, changed))
-  where n = g.n,
+fn changes(g: Placing, island: [Bool], asked: [Int]) -> Changes = match len(asked) {
+  0 => Changes(changed: {}, changers: {})
+  _ => Changes(changed: {x: changed[at-reach[x]] for x in asked}, changers: {x: changers[at-reach[x]] for x in asked})
+} where n = g.n,
         words = graph.bit-words(len(m.modules)),
         nothing = graph.bits-of([], words),
-        reached = graph.reached-bits(g.reverse, [graph.bits-of([g.stmts[k % n].module for x in [k] if k < n and island[k]
-                                                                and (g.stmts[k].placement == Effect or g.stmts[k].placement == Attached)], words)
-                                                 for k in 0..3 * n]),
-        pairs = [[x, k] for k in 0..3 * n if any w in reached[k]: w != 0 for x in g.writes[k]],
-        writers = graph.adjacency(3 * n, [p[0] for p in pairs], [p[1] for p in pairs]),
-        changed = [fold bits = (if k < n and not g.stmts[k].code then reached[k] else nothing) for w in writers[k]: graph.bits-or(bits, reached[w])
-                   for k in 0..3 * n]
+        reach = reachable(g.edges, asked),
+        at-reach = positions(reach, 3 * n),
+        writing = [k for x in reach if x < n for k in g.written-by[x]],
+        relevant = reachable(g.reverse, reach ++ writing),
+        at-relevant = positions(relevant, 3 * n),
+        reached = graph.reached-bits(induced(g.reverse, relevant, at-relevant),
+                                     [graph.bits-of([g.stmts[k % n].module for x in [k] if k < n and island[k]
+                                                     and (g.stmts[k].placement == Effect or g.stmts[k].placement == Attached)], words)
+                                      for k in relevant]),
+        changed = [fold bits = (if k < n and not g.stmts[k].code then reached[at-relevant[k]] else nothing)
+                     for w in (if k < n then g.written-by[k] else []) if any b in reached[at-relevant[w]]: b != 0:
+                     graph.bits-or(bits, reached[at-relevant[w]])
+                   for k in reach],
+        changers = graph.reached-bits(induced(g.edges, reach, at-reach), changed)
+
+# Every node `edges` reach from `from`, each once, those first.
+fn reachable(edges: [[Int]], from: [Int]) -> [Int] {
+  var seen = [false for e in edges]
+  var out: [Int] = []
+  for x in from {
+    if not seen[x] {
+      seen[x] = true
+      out ++= [x]
+    }
+  }
+  var cursor = 0
+  while cursor < len(out) {
+    let v = out[cursor]
+    cursor = cursor + 1
+    for w in edges[v] {
+      if not seen[w] {
+        seen[w] = true
+        out ++= [w]
+      }
+    }
+  }
+  out
+}
+
+# Where each of `nodes` stands among them, by node; -1 for the rest of `size`.
+fn positions(nodes: [Int], size: Int) -> [Int] {
+  var at = [-1 for i in 0..size]
+  for i in 0..len(nodes) { at[nodes[i]] = i }
+  at
+}
+
+# The graph `edges` makes of `nodes` alone, numbered as they stand: what they reach of one another.
+fn induced(edges: [[Int]], nodes: [Int], at: [Int]) -> [[Int]] = [[at[w] for w in edges[v] if at[w] >= 0] for v in nodes]
 
 fn changed-earlier?(g: Placing, changers: [Int], own: Int) -> Bool = any c in graph.bits-list(changers): earlier?(g, c, own)
 
@@ -636,19 +739,24 @@ fn changed-earlier?(g: Placing, changers: [Int], own: Int) -> Bool = any c in gr
 # that runs before it may change (`changers`); an attached write's target must not be run before
 # the write (`early`), nor changed by such initialization; and a statement shares the island of
 # anything it must share a unit with.
-fn grown(g: Placing, island: [Bool]) -> [Bool] =
+fn grown(g: Placing, independent: [Bool], island: [Bool]) -> [Bool] =
   [island[i] or together[i] in bound for i in 0..g.n]
   where n = g.n,
         first-island = graph.reached-min(g.local-reverse, [if k < n and island[k] then g.stmts[k].part else no-part for k in 0..3 * n]),
         available = graph.closed-safe(g.edges, [k >= n or g.stmts[k].hoisted or not g.wrapped[k] or (g.split[k] and not island[k]) for k in 0..3 * n]),
-        c = changes(g, island),
+        # What asks: what computes as it loads and is not free of what may change, and what an
+        # attached write leaving the island writes to.
+        asking = [i for i in 0..n if not island[i] and runs[i] and not (g.stmts[i].placement == Eager and independent[i])],
+        targets = [x for i in 0..n if not island[i] for t in [g.stmts[i].attached] if t >= 0 for x in at[t]],
+        c = changes(g, island, asking ++ targets),
         changed = c.changed,
         changers = c.changers,
         runs = [g.stmts[i].placement == Eager or g.stmts[i].placement == Attached for i in 0..n],
         hazard = [not island[i] and (
                     (not g.stmts[i].hoisted and first-island[i] < g.stmts[i].part)
-                    or (runs[i] and (not available[i] or g.forward[i] or changed-earlier?(g, changers[i], g.stmts[i].module)))
-                    or (g.stmts[i].attached >= 0 and (g.early[i] or (any c in at[g.stmts[i].attached]: island[c] or changed-earlier?(g, changed[c], g.stmts[i].module)))))
+                    or (runs[i] and (not available[i] or g.forward[i]
+                                     or (not (g.stmts[i].placement == Eager and independent[i]) and changed-earlier?(g, changers[i] ?? [], g.stmts[i].module))))
+                    or (g.stmts[i].attached >= 0 and (g.early[i] or (any c in at[g.stmts[i].attached]: island[c] or changed-earlier?(g, changed[c] ?? [], g.stmts[i].module)))))
                   for i in 0..n],
         at = {g.stmts[i].part: i for i in 0..n},
         # A write that cannot go with what it writes joins the island alone; what must share a unit

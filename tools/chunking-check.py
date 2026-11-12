@@ -519,12 +519,17 @@ for policy, fragments in MODES:
     output = build(root, ["a.js", "b.js"], policy, fragments)
     assert execute(root, output, ["a.js", "b.js"], "[m0.result,m1.result]") == expected
     if fragments:
-        # Computed as the library loads, so loaded by every entry that initializes it.
-        for marker in ("VEC_ONLY", "SHAPE_ONLY", "COLOR_ONLY", "LATE_ONLY"):
-            assert marker in closure(output, "a.js") and marker in closure(output, "b.js"), (policy, marker)
+        # Values the library computes as it loads, marked pure and reading no global that may
+        # change, compute whenever the chunk that uses them loads: each goes with its user, as a
+        # function does; what each entry sees is still what the unbundled program does (above).
+        for own, other, marker in (("a.js", "b.js", "VEC_ONLY"), ("b.js", "a.js", "SHAPE_ONLY"), ("b.js", "a.js", "COLOR_ONLY")):
+            assert marker in closure(output, own) and marker not in closure(output, other), (policy, marker)
+        # `_late` is made before `Late.prototype.isLate` is written, so the write stays where the
+        # library initializes, and the class it writes to with it: loaded by both.
+        assert "LATE_ONLY" in closure(output, "a.js") and "LATE_ONLY" in closure(output, "b.js"), policy
         assert only_own(output, "a.js", "HELPER_A", "HELPER_B"), policy
         assert only_own(output, "b.js", "HELPER_B", "HELPER_A"), policy
-print("ok   what computes as a library loads loads wherever it is initialized; functions stay their users'")
+print("ok   what a library computes as it loads, marked pure, goes with what uses it, as functions do")
 
 # What must not leave it: a value initialization changes before it is made; a value read before
 # it stands; a class property initialization reads before it is written; a function that assigns
