@@ -1,0 +1,10 @@
+import { reactive, computed, ref, watchEffect, effect, toRaw, shallowRef, readonly, isReactive, h, createApp, nextTick } from "vue";
+const out = [];
+const s = reactive({ a: 1, list: [1, 2, 3], m: new Map([["k", 1]]) });
+const total = computed(() => s.list.reduce((x, y) => x + y, 0) + s.a + s.m.get("k"));
+effect(() => out.push("eff " + total.value));
+s.a = 5; s.list.push(10); s.m.set("k", 7);
+const r = ref(3); const ro = readonly(s);
+out.push(isReactive(s), isReactive(toRaw(s)), r.value * 2, JSON.stringify(toRaw(s).list), typeof h, typeof createApp, Object.isFrozen(ro));
+const sr = shallowRef({ x: 1 }); sr.value = { x: 2 }; out.push(sr.value.x);
+console.log(out.join("|"));

@@ -198,6 +198,8 @@ git clone --depth 1 https://github.com/tc39/test262-parser-tests tests/test262
 python3 tools/guard.py 9500 500 tools/build-tools.sh -O3      # out/bin/{esb,jsparse,spec}
 out/bin/esb tests/apps/named.js --minify --outfile=out/app.js  # command line, esbuild style
 python3 tools/verify.py out/bin/esb out/bin/jsparse           # every claim below
+npm ci --prefix benchmarks/heldout --ignore-scripts            # libraries it was never tuned on
+python3 tools/heldout-sizes.py                                 # ... and the other tools/heldout-*.py
 (cd tests && ../out/bin/spec)                                 # the build build.bundler describes
 (cd tests && ../out/bin/spec other.bundler)                   # another spec, with the same steps
 ```
@@ -326,7 +328,8 @@ themselves are byte for byte those of the same build without it.
 
 - **Outputs**: each file's size, the files it imports and loads with `import()`, and what of each
   module it holds, to the byte, and of that what the bundler wrote for it (its CommonJS wrapper,
-  its namespace object); the rest is the file's own (imports, exports).
+  its namespace object); the rest is the file's own: imports and exports, the format's wrapper, the
+  banner and footer, the legal comments gathered at its end, the line naming its source map.
 - **Routes**: each entry and each `import()` root, the files it loads before it runs, their bytes,
   and how much of each module that is.
 - **Modules**: size in the output and in the source; statements kept of all; what it imports; the
@@ -379,6 +382,11 @@ CommonJS modules are a lot of analysis for a 50 ms build; the rest is the report
 copying linking's relations in, and the JSON. The page is made when it is looked at. A facts
 database is passed to a function by reference, and its queries read it where it is: nothing copies
 one but a binding that gives it a place of its own.
+`tools/heldout-analyze.py` checks the same against two measurements made without it, on
+fifteen libraries the bundler was never tuned on (`benchmarks/heldout`): esbuild's metafile
+(`bytesInOutput`; the same modules, each module's share of its output within two points) and the
+output's source map attributed byte by byte with Mozilla's `source-map` (each module within 0.5%,
+up to the wrappers and namespace objects a map cannot say have no source).
 `tools/analyze-check.py` checks the outputs are unchanged, every byte is attributed, each route
 loads what its files import and its modules and files' own bytes add up to it, a module holds code
 or passes names on, and what each module holds agrees with the same build's source map, up to what
@@ -466,19 +474,50 @@ ASCII, as esbuild's is by default (`--charset=utf8` turns that off).
 
 | App | Ours (bytes) | esbuild | Difference |
 |---|---|---|---|
-| lodash-es, tree-shaken | 35,145 | 35,207 | -0.2% |
-| all of lodash-es | 92,180 | 92,958 | -0.8% |
-| lodash (CommonJS) | 74,500 | 74,092 | +0.6% |
-| three | 263,253 | 258,124 | +2.0% |
-| zod | 456,947 | 454,182 | +0.6% |
-| rxjs | 18,199 | 17,510 | +3.9% |
-| date-fns | 23,240 | 22,915 | +1.4% |
+| lodash-es, tree-shaken | 35,541 | 35,207 | +0.9% |
+| all of lodash-es | 93,384 | 92,958 | +0.5% |
+| lodash (CommonJS) | 74,453 | 74,092 | +0.5% |
+| three | 262,779 | 258,124 | +1.8% |
+| zod | 456,977 | 454,182 | +0.6% |
+| rxjs | 17,655 | 17,510 | +0.8% |
+| date-fns | 23,250 | 22,915 | +1.5% |
 | preact | 11,047 | 11,045 | +0.0% |
-| immer | 9,562 | 9,431 | +1.4% |
-| react + react-dom/server | 218,736 | 216,850 | +0.9% |
-| d3 | 47,251 | 46,294 | +2.1% |
-| features test app (small) | 2,679 | 2,520 | +6.3% |
-| re-exports test app (small) | 1,400 | 1,357 | +3.2% |
+| immer | 9,566 | 9,431 | +1.4% |
+| react + react-dom/server | 218,404 | 216,850 | +0.7% |
+| d3 | 46,341 | 46,294 | +0.1% |
+| features test app (small) | 2,578 | 2,520 | +2.3% |
+| re-exports test app (small) | 1,342 | 1,357 | -1.1% |
+
+**Libraries it was never tuned on** (`benchmarks/heldout`, `tools/heldout-sizes.py`), minified, ES
+module output: every bundle prints what esbuild's prints (lit needs a DOM, and fails as esbuild's
+does). Median +0.5% bytes, +0.5% gzipped.
+
+| Library | Ours (bytes) | esbuild | Difference | gzip |
+|---|---|---|---|---|
+| chart.js 4.6.1 | 207,194 | 206,273 | +0.4% | +0.0% |
+| dayjs 1.11.23 (and three plugins) | 16,638 | 16,641 | -0.0% | -1.2% |
+| immutable 5.1.10 | 68,416 | 66,501 | +2.9% | +1.2% |
+| jquery 4.0.0 | 80,308 | 79,990 | +0.4% | +0.2% |
+| lit-html 3.3 | 8,289 | 8,295 | -0.1% | +0.5% |
+| marked 18.2.0 | 50,089 | 50,123 | -0.1% | -0.1% |
+| mobx 7.1.6 | 45,980 | 45,177 | +1.8% | +1.8% |
+| moment 2.31.0 | 64,170 | 64,222 | -0.1% | -0.3% |
+| @tanstack/query-core 5.107.1 | 25,539 | 25,247 | +1.2% | +0.9% |
+| ramda 0.32.0 | 59,212 | 58,668 | +0.9% | +0.5% |
+| @reduxjs/toolkit 2.14.0 | 30,858 | 30,172 | +2.3% | +1.6% |
+| solid-js 1.9.19 | 12,192 | 12,049 | +1.2% | +1.0% |
+| valibot 1.5.0 | 5,491 | 5,479 | +0.2% | +0.2% |
+| vue 3.5.45 | 69,126 | 67,090 | +3.0% | +2.3% |
+| yup 1.7.1 | 42,717 | 42,488 | +0.5% | +0.5% |
+
+Three gaps found this way are closed: mobx was +28.8% (its `__DEV__` flag, a `const`, was not
+written in, so its development messages stayed), query-core +8.8% (private names were not
+minified), and redux toolkit resolved another file than esbuild (the `module` condition).
+`tools/heldout-exercise.py` calls every export of ramda, valibot, immutable, yup and mobx on the
+exerciser's matrix, about 262,000 calls: ours prints what esbuild's prints, plain and minified.
+Writing in constants is a pass over each file of its own, where esbuild does it as it parses: it
+costs 2–6% more instructions on a minified build (three 5.8%, d3 4.2%, zod 2.5%, date-fns 1.8%),
+and nothing on one that is not.
 
 Unminified, tree-shaken lodash-es and all of lodash-es are **byte-identical** to esbuild's
 output after normalising. That covers tree shaking, module order and renaming.
@@ -894,7 +933,10 @@ output generation atomically remain follow-up work; file output is not a deploym
 
 ## What it does
 
-Module graph, Node resolution (`exports`, `main` fields, conditions, `sideEffects: false`),
+Module graph, Node resolution (`exports`, `main` fields, conditions as esbuild has them: the
+platform's, and `module` unless `--conditions` names others, `sideEffects: false`), an import, or an
+`export … from`, of a name its module does not export reported where it is written, as esbuild
+reports it (from TypeScript, which may import a type, it is not),
 scope hoisting, esbuild-compatible renaming, tree shaking with `/* @__PURE__ */` and class
 purity, CommonJS wrapping, re-exports from CommonJS, `__esm` wrapping for `require` and `import()`
 of ES modules, namespace objects, `define`, aliases, loaders (js, json, text, base64, dataurl with
@@ -911,8 +953,12 @@ checked by acorn at that version), `--drop:console`, `--drop:debugger`, `--pure:
 shared chunks and `import()` (`--splitting`, `--entry-names`, `--chunk-names`, `--outbase`), global
 names, `--external` (a package's subpaths with it, and `*` patterns; in ES module output each import
 of one stays an import statement, as esbuild leaves it), `--platform=node`, identifier and syntax
-minification, source maps, output to standard output when no path is given (its map inline), and
-resolve, load, transform and optimize hooks.
+minification (private names too, each class's own the shortest after those of the classes around
+it), `const`s written in where they are read with `--minify-syntax`, as esbuild does as it parses
+(those at the start of a statement list whose values are numbers, booleans, `null`, `undefined`,
+`NaN`, `Infinity` or strings of up to three characters, before tree shaking, so the branches they
+decide are gone: `src/bundle/constants.rules`), source maps, output to standard output when no path
+is given (its map inline), and resolve, load, transform and optimize hooks.
 
 ## What it does not do
 
@@ -920,7 +966,8 @@ Being explicit, because "everything esbuild does" is a lot:
 
 - **Not built:** CSS modules, CSS nesting and other CSS lowering, JavaScript
   (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
-  and inlining enum values across files.
+  inlining enum values across files, and writing in a constant another module exports (esbuild
+  prints an imported `const`'s value where it is read). A `switch` on a constant is not folded.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside
   another, `--legal-comments=inline`, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`
   class, and decorators on members with computed names.
@@ -930,12 +977,15 @@ Being explicit, because "everything esbuild does" is a lot:
 - **Simplifications:** CSS minification is whitespace and number spelling only, so minified
   stylesheets are a few percent larger than esbuild's. Content hashes in file names differ from
   esbuild's. Data URLs are spelled out or base64, without esbuild's percent escaping. Source maps have no
-  `names`. Regex patterns are not validated. Labels are not renamed. Single-use `const` inlining is
-  missing.
+  `names`. Regex patterns are not validated. Labels are not renamed. Output that is not minified
+  is printed compact: `--pretty` breaks lines, without esbuild's indentation, so compare sizes
+  minified.
 
 Known semantic gaps remain outside the Workbench acceptance target: scope hoisting does not
 preserve imported aliases accessed only through direct `eval`, and class-field lowering can
-reorder computed field and method keys. Local declarations read only by direct `eval` now retain
+reorder computed field and method keys. An assignment to a top-level `const` is not rejected, as
+esbuild rejects it: the bundle's top level is `var`, so the assignment succeeds where the original
+throws. Local declarations read only by direct `eval` now retain
 both their liveness and spelling, but complete lexical-environment preservation needs further work.
 These are correctness bugs, not completed production guarantees.
 
