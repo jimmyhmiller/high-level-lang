@@ -938,6 +938,9 @@
 (defn lex-sym [(n (slice u8))] (-> Code)
   (primitive/code-symbol "lex-" n))
 
+(defn token-sym [(n (slice u8))] (-> Code)
+  (primitive/code-symbol "token-" n))
+
 (defn hidden-sym [(n (slice u8))] (-> Code)
   (primitive/code-symbol "h-" n))
 
@@ -1503,7 +1506,7 @@
                   (memo (mut FirstMemo))] (-> void)
   (for i (range 0 (len (.alts d)))
     (emit-alt-fn! (mut g) (mut c) (.name d) i (get (.alts d) i) 0))
-  (let [gs (alt-guards g d (mut memo))]
+  (let [gs (alt-guards (mut g) d (mut memo))]
     (emit-rule-fn! (mut g)
                    d
                    (if (.any gs)
@@ -1543,17 +1546,182 @@
 ;;; is known and it cannot match nothing; whether there is one; and whether any alternative has one.
 (defstruct Guards [(tests (ArrayList Code)) (guarded (ArrayList bool)) (any bool)])
 
-(defn alt-guards [(g Grammar) (d Decl) (memo (mut FirstMemo))] (-> Guards)
+(defn alt-guards [(g (mut Grammar)) (d Decl) (memo (mut FirstMemo))] (-> Guards)
   (let [(mut tests) (ArrayList::new [Code] (malloc-allocator))
         (mut guarded) (ArrayList::new [bool] (malloc-allocator))
         (mut any) false]
     (for a (.alts d)
       (let [s (pe-start g (.seq a) (mut memo))
-            known (and (.known (.bytes s)) (not (.empty s)))]
-        (push! (mut tests) (if known (byte-test (.bytes s)) `true))
-        (push! (mut guarded) known)
-        (when known (set! any true))))
+            known (and (.known (.bytes s)) (not (.empty s)))
+            two (two-token-test (mut g) (.seq a) (mut memo))]
+        (push! (mut tests)
+               (match two
+                 (Some [t] (if known `(and ~(byte-test (.bytes s)) ~t) t))
+                 (None [] (if known (byte-test (.bytes s)) `true))))
+        (push! (mut guarded) (or known (is-some? two)))
+        (when (or known (is-some? two)) (set! any true))))
     (Guards :tests tests :guarded guarded :any any)))
+
+(defn is-some? [(o (Option Code))] (-> bool)
+  (match o (Some [_] true) (None [] false)))
+
+;; ---------------------------------------------------------------- two tokens
+;;;
+;;; An alternative that must begin with a token, and whose next token must begin with one of a few
+;;; bytes, is tried only where both hold: `x:` is a label, `x =>` an arrow, and `x;` neither, seen
+;;; by one look at a token the parse lexes anyway (the token cache keeps it) and one at the byte
+;;; after. Where it can begin otherwise too, or what follows is not known, there is no such test.
+
+;;; A first token an expression may begin with, and the bytes the token after it begins with. Its
+;;; `how`: 0 a literal, 1 a token rule, 2 a fragment matched in a rule (space, then its bytes).
+(defstruct Lead [(name (slice u8)) (how i64) (follow Start)])
+
+;;; The first tokens an expression may begin with; `through`: it may match nothing, and what
+;;; follows it begins instead; `ok`: every way it can begin is one of these.
+(defstruct Leads [(items (ArrayList Lead)) (through bool) (ok bool)])
+
+(defn leads-unknown [] (-> Leads)
+  (Leads :items (ArrayList::new [Lead] (malloc-allocator)) :through false :ok false))
+
+(defn leads-empty [] (-> Leads)
+  (Leads :items (ArrayList::new [Lead] (malloc-allocator)) :through true :ok true))
+
+(defn leads-one [(name (slice u8)) (how i64) (follow Start)] (-> Leads)
+  (let [(mut items) (ArrayList::new [Lead] (malloc-allocator))]
+    (push! (mut items) (Lead :name name :how how :follow follow))
+    (Leads :items items :through false :ok true)))
+
+;;; Where a starts, then b if a may match nothing: `cont` after `e`.
+(defn then-start [(g Grammar) (e PE) (cont Start) (m (mut FirstMemo))] (-> Start)
+  (seq-start (pe-start g e (mut m)) cont))
+
+(defn leads-of [(g Grammar) (e PE) (cont Start) (depth i64) (m (mut FirstMemo))] (-> Leads)
+  (if (> depth 8)
+      (leads-unknown)
+      (match (.op e)
+        (OLit [] (leads-one (.text e) 0 cont))
+        (ORef []
+              (match (find-decl g (.text e))
+                (None [] (leads-unknown))
+                (Some [d]
+                      (cond (= (.kind d) (DToken)) (leads-one (.name d) 1 cont)
+                            (= (.kind d) (DFragment)) (leads-one (.name d) 2 cont)
+                            (= (.kind d) (DHidden)) (leads-of g (.body d) cont (+ depth 1) (mut m))
+                            (= (.kind d) (DRule))
+                              (let [(mut out) (leads-empty)]
+                                (set! (.through out) false)
+                                (for a (.alts d)
+                                  (set! out (leads-or out (leads-of g (.seq a) cont (+ depth 1) (mut m)))))
+                                out)
+                            :else (leads-unknown)))))
+        (OSeq []
+              (let [items (.kids e)
+                    (mut out) (leads-empty)
+                    (mut i) 0]
+                (while (and (.ok out) (.through out) (< i (len items)))
+                  (let [(mut rest) cont]
+                    (for j (range 0 (- (len items) (+ i 1)))
+                      (set! rest (then-start g (get items (- (len items) (+ j 1))) rest (mut m))))
+                    (let [one (leads-of g (get items i) rest (+ depth 1) (mut m))]
+                      (set! (.ok out) (.ok one))
+                      (for l (.items one) (push! (mut (.items out)) l))
+                      (set! (.through out) (.through one))))
+                  (set! i (+ i 1)))
+                out))
+        (OChoice []
+                 (let [(mut out) (leads-empty)]
+                   (set! (.through out) false)
+                   (for k (.kids e)
+                     (set! out (leads-or out (leads-of g k cont (+ depth 1) (mut m)))))
+                   out))
+        (OOpt [] (leads-maybe (leads-of g (get (.kids e) 0) cont (+ depth 1) (mut m))))
+        (OStar []
+               (let [inner (get (.kids e) 0)]
+                 (leads-maybe (leads-of g inner (start-or (pe-start g inner (mut m)) cont) (+ depth 1) (mut m)))))
+        (OPlus []
+               (let [inner (get (.kids e) 0)]
+                 (leads-of g inner (start-or (pe-start g inner (mut m)) cont) (+ depth 1) (mut m))))
+        (OSepStar [] (leads-maybe (leads-of g (get (.kids e) 0) (start-or (comma-start) cont) (+ depth 1) (mut m))))
+        (OSepPlus [] (leads-of g (get (.kids e) 0) (start-or (comma-start) cont) (+ depth 1) (mut m)))
+        (OWith [] (leads-of g (get (.kids e) 0) cont depth (mut m)))
+        (OKeep [] (leads-of g (get (.kids e) 0) cont depth (mut m)))
+        ;; Zero width: tests that may only rule more out.
+        (OIf [] (leads-empty))
+        (OUnless [] (leads-empty))
+        (ONot [] (leads-empty))
+        (OAnd [] (leads-empty))
+        (ONl [] (leads-empty))
+        (ONoNl [] (leads-empty))
+        (_ (leads-unknown)))))
+
+(defn leads-or [(a Leads) (b Leads)] (-> Leads)
+  (let [(mut items) (ArrayList::new [Lead] (malloc-allocator))]
+    (for l (.items a) (push! (mut items) l))
+    (for l (.items b) (push! (mut items) l))
+    (Leads :items items :through (or (.through a) (.through b)) :ok (and (.ok a) (.ok b)))))
+
+(defn leads-maybe [(a Leads)] (-> Leads)
+  (Leads :items (.items a) :through true :ok (.ok a)))
+
+;;; What may begin either: the bytes of both.
+(defn start-or [(a Start) (b Start)] (-> Start)
+  (Start :bytes (bytes-union (.bytes a) (.bytes b)) :empty (.empty b)))
+
+(defn comma-start [] (-> Start)
+  (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)]
+    (push! (mut (.ranges f)) (Range :lo 44 :hi 44))
+    (Start :bytes (bytes-of-first f) :empty false)))
+
+;;; A test of `c`, the next byte, that the lead's first token can begin with it.
+(defn lead-first-test [(g Grammar) (l Lead) (m (mut FirstMemo))] (-> Code)
+  (let [start (if (= (.how l) 0)
+                  (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+                        b (cast i64 (get (.name l) 0))]
+                    (push! (mut (.ranges f)) (Range :lo b :hi b))
+                    (Start :bytes (bytes-of-first f) :empty false))
+                  (rule-start g (.name l) (mut m)))]
+    (if (and (.known (.bytes start)) (not (.empty start)))
+        (byte-test (.bytes start))
+        `true)))
+
+;;; Code matching a lead's first token here, space before it skipped as a rule would.
+(defn lead-match [(g (mut Grammar)) (l Lead)] (-> Code)
+  (cond (= (.how l) 0) `(~(lit-sym (lit-id (mut g) (.name l))) (mut p))
+        (= (.how l) 2) `(do (skip! (mut p)) (~(lex-sym (.name l)) (mut p)))
+        :else
+          (let [raw (match (find-decl g (.name l)) (Some [d] (.raw d)) (None [] false))]
+            (if raw
+                `(~(token-sym (.name l)) (mut p))
+                `(do (skip! (mut p)) (~(token-sym (.name l)) (mut p)))))))
+
+(defn every-byte? [(b Bytes)] (-> bool)
+  (and (= (.w0 b) -1) (= (.w1 b) -1) (= (.w2 b) -1) (= (.w3 b) -1)))
+
+;;; The two-token test of an alternative, where there is one worth making: it must begin with one
+;;; of a few first tokens, one a token rule, each with a known and narrow next byte.
+(defn two-token-test [(g (mut Grammar)) (e PE) (m (mut FirstMemo))] (-> (Option Code))
+  (let [ls (leads-of g e (unknown-start) 0 (mut m))
+        (mut useful) (and (.ok ls) (not (.through ls)) (> (len (.items ls)) 0) (<= (len (.items ls)) 6))
+        (mut any-token) false]
+    (for l (.items ls)
+      (when (= (.how l) 1) (set! any-token true))
+      (unless (and (.known (.bytes (.follow l)))
+                   (not (.empty (.follow l)))
+                   (not (every-byte? (.bytes (.follow l)))))
+        (set! useful false)))
+    (if (and useful any-token)
+        (let [(mut arms) (primitive/code-list-new)]
+          (for l (.items ls)
+            (push! (mut arms)
+                   `(and ~(lead-first-test g l (mut m))
+                         (do (set! (.pos p) s) true)
+                         ~(lead-match (mut g) l)
+                         (let [c (next-byte (mut p))] ~(byte-test (.bytes (.follow l)))))))
+          (Some `(let [s (.pos p)
+                       hit (or ~@arms)]
+                   (set! (.pos p) s)
+                   hit)))
+        (None [Code]))))
 
 ;;; A base, then alternatives that extend it: repeatedly, or at most once.
 (defn emit-chain! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl) (repeat bool) (memo (mut FirstMemo))]
@@ -1562,7 +1730,7 @@
     (emit-alt-fn! (mut g) (mut c) (.name d) i (get (.alts d) i) 1))
   ;; After each step, an alternative is tried only if the next token can begin it: most of what
   ;; follows a call, `,` `)` `;`, begins none, and the loop ends on one look at the next byte.
-  (let [gs (alt-guards g d (mut memo))
+  (let [gs (alt-guards (mut g) d (mut memo))
         step (if (.any gs)
                  `(let [c (next-byte (mut p))]
                     ~(guarded-alts (.name d) (.tests gs) (.guarded gs) 0))
@@ -1764,21 +1932,25 @@
             `(defn ~(lex-sym (.name d)) [(p (mut rt/P))] (-> bool)
                ~(lex-code g (mut c) (.body d))))
   (when (= (.kind d) (DToken))
+    ;; The token here (space already skipped), moving past it where it matches. Lexed here
+    ;; already, as this body, by the last token asked for: its end, without lexing again.
+    (add-aux! (mut g)
+              `(defn ~(token-sym (.name d)) :inline (Always) [(p (mut rt/P))] (-> bool)
+                 (let [start (.pos p)]
+                   (if (and (= (.tok-at p) start) (= (.tok-id p) ~(token-body-id g d)))
+                       (do (set! (.pos p) (.tok-end p)) (.tok-ok p))
+                       (let [ok (~(lex-sym (.name d)) (mut p))]
+                         (set! (.tok-at p) start)
+                         (set! (.tok-id p) ~(token-body-id g d))
+                         (set! (.tok-end p) (.pos p))
+                         (set! (.tok-ok p) ok)
+                         ok)))))
     (add-aux! (mut g)
               `(defn ~(rule-sym (.name d)) [(p (mut rt/P)) (out (mut Node))] (-> bool)
                  (let [before (.pos p)]
                    ~(if (.raw d) `0 `(skip! (mut p)))
                    (let [start (.pos p)
-                         ;; Lexed here already, as this body, by the last token asked for: its end.
-                         matched
-                           (if (and (= (.tok-at p) start) (= (.tok-id p) ~(token-body-id g d)))
-                               (do (set! (.pos p) (.tok-end p)) (.tok-ok p))
-                               (let [ok (~(lex-sym (.name d)) (mut p))]
-                                 (set! (.tok-at p) start)
-                                 (set! (.tok-id p) ~(token-body-id g d))
-                                 (set! (.tok-end p) (.pos p))
-                                 (set! (.tok-ok p) ok)
-                                 ok))]
+                         matched (~(token-sym (.name d)) (mut p))]
                      (if matched
                          (do
                            (set! out (leaf-in (mut p) (~(kind-sym (.name d)))
@@ -2170,7 +2342,10 @@
                                                     (or (.empty acc)
                                                         (.empty s1))))))
                                       acc)
-                                  (and (= (.kind d) (DPostfix))
+                                  ;; A chain (postfix, suffix, infix) begins with its base.
+                                  (and (or (= (.kind d) (DPostfix))
+                                           (= (.kind d) (DSuffix))
+                                           (= (.kind d) (DInfix)))
                                        (> (len (.over d)) 0))
                                     (rule-start g (.over d) (mut m))
                                   :else (unknown-start))]
