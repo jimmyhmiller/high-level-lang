@@ -2,6 +2,9 @@
 #   jsparse print FILE        print the compact form to stdout
 #   jsparse check LISTFILE    parse each path in LISTFILE; report the ones that fail
 #   jsparse pieces FILE       where a big file is cut for parsing at once, and whether each piece parses
+#   jsparse bench LIST N      each file parsed N times on one thread, and its early errors checked
+#                             N times: per file, `BENCH path bytes parse-best parse-median check-best
+#                             check-median`, in microseconds
 # A path ending in .module.js parses with module flags (top-level await).
 rules tools.jsparse over bundle.js
 use bundle.js as js
@@ -31,6 +34,39 @@ fn lines-of(text: Text) -> [Text] {
   }
   out
 }
+
+# How long parsing takes, and the early-error check after it, each by itself: the best and the
+# median of `rounds` runs, after one that settles how the file parses (as the bundler parses it: a
+# script, else with top-level `await`). One thread; the bundler parses a big file in pieces at once.
+fn bench-list(list: Text, rounds: Int) -> Void {
+  for path in lines-of(read-file(list)) {
+    let src = read-file(path)
+    let plain = flags-for(path)
+    let flags = if is-some(js.parse-opt(src, path, plain)) then plain else plain + js.flag-bit("await")
+    match js.parse-opt(src, path, flags) {
+      none => print "SKIP {} does not parse", path
+      some(tree) => {
+        let is-module = module-file?(path) or early.program-has-module-syntax?(tree)
+        var parses: [Int] = []
+        var checks: [Int] = []
+        for r in 0..rounds {
+          let a = now-us()
+          let t = js.parse-opt(src, path, flags)
+          let b = now-us()
+          let found = early.check(t ?? tree, is-module, true, typescript-file?(path))
+          let c = now-us()
+          if is-some(found) { panic "{}: an early error the first check did not find", path }
+          parses += b - a
+          checks += c - b
+        }
+        print "BENCH {} {} {} {} {} {}", path, len(src), best(parses), median(parses), best(checks), median(checks)
+      }
+    }
+  }
+}
+
+fn best(xs: [Int]) -> Int = fold m = xs[0] for x in xs: min(m, x)
+fn median(xs: [Int]) -> Int = (sort x in xs by x)[len(xs) / 2]
 
 fn check-list(list: Text, quiet: Bool, allow-return: Bool, script-goal: Bool) -> Void {
   var good = 0
@@ -121,6 +157,7 @@ fn run() -> Int {
     # test262 is strict about a top-level return; library code is often CommonJS.
     "strict" => { check-list(arg, false, false, true) 0 }
     "accepted" => { check-list(arg, true, false, true) 0 }
+    "bench" => { bench-list(arg, if arg-count() > 3 then parse-int(arg-at(3)) else 5) 0 }
     _ => {
       print "usage: jsparse print FILE | check LIST | accepted LIST"
       1

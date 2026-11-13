@@ -737,7 +737,7 @@ on Arrow(params, body) | AsyncArrow(params, body) as n {
 on Program(_, List(stmts...)) as n {
   problem += match part {
     true => none
-    false => checked(head-problem(n, module, now))
+    false => checked(head-problem(n, module, now, types-erased))
   }
   kids.strict = now
   kids.in-async = module
@@ -891,10 +891,32 @@ fn export-spec-problem(local: Node) -> Problem? =
 
 # What concerns a program's statements together: names exported twice, and what its top level
 # declares. `now-strict` is the program's strictness.
-fn head-problem(tree: Node, is-module: Bool, now-strict: Bool) -> Problem? =
+fn head-problem(tree: Node, is-module: Bool, now-strict: Bool, typed: Bool) -> Problem? =
   (first p in [Problem(message: "a name is exported twice", at: tree.lo)] if is-module and duplicates?([exported-names(s)... for s in stmts]): p)
-  ?? declaration-problem(stmts, not is-module, [], tree, now-strict)
-  where stmts = tree.body.kids
+  ?? declaration-problem(checked-stmts, not is-module, [], tree, now-strict)
+  where stmts = tree.body.kids,
+        # In TypeScript an import may name only a type, and a value declared by the same name does
+        # not collide with it (TypeScript reports the collision when the import is a value). Two
+        # imports of one name still collide.
+        local = module-names([s for s in stmts if not (s is Import(...))]),
+        checked-stmts = match typed {
+          true => [type-shadowed-import(s, local) for s in stmts]
+          false => stmts
+        }
+
+# An import without the bindings a local declaration shadows, which in TypeScript name types.
+fn type-shadowed-import(s: Node, local: [Text]) -> Node = match s {
+  Import(clause, from, attributes) => s with { kids: [without-shadowed(clause, local), from, attributes] }
+  _ => s
+}
+
+fn without-shadowed(c: Node, local: [Text]) -> Node = match c {
+  ImportDefault(x) | ImportNamespace(x) if unescaped(x.text) in local => ImportNamed(List()) with { lo: c.lo, hi: c.hi }
+  ImportNamed(List(specs...)) => c with { kids: [List([x for x in specs if not (x is TsErased()) and not (unescaped(x.name.text) in local)]...)] }
+  ImportDefaultAnd(x, rest) if unescaped(x.text) in local => without-shadowed(rest, local)
+  ImportDefaultAnd(x, rest) => c with { kids: [x, without-shadowed(rest, local)] }
+  _ => c
+}
 
 # The first early error in a program. `is-module` is whether it is an ES module, which the
 # bundler decides from its syntax. `top-return` is for CommonJS, whose top level is a function.
@@ -904,7 +926,7 @@ fn check(tree: Node, is-module: Bool, top-return: Bool, typed: Bool) -> Problem?
 # A big program checked in parts at once: first what concerns its statements together, then each
 # part's statements, in the program's context.
 fn check-head(tree: Node, is-module: Bool, top-return: Bool, typed: Bool) -> Problem? =
-  head-problem(tree, is-module, is-module or has-use-strict?(tree.body.kids))
+  head-problem(tree, is-module, is-module or has-use-strict?(tree.body.kids), typed)
 
 # What a program's statements may export, which each part's check needs.
 fn exportable-of(tree: Node) -> [Text] = module-names(tree.body.kids)

@@ -16,8 +16,9 @@
   - minified names reuse what a scope does not read from outside, as Terser's do, yet never where
     the language or lowering forbids it: a catch body's declarations, a block's `var`, a name a
     class's code means the class by;
-  - `?.` before a digit is a conditional and a number (`a?.5:b`, as minifiers write it), and a
-    TypeScript namespace exports its members in a file that is no module;
+  - `?.` before a digit is a conditional and a number (`a?.5:b`, as minifiers write it), a
+    TypeScript namespace exports its members in a file that is no module, and a TypeScript import
+    a local value shadows names a type and goes;
   - a module imported `with { type: "json" }` is a JSON module of its own, its value as JSON.parse
     makes it with only a default export, whether bundled, loaded by import(), or left outside with
     its attribute kept; what the build cannot honour is an error; and a default-only module that
@@ -248,11 +249,16 @@ print('ok   minified names never shadow where the language or lowering forbids i
 write({'syntax/ternary.js': 'const t = true, f = false;\nconsole.log(t?.5:1, f?.25:2, t?.0:3, [1]?.[0], ({a:4})?.a);\n',
        'syntax/space.ts': 'namespace Shapes { export class Square { constructor(public side: number) {} area() { return this.side ** 2; } } export namespace Inner { export const unit = "cm"; } }\n'
                           'module Legacy { export const answer = 42; }\nconsole.log(new Shapes.Square(3).area(), Shapes.Inner.unit, Legacy.answer);\n'})
-for entry, want in (('syntax/ternary.js', '0.5 2 0 1 4\n'), ('syntax/space.ts', '9 cm 42\n')):
-    built = run([ESB, entry, '--outfile=syntax-out.js'])
+# An import that names only a type, shadowed by a value of the module's own (as TypeScript's own
+# checker.ts has `import { SymbolLinks }` and `const SymbolLinks = class implements SymbolLinks`).
+write({'syntax/types.ts': 'export interface Links { a: number }\nexport const other = 2;\n',
+       'syntax/shadow.ts': 'import { Links, other, Made } from "./types";\nconst Links = class implements Links { a = 1 };\n'
+                           'function Made(this: Made) { this.a = 3; }\nconsole.log(new Links().a, other, new (Made as any)().a);\n'})
+for entry, want in (('syntax/ternary.js', '0.5 2 0 1 4\n'), ('syntax/space.ts', '9 cm 42\n'), ('syntax/shadow.ts', '1 2 3\n')):
+    built = run([ESB, entry, '--bundle', '--outfile=syntax-out.js'])
     got = run(['node', 'syntax-out.js'])
     ok(built.returncode == 0 and got.stdout == want, f'{entry}: {got.stdout!r}{built.stderr[-200:]!r} want {want!r}')
-print('ok   `?.` before a digit, and namespaces in a script, as real code writes them', flush=True)
+print('ok   `?.` before a digit, namespaces in a script, and a type import a value shadows, as real code writes them', flush=True)
 
 # ---------------------------------------------------------------- import attributes
 # A JSON module (`with { type: "json" }`) is its value as JSON.parse makes it, a `__proto__` key an
