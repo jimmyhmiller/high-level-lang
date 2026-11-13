@@ -1166,14 +1166,32 @@
         (if (and (.known f) (not empty)) (Some (bytes-of-first f)) (None [Bytes])))
       (None [Bytes])))
 
-;;; Past every byte not of the set from here on.
+;;; Past every byte not of the set from here on. Where the set is a few bytes (what ends a
+;;; comment, a line), eight bytes at a time first: a word with none of them in it is stepped over
+;;; whole. (A word less a byte repeated has a zero byte where it holds that byte, and
+;;; `(x - 0x01…) & ~x & 0x80…` is not zero exactly when x has a zero byte.)
 (defn byte-run-until [(b Bytes)] (-> Code)
-  `(let [src (.src p)
-         n (len src)
-         (mut i) (.pos p)]
-     (while (and (< i n) (let [c (cast i64 (get src i))] (not ~(byte-test b))))
-       (set! i (+ i 1)))
-     (set! (.pos p) i)))
+  (let [(mut stops) (ArrayList::new [i64] (malloc-allocator))
+        ones 72340172838076673
+        (mut tests) (primitive/code-list-new)]
+    (for x (range 0 256) (when (bytes-has? b x) (push! (mut stops) x)))
+    (for x stops
+      (let [rep (primitive/imul x ones)]
+        (push! (mut tests)
+               `(let [x (^ w ~rep)]
+                  (& (primitive/isub x 72340172838076673) (& (- -1 x) -9187201950435737472))))))
+    `(let [src (.src p)
+           n (len src)
+           (mut i) (.pos p)]
+       ~(if (and (> (len stops) 0) (<= (len stops) 4))
+            `(while (and (<= (+ i 8) n)
+                         (let [w (load (primitive/cast (ptr i64) (primitive/index (data src) i)))]
+                           (= (| 0 0 ~@tests) 0)))
+               (set! i (+ i 8)))
+            `0)
+       (while (and (< i n) (let [c (cast i64 (get src i))] (not ~(byte-test b))))
+         (set! i (+ i 1)))
+       (set! (.pos p) i))))
 
 ;;; Past every byte of the set from here on.
 (defn byte-run [(b Bytes)] (-> Code)
@@ -1831,6 +1849,9 @@
 (defn chain? [(d Decl)] (-> bool)
   (or (= (.kind d) (DPostfix)) (= (.kind d) (DSuffix)) (= (.kind d) (DInfix))))
 
+;;; How many rules' choices one layout holds, one inside another, before the next is a call.
+(defn plan-most [] (-> i64) 4)
+
 ;;; A layout for one byte: the code that parses what is found first, and the chains whose
 ;;; operators may follow it, innermost first.
 (defstruct Run [(terminal Code) (rests (ArrayList (slice u8)))])
@@ -1849,12 +1870,12 @@
       (None [] 0))))
 
 ;;; What rule `name` does at byte `x`, as it is written: not through its memo.
-(defn plan-run [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (inlined bool) (m (mut FirstMemo))] (-> Run)
+(defn plan-run [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (lists i64) (m (mut FirstMemo))] (-> Run)
   (match (find-decl g name)
     (None [] (panic "no rule named {}" name))
     (Some [d]
           (cond (chain? d)
-                  (let [(mut r) (plan-ref (mut g) (.over d) x (+ depth 1) inlined (mut m))]
+                  (let [(mut r) (plan-ref (mut g) (.over d) x (+ depth 1) lists (mut m))]
                     (push! (mut (.rests r)) name)
                     r)
                 (= (.kind d) (DRule))
@@ -1866,24 +1887,24 @@
                     (let [only (if (= (len apps) 1) (bare-ref g (get (.alts d) (get apps 0))) "")]
                       (if (and (> (len only) 0)
                                (not (.two (get infos (get apps 0)))))
-                          (plan-ref (mut g) only x (+ depth 1) inlined (mut m))
-                          ;; One rule's choice is laid out in a function: a second one, below
-                          ;; it, is that rule's own function to make.
-                          (if inlined
+                          (plan-ref (mut g) only x (+ depth 1) lists (mut m))
+                          ;; A few rules' choices are laid out in a function, one inside
+                          ;; another: one further down is that rule's own function to make.
+                          (if (>= lists (plan-most))
                               (run-of `(~(rule-sym name) (mut p) (mut out)))
                               (run-of `(let [save (.pos p)]
-                                         ~(plan-alts (mut g) d apps 0 x depth (mut m))))))))
+                                         ~(plan-alts (mut g) d apps 0 x depth lists (mut m))))))))
                 :else (run-of `(~(rule-sym name) (mut p) (mut out)))))))
 
 ;;; What asking for rule `name` does at byte `x`. A memoized rule is asked through its memo, and a
 ;;; token, or a rule too far down, by its function.
-(defn plan-ref [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (inlined bool) (m (mut FirstMemo))] (-> Run)
+(defn plan-ref [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (lists i64) (m (mut FirstMemo))] (-> Run)
   (match (find-decl g name)
     (None [] (panic "no rule named {}" name))
     (Some [d]
           (if (or (.memo d) (> depth 24) (not (or (chain? d) (= (.kind d) (DRule)))))
               (run-of `(~(rule-sym name) (mut p) (mut out)))
-              (plan-run (mut g) name x depth inlined (mut m))))))
+              (plan-run (mut g) name x depth lists (mut m))))))
 
 ;;; What a layout asks of an alternative, for every byte: what it starts with, whether it has a
 ;;; two-token test, and the first tokens it may begin with.
@@ -1938,16 +1959,16 @@
 
 ;;; The alternatives of `d` that can begin at `x`, from the k-th of them on, in order.
 (defn plan-alts [(g (mut Grammar)) (d Decl) (apps (ArrayList i64)) (k i64) (x i64) (depth i64)
-                 (m (mut FirstMemo))] (-> Code)
+                 (lists i64) (m (mut FirstMemo))] (-> Code)
   (if (>= k (len apps))
       `false
       (let [i (get apps k)
             a (get (.alts d) i)
             bare (bare-ref g a)
             body (if (> (len bare) 0)
-                     (run-code (mut g) (plan-ref (mut g) bare x (+ depth 1) true (mut m)) (mut m))
+                     (run-code (mut g) (plan-ref (mut g) bare x (+ depth 1) (+ lists 1) (mut m)) (mut m))
                      `(~(alt-sym (.name d) i) (mut p) (mut out)))
-            rest (plan-alts (mut g) d apps (+ k 1) x depth (mut m))
+            rest (plan-alts (mut g) d apps (+ k 1) x depth lists (mut m))
             info (get (alt-infos (mut g) d (mut m)) i)
             two (if (.two info)
                     (Some `(~(two-sym (.name d) i) (mut p) c))
@@ -2048,14 +2069,14 @@
 (defn key-text! [(out (mut (ArrayList u8))) (s (slice u8))] (-> void)
   (for ch s (push! (mut out) ch)))
 
-(defn key-run! [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (inlined bool) (m (mut FirstMemo))
+(defn key-run! [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (lists i64) (m (mut FirstMemo))
                 (out (mut (ArrayList u8)))] (-> void)
   (match (find-decl g name)
     (None [] (panic "no rule named {}" name))
     (Some [d]
           (cond (chain? d)
                   (do
-                    (key-ref! (mut g) (.over d) x (+ depth 1) inlined (mut m) (mut out))
+                    (key-ref! (mut g) (.over d) x (+ depth 1) lists (mut m) (mut out))
                     (key-text! (mut out) "+")
                     (key-text! (mut out) name))
                 (= (.kind d) (DRule))
@@ -2068,8 +2089,8 @@
                         (set! count (+ count 1))))
                     (let [only (if (= count 1) (bare-ref g (get (.alts d) first)) "")]
                       (cond (and (> (len only) 0) (not (.two (get infos first))))
-                              (key-ref! (mut g) only x (+ depth 1) inlined (mut m) (mut out))
-                            inlined (key-text! (mut out) name)
+                              (key-ref! (mut g) only x (+ depth 1) lists (mut m) (mut out))
+                            (>= lists (plan-most)) (key-text! (mut out) name)
                             :else
                               (do
                                 (key-text! (mut out) "[")
@@ -2087,19 +2108,19 @@
                                                 (key-text! (mut out) "~")))
                                         (None [] 0))
                                       (when (> (len bare) 0)
-                                        (key-ref! (mut g) bare x (+ depth 1) true (mut m) (mut out))
+                                        (key-ref! (mut g) bare x (+ depth 1) (+ lists 1) (mut m) (mut out))
                                         (key-text! (mut out) ";")))))
                                 (key-text! (mut out) "]")))))
                 :else (key-text! (mut out) name)))))
 
-(defn key-ref! [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (inlined bool) (m (mut FirstMemo))
+(defn key-ref! [(g (mut Grammar)) (name (slice u8)) (x i64) (depth i64) (lists i64) (m (mut FirstMemo))
                 (out (mut (ArrayList u8)))] (-> void)
   (match (find-decl g name)
     (None [] (panic "no rule named {}" name))
     (Some [d]
           (if (or (.memo d) (> depth 24) (not (or (chain? d) (= (.kind d) (DRule)))))
               (key-text! (mut out) name)
-              (key-run! (mut g) name x depth inlined (mut m) (mut out))))))
+              (key-run! (mut g) name x depth lists (mut m) (mut out))))))
 
 ;;; Whether a layout can say more than the rule's alternatives in order do: a chain's can, and a
 ;;; rule's that passes another rule or a token on.
@@ -2133,29 +2154,20 @@
     (for x (range -1 256)
       (let [(mut at) -1]
         (clear! (mut scratch))
-        (key-run! (mut g) (.name d) x 0 false (mut m) (mut scratch))
+        (key-run! (mut g) (.name d) x 0 0 (mut m) (mut scratch))
         (for i (range 0 (len keys))
           (when (= (get keys i) (slice scratch)) (set! at i)))
         (when (< at 0)
           (set! at (len keys))
           (push! (mut keys) (dsl/join2 (slice scratch) ""))
-          (push! (mut codes) (run-code (mut g) (plan-run (mut g) (.name d) x 0 false (mut m)) (mut m))))
+          (push! (mut codes) (run-code (mut g) (plan-run (mut g) (.name d) x 0 0 (mut m)) (mut m))))
         (push! (mut table) (cast u8 (class-byte at)))))
-    ;; Each layout is a function of its own, so that no function the compiler checks is as big
-    ;; as all of a rule's layouts together; they are put back together once checked.
     (let [heads (if (.plan-c2 g)
                     `(c (next-byte (mut p)) w (next-word (mut p)))
-                    `(c (next-byte (mut p)) w 0))
-          (mut calls) (ArrayList::new [Code] (malloc-allocator))]
-      (for i (range 0 (len codes))
-        (let [name (primitive/code-symbol (dsl/join3 "p-" (.name d) "-at") i)]
-          (add-aux! (mut g)
-                    `(defn ~name :inline (Always) [(p (mut rt/P)) (out (mut Node)) (c i64) (w i64)] (-> bool)
-                       ~(get codes i)))
-          (push! (mut calls) `(~name (mut p) (mut out) c w))))
+                    `(c (next-byte (mut p))))]
       (if (= (len codes) 1)
-          `(let [~@heads] ~(get calls 0))
-          `(let [~@heads] ~(by-class table calls))))))
+          `(let [~@heads] ~(get codes 0))
+          `(let [~@heads] ~(by-class table codes))))))
 
 ;;; Alternatives in order, each tried only when the next token's first byte is one it can begin with.
 (defn guarded-alts [(name (slice u8))
@@ -2399,7 +2411,7 @@
         (when (< at 0)
           (set! at (len keys))
           (push! (mut keys) (dsl/join2 (slice scratch) ""))
-          (push! (mut codes) (plan-alts (mut g) d apps 0 x 0 (mut m))))
+          (push! (mut codes) (plan-alts (mut g) d apps 0 x 0 (plan-most) (mut m))))
         (push! (mut table) (cast u8 (class-byte at)))))
     (let [heads (if (.plan-c2 g)
                     `(c (next-byte (mut p)) w (next-word (mut p)))
