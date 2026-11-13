@@ -18,6 +18,10 @@
     class's code means the class by;
   - `?.` before a digit is a conditional and a number (`a?.5:b`, as minifiers write it), and a
     TypeScript namespace exports its members in a file that is no module;
+  - a module imported `with { type: "json" }` is a JSON module of its own, its value as JSON.parse
+    makes it with only a default export, whether bundled, loaded by import(), or left outside with
+    its attribute kept; what the build cannot honour is an error; and a default-only module that
+    import() loads has its namespace filled;
   - a direct `eval`, called by name or in parentheses, sees its module's names as written, while
     `eval` read any other way does not stop minifying; and one module reading `eval` leaves the
     names linking makes (`init_x`) distinct.
@@ -249,6 +253,49 @@ for entry, want in (('syntax/ternary.js', '0.5 2 0 1 4\n'), ('syntax/space.ts', 
     got = run(['node', 'syntax-out.js'])
     ok(built.returncode == 0 and got.stdout == want, f'{entry}: {got.stdout!r}{built.stderr[-200:]!r} want {want!r}')
 print('ok   `?.` before a digit, and namespaces in a script, as real code writes them', flush=True)
+
+# ---------------------------------------------------------------- import attributes
+# A JSON module (`with { type: "json" }`) is its value as JSON.parse makes it, a `__proto__` key an
+# own property, with only a default export; imported statically or by import(), bundled or left
+# outside, where the output keeps the attribute Node requires. The plain JSON import is a module of
+# its own. A default-only module that import() loads without splitting has its namespace filled.
+write({'attrs/data.json': '{"a":1,"b":[2,3],"__proto__":{"p":1},"s":"x\\u0041","n":-1.5e3}\n',
+       'attrs/only-default.js': 'export default { kind: "default only" };\n',
+       'attrs/node_modules/extjson/package.json': '{"name":"extjson","exports":{"./data.json":"./data.json"}}',
+       'attrs/node_modules/extjson/data.json': '{"outside":true}\n',
+       'attrs/main.js': 'import d from "./data.json" with { type: "json" };\n'
+                        'import * as ns from "./data.json" with { "type": "json", };\n'
+                        'import ext from "extjson/data.json" with { type: "json" };\n'
+                        'const dyn = await import("./data.json", { with: { type: "json" } });\n'
+                        'const only = await import("./only-default.js");\n'
+                        'console.log(JSON.stringify([d, Object.keys(ns), dyn.default === d, ns.default === d, Object.keys(d), Object.getPrototypeOf(d) === Object.prototype, ext, only.default]));\n'})
+want = run(['node', 'attrs/main.js']).stdout
+# The output is written beside the package the build leaves outside, where Node finds it.
+for flags in ([], ['--minify'], ['--splitting', '--outdir=attrs/split'], ['--splitting', '--minify', '--outdir=attrs/split-min']):
+    out = [f[len('--outdir='):] for f in flags if f.startswith('--outdir=')]
+    target = out[0] + '/main.js' if out else 'attrs/out.mjs'
+    built = run([ESB, 'attrs/main.js', '--bundle', '--format=esm', '--external:extjson/data.json'] + flags + ([] if out else ['--outfile=' + target]))
+    got = run(['node', target]) if built.returncode == 0 else built
+    ok(built.returncode == 0 and got.stdout == want, f'JSON modules {flags}: {got.stdout!r}{built.stderr[-300:]!r}{got.stderr[-300:]!r} want {want!r}')
+write({'attrs/plain.js': 'import plain from "./data.json"; import typed from "./data.json" with { type: "json" };\n'
+                         'console.log(plain === typed, JSON.stringify(plain) === JSON.stringify(typed), Object.keys(plain).join());\n'})
+built = run([ESB, 'attrs/plain.js', '--bundle', '--format=esm', '--outfile=attrs-plain.mjs'])
+got = run(['node', 'attrs-plain.mjs'])
+ok(built.returncode == 0 and got.stdout == 'false true a,b,__proto__,s,n\n', f'a plain JSON import is not the JSON module: {got.stdout!r}{built.stderr[-300:]!r}')
+write({'attrs/bad.json': '{"a": 1,}\n', 'attrs/comment.json': '{"a": 1} // no\n'})
+for name, source, message in (
+        ('css', 'import x from "./data.json" with { type: "css" }; console.log(x);', 'importing with a type attribute of "css" is not supported'),
+        ('key', 'import x from "./data.json" with { mode: "x" }; console.log(x);', 'importing with the "mode" attribute is not supported'),
+        ('twice', 'import x from "./data.json" with { type: "json", type: "json" }; console.log(x);', 'this import attribute is given twice'),
+        ('named', 'import { a } from "./data.json" with { type: "json" }; console.log(a);', 'No matching export in "attrs/data.json with { type: \'json\' }" for import "a"'),
+        ('options', 'const o = { with: { type: "json" } }; import("./data.json", o);', "import()'s options must be an object literal"),
+        ('notjson', 'import x from "./bad.json" with { type: "json" }; console.log(x);', 'bad.json:1:9:'),
+        # The json loader reads JSON, as esbuild's does: no comments, no trailing commas.
+        ('loader', 'import x from "./comment.json"; console.log(x);', 'comment.json:1:10:')):
+    write({f'attrs/err-{name}.js': source + '\n'})
+    built = run([ESB, f'attrs/err-{name}.js', '--bundle', '--format=esm', '--outfile=attrs-err.mjs'])
+    ok(built.returncode != 0 and message in built.stderr, f'import attributes error {name}: {built.returncode} {built.stderr[-300:]!r} want {message!r}')
+print('ok   import attributes: JSON modules bundled and left outside, and what the build cannot honour', flush=True)
 
 # ---------------------------------------------------------------- eval
 write({'ev/direct.js': 'const secretValue = 41;\nexport function viaDirect() { return eval("secretValue + 1"); }\n',

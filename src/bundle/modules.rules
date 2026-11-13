@@ -10,6 +10,7 @@ use bundle.constants as consts
 use bundle.writes as writes
 use bundle.early as early
 use bundle.calls as calls
+use bundle.attributes as at
 use bundle.comments as cm
 use bundle.minhost as host
 use bundle.jsx as jsx
@@ -17,25 +18,55 @@ use bundle.ts as ts
 use bundle.cssbundle as cssb
 use bundle.legal as legal
 use bundle.tsconfig as tsc
+use bundle.jsonmodule as jsonmod
 
 # Resolution requests preserve their kind, including when one module imports and requires the
 # same spelling. Keys are a serialization for maps and work items, never module identities.
-record Request { spec: Text, kind: res.Kind }
+# `json`: imported `with { type: "json" }`, which makes the file a JSON module, a module of its own.
+record Request { spec: Text, kind: res.Kind, json: Bool }
 
-fn import-request(spec: Text) -> Request = Request(spec: spec, kind: res.Import)
-fn require-request(spec: Text) -> Request = Request(spec: spec, kind: res.Require)
-fn request-key(r: Request) -> Text = match r.kind { res.Import => "import:" res.Require => "require:" } ++ r.spec
+fn import-request(spec: Text) -> Request = Request(spec: spec, kind: res.Import, json: false)
+fn json-request(spec: Text) -> Request = Request(spec: spec, kind: res.Import, json: true)
+fn require-request(spec: Text) -> Request = Request(spec: spec, kind: res.Require, json: false)
+fn request-key(r: Request) -> Text = match r.json {
+  true => "json:"
+  false => match r.kind { res.Import => "import:" res.Require => "require:" }
+} ++ r.spec
 fn request-of(key: Text) -> Request = match key {
   "import:" ++ spec => import-request(spec)
+  "json:" ++ spec => json-request(spec)
   "require:" ++ spec => require-request(spec)
   _ => panic "invalid resolution request {}", key
 }
-fn requests-in(tree: Node, required: [Text], dynamic: [Text]) -> [Request] =
-  [import-request(s) for s in imported-specs(tree)] ++ [require-request(s) for s in required]
-  ++ [import-request(s) for s in dynamic]
+fn requests-in(tree: Node, required: [Text], dynamic: [Text], json-dynamic: [Text]) -> [Request] =
+  [r for s in tree.body.kids if let some(r) = statement-request(s)] ++ [require-request(s) for s in required]
+  ++ [import-request(s) for s in dynamic] ++ [json-request(s) for s in json-dynamic]
 fn requests-of(p: Parsed) -> [Request] = match p.analysed {
-  true => requests-in(p.tree, p.required, p.imports)
-  false => requests-in(p.tree, p.requires, p.imports)
+  true => requests-in(p.tree, p.required, p.imports, p.json-imports)
+  false => requests-in(p.tree, p.requires, p.imports, p.json-imports)
+}
+
+# Where a module's import leads, by what it asks for.
+fn request-target(mo: Module, r: Request) -> Int? = match r.json {
+  true => mo.json-ids[r.spec]
+  false => mo.dep-ids[r.spec]
+}
+
+# What an import statement or an `import()` with a literal path asks for.
+fn request-at(n: Node) -> Request? = match n {
+  ImportCall(Str(raw), options, _) => match at.call-attributes(options) {
+    some(a) if at.json?(a) => some(json-request(unquote(raw)))
+    some(_) => some(import-request(unquote(raw)))
+    none => panic "an import() whose options the check let through: {}", raw
+  }
+  _ => statement-request(n)
+}
+
+# What an import statement asks for: its specifier, as a JSON module when its attributes say so.
+fn statement-request(s: Node) -> Request? = match import-spec-of(s) {
+  some(spec) if at.json?(at.statement-attributes(at.attributes-of(s))) => some(json-request(spec))
+  some(spec) => some(import-request(spec))
+  none => none
 }
 
 # `External` is an import left for the runtime: it has no source and no statements.
@@ -52,6 +83,7 @@ boxed record Module {
   side-effects: Bool,
   deps: [Int],
   dep-ids: {Text:Int},  # imports and import() by specifier
+  json-ids: {Text:Int}, # imports and import() `with { type: "json" }`, by specifier
   require-ids: {Text:Int}, # require() has its own conditions and may resolve the same name differently
   symbol-shift: Int,    # how far those symbols moved when its table joined the shared one
   base: Text,
@@ -261,7 +293,7 @@ fn normalized(n: Node) -> [Node] = match n {
 # ---------------------------------------------------------------- dependencies
 
 # What a final tree loads at run time: its `require`s, then its `import()`s, in source order.
-fn loads-of(tree: Node) -> Checked = Checked(tree: tree, requires: found.requires, imports: found.imports)
+fn loads-of(tree: Node) -> Checked = Checked(tree: tree, requires: found.requires, imports: found.imports, json-imports: found.json-imports)
   where found = calls.run(tree)
 
 # ---------------------------------------------------------------- defines
@@ -303,12 +335,12 @@ fn substitute(n: Node, b: {Int:Int}) -> Node = match defined(n, b) {
 # ---------------------------------------------------------------- loading
 
 # A parsed and checked file, and the `require`s and `import()`s the check's traversal found.
-boxed record Checked { tree: Node, requires: [Text], imports: [Text] }
+boxed record Checked { tree: Node, requires: [Text], imports: [Text], json-imports: [Text] }
 
 # Parse and check a file. A file with import or export syntax is a module; anything else may be
 # CommonJS, whose top level is a function body.
 fn parse-file(src: Text, path: Text) -> Checked = match found.problem {
-  none => Checked(tree: tree, requires: found.requires, imports: found.imports)
+  none => Checked(tree: tree, requires: found.requires, imports: found.imports, json-imports: found.json-imports)
   some(p) => panic "{}:{}:{}: {}", path, line-of(src, p.at), col-of(src, p.at), p.message
 } where loader = loader-of(path),
         syntax = sum flag in [x for x in ["jsx"] if loader == "jsx" or loader == "tsx"]
@@ -318,21 +350,28 @@ fn parse-file(src: Text, path: Text) -> Checked = match found.problem {
         is-module = module-file?(tree, src, path),
         found = found-in(tree, is-module, loader == "ts" or loader == "tsx")
 
-# What checking a program finds: the first early error, and what it loads. What concerns its
-# statements together is checked of the program; then each statement is checked by itself, in the
-# program's context.
-record Found { problem: early.Problem?, requires: [Text], imports: [Text] }
+# What checking a program finds: the first early error, or else the first import the build cannot
+# honour, and what it loads. What concerns its statements together is checked of the program; then
+# each statement is checked by itself, in the program's context.
+record Found { problem: early.Problem?, requires: [Text], imports: [Text], json-imports: [Text] }
 
 # The same, of the program in one check.
 fn found-whole(tree: Node, is-module: Bool, typed: Bool) -> Found =
-  Found(problem: a.problem, requires: a.requires, imports: a.imports)
+  Found(problem: a.problem ?? unhonoured(a.unhonoured), requires: a.requires, imports: a.imports, json-imports: a.json-imports)
   where a = early.run(tree, is-module, not is-module, typed, false, false, [])
 
 fn found-in(tree: Node, is-module: Bool, typed: Bool) -> Found =
-  Found(problem: early.check-head(tree, is-module, not is-module, typed) ?? (first a in each for p in a.problem: p),
-        requires: [r for a in each for r in a.requires], imports: [r for a in each for r in a.imports])
+  Found(problem: early.check-head(tree, is-module, not is-module, typed) ?? (first a in each for p in a.problem: p)
+                 ?? unhonoured(first a in each for u in a.unhonoured: u),
+        requires: [r for a in each for r in a.requires], imports: [r for a in each for r in a.imports],
+        json-imports: [r for a in each for r in a.json-imports])
   where exportable = early.exportable-of(tree),
         each = [early.part-found(tree, is-module, not is-module, typed, exportable, [s]) for s in tree.body.kids]
+
+fn unhonoured(u: at.Unhonoured?) -> early.Problem? = match u {
+  some(x) => some(early.Problem(message: x.message, at: x.at))
+  none => none
+}
 
 # Lowering JSX or TypeScript makes another tree of a file's.
 fn lowered-loader?(loader: Text) -> Bool = loader == "jsx" or loader == "tsx" or loader == "ts"
@@ -360,7 +399,7 @@ fn node-mode?(path: Text) -> Bool = ends-with(path, ".mjs") or res.package-type-
 
 fn blank-module(id: Int, path: Text, kind: ModuleKind, root: Int) -> Module =
   Module(id: id, path: path, kind: kind, root: root, side-effects: true,
-         deps: [], dep-ids: {}, require-ids: {}, symbol-shift: 0, base: base-name(path), free: [],
+         deps: [], dep-ids: {}, json-ids: {}, require-ids: {}, symbol-shift: 0, base: base-name(path), free: [],
          legal: [], helpers: [], calls: true, script: false, forbidden: [])
 
 # What a module is made of: its tree; the symbol each name leaf is, by where it starts, as its own
@@ -438,7 +477,10 @@ fn searched-for(request: Request, importer: Text) -> res.Resolved = match config
   }, request.kind)
 } where spec = request.spec, wanted = aliased(spec)
 
-fn loader-of(path: Text) -> Text = (first l in loading.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
+fn loader-of(path: Text) -> Text = match path {
+  "json:" ++ _ => "json module"
+  _ => (first l in loading.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
+}
 
 fn default-loader(path: Text) -> Text = match path {
   _ ++ ".json" => "json"
@@ -455,8 +497,11 @@ fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
   _ => module-text(text, path)
 }
 
-# A load hook may supply a file's text, or the file does.
-fn source-of(path: Text) -> Text = (first hook in loading.on-load: hook(path)) ?? file-source(path)
+# A load hook may supply a file's text, or the file does. A JSON module's is its file's.
+fn source-of(path: Text) -> Text = match path {
+  "json:" ++ file => source-of(file)
+  _ => (first hook in loading.on-load: hook(path)) ?? file-source(path)
+}
 
 fn file-source(path: Text) -> Text = match path {
   "disabled:" ++ _ => "module.exports = {};"
@@ -465,8 +510,8 @@ fn file-source(path: Text) -> Text = match path {
 
 # The specifier a statement imports from, or nothing.
 fn import-spec-of(s: Node) -> Text? = match s {
-  Import(_, from) | ExportAllAs(_, from) | ExportFrom(_, from) => some(module-of-str(from))
-  ImportBare(from) | ExportAll(from) => some(module-of-str(from))
+  Import(_, from, _) | ExportAllAs(_, from, _) | ExportFrom(_, from, _) => some(module-of-str(from))
+  ImportBare(from, _) | ExportAll(from, _) => some(module-of-str(from))
   _ => none
 }
 
@@ -498,6 +543,7 @@ boxed record Parsed {
   required: [Text],     # with the analysis: what its final tree `require`s
   requires: [Text],     # what the tree as parsed `require`s, and `import()`s, when `found`
   imports: [Text],
+  json-imports: [Text], # and `import()`s of JSON modules
   found: Bool
 }
 
@@ -601,8 +647,16 @@ fn pure-annotated?(b: Body, n: Node) -> Bool = n.lo in b.pure-at or (any hi in b
 # The text a module of this loader stands for. Not the file loader's: that writes an asset, so it
 # is made by `as-module`, on the thread that links.
 fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
+  # A file a package's browser field disables is an empty CommonJS module, whatever its loader.
+  _ if path is "disabled:" ++ _ => text
   "js" | "jsx" | "ts" | "tsx" => text
-  "json" => "module.exports = " ++ text
+  "json" => "module.exports = " ++ jsonmod.js-of(text, path)
+  # A JSON module's one export is its default.
+  "json module" => match path {
+    "json:disabled:" ++ _ => "export default {};"
+    "json:" ++ file => "export default " ++ jsonmod.js-of(text, file) ++ ";"
+    _ => panic "{}: a JSON module without its key", path
+  }
   "text" => "export default " ++ host.js-string(text) ++ ";"
   "base64" => "export default \"" ++ host.base64(text) ++ "\";"
   "dataurl" => "export default \"" ++ host.data-url-of(text, host.mime-of(path)) ++ "\";"
@@ -626,7 +680,7 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
   Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
          legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: found.requires, imports: found.imports,
-         found: is-none(known),
+         json-imports: found.json-imports, found: is-none(known),
          analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], required: [])
   where loader = loader-of(path),
         config = tsc.for-file(path),
@@ -645,24 +699,25 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
         # a file the build never uses, but never misses one it does. The check found them already, in
         # the tree a plain JavaScript file keeps. A file put together from pieces knows its specifiers.
         found = match known, checked {
-          some(_), _ => Checked(tree: typed.tree, requires: [], imports: [])
+          some(_), _ => Checked(tree: typed.tree, requires: [], imports: [], json-imports: [])
           none, some(c) if not lowered-loader?(loader) => c
           _, _ => loads-of(typed.tree)
         },
-        specs = known ?? (imported-specs(typed.tree) ++ found.requires ++ found.imports)
+        specs = known ?? (imported-specs(typed.tree) ++ found.requires ++ found.imports ++ found.json-imports)
 
 # The same, with scopes analysed too, in a table of the file's own. Not while a spec's transform
 # has to see the tree first.
 fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
   true => p
-  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, required: found.requires, imports: found.imports, specs: specs }
+  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, required: found.requires, imports: found.imports,
+                    json-imports: found.json-imports, specs: specs }
     where a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers),
           # The calls are the parsed tree's unless a define changed it, and those were found already.
           found = match p.found and not a.analysis.defined {
-            true => Checked(tree: p.tree, requires: p.requires, imports: p.imports)
+            true => Checked(tree: p.tree, requires: p.requires, imports: p.imports, json-imports: p.json-imports)
             false => loads-of(a.analysis.tree)
           },
-          calls = found.requires ++ found.imports,
+          calls = found.requires ++ found.imports ++ found.json-imports,
           # Once defines have removed code, what it loads is what is left: `require`s a define
           # removed, as of a development build, are not read ahead.
           specs = match a.analysis.defined {
@@ -700,8 +755,10 @@ fn searched(request: Request, wanted: Text, importer: Text) -> Text? =
 # Where an import would lead, or nothing if it leads nowhere or stays outside the bundle.
 fn target-of(request: Request, importer: Text) -> Text? = match request.spec {
   _ if stays-external?(request.spec, importer) => none
-  _ => hook-path(wanted, importer) ?? configured-path(wanted, importer) ?? searched(request, wanted, importer)
-    where spec = request.spec, wanted = aliased(spec)
+  _ => match hook-path(wanted, importer) ?? configured-path(wanted, importer) ?? searched(request, wanted, importer) {
+    some(path) => some(module-key(request, path))
+    none => none
+  } where spec = request.spec, wanted = aliased(spec)
 }
 
 # Every file the entries can reach, loaded before the graph is made; how many.
@@ -764,7 +821,7 @@ fn loaded(path: Text) -> Loaded =
   Loaded(path: path, parsed: p, tree0: tree0, analysis: a.analysis, scopes: a.scopes, specs: specs, calls: calls,
          requests: requests, leads: [lead-request(request, path) for request in requests],
          whole: [lead-request(r, path).key for r in [require-request(s) for s in required]
-                   ++ [import-request(x) for st in tree0.body.kids for x in wholly-imported(st)]])
+                   ++ [r for st in tree0.body.kids for r in wholly-imported(st)]])
   where p = parsed-of(path),
         # A spec's transform sees the tree before its scopes are analysed (see `analysed-file`).
         tree0 = match p.analysed {
@@ -777,25 +834,22 @@ fn loaded(path: Text) -> Loaded =
         },
         # Imports in source order, then what it loads at run time. Statements `define` removed import nothing.
         found = match p.analysed {
-          true => Checked(tree: p.tree, requires: p.required, imports: [])
+          true => Checked(tree: p.tree, requires: p.required, imports: p.imports, json-imports: p.json-imports)
           false => loads-of(a.analysis.tree)
         },
-        calls = match p.analysed {
-          true => p.calls
-          false => found.requires ++ found.imports
-        },
+        calls = found.requires ++ found.imports ++ found.json-imports,
         required = found.requires,
         specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls,
-        requests = requests-in(tree0, required, [s for s in calls[len(required)..len(calls)]])
+        requests = requests-in(tree0, required, found.imports, found.json-imports)
 
 fn transformed(tree: Node) -> Node = transform(tree) where transform = loading.transform
 
 # What a statement imports as a whole, its default or namespace: what a script must be CommonJS for.
-fn wholly-imported(s: Node) -> [Text] = match s {
-  Import(clause, from) if whole-clause?(clause) => [module-of-str(from)]
-  ExportAllAs(_, from) => [module-of-str(from)]
-  ExportFrom(List(specs...), from) if any x in specs: (x is ExportName(...) or x is ExportAs(...)) and module-name(x.local) == "default" =>
-    [module-of-str(from)]
+fn wholly-imported(s: Node) -> [Request] = match s {
+  Import(clause, _, _) if whole-clause?(clause) => [r for r in statement-request(s)]
+  ExportAllAs(...) => [r for r in statement-request(s)]
+  ExportFrom(List(specs...), _, _) if any x in specs: (x is ExportName(...) or x is ExportAs(...)) and module-name(x.local) == "default" =>
+    [r for r in statement-request(s)]
   _ => []
 }
 
@@ -809,7 +863,14 @@ fn lead(spec: Text, importer: Text) -> Lead = lead-request(import-request(spec),
 
 fn lead-request(request: Request, importer: Text) -> Lead = match stays-external?(request.spec, importer) {
   true => Lead(key: "external:" ++ aliased(request.spec), effects: false)
-  false => Lead(key: r.path, effects: r.side-effects) where r = resolved-now(request, importer)
+  false => Lead(key: module-key(request, r.path), effects: r.side-effects) where r = resolved-now(request, importer)
+}
+
+# A file as a node of the graph: its path; or, imported `with { type: "json" }`, the JSON module of
+# it, a module of its own (as esbuild has it), keyed `json:` and its path.
+fn module-key(request: Request, path: Text) -> Text = match request.json {
+  true => "json:" ++ path
+  false => path
 }
 
 # What a node of the graph leads to: an outside import, nothing.
@@ -919,7 +980,8 @@ fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift
     symbol-shift: symbol-shift, side-effects: effects,
     free: l.analysis.free,
     legal: l.parsed.legal, helpers: l.parsed.helpers, deps: deps,
-    dep-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].kind == res.Import},
+    dep-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].kind == res.Import and not l.requests[k].json},
+    json-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].json},
     require-ids: {l.requests[k].spec: deps[k] for k in 0..len(l.requests) if l.requests[k].kind == res.Require}, calls: len(l.calls) > 0,
     script: l.analysis.script and kind == Esm, forbidden: l.analysis.forbidden
   } where kind = match l.analysis.cjs, l.analysis.script and whole {
@@ -933,7 +995,10 @@ fn file-module(id: Int, l: Loaded, effects: Bool, scope-shift: Int, symbol-shift
 # ---------------------------------------------------------------- paths as the output shows them
 
 # A path from the root, as esbuild's resolver has it: links resolved where something is there.
-fn full-path(path: Text) -> Text = res.canonical(from-root(path))
+fn full-path(path: Text) -> Text = match path {
+  "json:" ++ file => full-path(file)
+  _ => res.canonical(from-root(path))
+}
 
 # A path from the root, as written: from the working directory when it is relative.
 fn from-root(path: Text) -> Text = match path {
@@ -952,6 +1017,7 @@ fn relative-path(from: Text, to: Text) -> Text = match join([".." for i in commo
 # A module's path as the output shows it: from the working directory, as a relative path already is.
 fn shown-path(path: Text) -> Text = match path {
   "/" ++ _ => relative-path(full-path("."), full-path(path))
+  "json:" ++ file => shown-path(file) ++ " with { type: 'json' }"
   _ => path
 }
 
@@ -967,8 +1033,8 @@ fn css-imports() -> [Text] = [modules[id].path for id in order if loader-of(modu
 # CSS belongs to an evaluation root's static import closure. Dynamic imports start a separate
 # closure. The shared graph walk supplies cycle-safe postorder; no chunk policy decides cascade.
 fn static-dependencies(id: Int) -> [Text] = [int-text(target)
-  for statement in body-of(id).tree.body.kids for spec in import-spec-of(statement)
-  for target in modules[id].dep-ids[spec] if modules[target].kind != External distinct int-text(target)]
+  for statement in body-of(id).tree.body.kids for r in statement-request(statement)
+  for target in request-target(modules[id], r) if modules[target].kind != External distinct int-text(target)]
 
 fn static-style-children(key: Text) -> [Text] = static-dependencies(parse-int(key))
 

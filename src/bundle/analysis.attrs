@@ -83,9 +83,12 @@ fn root-sym(mo: m.Module, name: Text) -> Int? = sym.scope-at(m.table, mo.root).n
 # A symbol of the runtime module, by name.
 fn helper(name: Text) -> Int = root-sym(m.modules[0], name) ?? panic "the runtime has no helper named {}", name
 
-# The module a specifier of an import, `require` or `import()` led to when its module was loaded.
-fn known-dep(mo: m.Module, from: Node) -> Int =
-  mo.dep-ids[m.module-of-str(from)] ?? panic "{}: {} was not loaded", mo.path, from.text
+# The module an import statement, or an `import()` with a literal path, led to when its module
+# was loaded: by its specifier, and whether it asks for a JSON module.
+fn known-dep(mo: m.Module, n: Node) -> Int = match m.request-at(n) {
+  some(r) => m.request-target(mo, r) ?? panic "{}: {} was not loaded", mo.path, r.spec
+  none => panic "{}: a statement that imports nothing, at {}", mo.path, n.lo
+}
 
 fn known-required(mo: m.Module, from: Node) -> Int =
   mo.require-ids[m.module-of-str(from)] ?? panic "{}: require {} was not loaded", mo.path, from.text
@@ -174,11 +177,11 @@ on Member(Ident(_) as object, PropName(_) as property) if counting and imported-
   object.counting = false
 }
 # `import()` of an outside module stays as it is, and needs nothing of the bundle.
-on ImportCall(...) as n if counting and imported-str(n) is some(from) and m.modules[known-dep(here, from)].kind != External {
+on ImportCall(...) as n if counting and imported-str(n) is some(_) and m.modules[known-dep(here, n)].kind != External {
   mentions += mentioned(match linking.splitting {
                           true => Chunk
                           false => Whole
-                        }, known-dep(here, from))
+                        }, known-dep(here, n))
   kids.counting = false
 }
 # A direct eval in a retained declaration can read any visible module binding. Scope analysis
@@ -234,7 +237,7 @@ fn statement-summary(s: Node) -> Summary = match walked?(s) {
 }
 
 fn walked?(s: Node) -> Bool = match s {
-  Import(...) | ImportBare(_) | ExportAll(_) | ExportAllAs(...) | ExportFrom(...) | ExportNamed(_) => false
+  Import(...) | ImportBare(...) | ExportAll(...) | ExportAllAs(...) | ExportFrom(...) | ExportNamed(_) => false
   _ => true
 }
 
@@ -263,7 +266,7 @@ fn required-str(b: m.Body, n: Node) -> Node? = match n {
 }
 
 # The modules those name, once everything is resolved: these only look up, so many threads may ask.
-fn known-import-call-target(mo: m.Module, n: Node) -> Int? = first from in imported-str(n): known-dep(mo, from)
+fn known-import-call-target(mo: m.Module, n: Node) -> Int? = first from in imported-str(n): known-dep(mo, n)
 
 fn known-require-target(b: m.Body, mo: m.Module, n: Node) -> Int? = first from in required-str(b, n): known-required(mo, from)
 
@@ -447,7 +450,7 @@ fn pure-stmt?(s: Node) -> Bool = match s {
 record Load { target: Int, by-import: Bool }
 
 fn loads-of(mo: m.Module, n: Node) -> [Load] = match n {
-  ImportCall(...) => [Load(target: known-dep(mo, from), by-import: true) for from in imported-str(n)]
+  ImportCall(...) => [Load(target: known-dep(mo, n), by-import: true) for from in imported-str(n)]
   CallExpr(...) => [Load(target: known-required(mo, from), by-import: false) for from in required-str(body, n)]
   _ => []
 }
@@ -486,7 +489,7 @@ fn import-bindings(mo: m.Module) -> [Bound] = match mo.kind {
 }
 
 fn statement-bindings(mo: m.Module, s: Node) -> [Bound] = match s {
-  Import(clause, from) => clause-bindings(mo, known-dep(mo, from), clause)
+  Import(clause, _, _) => clause-bindings(mo, known-dep(mo, s), clause)
   _ => []
 }
 
@@ -508,11 +511,11 @@ fn bound(mo: m.Module, t: Int, name: Text, b: Node, namespace: Bool, at: Int) ->
 record Reexport { target: Int, name: Text, namespace: Bool, exported: Text }
 
 fn statement-reexports(mo: m.Module, s: Node) -> [Reexport] = match s {
-  ExportAllAs(name, from) => [Reexport(target: t, name: "*", namespace: true, exported: m.module-name(name))
-                              for t in [known-dep(mo, from)] if opaque?(m.modules[t])]
-  ExportFrom(List(specs...), from) =>
+  ExportAllAs(name, _, _) => [Reexport(target: t, name: "*", namespace: true, exported: m.module-name(name))
+                              for t in [known-dep(mo, s)] if opaque?(m.modules[t])]
+  ExportFrom(List(specs...), _, _) =>
     [Reexport(target: t, name: m.module-name(spec.local), namespace: false, exported: export-spec-names(spec))
-     for t in [known-dep(mo, from)] if opaque?(m.modules[t]) for spec in specs]
+     for t in [known-dep(mo, s)] if opaque?(m.modules[t]) for spec in specs]
   _ => []
 }
 
@@ -566,9 +569,9 @@ fn made-key(x: Made) -> Text = int-text(match x.purpose { Require => 0  Exports 
 # What a statement needs made: the variable an opaque import is held in, and the names re-exported
 # from it.
 fn statement-made(mo: m.Module, s: Node) -> [Made] = match s {
-  Import(_, from) | ImportBare(from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
-  ExportAll(from) => [star-made(mo, t) for t in [known-dep(mo, from)] if opaque?(m.modules[t]) and not kept-star?(mo, m.modules[t])]
-  ExportAllAs(_, from) | ExportFrom(_, from) => [import-made(mo, t) for t in [known-dep(mo, from)] if held?(m.modules[t])]
+  Import(...) | ImportBare(...) => [import-made(mo, t) for t in [known-dep(mo, s)] if held?(m.modules[t])]
+  ExportAll(...) => [star-made(mo, t) for t in [known-dep(mo, s)] if opaque?(m.modules[t]) and not kept-star?(mo, m.modules[t])]
+  ExportAllAs(...) | ExportFrom(...) => [import-made(mo, t) for t in [known-dep(mo, s)] if held?(m.modules[t])]
     ++ [Made(purpose: ReexportName, owner: mo.id, exported: r.exported, scope: mo.root, name: reexport-name(r))
         for r in statement-reexports(mo, s)]
   _ => []
@@ -616,7 +619,7 @@ fn synthetic(mo: m.Module, wrapped: {Int:Bool}) -> [Node] = match mo.kind, mo.id
 
 # `export * from` CommonJS: names only known at run time.
 fn dynamic-star?(mo: m.Module, s: Node) -> Bool = match s {
-  ExportAll(from) => opaque?(t) and not kept-star?(mo, t) where t = m.modules[known-dep(mo, from)]
+  ExportAll(...) => opaque?(t) and not kept-star?(mo, t) where t = m.modules[known-dep(mo, s)]
   _ => false
 }
 
@@ -642,7 +645,7 @@ fn module-link(id: Int) -> ModuleLink = with here = m.modules[id], body = m.body
              awaits: linking.splitting and ev.top-await?(body.tree),
              initializes: linking.splitting and not ev.module-inert?(body.tree),
              forwarding: linking.splitting and (all s in body.tree.body.kids: ev.inert-stmt(s)),
-             imports: [target for s in body.tree.body.kids if linking.splitting for spec in m.import-spec-of(s) for target in here.dep-ids[spec] distinct target])
+             imports: [target for s in body.tree.body.kids if linking.splitting for r in m.statement-request(s) for target in m.request-target(here, r) distinct target])
 }
 
 fn linked-of(links: [ModuleLink], first: Int) -> Linked =
@@ -843,10 +846,11 @@ fn synthetic-facts(mo: m.Module, start: Int) -> [link.Fact] = match mo.kind, wra
 fn namespace-part(mo: m.Module, part: Int) -> [link.Fact] =
   [link.fact-part-of(part, mo.id), link.fact-ns-part(part, mo.id), link.fact-ns-symbol(mo.id, ns-sym(mo)),
    link.fact-declares(part, ns-sym(mo))]
-  ++ [link.fact-mentions(part, helper("__export")) for s in [mo] if any x in body.tree.body.kids: exporting?(x)]
+  ++ [link.fact-mentions(part, helper("__export")) for s in [mo] if any x in body.source: exporting?(x)]
   ++ entry-namespace(mo, part)
 
 # A statement that exports: a module with none has an empty namespace object, and no `__export`.
+# Asked of the statements as written: normalising has made `export default` a declaration.
 fn exporting?(s: Node) -> Bool = starts-with(js.kind-name(s.kind), "Export")
 
 fn entry-namespace(mo: m.Module, part: Int) -> [link.Fact] = match linking.entry-namespace and mo.id == m.entry {
@@ -935,11 +939,11 @@ fn kept-reexported(mo: m.Module, part: Int, exported: Text) -> [link.Fact] =
 fn part-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact] = [link.fact-part-of(part, mo.id)] ++ statement-facts(mo, s, sm, part)
 
 fn statement-facts(mo: m.Module, s: Node, sm: Summary, part: Int) -> [link.Fact] = match s {
-  Import(clause, from) => imported(mo, part, t) ++ import-facts(mo, part, t, clause, s) where t = known-dep(mo, from)
-  ImportBare(from) => imported(mo, part, t) ++ held-by(mo, s, part, t, bare-import-facts(mo, part, t)) where t = known-dep(mo, from)
-  ExportAll(from) => imported(mo, part, t) ++ star-facts(mo, part, t) where t = known-dep(mo, from)
-  ExportAllAs(name, from) => imported(mo, part, t) ++ star-as-facts(mo, part, t, m.module-name(name), s) where t = known-dep(mo, from)
-  ExportFrom(List(specs...), from) => imported(mo, part, t) ++ export-from-facts(mo, part, t, specs, s) where t = known-dep(mo, from)
+  Import(clause, _, _) => imported(mo, part, t) ++ import-facts(mo, part, t, clause, s) where t = known-dep(mo, s)
+  ImportBare(...) => imported(mo, part, t) ++ held-by(mo, s, part, t, bare-import-facts(mo, part, t)) where t = known-dep(mo, s)
+  ExportAll(...) => imported(mo, part, t) ++ star-facts(mo, part, t) where t = known-dep(mo, s)
+  ExportAllAs(name, _, _) => imported(mo, part, t) ++ star-as-facts(mo, part, t, m.module-name(name), s) where t = known-dep(mo, s)
+  ExportFrom(List(specs...), _, _) => imported(mo, part, t) ++ export-from-facts(mo, part, t, specs, s) where t = known-dep(mo, s)
   ExportNamed(List(specs...)) => [export-local(mo, export-spec-names(spec), m.module-name(spec.local)) for spec in specs]
   # The runtime's statements are only ever live through a mention. A wrapped module's are shaken as
   # any module's are, as esbuild shakes them: its initialiser runs what is left, and its imports
@@ -971,7 +975,7 @@ fn holder?(mo: m.Module, s: Node, t: Int) -> Bool = ((first x in m.body-of(mo.id
 # A statement that holds a module in an import variable when it is held: an import, a bare import,
 # or a re-export of names from it.
 fn holds?(mo: m.Module, s: Node, t: Int) -> Bool = match s {
-  Import(_, from) | ImportBare(from) | ExportFrom(_, from) | ExportAllAs(_, from) => known-dep(mo, from) == t
+  Import(...) | ImportBare(...) | ExportFrom(...) | ExportAllAs(...) => known-dep(mo, s) == t
   _ => false
 }
 

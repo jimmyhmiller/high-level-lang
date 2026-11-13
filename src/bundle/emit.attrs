@@ -323,7 +323,7 @@ fn reexport-all(t: m.Module) -> Node = stmt`$re($ns, $value);`
 
 # In ES module output, `export *` from an outside module copies its namespace, imported where the
 # statement stands, as esbuild writes it: `__reExport(x_exports, y_star); import * as y_star from "y";`.
-fn reexport-kept(t: m.Module) -> [Node] = [stmt`$re($ns, $star);`, Import(ImportNamespace(BindName(star)), path-of(t))]
+fn reexport-kept(t: m.Module, attributes: Node) -> [Node] = [stmt`$re($ns, $star);`, Import(ImportNamespace(BindName(star)), path-of(t), attributes)]
   where re = helper-name("__reExport"),
         ns = final-of(an.ns-sym(here)),
         star = final-of(an.known-import-var(here, t.id))
@@ -343,39 +343,40 @@ fn kept-declarators(n: Node, kept: [Node]) -> Node = match kept {
   _ => n with { kids: [List(kept...)] }
 }
 
-fn held-elsewhere?(s: Node, from: Node) -> Bool = an.held?(t) and not an.holder?(here, s, t.id)
-  where t = m.modules[an.known-dep(here, from)]
+fn held-elsewhere?(s: Node) -> Bool = an.held?(t) and not an.holder?(here, s, t.id)
+  where t = m.modules[an.known-dep(here, s)]
 
 # The body statements of a part, ready to print. None for a part with no code.
 fn part-output(s: Node) -> Node? = match s {
   # Another statement holds the module in its variable (see `analysis.held-by`).
-  ImportBare(from) | Import(_, from) | ExportFrom(_, from) | ExportAllAs(_, from) if held-elsewhere?(s, from) => none
-  ImportBare(from) => match t.kind {
+  # An outside module kept as an import keeps the statement's attributes: they say what it is.
+  ImportBare(...) | Import(...) | ExportFrom(...) | ExportAllAs(...) if held-elsewhere?(s) => none
+  ImportBare(_, attributes) => match t.kind {
     Cjs => some(import-cjs-stmt(t))
-    External if an.kept?(t) => some(ImportBare(path-of(t)))
+    External if an.kept?(t) => some(ImportBare(path-of(t), attributes))
     External => some(stmt`var $v = $object;`) where v = final-of(an.known-import-var(here, t.id)), object = external-required(t)
     _ => init-call(t)
-  } where t = m.modules[an.known-dep(here, from)]
-  ExportAll(from) => match an.opaque?(t) {
-    true if an.kept-star?(here, t) => some(ExportAll(path-of(t)))
-    true if an.kept?(t) => some(List(reexport-kept(t)...))
+  } where t = m.modules[an.known-dep(here, s)]
+  ExportAll(_, attributes) => match an.opaque?(t) {
+    true if an.kept-star?(here, t) => some(ExportAll(path-of(t), attributes))
+    true if an.kept?(t) => some(List(reexport-kept(t, attributes)...))
     true => some(reexport-all(t))
     false => init-call(t)
-  } where t = m.modules[an.known-dep(here, from)]
-  ExportAllAs(name, from) => match an.kept?(t) {
-    true => some(Import(ImportNamespace(BindName(reexport-local(name))), path-of(t)))
+  } where t = m.modules[an.known-dep(here, s)]
+  ExportAllAs(name, _, attributes) => match an.kept?(t) {
+    true => some(Import(ImportNamespace(BindName(reexport-local(name))), path-of(t), attributes))
     false => import-or-init(t)
-  } where t = m.modules[an.known-dep(here, from)]
-  ExportFrom(List(specs...), from) => match an.kept?(t) {
+  } where t = m.modules[an.known-dep(here, s)]
+  ExportFrom(List(specs...), _, attributes) => match an.kept?(t) {
     true => some(Import(ImportNamed(List([import-spec(spec.local, reexport-local(spec)) for spec in specs if exported-spec?(spec)]...)),
-                        path-of(t)))
+                        path-of(t), attributes))
     false => import-or-init(t)
-  } where t = m.modules[an.known-dep(here, from)]
+  } where t = m.modules[an.known-dep(here, s)]
   ExportNamed(...) => none
-  Import(clause, from) => match an.kept?(t) {
-    true => some(kept-import(clause, t))
+  Import(clause, _, attributes) => match an.kept?(t) {
+    true => some(kept-import(clause, t, attributes))
     false => import-or-init(t)
-  } where t = m.modules[an.known-dep(here, from)]
+  } where t = m.modules[an.known-dep(here, s)]
   ExportVar(list) => some(rewritten(VarDecl(list) with { lo: s.lo, hi: s.hi }))
   ExportLexical(d) | ExportFunction(d) | ExportClass(d) => some(rewritten(d))
   _ => some(rewritten(s))
@@ -386,9 +387,9 @@ fn part-output(s: Node) -> Node? = match s {
 # An import an external module keeps in ES module output, its names as the output spells them, and
 # those nothing reads left out when asked, as esbuild's `--minify-syntax` leaves them: with none
 # left, only the loading.
-fn kept-import(clause: Node, t: m.Module) -> Node = match kept-clause(clause) {
-  some(c) => Import(c, path-of(t))
-  none => ImportBare(path-of(t))
+fn kept-import(clause: Node, t: m.Module, attributes: Node) -> Node = match kept-clause(clause) {
+  some(c) => Import(c, path-of(t), attributes)
+  none => ImportBare(path-of(t), attributes)
 }
 
 fn kept-clause(c: Node) -> Node? = match c {
@@ -697,12 +698,7 @@ fn imported-module(mo: m.Module, p: Int) -> Int =
 record ImportPart { part: Int, target: Int }
 
 fn import-parts(id: Int) -> [ImportPart] = with here = m.modules[id], body = m.body-of(id) {
-  [ImportPart(part: p, target: an.known-dep(here, from)) for p in parts-of(id) for from in import-from(an.stmt-in(body, here, p))]
-}
-
-fn import-from(s: Node) -> Node? = match s {
-  Import(_, from) | ImportBare(from) | ExportFrom(_, from) | ExportAllAs(_, from) | ExportAll(from) => some(from)
-  _ => none
+  [ImportPart(part: p, target: an.known-dep(here, s)) for p in parts-of(id) for s in [an.stmt-in(body, here, p)] if is-some(m.import-spec-of(s))]
 }
 
 # Whether importing this runs code at the import, rather than the module's own code coming before.

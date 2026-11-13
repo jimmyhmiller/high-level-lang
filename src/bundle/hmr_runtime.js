@@ -69,6 +69,12 @@ var __hmr = (() => {
         var r = load(t);
         return r.esm ? r.ns : __toESM(r.module.exports);
       },
+      // A module imported `with { type: "json" }`: its JSON module, keyed apart.
+      importJson(spec) {
+        var t = target("json", spec);
+        if (t === null) throw new Error("[hmr] " + spec + " is a JSON module outside the bundle, and nothing here can load it");
+        return load(t).ns;
+      },
       require(spec) {
         var t = target("require", spec);
         if (t === null) return outside(spec);
