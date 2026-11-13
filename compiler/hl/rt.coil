@@ -1808,8 +1808,8 @@
 
 ;; ---------------------------------------------------------------- parser state
 
-;;; One memo table entry: did the rule match here, where did it end, and its node
-;;; as an address, because this module does not know the grammar's node type.
+;;; One memo table entry: did the rule match here, where did it end, and its node, as an index
+;;; into the parse's kept answers, because this module does not know the grammar's node type.
 (defstruct MemoHit [(ok bool) (end i64) (node i64)])
 
 ;;; Generated parsers work directly on bytes. `pos` is always just past the last
@@ -1828,6 +1828,12 @@
    (far i64)
    (want (slice u8))
    (memos (ArrayList MemoTable))
+   ;; The memo's answers as they are made, in order. An answer is asked for again only after the
+   ;; parse backtracks over it, so answers wait here, cheaply, and go into `memos` only then (see
+   ;; `backtrack!`); every answer at or past the place backtracked to is the backtracked one's.
+   (memo-log (ArrayList MemoEntry))
+   ;; The furthest key any table holds: past it, every table is asked for nothing.
+   (memo-top i64)
    ;; Where the space from each offset ends, once skipped: (length + 1) * 2, plus one when it
    ;; holds a line terminator; 0 when not skipped yet. A backtracking parser skips the same
    ;; space, comments and all, once for every way it tries the token after.
@@ -1835,7 +1841,16 @@
    (ws-base i64)  ; the offset `ws-ends` starts at
    ;; Try every alternative, as if no first-byte guard ruled any out: for the parse that says why
    ;; a program is wrong, whose furthest failure is then what trying them all finds.
-   (careful bool)])
+   (careful bool)
+   ;; Where the tree goes: the storage the parse began in.
+   (alloc (dyn Allocator))
+   ;; The grammar's own working lists, which this module cannot name: the items of lists being
+   ;; parsed, and the memo's answers (`MemoHit.node` is an index into these).
+   (stack i64)
+   (memo-nodes i64)])
+
+;;; An answer in the memo's log: which memo, its key, the answer.
+(defstruct MemoEntry [(id i64) (key i64) (hit MemoHit)])
 
 ;;; A memo table: open addressing on the key, which is never negative and is kept plus one, so a
 ;;; slot of zeros is empty and a table is made by zeroing memory.
@@ -1924,11 +1939,10 @@
              (memo-count i64)
              (from i64)] (-> P)
   (let [(mut memos) (ArrayList::new [MemoTable] (malloc-allocator))
-        (mut cap) 64
         (mut ends) (ArrayList::new [i32] (malloc-allocator))
         size (- (len src) from)]
-    (while (< (* cap 64) size) (set! cap (* cap 2)))
-    (for _ (range 0 memo-count) (push! (mut memos) (memo-table cap)))
+    ;; The tables hold only answers backtracked over, few of them: they start small and grow.
+    (for _ (range 0 memo-count) (push! (mut memos) (memo-table 64)))
     (extend-zeroed! (mut ends) (+ size 1))
     (P
       :src src
@@ -1942,15 +1956,21 @@
       :far from
       :want "a program"
       :memos memos
+      :memo-log (ArrayList::new [MemoEntry] (malloc-allocator))
+      :memo-top -1
       :ws-ends ends
       :ws-base from
-      :careful false)))
+      :careful false
+      :alloc (tree-allocator)
+      :stack 0
+      :memo-nodes 0)))
 
 ;;; A parse is done: its memo tables and space cache go.
 (defn p-free! [(p (mut P))] (-> void)
   (for i (range 0 (len (.memos p)))
     (memo-table-free! (elem (mut (.memos p)) i)))
   (free! (mut (.memos p)))
+  (free! (mut (.memo-log p)))
   (free! (mut (.ws-ends p)))
   0)
 
@@ -2064,11 +2084,35 @@
 (defn memo-key [(p (mut P))] (-> i64)
   (+ (* (.pos p) 256) (.flags p)))
 
-(defn memo-get [(p (mut P)) (id i64) (key i64)] (-> (Option MemoHit))
-  (memo-table-get (elem (mut (.memos p)) id) key))
+(defn memo-get :inline (Always) [(p (mut P)) (id i64) (key i64)] (-> (Option MemoHit))
+  (if (> key (.memo-top p))
+      (None [MemoHit])
+      (memo-table-get (elem (mut (.memos p)) id) key)))
 
 (defn memo-put! [(p (mut P)) (id i64) (key i64) (hit MemoHit)] (-> void)
-  (memo-table-put! (elem (mut (.memos p)) id) key hit))
+  (push! (mut (.memo-log p)) (MemoEntry :id id :key key :hit hit))
+  0)
+
+;;; The parse goes back to `to`: what the memo answered at or past it was the attempt that failed,
+;;; and may be asked for again.
+(defn backtrack! :inline (Always) [(p (mut P)) (to i64)] (-> void)
+  (set! (.pos p) to)
+  (let [n (len (.memo-log p))]
+    (when (and (> n 0) (>= (.key (get (.memo-log p) (- n 1))) (* to 256)))
+      (memo-promote! (mut p) to)))
+  0)
+
+(defn memo-promote! [(p (mut P)) (to i64)] (-> void)
+  (let [(mut go) true]
+    (while go
+      (let [n (len (.memo-log p))]
+        (if (and (> n 0) (>= (.key (get (.memo-log p) (- n 1))) (* to 256)))
+            (let [e (get (.memo-log p) (- n 1))]
+              (memo-table-put! (elem (mut (.memos p)) (.id e)) (.key e) (.hit e))
+              (when (> (.key e) (.memo-top p)) (set! (.memo-top p) (.key e)))
+              (pop! (mut (.memo-log p))))
+            (set! go false)))))
+  0)
 
 ;;; Is byte `c` in the set whose 256 bits are w0..w3? -1, the end of input, is in none.
 (defn byte-in? :inline (Always) [(c i64) (w0 i64) (w1 i64) (w2 i64) (w3 i64)]
