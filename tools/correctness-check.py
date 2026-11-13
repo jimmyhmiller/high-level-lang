@@ -16,6 +16,8 @@
   - minified names reuse what a scope does not read from outside, as Terser's do, yet never where
     the language or lowering forbids it: a catch body's declarations, a block's `var`, a name a
     class's code means the class by;
+  - `?.` before a digit is a conditional and a number (`a?.5:b`, as minifiers write it), and a
+    TypeScript namespace exports its members in a file that is no module;
   - a direct `eval`, called by name or in parentheses, sees its module's names as written, while
     `eval` read any other way does not stop minifying; and one module reading `eval` leaves the
     names linking makes (`init_x`) distinct.
@@ -237,6 +239,16 @@ for flags in (['--minify'], ['--minify', '--target=es2015'], ['--minify', '--tar
     got = run(['node', 'shadow-out.mjs'])
     ok(built.returncode == 0 and got.stdout == want, f'minified names that may not shadow {flags}: {got.stdout!r}{got.stderr[-200:]!r} want {want!r}')
 print('ok   minified names never shadow where the language or lowering forbids it', flush=True)
+
+# ---------------------------------------------------------------- syntax real code has
+write({'syntax/ternary.js': 'const t = true, f = false;\nconsole.log(t?.5:1, f?.25:2, t?.0:3, [1]?.[0], ({a:4})?.a);\n',
+       'syntax/space.ts': 'namespace Shapes { export class Square { constructor(public side: number) {} area() { return this.side ** 2; } } export namespace Inner { export const unit = "cm"; } }\n'
+                          'module Legacy { export const answer = 42; }\nconsole.log(new Shapes.Square(3).area(), Shapes.Inner.unit, Legacy.answer);\n'})
+for entry, want in (('syntax/ternary.js', '0.5 2 0 1 4\n'), ('syntax/space.ts', '9 cm 42\n')):
+    built = run([ESB, entry, '--outfile=syntax-out.js'])
+    got = run(['node', 'syntax-out.js'])
+    ok(built.returncode == 0 and got.stdout == want, f'{entry}: {got.stdout!r}{built.stderr[-200:]!r} want {want!r}')
+print('ok   `?.` before a digit, and namespaces in a script, as real code writes them', flush=True)
 
 # ---------------------------------------------------------------- eval
 write({'ev/direct.js': 'const secretValue = 41;\nexport function viaDirect() { return eval("secretValue + 1"); }\n',
