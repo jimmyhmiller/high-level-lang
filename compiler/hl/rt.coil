@@ -1841,22 +1841,36 @@
    (flags i64)
    (ws-from i64)
    (ws-to i64)
+   ;; Whether the space from `ws-nl-at` holds a line end: worked out when a rule asks, since few do.
    (ws-nl bool)
+   (ws-nl-at i64)
    (ws-scan i64)
    (far i64)
    (want (slice u8))
    (memos (ArrayList MemoTable))
-   ;; The memo's answers as they are made, in order. An answer is asked for again only after the
-   ;; parse backtracks over it, so answers wait here, cheaply, and go into `memos` only then (see
-   ;; `backtrack!`); every answer at or past the place backtracked to is the backtracked one's.
+   ;; The memo's answers as they are made, the last `memo-ring-size` of them, in a ring: answer
+   ;; number n is in slot n mod the size, its node in the same slot of `memo-ring-nodes`. An
+   ;; answer is asked for again only after the parse backtracks over it, so answers wait here,
+   ;; cheaply, and go into `memos` only then (see `backtrack!`); every answer at or past the place
+   ;; backtracked to is the backtracked one's. Answers `memo-low` up to `memo-next` are in the
+   ;; ring. One pushed out by later ones is forgotten: it is parsed again if a backtrack over
+   ;; more answers than the ring holds ever asks.
    (memo-log (ArrayList MemoEntry))
+   (memo-low i64)
+   (memo-next i64)
+   ;; The nodes of the ring's answers, and those of the answers in `memos` (`MemoHit.node` is an
+   ;; index into these): bytes, because this module does not know the grammar's node type.
+   (memo-ring-nodes (ArrayList u8))
+   (memo-kept (ArrayList u8))
+   (memo-node-bytes i64)
    ;; The furthest key any table holds: past it, every table is asked for nothing.
    (memo-top i64)
-   ;; Where the space from each offset ends, once skipped: (length + 1) * 2, plus one when it
-   ;; holds a line terminator; 0 when not skipped yet. A backtracking parser skips the same
-   ;; space, comments and all, once for every way it tries the token after.
-   (ws-ends (ArrayList i32))
-   (ws-base i64)  ; the offset `ws-ends` starts at
+   ;; Where the space from some offsets ends, once skipped: a small table of the last ones asked
+   ;; about, an offset's slot its low bits, the entry the offset plus one above the length plus
+   ;; one; 0 an empty slot. A backtracking parser skips the same space, comments and all, once for
+   ;; every way it tries the token after.
+   (ws-ends (ArrayList i64))
+   (ws-mask i64)
    ;; Try every alternative, as if no first-byte guard ruled any out: for the parse that says why
    ;; a program is wrong, whose furthest failure is then what trying them all finds.
    (careful bool)
@@ -1864,10 +1878,9 @@
    ;; cursor, the cursor, which a node's children are taken from directly (see `p-alloc`).
    (alloc (dyn Allocator))
    (cursor i64)
-   ;; The grammar's own working lists, which this module cannot name: the items of lists being
-   ;; parsed, and the memo's answers (`MemoHit.node` is an index into these).
+   ;; The grammar's own working list, which this module cannot name: the items of lists being
+   ;; parsed.
    (stack i64)
-   (memo-nodes i64)
    ;; The token last lexed: where, which of the grammar's token bodies, where it ended, whether it
    ;; matched. Alternatives often ask for the same token again where the last one began.
    (tok-at i64)
@@ -1957,19 +1970,32 @@
 (defstruct ParseError
   [(path (slice u8)) (line i64) (col i64) (want (slice u8)) (found (slice u8))])
 
+;;; How many answers the memo's ring holds, and how many offsets the space table.
+(defn memo-ring-size :inline (Always) [] (-> i64) 1024)
+(defn ws-slots :inline (Always) [] (-> i64) 4096)
+
 ;;; A parser over `src` from `from` on: what comes before is another parser's, and the end of
-;;; `src` is the end of input.
+;;; `src` is the end of input. `node-bytes` is the size of the grammar's node.
 (defn p-new [(src (slice u8))
              (path (slice u8))
              (flags i64)
              (memo-count i64)
-             (from i64)] (-> P)
+             (from i64)
+             (node-bytes i64)] (-> P)
   (let [(mut memos) (ArrayList::new [MemoTable] (malloc-allocator))
-        (mut ends) (ArrayList::new [i32] (malloc-allocator))
-        size (- (len src) from)]
+        (mut ends) (ArrayList::new [i64] (malloc-allocator))
+        (mut log) (ArrayList::new [MemoEntry] (malloc-allocator))
+        (mut ring-nodes) (ArrayList::new [u8] (malloc-allocator))
+        size (- (len src) from)
+        ;; A short text asks about few offsets: its table is no bigger than it.
+        (mut slots) 16]
+    (while (and (< slots (ws-slots)) (< slots (+ size 1))) (set! slots (* slots 2)))
     ;; The tables hold only answers backtracked over, few of them: they start small and grow.
     (for _ (range 0 memo-count) (push! (mut memos) (memo-table 64)))
-    (extend-zeroed! (mut ends) (+ size 1))
+    (extend-zeroed! (mut ends) slots)
+    (when (> memo-count 0)
+      (reserve! (mut log) (memo-ring-size))
+      (reserve! (mut ring-nodes) (* (memo-ring-size) node-bytes)))
     (P
       :src src
       :path path
@@ -1978,19 +2004,24 @@
       :ws-from -1
       :ws-to from
       :ws-nl false
+      :ws-nl-at -1
       :ws-scan from
       :far from
       :want "a program"
       :memos memos
-      :memo-log (memo-log-for memo-count size)
+      :memo-log log
+      :memo-low 0
+      :memo-next 0
+      :memo-ring-nodes ring-nodes
+      :memo-kept (ArrayList::new [u8] (malloc-allocator))
+      :memo-node-bytes node-bytes
       :memo-top -1
       :ws-ends ends
-      :ws-base from
+      :ws-mask (- slots 1)
       :careful false
       :alloc (tree-allocator)
       :cursor (top-cursor)
       :stack 0
-      :memo-nodes 0
       :tok-at -1
       :tok-id -1
       :tok-end -1
@@ -2002,26 +2033,22 @@
     (memo-table-free! (elem (mut (.memos p)) i)))
   (free! (mut (.memos p)))
   (free! (mut (.memo-log p)))
+  (free! (mut (.memo-ring-nodes p)))
+  (free! (mut (.memo-kept p)))
   (free! (mut (.ws-ends p)))
   0)
 
 (defn p-alloc :inline (Always) [(p (mut P)) (bytes i64)] (-> (ptr i8))
   (cursor-allocate (primitive/cast (ptr Cursor) (.cursor p)) bytes 8))
 
-;;; Room for the memo's log from the start: a grammar with memos logs about one answer for every
-;;; two dozen bytes of program.
-(defn memo-log-for [(memo-count i64) (size i64)] (-> (ArrayList MemoEntry))
-  (let [(mut log) (ArrayList::new [MemoEntry] (malloc-allocator))]
-    (when (> memo-count 0) (reserve! (mut log) (+ 64 (/ size 24))))
-    log))
+;;; The length plus one of the space from `from`, or 0 when the table does not hold it.
+(defn ws-known :inline (Always) [(p (mut P)) (from i64)] (-> i64)
+  (let [e (load (primitive/index (.data (.ws-ends p)) (& from (.ws-mask p))))]
+    (if (= (>> e 32) (+ from 1)) (& e 4294967295) 0)))
 
-(defn ws-known [(p (mut P)) (from i64)] (-> i64)
-  (cast i64 (get (.ws-ends p) (- from (.ws-base p)))))
-
-(defn ws-remember! [(p (mut P)) (from i64) (to i64) (nl bool)] (-> void)
-  (set! (mut (.ws-ends p))
-        (- from (.ws-base p))
-        (cast i32 (+ (* (+ (- to from) 1) 2) (if nl 1 0))))
+(defn ws-remember! :inline (Always) [(p (mut P)) (from i64) (to i64)] (-> void)
+  (store! (primitive/index (.data (.ws-ends p)) (& from (.ws-mask p)))
+          (| (<< (+ from 1) 32) (+ (- to from) 1)))
   0)
 
 (defn peek :inline (Always) [(p (mut P))] (-> i64)
@@ -2110,34 +2137,53 @@
       (None [MemoHit])
       (memo-table-get (elem (mut (.memos p)) id) key)))
 
+;;; The slot of the ring the next answer goes in: its node is written there first (the
+;;; grammar's module does that, knowing the type), then `memo-put!` writes the answer.
+(defn memo-slot :inline (Always) [(p (mut P))] (-> i64)
+  (& (.memo-next p) (- (memo-ring-size) 1)))
+
 (defn memo-put! :inline (Always) [(p (mut P)) (id i64) (key i64) (hit MemoHit)] (-> void)
-  (let [log (primitive/cast (ptr (ArrayList MemoEntry)) (mut (.memo-log p)))
-        k (load (field log len))]
-    (if (< k (load (field log cap)))
-        (do
-          (store! (primitive/index (load (field log data)) k) (MemoEntry :id id :key key :hit hit))
-          (store! (field log len) (+ k 1)))
-        (do (push! log (MemoEntry :id id :key key :hit hit)) 0)))
+  (let [n (.memo-next p)]
+    (store! (primitive/index (.data (.memo-log p)) (& n (- (memo-ring-size) 1)))
+            (MemoEntry :id id :key key :hit hit))
+    (set! (.memo-next p) (+ n 1))
+    ;; A full ring gives up its oldest answer.
+    (when (> (- (+ n 1) (.memo-low p)) (memo-ring-size)) (set! (.memo-low p) (+ (.memo-low p) 1))))
   0)
 
 ;;; The parse goes back to `to`: what the memo answered at or past it was the attempt that failed,
 ;;; and may be asked for again.
 (defn backtrack! :inline (Always) [(p (mut P)) (to i64)] (-> void)
   (set! (.pos p) to)
-  (let [n (len (.memo-log p))]
-    (when (and (> n 0) (>= (.key (get (.memo-log p) (- n 1))) (* to 256)))
+  (let [n (.memo-next p)]
+    (when (and (> n (.memo-low p))
+               (>= (.key (load (primitive/index (.data (.memo-log p)) (& (- n 1) (- (memo-ring-size) 1)))))
+                   (* to 256)))
       (memo-promote! (mut p) to)))
   0)
 
 (defn memo-promote! [(p (mut P)) (to i64)] (-> void)
-  (let [(mut go) true]
+  (let [(mut go) true
+        mask (- (memo-ring-size) 1)
+        size (.memo-node-bytes p)]
     (while go
-      (let [n (len (.memo-log p))]
-        (if (and (> n 0) (>= (.key (get (.memo-log p) (- n 1))) (* to 256)))
-            (let [e (get (.memo-log p) (- n 1))]
-              (memo-table-put! (elem (mut (.memos p)) (.id e)) (.key e) (.hit e))
-              (when (> (.key e) (.memo-top p)) (set! (.memo-top p) (.key e)))
-              (pop! (mut (.memo-log p))))
+      (let [n (.memo-next p)]
+        (if (> n (.memo-low p))
+            (let [slot (& (- n 1) mask)
+                  e (load (primitive/index (.data (.memo-log p)) slot))]
+              (if (>= (.key e) (* to 256))
+                  (let [(mut hit) (.hit e)]
+                    ;; Its node moves to where the tables' answers keep theirs.
+                    (when (.ok hit)
+                      (let [at (len (.memo-kept p))]
+                        (extend! (mut (.memo-kept p))
+                                 (primitive/index (.data (.memo-ring-nodes p)) (* slot size))
+                                 size)
+                        (set! (.node hit) (/ at size))))
+                    (memo-table-put! (elem (mut (.memos p)) (.id e)) (.key e) hit)
+                    (when (> (.key e) (.memo-top p)) (set! (.memo-top p) (.key e)))
+                    (set! (.memo-next p) (- n 1)))
+                  (set! go false)))
             (set! go false)))))
   0)
 
