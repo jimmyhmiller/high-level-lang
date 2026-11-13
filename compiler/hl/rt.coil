@@ -1473,6 +1473,7 @@
           before (.let-go q)
           bytes-before (.bytes-let-go q)
           (mut ranges) (regions-let-go!)]
+      (chunk-pool-trim!)
       (when (> (len ranges) 0) (writer-forget-ranges! (the-writer) ranges))
       (when (env-on? "HL_REGION_TRACE")
         (println "[regions] let go {} regions, {} KB; {} alive, {} KB"
@@ -1528,6 +1529,8 @@
 ;;; regions in malloc mixes short-lived region storage with long-lived metadata and can retain
 ;;; dirty pages across rebuilds even while live allocation counts stay flat. Pages are counted
 ;;; in 64 KB, a multiple of every supported page size.
+;;; Chunks of the one size regions grow to are not given back at once: as many as the last build
+;;; asked for wait for the next (see ChunkPool).
 (defn big-chunk? [(size i64)] (-> bool)
   (>= size 65536))
 
@@ -1540,10 +1543,68 @@
                 (primitive/cast i32 MAP-ANON-PRIVATE) (: -1 i32) 0)]
     (if (= (primitive/cast i64 p) -1) (primitive/cast (ptr i8) 0) p)))
 
+;;; The size a region's chunks grow to (see `region-new`): nearly all of a region's memory is in
+;;; chunks of exactly this size, so one let go fits the next one asked for.
+(defn pooled-chunk-size :inline (Always) [] (-> i64) 65536)
+
+;;; Chunks of that size that regions have let go, kept for the next region to take: a program
+;;; that lets regions go makes more (a watcher's next build, a loop's next turn), and a chunk
+;;; taken back from here costs neither the system call nor the page faults of a new one (a
+;;; watcher's rebuild of a big module is about 6% faster for it). It keeps no more than were
+;;; asked for since the last safe point, what one build or turn used: the rest goes back to the
+;;; system there, as every chunk did before (see `chunk-pool-trim!`), so a build bigger than
+;;; those after it does not leave its size behind.
+(defstruct ChunkPool [(lock i64) (ready bool) (free (ArrayList i64)) (asked i64)])
+
+(defn chunk-pool [] (-> (ptr ChunkPool))
+  (let [q (primitive/alloc-static ChunkPool)]
+    (unless (.ready q)
+      (init-lock!)
+      (unless (.ready q)
+        (set! (.free q) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.ready q) true))
+      (init-unlock!))
+    q))
+
+;;; A kept chunk, or 0; and one more asked for.
+(defn chunk-pool-take! [] (-> i64)
+  (let [q (chunk-pool)]
+    (spin-lock! (field q lock))
+    (set! (.asked q) (+ (.asked q) 1))
+    (let [at (match (pop! (mut (.free q))) (Some [a] a) (None [] 0))]
+      (spin-unlock! (field q lock))
+      at)))
+
+(defn chunk-pool-keep! [(at i64)] (-> void)
+  (let [q (chunk-pool)]
+    (spin-lock! (field q lock))
+    (push! (mut (.free q)) at)
+    (spin-unlock! (field q lock)))
+  0)
+
+;;; At a safe point, after regions were let go: the chunks kept beyond how many were asked for
+;;; since the last one go back to the system.
+(defn chunk-pool-trim! [] (-> void)
+  (let [q (chunk-pool)
+        (mut go) true]
+    (spin-lock! (field q lock))
+    (let [keep (.asked q)]
+      (set! (.asked q) 0)
+      (while (and go (> (len (.free q)) keep))
+        (match (pop! (mut (.free q)))
+          (Some [at]
+                (munmap (primitive/cast (ptr i8) at) (primitive/cast isize (pooled-chunk-size))))
+          (None [] (set! go false)))))
+    (spin-unlock! (field q lock)))
+  0)
+
 (defn chunk-memory [(size i64)] (-> (ptr i8))
-  (if (or (region-check?) (big-chunk? size))
-      (pages-new size)
-      (malloc (primitive/cast isize size))))
+  (cond (region-check?) (pages-new size)
+        (= size (pooled-chunk-size))
+          (let [at (chunk-pool-take!)]
+            (if (!= at 0) (primitive/cast (ptr i8) at) (pages-new size)))
+        (big-chunk? size) (pages-new size)
+        :else (malloc (primitive/cast isize size))))
 
 (defn chunk-let-go! [(at i64) (size i64)] (-> void)
   (cond (region-check?)
@@ -1555,6 +1616,7 @@
                          (primitive/cast i32 (+ MAP-ANON-PRIVATE 16)) (: -1 i32) 0)]
             (when (!= (primitive/cast i64 p) at)
               (panic "cannot poison released region pages")))
+        (= size (pooled-chunk-size)) (chunk-pool-keep! at)
         (big-chunk? size)
           (munmap (primitive/cast (ptr i8) at) (primitive/cast isize (chunk-pages size)))
         :else
@@ -2053,6 +2115,10 @@
 
 (defn peek :inline (Always) [(p (mut P))] (-> i64)
   (if (< (.pos p) (len (.src p))) (cast i64 (get (.src p) (.pos p))) -1))
+
+;;; The byte at an offset of a text; -1 past its end.
+(defn byte-at-or-end :inline (Always) [(s (slice u8)) (at i64)] (-> i64)
+  (if (< at (len s)) (cast i64 (get s at)) -1))
 
 (defn advance! :inline (Always) [(p (mut P)) (n i64)] (-> void)
   (set! (.pos p) (+ (.pos p) n)))

@@ -1081,10 +1081,11 @@
                 (None [] (None [Bytes])))))
     (_ (None [Bytes]))))
 
-;;; The bytes a fragment takes one at a time by its first alternatives: of a choice (or a
-;;; fragment that is one) whose leading alternatives are single bytes, those bytes. The choice,
-;;; tried at one of them, matches that byte and no more, since PEG tries alternatives in order
-;;; and these come first. None when the first alternative is no single byte.
+;;; The bytes a fragment takes one at a time: of a choice (or a fragment that is one), the bytes of
+;;; its single-byte alternatives, less those an earlier alternative of more than a byte can begin
+;;; with. The choice, tried at one of them, matches that byte and no more: PEG tries alternatives
+;;; in order, and every one before it either cannot begin there or is a single byte too. None
+;;; when there are none, or an earlier alternative's first bytes are not known.
 (defn leading-bytes [(g Grammar) (e PE) (depth i64)] (-> (Option Bytes))
   (match (.op e)
     (ORef []
@@ -1098,18 +1099,36 @@
                 (None [] (None [Bytes])))))
     (OChoice []
              (let [(mut out) (bytes-none)
+                   (mut blocked) (bytes-none)
                    (mut any) false
                    (mut going) true]
                (for k (.kids e)
                  (when going
                    (match (byte-set-of g k 0)
-                     (Some [b] (set! out (bytes-union out b)) (set! any true))
-                     (None [] (set! going false)))))
+                     (Some [b]
+                           (set! out (bytes-union out (bytes-less b blocked)))
+                           (set! any true))
+                     (None []
+                           (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)]
+                             (first-of! g k (mut f) 0)
+                             (if (.known f)
+                                 (set! blocked (bytes-union blocked (bytes-of-first f)))
+                                 (set! going false)))))))
                (if any (Some out) (None [Bytes]))))
     (_ (None [Bytes]))))
 
-;;; The bytes the alternatives after a fragment's leading single bytes can begin with (see
-;;; `leading-bytes`); None when that is not known. An alternative that can match nothing is no
+;;; The bytes of `a` that are not in `b`.
+(defn bytes-less [(a Bytes) (b Bytes)] (-> Bytes)
+  (Bytes
+    :w0 (& (.w0 a) (- -1 (.w0 b)))
+    :w1 (& (.w1 a) (- -1 (.w1 b)))
+    :w2 (& (.w2 a) (- -1 (.w2 b)))
+    :w3 (& (.w3 a) (- -1 (.w3 b)))
+    :known (and (.known a) (.known b))))
+
+;;; The bytes a fragment's alternatives of more than a byte can begin with: a byte that is none of
+;;; its `leading-bytes` can only be matched by one of them, and only where it can begin. None when
+;;; that is not known. An alternative that can match nothing is no
 ;;; matter to a repetition, which stops at a step that takes no byte; `strict` is for a single
 ;;; match, where it is one: None then.
 (defn after-leading [(g Grammar) (e PE) (depth i64) (strict bool)] (-> (Option Bytes))
@@ -1125,19 +1144,36 @@
                 (None [] (None [Bytes])))))
     (OChoice []
              (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
-                   (mut leading) true
                    (mut empty) false]
                (for k (.kids e)
-                 (when leading
-                   (match (byte-set-of g k 0)
-                     (Some [_] 0)
-                     (None [] (set! leading false))))
-                 (unless leading
-                   (when (first-of! g k (mut f) 0) (set! empty true))))
+                 (match (byte-set-of g k 0)
+                   (Some [_] 0)
+                   (None [] (when (first-of! g k (mut f) 0) (set! empty true)))))
                (if (and (.known f) (not (and strict empty)))
                    (Some (bytes-of-first f))
                    (None [Bytes]))))
     (_ (None [Bytes]))))
+
+;;; For `!X .`, any byte where X does not match: the bytes X can begin with, when they are known
+;;; and X cannot match nothing. Any other byte is one the step takes.
+(defn until-bytes [(g Grammar) (e PE)] (-> (Option Bytes))
+  (if (and (= (.op e) (OSeq))
+           (= (len (.kids e)) 2)
+           (= (.op (get (.kids e) 0)) (ONot))
+           (= (.op (get (.kids e) 1)) (OAny)))
+      (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+            empty (first-of! g (get (.kids (get (.kids e) 0)) 0) (mut f) 0)]
+        (if (and (.known f) (not empty)) (Some (bytes-of-first f)) (None [Bytes])))
+      (None [Bytes])))
+
+;;; Past every byte not of the set from here on.
+(defn byte-run-until [(b Bytes)] (-> Code)
+  `(let [src (.src p)
+         n (len src)
+         (mut i) (.pos p)]
+     (while (and (< i n) (let [c (cast i64 (get src i))] (not ~(byte-test b))))
+       (set! i (+ i 1)))
+     (set! (.pos p) i)))
 
 ;;; Past every byte of the set from here on.
 (defn byte-run [(b Bytes)] (-> Code)
@@ -1152,6 +1188,65 @@
 (defn byte-step [(b Bytes)] (-> Code)
   `(let [c (rt/peek (mut p))]
      (if ~(byte-test b) (do (rt/advance! (mut p) 1) true) false)))
+
+;;; What an alternative begins with, and what comes after that: its first item and the rest.
+(defn alt-head [(k PE)] (-> PE)
+  (if (and (= (.op k) (OSeq)) (> (len (.kids k)) 0)) (get (.kids k) 0) k))
+
+(defn alt-rest [(k PE)] (-> PE)
+  (let [(mut out) (pe-new (OSeq) "" (.tok k))]
+    (when (= (.op k) (OSeq))
+      (for i (range 1 (len (.kids k))) (push! (mut (.kids out)) (get (.kids k) i))))
+    (if (= (len (.kids out)) 1) (get (.kids out) 0) out)))
+
+;;; What an expression of bytes begins with, as a set; unknown when it can match nothing.
+(defn lex-first [(g Grammar) (e PE)] (-> Bytes)
+  (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+        empty (first-of! g e (mut f) 0)
+        (mut b) (bytes-of-first f)]
+    (when empty (set! (.known b) false))
+    b))
+
+(defn bytes-apart? [(a Bytes) (b Bytes)] (-> bool)
+  (and (.known a) (.known b)
+       (= (& (.w0 a) (.w0 b)) 0) (= (& (.w1 a) (.w1 b)) 0)
+       (= (& (.w2 a) (.w2 b)) 0) (= (& (.w3 a) (.w3 b)) 0)))
+
+;;; A choice's alternatives with those that begin alike made one: `A b | A c` is `A (b | c)`,
+;;; which matches the same and matches `A` once. An expression matches the same way wherever it
+;;; is asked at the same place, so that is always so in a PEG; and an alternative between two
+;;; that begin alike is stepped over where it cannot begin as they do, since then its place among
+;;; them makes no difference.
+(defn factored [(g Grammar) (kids (ArrayList PE))] (-> (ArrayList PE))
+  (let [(mut out) (empty-pes)
+        (mut used) (ArrayList::new [bool] (malloc-allocator))]
+    (for _ kids (push! (mut used) false))
+    (for i (range 0 (len kids))
+      (unless (get used i)
+        (let [k (get kids i)
+              head (alt-head k)
+              first (lex-first g head)
+              (mut rests) (empty-pes)
+              (mut going) (= (.op k) (OSeq))]
+          (push! (mut rests) (alt-rest k))
+          (for j (range (+ i 1) (len kids))
+            (when (and going (not (get used j)))
+              (let [other (get kids j)]
+                (if (and (= (.op other) (OSeq)) (pe-same? (alt-head other) head))
+                    (do
+                      (push! (mut rests) (alt-rest other))
+                      (set! (mut used) j true))
+                    (unless (bytes-apart? first (lex-first g other))
+                      (set! going false))))))
+          (if (> (len rests) 1)
+              (let [(mut both) (pe-new (OSeq) "" (.tok k))
+                    (mut choice) (pe-new (OChoice) "" (.tok k))]
+                (for r rests (push! (mut (.kids choice)) r))
+                (push! (mut (.kids both)) head)
+                (push! (mut (.kids both)) choice)
+                (push! (mut out) both))
+              (push! (mut out) k)))))
+    out))
 
 (defn lex-code [(g Grammar) (c (mut dsl/Cur)) (e PE)] (-> Code)
   (match (byte-set-of g e 0)
@@ -1209,7 +1304,7 @@
     ;; a failing alternative leaves the position where it was.
     (OChoice []
              (let [(mut parts) (primitive/code-list-new)]
-               (for k (.kids e)
+               (for k (factored g (.kids e))
                  (let [code (lex-code g (mut c) k)
                        (mut f)
                          (First
@@ -1230,6 +1325,19 @@
            (match (byte-set-of g (get (.kids e) 0) 0)
              (Some [b] `(do ~(byte-run b) true))
              (None []
+                   (match (until-bytes g (get (.kids e) 0))
+                     ;; `(!X .)*`: every byte X cannot begin with is taken in a loop of its
+                     ;; own, and X is tried only at one it can.
+                     (Some [stop]
+                           (let [inner (get (.kids e) 0)]
+                             `(let [(mut go) true]
+                                (while go
+                                  ~(byte-run-until stop)
+                                  (let [s (.pos p)]
+                                    (unless (and ~(lex-code g (mut c) inner) (> (.pos p) s))
+                                      (set! go false))))
+                                true)))
+                     (None []
                    (match (leading-bytes g (get (.kids e) 0) 0)
                      ;; A run of an identifier's characters: the leading bytes in a loop of their
                      ;; own, the fragment itself only for the others.
@@ -1255,7 +1363,7 @@
                                   (unless (and ~(lex-code g (mut c) (get (.kids e) 0))
                                                (> (.pos p) s))
                                     (set! go false))))
-                              true))))))
+                              true))))))))
     (OPlus []
            (match (byte-set-of g (get (.kids e) 0) 0)
              (Some [b]
@@ -1483,6 +1591,54 @@
                  ~(seq-code (mut g) (mut c) items (+ i 1) cap tail direct)
                  false)))))
 
+;;; `inner` with the place for a node's `total` children made: `kids`, and `d`, its first.
+(defn kids-place [(inner Code) (total i64)] (-> Code)
+  `(let [(mut kids) (kids-sized-in (mut p) ~total)
+         d (.data kids)]
+     ~inner))
+
+;;; The items of a node with `total` children, two or more, which are counted before any is
+;;; parsed: their place is made as soon as the alternative has matched something (a literal, or
+;;; its first child), and each child after that is parsed where it will stay. `made`: the place is
+;;; there, as `d`. An alternative that fails after that leaves the place behind, as it does what
+;;; its children made.
+(defn seq-in-place [(g (mut Grammar))
+                    (c (mut dsl/Cur))
+                    (items (ArrayList PE))
+                    (i i64)
+                    (cap i64)
+                    (total i64)
+                    (made bool)
+                    (matched bool)
+                    (tail Code)] (-> Code)
+  (if (>= i (len items))
+      tail
+      (let [e (get items i)]
+        (cond (not (captures? g (mut c) e))
+                `(if ~(rec-code (mut g) (mut c) e)
+                     ~(seq-in-place (mut g) (mut c) items (+ i 1) cap total made
+                                    (or matched (= (.op e) (OLit))) tail)
+                     false)
+              made
+                `(if ~(capture-call (mut g) (mut c) e `(primitive/index d ~cap))
+                     ~(seq-in-place (mut g) (mut c) items (+ i 1) (+ cap 1) total true true tail)
+                     false)
+              ;; A literal has matched: the place is made before this child.
+              matched
+                (kids-place `(if ~(capture-call (mut g) (mut c) e `(primitive/index d ~cap))
+                            ~(seq-in-place (mut g) (mut c) items (+ i 1) (+ cap 1) total true true tail)
+                            false)
+                       total)
+              ;; Nothing has yet: this child is parsed first, and moved in when it matched.
+              :else
+                `(let [(mut first) (primitive/zeroed Node)]
+                   (if ~(capture-call (mut g) (mut c) e `(mut first))
+                       ~(kids-place `(do
+                                  (store! (primitive/index d ~cap) first)
+                                  ~(seq-in-place (mut g) (mut c) items (+ i 1) (+ cap 1) total true true tail))
+                               total)
+                       false))))))
+
 ;;; All items matched: build the node, or pass the one capture through.
 (defn alt-tail [(g Grammar) (c (mut dsl/Cur)) (a Alt) (extra i64)] (-> Code)
   (if (= (len (.label a)) 0)
@@ -1495,16 +1651,28 @@
                  (if (and (= i 0) (> extra 0))
                      `(store! (primitive/index d 0) out)
                      `(store! (primitive/index d ~i) ~(cap-sym i)))))
-        (if (= total 0)
-            `(do (set! out (mk (~(kind-sym (.label a))) (kids-in (mut p)) lo (.pos p))) true)
-            ;; The node's children are counted here already: one allocation of that size, each
-            ;; child written in its place.
-            `(let [(mut kids) (kids-sized-in (mut p) ~total)]
-               (let [d (.data kids)]
-                 ~@stores
-                 (set! (.len kids) ~total))
-               (set! out (mk (~(kind-sym (.label a))) kids lo (.pos p)))
-               true)))))
+        (cond (= total 0)
+                `(do (set! out (mk (~(kind-sym (.label a))) (kids-in (mut p)) lo (.pos p))) true)
+              ;; Its children are where they stay (see `seq-in-place`): a chain's base joins them.
+              (in-place? g (mut c) a extra)
+                `(do
+                   ~(if (> extra 0) `(store! (primitive/index d 0) out) `0)
+                   (set! (.len kids) ~total)
+                   (set! out (mk (~(kind-sym (.label a))) kids lo (.pos p)))
+                   true)
+              ;; The node's children are counted here already: one allocation of that size, each
+              ;; child written in its place.
+              :else
+                `(let [(mut kids) (kids-sized-in (mut p) ~total)]
+                   (let [d (.data kids)]
+                     ~@stores
+                     (set! (.len kids) ~total))
+                   (set! out (mk (~(kind-sym (.label a))) kids lo (.pos p)))
+                   true)))))
+
+;;; Whether a labelled alternative's children are parsed in place: with two or more of its own.
+(defn in-place? [(g Grammar) (c (mut dsl/Cur)) (a Alt) (extra i64)] (-> bool)
+  (and (> (len (.label a)) 0) (>= (count-captures g (mut c) (.seq a)) 2)))
 
 ;;; An alternative without a label and with one capture, not extending a base: what it captures
 ;;; is what it makes, so it is parsed into the caller's place directly.
@@ -1520,7 +1688,10 @@
                     (extra i64)] (-> void)
   (let [tail (alt-tail g (mut c) a extra)
         direct (and (= extra 0) (pass-through? g (mut c) a extra))
-        body (seq-code (mut g) (mut c) (seq-items (.seq a)) 0 extra tail direct)]
+        body (if (in-place? g (mut c) a extra)
+                 (seq-in-place (mut g) (mut c) (seq-items (.seq a)) 0 extra
+                               (+ (count-captures g (mut c) (.seq a)) extra) false false tail)
+                 (seq-code (mut g) (mut c) (seq-items (.seq a)) 0 extra tail direct))]
     ;; Each writes what it makes to `out` and says whether it matched. One that extends a base
     ;; finds the base in `out`, and leaves it there unless it matches.
     (add-aux! (mut g)
@@ -1539,6 +1710,9 @@
            (do
              (rt/backtrack! (mut p) save)
              ~(try-alts name (+ i 1) total)))))
+
+;;; How many bytes a match must be longer than for a memo to keep it.
+(defn memo-least [] (-> i64) 16)
 
 (defn slow-sym [(n (slice u8))] (-> Code)
   (primitive/code-symbol (dsl/join3 "p-" n "-slow")))
@@ -1586,14 +1760,18 @@
                                          (do (set! out (memo-node (mut p) (.node hit))) true)
                                          false))
                                (None []
-                                     (let [r (~(impl-sym (.name d)) (mut p) (mut out))]
-                                       (rt/memo-put! (mut p)
-                                                     ~id
-                                                     key
-                                                     (rt/MemoHit
-                                                       :ok r
-                                                       :end (.pos p)
-                                                       :node (if r (memo-node-keep! (mut p) (mut out)) 0)))
+                                     (let [from (.pos p)
+                                           r (~(impl-sym (.name d)) (mut p) (mut out))]
+                                       ;; A match of a few bytes is parsed again as quickly as it
+                                       ;; is looked up: only longer ones, and failures, are kept.
+                                       (when (or (not r) (> (- (.pos p) from) ~(memo-least)))
+                                         (rt/memo-put! (mut p)
+                                                       ~id
+                                                       key
+                                                       (rt/MemoHit
+                                                         :ok r
+                                                         :end (.pos p)
+                                                         :node (if r (memo-node-keep! (mut p) (mut out)) 0))))
                                        r))))))))
         (add-aux! (mut g)
                   `(defn ~(rule-sym (.name d)) [(p (mut rt/P)) (out (mut Node))] (-> bool)
@@ -1667,7 +1845,7 @@
     (match (two-token-test (mut g) (.seq (get (.alts d) i)) (mut m))
       (Some [t]
             (add-aux! (mut g)
-                      `(defn ~(two-sym (.name d) i) [(p (mut rt/P)) (c i64)] (-> bool) ~t)))
+                      `(defn ~(two-sym (.name d) i) :inline (Hint) [(p (mut rt/P)) (c i64)] (-> bool) ~t)))
       (None [] 0))))
 
 ;;; What rule `name` does at byte `x`, as it is written: not through its memo.
@@ -1832,23 +2010,26 @@
         (mut all) (bytes-none)
         (mut name) "p-after"]
     (for r rests (set! name (dsl/join3 name "-" r)))
+    (for i (range 0 (len rests))
+      (let [own (rest-bytes g (get rests i) (mut m))
+            call (rest-call g (get rests i))
+            again (if (< (+ i 1) (len rests)) `(set! c (next-byte (mut p))) `0)]
+        (set! all (bytes-union all own))
+        (push! (mut steps)
+               (if (.known own)
+                   `(when ~(byte-test own) ~call ~again)
+                   `(do ~call ~again)))))
     (unless (contains? (.rests-made g) name)
       (push! (mut (.rests-made g)) name)
-      (for i (range 0 (len rests))
-        (let [own (rest-bytes g (get rests i) (mut m))
-              call (rest-call g (get rests i))
-              again (if (< (+ i 1) (len rests)) `(set! c (next-byte (mut p))) `0)]
-          (set! all (bytes-union all own))
-          (push! (mut steps)
-                 (if (.known own)
-                     `(when ~(byte-test own) ~call ~again)
-                     `(do ~call ~again)))))
       (add-aux! (mut g)
-                `(defn ~(primitive/code-symbol name) [(p (mut rt/P)) (out (mut Node))] (-> void)
-                   ~(if (.known all)
-                        `(let [(mut c) (next-byte (mut p))] (when ~(byte-test all) ~@steps))
-                        `(let [(mut c) (next-byte (mut p))] ~@steps)))))
-    `(~(primitive/code-symbol name) (mut p) (mut out))))
+                `(defn ~(primitive/code-symbol name) :inline (Hint) [(p (mut rt/P)) (out (mut Node)) (first i64)] (-> void)
+                   (let [(mut c) first] ~@steps))))
+    ;; The one look that mostly finds no operator is taken where the operand was parsed: only an
+    ;; operator's byte calls the function.
+    (if (.known all)
+        `(let [c (next-byte (mut p))]
+           (when ~(byte-test all) (~(primitive/code-symbol name) (mut p) (mut out) c)))
+        `(~(primitive/code-symbol name) (mut p) (mut out) (next-byte (mut p))))))
 
 (defn run-code [(g (mut Grammar)) (r Run) (m (mut FirstMemo))] (-> Code)
   (if (= (len (.rests r)) 0)
@@ -1960,8 +2141,8 @@
           (push! (mut keys) (dsl/join2 (slice scratch) ""))
           (push! (mut codes) (run-code (mut g) (plan-run (mut g) (.name d) x 0 false (mut m)) (mut m))))
         (push! (mut table) (cast u8 (class-byte at)))))
-    ;; Each layout is a function of its own, so that no function is as big as all of a rule's
-    ;; layouts together.
+    ;; Each layout is a function of its own, so that no function the compiler checks is as big
+    ;; as all of a rule's layouts together; they are put back together once checked.
     (let [heads (if (.plan-c2 g)
                     `(c (next-byte (mut p)) w (next-word (mut p)))
                     `(c (next-byte (mut p)) w 0))
@@ -1969,7 +2150,7 @@
       (for i (range 0 (len codes))
         (let [name (primitive/code-symbol (dsl/join3 "p-" (.name d) "-at") i)]
           (add-aux! (mut g)
-                    `(defn ~name [(p (mut rt/P)) (out (mut Node)) (c i64) (w i64)] (-> bool)
+                    `(defn ~name :inline (Always) [(p (mut rt/P)) (out (mut Node)) (c i64) (w i64)] (-> bool)
                        ~(get codes i)))
           (push! (mut calls) `(~name (mut p) (mut out) c w))))
       (if (= (len codes) 1)
@@ -2124,20 +2305,15 @@
 
 ;;; What may begin either: the bytes of both.
 (defn start-or [(a Start) (b Start)] (-> Start)
-  (Start :bytes (bytes-union (.bytes a) (.bytes b)) :empty (.empty b)))
+  (start-union a b (.empty b)))
 
 (defn comma-start [] (-> Start)
-  (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)]
-    (push! (mut (.ranges f)) (Range :lo 44 :hi 44))
-    (Start :bytes (bytes-of-first f) :empty false)))
+  (lit-start ","))
 
 ;;; A test of `c`, the next byte, that the lead's first token can begin with it.
 (defn lead-first-test [(g Grammar) (l Lead) (m (mut FirstMemo))] (-> Code)
   (let [start (if (= (.how l) 0)
-                  (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
-                        b (cast i64 (get (.name l) 0))]
-                    (push! (mut (.ranges f)) (Range :lo b :hi b))
-                    (Start :bytes (bytes-of-first f) :empty false))
+                  (lit-start (.name l))
                   (rule-start g (.name l) (mut m)))]
     (if (and (.known (.bytes start)) (not (.empty start)))
         (byte-test (.bytes start))
@@ -2155,6 +2331,18 @@
 
 (defn every-byte? [(b Bytes)] (-> bool)
   (and (= (.w0 b) -1) (= (.w1 b) -1) (= (.w2 b) -1) (= (.w3 b) -1)))
+
+;;; A bool: can what follows a lead's first token begin here? By the next token's first byte; and
+;;; where all that may follow is literals, by their bytes, as far as eight say (`x =>` is an arrow,
+;;; `x = 1` is not).
+(defn follow-test [(follow Start)] (-> Code)
+  (if (and (.plain follow) (> (len (.lits follow)) 0))
+      (let [(mut tests) (primitive/code-list-new)]
+        (for l (.lits follow) (push! (mut tests) (prefix-test l)))
+        `(let [c (next-byte (mut p))]
+           (and ~(byte-test (.bytes follow))
+                (let [w (next-word (mut p))] (or ~@tests false)))))
+      `(let [c (next-byte (mut p))] ~(byte-test (.bytes follow)))))
 
 ;;; The two-token test of an alternative, where there is one worth making: it must begin with one
 ;;; of a few first tokens, one a token rule, each with a known and narrow next byte.
@@ -2175,7 +2363,7 @@
                    `(and ~(lead-first-test g l (mut m))
                          (do (set! (.pos p) s) true)
                          ~(lead-match (mut g) l)
-                         (let [c (next-byte (mut p))] ~(byte-test (.bytes (.follow l)))))))
+                         ~(follow-test (.follow l)))))
           (Some `(let [s (.pos p)
                        hit (or ~@arms)]
                    (set! (.pos p) s)
@@ -2380,7 +2568,7 @@
                        (if (~(rule-sym n) (mut p) (mut v))
                            (stack-push! (mut p) (mut v))
                            (do (rt/backtrack! (mut p) save) (set! go false)))))
-                   (set! out (mk (KList) (stack-take! (mut p) base) lo (.pos p)))
+                   (list-node! (mut p) (mut out) base lo)
                    true)))
     (add-aux! (mut g)
               `(defn ~(rep1-sym n) [(p (mut rt/P)) (out (mut Node))] (-> bool)
@@ -2399,7 +2587,7 @@
                              (stack-push! (mut p) (mut v))
                              (unless (comma! (mut p)) (set! go false)))
                            (do (rt/backtrack! (mut p) save) (set! go false)))))
-                   (set! out (mk (KList) (stack-take! (mut p) base) lo (.pos p)))
+                   (list-node! (mut p) (mut out) base lo)
                    true)))
     ;; X,+ : one or more, no trailing comma.
     (add-aux! (mut g)
@@ -2418,7 +2606,7 @@
                                  (do
                                    (rt/backtrack! (mut p) save)
                                    (set! go false)))))
-                         (set! out (mk (KList) (stack-take! (mut p) base) lo (.pos p)))
+                         (list-node! (mut p) (mut out) base lo)
                          true)))))))
 
 ;;; Two parsing expressions alike in every part.
@@ -2486,13 +2674,71 @@
                            (set! (.pos p) before)
                            false))))))))
 
+;;; Whether `e` cannot match while flag `f` is off: it tests the flag, or something it needs does.
+(defn fails-without? [(g Grammar) (e PE) (f (slice u8)) (depth i64)] (-> bool)
+  (match (.op e)
+    (OIf [] (= (.text e) f))
+    (OSeq []
+          (let [(mut hit) false]
+            (for k (.kids e) (when (fails-without? g k f depth) (set! hit true)))
+            hit))
+    (OChoice []
+             (let [(mut all) true]
+               (for k (.kids e) (unless (fails-without? g k f depth) (set! all false)))
+               all))
+    (OPlus [] (fails-without? g (get (.kids e) 0) f depth))
+    (ORef []
+          (if (> depth 8)
+              false
+              (match (find-decl g (.text e))
+                (Some [d] (and (= (.kind d) (DHidden)) (fails-without? g (.body d) f (+ depth 1))))
+                (None [] false))))
+    (_ false)))
+
+;;; Whether `e` matches, and takes nothing, while flag `f` is off: it is optional things that
+;;; need the flag.
+(defn nothing-without? [(g Grammar) (e PE) (f (slice u8)) (depth i64)] (-> bool)
+  (match (.op e)
+    (OOpt [] (fails-without? g (get (.kids e) 0) f depth))
+    (OStar [] (fails-without? g (get (.kids e) 0) f depth))
+    (OSeq []
+          (let [(mut all) true]
+            (for k (.kids e) (unless (nothing-without? g k f depth) (set! all false)))
+            all))
+    (ORef []
+          (if (> depth 8)
+              false
+              (match (find-decl g (.text e))
+                (Some [d] (and (= (.kind d) (DHidden)) (nothing-without? g (.body d) f (+ depth 1))))
+                (None [] false))))
+    (_ false)))
+
+;;; A hidden rule's function. One that is nothing while a flag is off (a language's extension to
+;;; another, under its flag) answers at once then, where it is asked: only with the flag on is
+;;; anything called.
 (defn emit-hidden! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl)] (-> void)
-  (add-aux! (mut g)
-            `(defn ~(hidden-sym (.name d)) [(p (mut rt/P))] (-> bool)
-               (let [s (.pos p)]
-                 (if ~(rec-code (mut g) (mut c) (.body d))
-                     true
-                     (do (rt/backtrack! (mut p) s) false))))))
+  (let [body `(let [s (.pos p)]
+                (if ~(rec-code (mut g) (mut c) (.body d))
+                    true
+                    (do (rt/backtrack! (mut p) s) false)))
+        (mut flag) ""
+        (mut answer) false]
+    (for f (.flags g)
+      (when (= (len flag) 0)
+        (cond (nothing-without? g (.body d) f 0) (do (set! flag f) (set! answer true))
+              (fails-without? g (.body d) f 0) (do (set! flag f) (set! answer false))
+              :else 0)))
+    (if (= (len flag) 0)
+        (add-aux! (mut g)
+                  `(defn ~(hidden-sym (.name d)) [(p (mut rt/P))] (-> bool) ~body))
+        (let [full (primitive/code-symbol (dsl/join3 "h-" (.name d) "-on"))]
+          (add-aux! (mut g)
+                    `(defn ~full :inline (Never) [(p (mut rt/P))] (-> bool) ~body))
+          (add-aux! (mut g)
+                    `(defn ~(hidden-sym (.name d)) :inline (Always) [(p (mut rt/P))] (-> bool)
+                       (if (rt/flag? (mut p) ~(flag-sym flag))
+                           (~full (mut p))
+                           ~(if answer `true `false))))))))
 
 ;;; The bytes a punctuation literal may not stand before (`notbefore`), or "".
 (defn not-before-of [(g Grammar) (text (slice u8))] (-> (slice u8))
@@ -2853,8 +3099,37 @@
             (set! i (+ i 67)))
           (set! i (+ i 1))))))
 
-;;; What a reference begins with, and whether it can match nothing.
-(defstruct Start [(bytes Bytes) (empty bool)])
+;;; What a reference begins with, and whether it can match nothing. `plain`: every way it begins
+;;; is with one of the literals `lits` (nothing else: no token, no fragment).
+(defstruct Start [(bytes Bytes) (empty bool) (lits (ArrayList (slice u8))) (plain bool)])
+
+;;; The literals either begins with.
+(defn lits-union [(a Start) (b Start)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (empty-strs)]
+    (for l (.lits a) (add-unique! (mut out) l))
+    (for l (.lits b) (add-unique! (mut out) l))
+    out))
+
+;;; What begins as either does: `empty` says whether it can match nothing.
+(defn start-union [(a Start) (b Start) (empty bool)] (-> Start)
+  (Start
+    :bytes (bytes-union (.bytes a) (.bytes b))
+    :empty empty
+    :lits (lits-union a b)
+    :plain (and (.plain a) (.plain b))))
+
+;;; What begins with nothing yet: the start of a choice before its alternatives are added.
+(defn no-start [] (-> Start)
+  (Start :bytes (bytes-none) :empty false :lits (empty-strs) :plain true))
+
+;;; What begins with this literal.
+(defn lit-start [(text (slice u8))] (-> Start)
+  (let [(mut f) (First :ranges (ArrayList::new [Range] (malloc-allocator)) :known true)
+        b (cast i64 (get text 0))
+        (mut lits) (empty-strs)]
+    (push! (mut (.ranges f)) (Range :lo b :hi b))
+    (push! (mut lits) text)
+    (Start :bytes (bytes-of-first f) :empty false :lits lits :plain true)))
 
 ;;; Each rule's start, worked out once for the grammar. A rule met again while its own is being
 ;;; worked out is a cycle: unknown.
@@ -2878,7 +3153,9 @@
         :w2 0
         :w3 0
         :known false)
-    :empty false))
+    :empty false
+    :lits (empty-strs)
+    :plain false))
 
 (defn lexical-start [(g Grammar) (body PE)] (-> Start)
   (let [(mut f)
@@ -2886,7 +3163,7 @@
             :ranges (ArrayList::new [Range] (malloc-allocator))
             :known true)
         empty (first-of! g body (mut f) 0)]
-    (Start :bytes (bytes-of-first f) :empty empty)))
+    (Start :bytes (bytes-of-first f) :empty empty :lits (empty-strs) :plain false)))
 
 ;;; The bytes the next token can begin with when a rule matches, space skipped first.
 (defn rule-start [(g Grammar) (name (slice u8)) (m (mut FirstMemo))] (-> Start)
@@ -2908,20 +3185,10 @@
                                   (= (.kind d) (DHidden))
                                     (pe-start g (.body d) (mut m))
                                   (= (.kind d) (DRule))
-                                    (let [(mut acc)
-                                            (Start
-                                              :bytes (bytes-none)
-                                              :empty false)]
+                                    (let [(mut acc) (no-start)]
                                       (for a (.alts d)
                                         (let [s1 (pe-start g (.seq a) (mut m))]
-                                          (set! acc
-                                                (Start
-                                                  :bytes
-                                                    (bytes-union (.bytes acc)
-                                                                 (.bytes s1))
-                                                  :empty
-                                                    (or (.empty acc)
-                                                        (.empty s1))))))
+                                          (set! acc (start-union acc s1 (or (.empty acc) (.empty s1))))))
                                       acc)
                                   ;; A chain (postfix, suffix, infix) begins with its base.
                                   (and (or (= (.kind d) (DPostfix))
@@ -2937,26 +3204,19 @@
 
 (defn seq-start [(a Start) (b Start)] (-> Start)
   (if (.empty a)
-      (Start :bytes (bytes-union (.bytes a) (.bytes b)) :empty (.empty b))
+      (start-union a b (.empty b))
       a))
 
 (defn maybe [(s Start)] (-> Start)
-  (Start :bytes (.bytes s) :empty true))
+  (Start :bytes (.bytes s) :empty true :lits (.lits s) :plain (.plain s)))
 
 (defn zero-width [] (-> Start)
-  (Start :bytes (bytes-none) :empty true))
+  (Start :bytes (bytes-none) :empty true :lits (empty-strs) :plain true))
 
 ;;; The same for a parsing expression of a rule.
 (defn pe-start [(g Grammar) (e PE) (m (mut FirstMemo))] (-> Start)
   (match (.op e)
-    (OLit []
-          (let [(mut f)
-                  (First
-                    :ranges (ArrayList::new [Range] (malloc-allocator))
-                    :known true)
-                b (cast i64 (get (.text e) 0))]
-            (push! (mut (.ranges f)) (Range :lo b :hi b))
-            (Start :bytes (bytes-of-first f) :empty false)))
+    (OLit [] (lit-start (.text e)))
     (ORef [] (rule-start g (.text e) (mut m)))
     (OSeq []
           (let [(mut acc) (zero-width)]
@@ -2965,13 +3225,10 @@
                 (set! acc (seq-start acc (pe-start g k (mut m))))))
             acc))
     (OChoice []
-             (let [(mut acc) (Start :bytes (bytes-none) :empty false)]
+             (let [(mut acc) (no-start)]
                (for k (.kids e)
                  (let [s (pe-start g k (mut m))]
-                   (set! acc
-                         (Start
-                           :bytes (bytes-union (.bytes acc) (.bytes s))
-                           :empty (or (.empty acc) (.empty s))))))
+                   (set! acc (start-union acc s (or (.empty acc) (.empty s))))))
                acc))
     (OStar [] (maybe (pe-start g (get (.kids e) 0) (mut m))))
     (OOpt [] (maybe (pe-start g (get (.kids e) 0) (mut m))))
@@ -3029,6 +3286,27 @@
     (OLineStart [] true)
     (OEof [] true)
     (_ (set! (.known f) false) false)))
+
+;;; A bool over `c`, the byte at `from`: is the space here that one byte and no more? It is where
+;;; the byte is one of the space fragment's plain bytes and the byte after is neither one of
+;;; those nor one another alternative of the fragment can begin with. `false` for a fragment that
+;;; is not a repetition with plain bytes.
+(defn space-single [(g (mut Grammar)) (cu (mut dsl/Cur))] (-> Code)
+  (match (find-decl g (.space g))
+    (None [] `false)
+    (Some [d]
+          (if (= (.op (.body d)) (OStar))
+              (let [inner (get (.kids (.body d)) 0)]
+                (match (leading-bytes g inner 0)
+                  (Some [lead]
+                        (match (after-leading g inner 0 false)
+                          (Some [rest]
+                                `(and ~(byte-test lead)
+                                      (let [c (rt/byte-at-or-end (.src p) (+ from 1))]
+                                        (not ~(byte-test (bytes-union lead rest))))))
+                          (None [] `false)))
+                  (None [] `false)))
+              `false))))
 
 ;;; Space not found before, from `from`, the position: a repetition's leading single bytes in a
 ;;; loop here, the fragment itself only where one of its other alternatives can begin after them
@@ -3420,29 +3698,31 @@
        (defn stack-height [(p (mut rt/P))] (-> i64)
          (len (load (parse-stack (mut p)))))
        ;;; The items above `base`, as a list of their own, and off the stack.
-       (defn stack-take! :inline (Always) [(p (mut rt/P)) (base i64)] (-> (ArrayList Node))
+       ;;; The items above `base` as a List node, written where the node goes, and off the stack.
+       ;;; Most lists are short, and many empty: nothing is called for them, and the node's fields
+       ;;; are written one by one, with no list or node made anywhere else first.
+       (defn list-node! :inline (Always) [(p (mut rt/P)) (out (mut Node)) (base i64) (lo i64)] (-> void)
          (let [s (parse-stack (mut p))
                n (- (load (field s len)) base)]
-           (cond (= n 0) (kids-in (mut p))
-                 ;; Most lists are short: their items are moved one by one, with no call.
-                 (<= n 2)
-                   (let [(mut out) (kids-sized-in (mut p) n)
-                         from (load (field s data))
-                         d (.data out)]
-                     (store! (primitive/index d 0) (load (primitive/index from base)))
-                     (when (= n 2)
-                       (store! (primitive/index d 1) (load (primitive/index from (+ base 1)))))
-                     (set! (.len out) n)
-                     (store! (field s len) base)
-                     out)
-                 :else (stack-take-many! (mut p) base))))
-       (defn stack-take-many! [(p (mut rt/P)) (base i64)] (-> (ArrayList Node))
-         (let [s (parse-stack (mut p))
-               n (- (len (load s)) base)
-               (mut out) (kids-sized-in (mut p) n)]
-           (extend! (mut out) (elem s base) n)
-           (store! (field s len) base)
-           out))
+           (set! (.kind out) (KList))
+           (set! (.text out) "")
+           (set! (.lo out) lo)
+           (set! (.hi out) (.pos p))
+           (set! (.gen out) 0)
+           (set! (.kids out) (kids-in (mut p)))
+           (when (> n 0)
+             (if (!= (.cursor p) 0)
+                 (do
+                   (set! (.data (.kids out))
+                         (primitive/cast (ptr Node) (rt/p-alloc (mut p) (* n (sizeof Node)))))
+                   (set! (.cap (.kids out)) n))
+                 (reserve! (mut (.kids out)) n))
+             (let [from (load (field s data))
+                   d (.data (.kids out))]
+               (for i (range 0 n)
+                 (store! (primitive/index d i) (load (primitive/index from (+ base i))))))
+             (set! (.len (.kids out)) n)
+             (store! (field s len) base))))
        ;;; A memo's answer as it is made: its node goes in the ring's next slot (see `rt/memo-put!`).
        (defn memo-node-keep! :inline (Always) [(p (mut rt/P)) (n (mut Node))] (-> i64)
          (store! (primitive/index (primitive/cast (ptr Node) (.data (.memo-ring-nodes p)))
@@ -3494,12 +3774,18 @@
          (let [from (.pos p)
                c (rt/peek (mut p))]
            (if ~(space-start-test (mut g) (mut c))
-               (let [known (rt/ws-known (mut p) from)]
-                 (if (> known 0)
-                     (do
-                       (set! (.ws-from p) from)
-                       (set! (.ws-to p) (+ from (- known 1))))
-                     ~(space-scan (mut g) (mut c))))
+               (if ~(space-single (mut g) (mut c))
+                   ;; One plain byte of space and then a token, the commonest space there is:
+                   ;; nothing to remember, since finding it again is as quick as looking it up.
+                   (do
+                     (set! (.ws-from p) from)
+                     (set! (.ws-to p) (+ from 1)))
+                   (let [known (rt/ws-known (mut p) from)]
+                     (if (> known 0)
+                         (do
+                           (set! (.ws-from p) from)
+                           (set! (.ws-to p) (+ from (- known 1))))
+                         ~(space-scan (mut g) (mut c)))))
                (do
                  (set! (.ws-from p) from)
                  (set! (.ws-to p) from)))))
