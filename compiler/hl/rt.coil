@@ -395,7 +395,7 @@
     (unless (.lasting r) (atomic/add (field (region-queue) bytes-made) size))
     (+ p (chunk-header-bytes))))
 
-(defn cursor-allocate [(c (ptr Cursor)) (bytes i64) (align i64)] (-> (ptr i8))
+(defn cursor-allocate :inline (Always) [(c (ptr Cursor)) (bytes i64) (align i64)] (-> (ptr i8))
   (let [p (align-to (.at c) align)]
     (if (and (> (.at c) 0) (<= (+ p bytes) (.end c)))
         (do (set! (.at c) (+ p bytes))
@@ -604,6 +604,13 @@
               (primitive/make-dyn Allocator (primitive/cast (ptr SharedCursor) state))
               (primitive/make-dyn Allocator (primitive/cast (ptr Cursor) state))))
     0))
+
+;;; This thread's own cursor into the region on top of its stack, as an address, when values go
+;;; through one, and not through a cursor threads share: 0 then.
+(defn top-cursor [] (-> i64)
+  (let [t (thread-regions)
+        n (len (.stack t))]
+    (if (= (get (.stack t) (- n 1)) 0) (get (.stack t) (- n 2)) 0)))
 
 ;;; A region for values that will be held: by whoever made it, until they let it go.
 (defn region-new [] (-> (ptr Region))
@@ -1312,19 +1319,30 @@
 ;;; A statement loop at the top of a program that watches (no memo computing): where this thread's
 ;;; regions are, before the loop; each turn lets the last turn's region go and, while the run
 ;;; reclaims memory, makes its own; the loop's end lets the last go. Elsewhere nothing happens.
+;;; Whether the turns have regions is the same for every turn, so the mark says it once: -1 when
+;;; they have none, and each turn then costs one comparison.
 (defn iteration-mark [] (-> i64)
-  (len (.stack (thread-regions))))
+  (if (and (reclaiming?) (not (dep-in-frame?)))
+      (len (.stack (thread-regions)))
+      -1))
 
-(defn iteration-begin! [(mark i64)] (-> void)
-  (iteration-end! mark)
-  (when (and (reclaiming?) (not (dep-in-frame?)))
-    (let [r (region-new)]
-      (set! (.label r) "a loop's turn")
-      (when (region-labels?) (regions-live-add! r))
-      (region-enter! r)))
+(defn iteration-begin! :inline (Always) [(mark i64)] (-> void)
+  (when (>= mark 0) (iteration-turn! mark))
   0)
 
-(defn iteration-end! [(mark i64)] (-> void)
+(defn iteration-turn! [(mark i64)] (-> void)
+  (iteration-end! mark)
+  (let [r (region-new)]
+    (set! (.label r) "a loop's turn")
+    (when (region-labels?) (regions-live-add! r))
+    (region-enter! r))
+  0)
+
+(defn iteration-end! :inline (Always) [(mark i64)] (-> void)
+  (when (>= mark 0) (iteration-leave! mark))
+  0)
+
+(defn iteration-leave! [(mark i64)] (-> void)
   (let [t (thread-regions)]
     (while (> (len (.stack t)) mark)
       (let [r (region-current)]
@@ -1334,7 +1352,7 @@
 
 ;;; Whether a turn of the loop marked `mark` has a region of its own.
 (defn iterating-since? [(mark i64)] (-> bool)
-  (> (len (.stack (thread-regions))) mark))
+  (and (>= mark 0) (> (len (.stack (thread-regions))) mark)))
 
 ;;; A region a `var` held, taken over by the region values go to now when the var's block ends: it
 ;;; lives as long as that region, which may hold the var's value. One the program's own region
@@ -1842,8 +1860,10 @@
    ;; Try every alternative, as if no first-byte guard ruled any out: for the parse that says why
    ;; a program is wrong, whose furthest failure is then what trying them all finds.
    (careful bool)
-   ;; Where the tree goes: the storage the parse began in.
+   ;; Where the tree goes: the storage the parse began in; and, when that is this thread's own
+   ;; cursor, the cursor, which a node's children are taken from directly (see `p-alloc`).
    (alloc (dyn Allocator))
+   (cursor i64)
    ;; The grammar's own working lists, which this module cannot name: the items of lists being
    ;; parsed, and the memo's answers (`MemoHit.node` is an index into these).
    (stack i64)
@@ -1956,12 +1976,13 @@
       :far from
       :want "a program"
       :memos memos
-      :memo-log (ArrayList::new [MemoEntry] (malloc-allocator))
+      :memo-log (memo-log-for memo-count size)
       :memo-top -1
       :ws-ends ends
       :ws-base from
       :careful false
       :alloc (tree-allocator)
+      :cursor (top-cursor)
       :stack 0
       :memo-nodes 0)))
 
@@ -1973,6 +1994,16 @@
   (free! (mut (.memo-log p)))
   (free! (mut (.ws-ends p)))
   0)
+
+(defn p-alloc :inline (Always) [(p (mut P)) (bytes i64)] (-> (ptr i8))
+  (cursor-allocate (primitive/cast (ptr Cursor) (.cursor p)) bytes 8))
+
+;;; Room for the memo's log from the start: a grammar with memos logs about one answer for every
+;;; two dozen bytes of program.
+(defn memo-log-for [(memo-count i64) (size i64)] (-> (ArrayList MemoEntry))
+  (let [(mut log) (ArrayList::new [MemoEntry] (malloc-allocator))]
+    (when (> memo-count 0) (reserve! (mut log) (+ 64 (/ size 24))))
+    log))
 
 (defn ws-known [(p (mut P)) (from i64)] (-> i64)
   (cast i64 (get (.ws-ends p) (- from (.ws-base p)))))
@@ -2052,13 +2083,12 @@
 
 ;;; Does the text hold this byte?
 (defn has-byte? [(s (slice u8)) (b i64)] (-> bool)
-  (let [(mut hit) false
-        (mut i) 0
-        n (len s)]
-    (while (and (not hit) (< i n))
-      (when (= (cast i64 (get s i)) b) (set! hit true))
-      (set! i (+ i 1)))
-    hit))
+  (and (> (len s) 0)
+       (>= b 0)
+       (< b 256)
+       (!= (primitive/cast i64 (memchr (primitive/cast (ptr i8) (data s)) (cast i32 b) (len s))) 0)))
+
+(extern memchr :cc (cc/C) [(ptr i8) i32 isize] (-> (ptr i8)))
 
 ;;; Plain substring search.
 (defn contains-text? [(s (slice u8)) (needle (slice u8))] (-> bool)
