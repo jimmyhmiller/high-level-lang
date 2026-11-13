@@ -1442,9 +1442,15 @@
                (rt/backtrack! (mut p) save)
                ~(try-alts name (+ i 1) total base)))))
 
-(defn emit-rule-fn! [(g (mut Grammar)) (d Decl) (body Code)] (-> void)
+(defn emit-rule-fn! [(g (mut Grammar)) (d Decl) (body Code) (memo (mut FirstMemo))] (-> void)
   (if (.memo d)
-      (let [id (.memo-count g)]
+      (let [id (.memo-count g)
+            start (rule-start g (.name d) (mut memo))
+            ;; A rule asked for where its first byte cannot be fails there at once, and nothing
+            ;; is gained remembering it: what it cannot begin with is not looked up or logged.
+            can-start (if (and (.known (.bytes start)) (not (.empty start)))
+                          `(or (let [c (next-byte (mut p))] ~(byte-test (.bytes start))) (.careful p))
+                          `true)]
         (set! (.memo-count g) (+ id 1))
         (add-aux! (mut g)
                   `(defn ~(impl-sym (.name d)) [(p (mut rt/P))]
@@ -1453,6 +1459,8 @@
         (add-aux! (mut g)
                   `(defn ~(rule-sym (.name d)) [(p (mut rt/P))]
                      (-> (Option Node))
+                     (if (not ~can-start)
+                         (None [Node])
                      (let [key (rt/memo-key (mut p))]
                        (match (rt/memo-get (mut p) ~id key)
                          (Some [hit]
@@ -1479,7 +1487,7 @@
                                                          :ok false
                                                          :end (.pos p)
                                                          :node 0))))
-                                 r)))))))
+                                 r))))))))
       (add-aux! (mut g)
                 `(defn ~(rule-sym (.name d)) [(p (mut rt/P))] (-> (Option Node))
                    ~body))))
@@ -1498,7 +1506,8 @@
                               c (next-byte (mut p))]
                           ~(guarded-alts (.name d) (.tests gs) (.guarded gs) 0 false))
                        `(let [save (.pos p)]
-                          ~(try-alts (.name d) 0 (len (.alts d)) false))))))
+                          ~(try-alts (.name d) 0 (len (.alts d)) false)))
+                   (mut memo))))
 
 ;;; Alternatives in order, each tried only when the next token's first byte is one it can begin with.
 (defn guarded-alts [(name (slice u8))
@@ -1572,7 +1581,8 @@
                                 (let [save (.pos p)]
                                   (match ~step
                                     (Some [r] (Some r))
-                                    (None [] (rt/backtrack! (mut p) save) (Some acc))))))))))
+                                    (None [] (rt/backtrack! (mut p) save) (Some acc)))))))
+                   (mut memo))))
 
 ;;; An infix declaration is parsed by climbing: one loop over the operators of every level, each
 ;;; level's right operand parsed by the same loop with only tighter levels allowed. The tree is the
@@ -1717,6 +1727,35 @@
                                      (set! go false))))
                              (Some (mk (KList) (stack-take! (mut p) base) lo (.pos p)))))))))))
 
+;;; Two parsing expressions alike in every part.
+(defn pe-same? [(a PE) (b PE)] (-> bool)
+  (and (= (.op a) (.op b))
+       (= (.text a) (.text b))
+       (= (.neg a) (.neg b))
+       (= (len (.ranges a)) (len (.ranges b)))
+       (block :ranges
+         (for i (range 0 (len (.ranges a)))
+           (let [x (get (.ranges a) i) y (get (.ranges b) i)]
+             (unless (and (= (.lo x) (.lo y)) (= (.hi x) (.hi y))) (return-from :ranges false))))
+         true)
+       (same-strs? (.on a) (.on b))
+       (same-strs? (.off a) (.off b))
+       (= (len (.kids a)) (len (.kids b)))
+       (block :kids
+         (for i (range 0 (len (.kids a)))
+           (unless (pe-same? (get (.kids a) i) (get (.kids b) i)) (return-from :kids false)))
+         true)))
+
+;;; Which body a token has, as the first token with that body: tokens that are the same bytes
+;;; (an identifier where a name is bound, read, or labels) share what was last lexed.
+(defn token-body-id [(g Grammar) (d Decl)] (-> i64)
+  (let [(mut out) -1]
+    (for i (range 0 (len (.decls g)))
+      (let [e (get (.decls g) i)]
+        (when (and (< out 0) (= (.kind e) (DToken)) (pe-same? (.body e) (.body d)))
+          (set! out i))))
+    out))
+
 (defn emit-token! [(g (mut Grammar)) (c (mut dsl/Cur)) (d Decl)] (-> void)
   (add-aux! (mut g)
             `(defn ~(lex-sym (.name d)) [(p (mut rt/P))] (-> bool)
@@ -1726,8 +1765,18 @@
               `(defn ~(rule-sym (.name d)) [(p (mut rt/P))] (-> (Option Node))
                  (let [before (.pos p)]
                    ~(if (.raw d) `0 `(skip! (mut p)))
-                   (let [start (.pos p)]
-                     (if (~(lex-sym (.name d)) (mut p))
+                   (let [start (.pos p)
+                         ;; Lexed here already, as this body, by the last token asked for: its end.
+                         matched
+                           (if (and (= (.tok-at p) start) (= (.tok-id p) ~(token-body-id g d)))
+                               (do (set! (.pos p) (.tok-end p)) (.tok-ok p))
+                               (let [ok (~(lex-sym (.name d)) (mut p))]
+                                 (set! (.tok-at p) start)
+                                 (set! (.tok-id p) ~(token-body-id g d))
+                                 (set! (.tok-end p) (.pos p))
+                                 (set! (.tok-ok p) ok)
+                                 ok))]
+                     (if matched
                          (Some (leaf-in (mut p) (~(kind-sym (.name d)))
                                      (rt/span (mut p) start (.pos p))
                                      start
@@ -2593,7 +2642,14 @@
        (defn skip! :inline (Always) [(p (mut rt/P))] (-> void)
          (if (= (.ws-from p) (.pos p))
              (set! (.pos p) (.ws-to p))
-             (skip-new! (mut p))))
+             ;; Where no space can begin, there is none: nothing to look up or scan.
+             (let [c (rt/peek (mut p))]
+               (if ~(space-start-test (mut g) (mut c))
+                   (skip-new! (mut p))
+                   (do
+                     (set! (.ws-nl p) false)
+                     (set! (.ws-from p) (.pos p))
+                     (set! (.ws-to p) (.pos p)))))))
 
        (defn skip-new! [(p (mut rt/P))] (-> void)
          (let [from (.pos p)
@@ -2616,13 +2672,13 @@
            (set! (.ws-to p) (.pos p))))
 
        ;;; Is there a line terminator between here and the next token?
-       (defn newline-ahead? [(p (mut rt/P))] (-> bool)
+       (defn newline-ahead? :inline (Always) [(p (mut rt/P))] (-> bool)
          (let [s (.pos p)]
            (skip! (mut p))
            (set! (.pos p) s)
            (.ws-nl p)))
 
-       (defn skip-peek? [(p (mut rt/P))] (-> bool)
+       (defn skip-peek? :inline (Always) [(p (mut rt/P))] (-> bool)
          (let [s (.pos p)]
            (skip! (mut p))
            (let [at-end (rt/eof? (mut p))]
@@ -2630,7 +2686,7 @@
              at-end)))
 
        ;;; The first byte of the next token, without consuming anything.
-       (defn next-byte [(p (mut rt/P))] (-> i64)
+       (defn next-byte :inline (Always) [(p (mut rt/P))] (-> i64)
          (let [s (.pos p)]
            (skip! (mut p))
            (let [b (rt/peek (mut p))]
@@ -2638,7 +2694,7 @@
              b)))
 
        ;;; Where the next token begins, without consuming the space before it.
-       (defn token-start [(p (mut rt/P))] (-> i64)
+       (defn token-start :inline (Always) [(p (mut rt/P))] (-> i64)
          (let [s (.pos p)]
            (skip! (mut p))
            (let [t (.pos p)]
