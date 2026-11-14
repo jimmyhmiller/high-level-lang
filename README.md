@@ -620,6 +620,64 @@ Limits:
 - Dependencies are read from the `package.json` where the build runs.
 - Stylesheets are not in the relations.
 
+## Rewrites and fixes
+
+The same files hold rewrites, `rewrite NAME `pattern` => `template` [:- conditions] ;`, made with
+`--rewrite=FILE` (in a spec, `rewrite "FILE"`) to each module's code as it loads
+(`src/bundle/rewrites.rules`):
+
+```
+rewrite no-get `$G($O, $K)` => `$O?.[$K]` :- imported(G, "tiny-get", "get") ;
+rewrite no-asserts `$A($$X)` => `` :- imported(A, "./assert.js", "assert") ;
+off("beta");
+rewrite flags-off `$Fl.$F` => `false` :- imported(Fl, "./flags.js", "flags"), off(F) ;
+```
+
+They are made before scopes and linking, where a spec's `transform` is. So tree shaking, renaming,
+minifying and source maps all see what they make:
+
+- an `assert` taken out takes its module with it;
+- `get(o, k)` written `o?.[k]` stops shipping the package;
+- with `--minify-syntax`, a flag rewritten `false` takes its branch out before tree shaking, as a
+  constant's does, and with it what only that branch read.
+
+On `tests/apps/rewrite` the three rules take the build from 523 bytes to 135. A tree is rewritten
+from its leaves up: each node, its children rewritten first, by the first rewrite that holds. What
+a rewrite makes is not rewritten again, so rewrites cannot loop. An empty template takes out a
+statement, or the expression statement whose expression it matched. Every node a template makes
+is placed where the code it replaced was, so a source map still says where the code came from.
+
+A rewrite's conditions read what the names its pattern matched are in their module, as the
+module's own scope analysis says:
+
+- `imported(X, Spec, Name)`: X is an import (`Name` is the name imported, `default` or `*`);
+- `global(X)`: no declaration of the module's is X;
+- `local(X)`: X is declared in the module;
+- `in-module(M)`, `in-package(K)`: where the code is;
+- and what the file's own facts derive.
+
+So a function of the module's own called `get` is not the import. What a build ships is not a
+rewrite's to read, since rewriting changes it; reading `ships` in a rewrite is an error at its place,
+as are a template variable the pattern binds nowhere and a pattern js.syntax cannot read. Rewrite
+files are watched inputs, as rule files are. `examples/rewrites.lint` has these and a
+`console.log` rewrite that keeps a module's own `console`.
+
+A lint may have fixes, `fix LINT `pattern` => `template` ;`. `--fix` makes them to the source
+files instead of building. In the statement each finding of the lint is at, what the pattern
+matches becomes the template, filled with the code each variable matched as it is written. An
+empty template takes the statement out, and its line when the statement was all of it. A package's
+files are not the project's to fix. `examples/ship.lint` fixes its `debugger` and `console.log`
+findings so.
+
+`tools/rewrite-check.py`, part of `tools/verify.py`, checks:
+
+- the fixture's output, and that it prints what it printed;
+- a source map through a rewrite;
+- each kind of rule error;
+- watching, and a spec's `rewrite`;
+- that `--fix` edits only what it should (whole lines, a filled template, no package files), and
+  that linting again finds what was fixed gone.
+
 ## Paired client/server builds
 
 A target with `client-outfile` builds one server entry and discovers browser entries from its

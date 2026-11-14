@@ -32,7 +32,12 @@ record LintDef { name: Text, severity: Text, at: Text, message: Text, vars: [Tex
 # A JavaScript pattern, its relation (`code` of it): the statement, the place it matched, and its
 # variables' values.
 record Pattern { rel: Text, text: Text, label: Text, vars: [Text] }
-record Program { clauses: [Clause], lints: [LintDef], patterns: [Pattern] }
+# A rewrite: its pattern and template, as written, and the conditions under which it is made, of the
+# module and its names (`rewrite-relations`).
+record RewriteDef { name: Text, pattern: Text, template: Text, label: Text, body: [Lit], spot: Spot }
+# A fix of a lint's findings.
+record FixDef { lint: Text, pattern: Text, template: Text, label: Text, spot: Spot }
+record Program { clauses: [Clause], lints: [LintDef], patterns: [Pattern], rewrites: [RewriteDef], fixes: [FixDef] }
 
 # The file being read, for where its errors are.
 setting path: Text
@@ -42,7 +47,8 @@ fn program-of(files: [Text]) -> Program = checked(joined([file-program(f) for f 
 
 fn joined(ps: [Program]) -> Program =
   Program(clauses: [c for p in ps for c in p.clauses], lints: [x for p in ps for x in p.lints],
-          patterns: [x for p in ps for x in p.patterns distinct x.rel])
+          patterns: [x for p in ps for x in p.patterns distinct x.rel], rewrites: [x for p in ps for x in p.rewrites],
+          fixes: [x for p in ps for x in p.fixes])
 
 # A file's rules, read: an answer the pipeline keeps (build.pipeline), so a watcher reads the file
 # again when it changes.
@@ -53,8 +59,21 @@ fn spot(n: Node) -> Spot = Spot(path: path, line: line-of(source, n.lo), col: co
 fn fail-at(s: Spot, message: Text) -> Never = fail-build(s.path ++ ":" ++ int-text(s.line) ++ ":" ++ int-text(s.col) ++ ": " ++ message)
 
 fn read-program(f: Node) -> Program =
-  Program(clauses: [clause-of(i) for i in f.items.kids], lints: [lint-of(i) for i in f.items.kids if i is Lint(...)],
-          patterns: [p for i in f.items.kids for p in patterns-in(i)])
+  Program(clauses: [clause-of(i) for i in f.items.kids if not (i is Rewrite(...) or i is Fix(...))],
+          lints: [lint-of(i) for i in f.items.kids if i is Lint(...)],
+          patterns: [p for i in f.items.kids for p in patterns-in(i)],
+          rewrites: [rewrite-of(i) for i in f.items.kids if i is Rewrite(...)], fixes: [fix-of(i) for i in f.items.kids if i is Fix(...)])
+
+fn rewrite-of(i: Node) -> RewriteDef = match i {
+  Rewrite(name, pattern, template, conditions) =>
+    RewriteDef(name: name.text, pattern: pattern-text(pattern), template: pattern-text(template), label: pattern-label(pattern),
+               body: match conditions { Conditions(ls) => [lit-of(x) for x in ls.kids]  _ => [] }, spot: spot(i))
+}
+
+fn fix-of(i: Node) -> FixDef = match i {
+  Fix(name, pattern, template) => FixDef(lint: name.text, pattern: pattern-text(pattern), template: pattern-text(template),
+                                         label: pattern-label(pattern), spot: spot(i))
+}
 
 fn clause-of(i: Node) -> Clause = match i {
   Rule(head, body) => Clause(rel: head.name.text, head: [head-term(a) for a in head.args.kids], aggs: [agg-of(a) for a in head.args.kids],
@@ -147,7 +166,7 @@ fn given-arity(name: Text) -> Int = (first r in sh.relations() if r.name == name
 fn checked(p: Program) -> Program = match problems {
   [] => p
   [x, ...] => fail-at(x.spot, x.message)
-} where problems = arity-problems(p) ++ head-problems(p) ++ binding-problems(p) ++ message-problems(p)
+} where problems = arity-problems(p) ++ head-problems(p) ++ binding-problems(p) ++ message-problems(p) ++ rewrite-problems(p) ++ fix-problems(p)
                    ++ [x for s in [strata(p)] if s.cycle != "" for x in [Problem(spot: s.spot, message: s.cycle)]]
 
 record Problem { spot: Spot, message: Text }
@@ -198,6 +217,61 @@ fn placeholders(t: Text) -> [Text] = match index-of(t, "{") {
     some(j) => [t[i + 1..i + j]] ++ placeholders(t[i + j + 1..len(t)])
   }
 }
+
+# ---------------------------------------------------------------- rewrites
+
+# What a rewrite's conditions may read: what its variables' names are in their module, as its scopes
+# say (an import's module and name, a global, a local), which module it is and which package; and
+# what the file's facts derive.
+fn rewrite-arity(name: Text) -> Int = match name {
+  "imported" => 3
+  "global" | "local" | "in-module" | "in-package" => 1
+  _ => -1
+}
+
+# The relations the file's facts alone derive, and its rules derive from them alone.
+fn fact-relations(p: Program) -> [Text] = facts-from(p, [c.rel for c in p.clauses if len(c.body) == 0 distinct c.rel])
+
+fn facts-from(p: Program, known: [Text]) -> [Text] = match more {
+  [] => known
+  _ => facts-from(p, known ++ more)
+} where more = [c.rel for c in p.clauses if not (c.rel in known) and not starts-with(c.rel, "lint:")
+                if all x in c.body: (x.kind != "atom" and x.kind != "not") or x.rel in known distinct c.rel
+                if all d in p.clauses: d.rel != c.rel or (all x in d.body: (x.kind != "atom" and x.kind != "not") or x.rel in known)]
+
+fn rewrite-problems(p: Program) -> [Problem] =
+  [x for r in p.rewrites for x in one-rewrite-problems(p, r, facts)] where facts = fact-relations(p)
+
+fn one-rewrite-problems(p: Program, r: RewriteDef, facts: [Text]) -> [Problem] =
+  [Problem(spot: r.spot, message: "the template's $" ++ v ++ " is bound by nothing in the pattern") for v in sh.bindable(r.template, r.label) if not (v in binds)]
+  ++ [Problem(spot: x.spot, message: x.rel ++ " is not a rewrite's to read: it sees its module and its names (imported, global, local, in-module, in-package) and what the file's facts derive")
+      for x in r.body if (x.kind == "atom" or x.kind == "not") and rewrite-arity(x.rel) < 0 and not (x.rel in facts)]
+  ++ [Problem(spot: x.spot, message: x.rel ++ " has " ++ int-text(n) ++ " columns, not " ++ int-text(len(x.args)))
+      for x in r.body if x.kind == "atom" or x.kind == "not" for n in [if rewrite-arity(x.rel) >= 0 then rewrite-arity(x.rel) else arity-of(p, x.rel)]
+      if n >= 0 and n != len(x.args)]
+  ++ plan(Clause(rel: "rewrite:" ++ r.name, head: [], aggs: [], body: r.body, spot: r.spot), binds).problems
+  where binds = sh.bindable(r.pattern, r.label)
+
+fn fix-problems(p: Program) -> [Problem] =
+  [Problem(spot: f.spot, message: problem) for f in p.fixes
+   for problem in [match first x in p.lints if x.name == f.lint: x {
+     none => "no lint named " ++ f.lint ++ " to fix"
+     some(x) if x.at == "" => "lint " ++ f.lint ++ " says no place (`at`), so there is nowhere to fix"
+     some(_) => match [v for v in sh.bindable(f.template, f.label) if not (v in sh.bindable(f.pattern, f.label))] {
+       [] => ""
+       vs => "the template's $" ++ vs[0] ++ " is bound by nothing in the pattern"
+     }
+   }] if problem != ""]
+
+# The file's facts solved: what a rewrite's conditions read besides its module and names.
+fn facts-db(p: Program) -> Db = solved(p with { clauses: [c for c in p.clauses if c.rel in facts], lints: [] }, {})
+  where facts = fact-relations(p)
+
+# Whether a rewrite's conditions hold, its pattern's variables given, with what its module and names
+# are as `rows`.
+fn condition-holds?(db: Db, rows: {Text:[[Text]]}, body: [Lit], vals: {Text:Text}) -> Bool =
+  len(envs-of(plan(Clause(rel: "", head: [], aggs: [], body: body, spot: Spot(path: "", line: 0, col: 0)), keys(vals)).steps,
+              db with { rows: db.rows ++ rows }, {}, -1, Env(vals: vals, used: []), 0, false, {})) > 0
 
 # ---------------------------------------------------------------- order
 
@@ -417,8 +491,9 @@ fn compared(x: Lit, e: Env) -> Bool = match x.kind, parse-int-opt(a), parse-int-
 
 # ---------------------------------------------------------------- findings
 
-record Finding { lint: Text, severity: Text, place: Text, text: Text, message: Text, why: [Text] }
-record Linted { findings: [Finding], errors: Int, warnings: Int, text: Text }
+record Finding { lint: Text, severity: Text, at: Text, place: Text, text: Text, message: Text, why: [Text] }
+# What the lints found, said; and with `--fix`, the edits the fixes of what they found make.
+record Linted { findings: [Finding], errors: Int, warnings: Int, text: Text, edits: [sh.Edit] }
 
 # What the build gives the rules: the relations they read, each pattern's matches.
 fn given-of(p: Program, b: sh.Build) -> {Text:[[Text]]} =
@@ -427,7 +502,8 @@ fn given-of(p: Program, b: sh.Build) -> {Text:[[Text]]} =
 
 fn linted(files: [Text], b: sh.Build) -> Linted =
   Linted(findings: findings, errors: count f in findings: f.severity == "error", warnings: count f in findings: f.severity == "warning",
-         text: report-text(findings))
+         text: report-text(findings),
+         edits: [e for f in findings if b.fix for x in p.fixes if x.lint == f.lint for e in sh.fix-edits(f.at, x.pattern, x.template, x.label)])
   where p = program-of(files),
         db = solved(p, given-of(p, b)),
         parts = {x.key: x for x in b.ledger.parts},
@@ -453,7 +529,7 @@ fn chains-of(db: link.Db, parts: {Int:Text}) -> Chains =
   Chains(db: db, parts: parts, ids: {parts[k] ?? "": k for k in keys(parts)}, roots: {l.module-key(id): id for id in m.order})
 
 fn finding(p: Program, db: Db, db-ix: {Text:Index}, chains: Chains, parts: {Text:l.Part}, x: LintDef, row: [Text]) -> Finding =
-  Finding(lint: x.name, severity: x.severity, place: match x.at { "" => ""  v => shown(vals[v] ?? "", parts) },
+  Finding(lint: x.name, severity: x.severity, at: match x.at { "" => ""  v => vals[v] ?? "" }, place: match x.at { "" => ""  v => shown(vals[v] ?? "", parts) },
           text: match x.at { "" => ""  v => (match parts[vals[v] ?? ""] { some(q) => q.text  none => "" }) },
           message: filled(x.message, vals, parts),
           why: after-first([w for c in p.clauses if c.rel == "lint:" ++ x.name for w in explained(p, db, db-ix, chains, parts, c.rel, row, 0, [])]))

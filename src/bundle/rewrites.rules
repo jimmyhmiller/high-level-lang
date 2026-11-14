@@ -1,0 +1,145 @@
+# Rewrites (bundle.lint's `rewrite` rules), made to each module's tree as it loads: before its scopes
+# are analysed and before linking, so tree shaking, renaming, minifying and source maps all see the
+# rewritten code, as they see a spec's `transform`.
+#
+# A tree is rewritten from its leaves up: each node, its children rewritten first, becomes the
+# template of the first rewrite whose pattern it is and whose conditions hold; what a rewrite makes
+# is not rewritten again, so rewrites cannot loop. An empty template takes out a statement, or the
+# statement an expression is all of.
+#
+# What conditions read of a match is its module and its names, as the module's own scopes say what
+# each name the pattern's variables matched is: `imported(X, Spec, Name)` when it is an import
+# (`Name` "default", "*", or the name imported), `global(X)` when no declaration of the module's is
+# it, `local(X)` otherwise; `in-module(M)`, `in-package(K)`. So `get` imported from lodash is not a
+# function of the module's own that happens to be called `get`.
+rules bundle.rewrites over bundle.js
+use bundle.js as js
+use bundle.lint as lint
+use bundle.shipped as sh
+use bundle.scopes as sc
+use bundle.modules as m
+use bundle.dce as dce
+
+# A rewrite, its pattern and template read.
+record Ready { def: lint.RewriteDef, pattern: Node, template: Node, empty: Bool, statement: Bool }
+
+# What a module's rewrite reads: the rewrites, its source, the facts, and what its names are.
+record Ctx { ready: [Ready], text: Text, db: lint.Db, analysis: sym.Analysis, imports: {Int:Imp}, module: Text, package: Text }
+record Imp { spec: Text, name: Text }
+
+# The module at `path`, its tree rewritten by the rules of the build's rewrite files.
+fn rewritten(tree: Node, path: Text, text: Text) -> Node = match any r in ready: sh.anywhere?(tree, r.pattern, text) {
+  false => tree
+  true => decided(applied(tree, ctx-of(tree, path, text, p, ready)))
+} where p = lint.program-of(m.loading.rewrites),
+        ready = [ready-of(r) for r in p.rewrites]
+
+# With `--minify-syntax`, the branches what a rewrite made decides are taken out before tree
+# shaking, as constants' are (bundle.constants): `flags.beta` made `false` takes its `if` with it,
+# and what only that branch read.
+fn decided(tree: Node) -> Node = match m.loading.inline-constants {
+  true => dce.run(tree)
+  false => tree
+}
+
+fn ready-of(r: lint.RewriteDef) -> Ready =
+  Ready(def: r, pattern: pat, template: match empty { true => pat  false => sh.pattern-node(r.template, r.label) }, empty: empty,
+        statement: statement-pattern?(r.pattern, r.label))
+  where pat = sh.pattern-node(r.pattern, r.label),
+        empty = trim(r.template) == ""
+
+# Whether a pattern is a statement, not an expression: what an empty template may take out of a
+# list of statements where it stands.
+fn statement-pattern?(pattern: Text, label: Text) -> Bool = match js.parse(pattern ++ ";", label).body.kids {
+  [ExprStmt(_)] => false
+  _ => true
+}
+
+fn ctx-of(tree: Node, path: Text, text: Text, p: lint.Program, ready: [Ready]) -> Ctx =
+  Ctx(ready: ready, text: text, db: lint.facts-db(p), analysis: a, imports: imports-of(tree, a), module: m.shown-path(path), package: package-of(path))
+  where a = sc.analysis(tree, [])
+
+fn package-of(path: Text) -> Text = match last-index-of(path, "node_modules/") {
+  none => ""
+  some(at) => match split(path[at + 13..len(path)], "/") {
+    [scope, name, ...] if starts-with(scope, "@") => scope ++ "/" ++ name
+    [name, ...] => name
+    _ => ""
+  }
+}
+
+# What each name an import statement declares is: the module it names, and the name it imports.
+fn imports-of(tree: Node, a: sym.Analysis) -> {Int:Imp} =
+  {s: Imp(spec: unquote(from.text), name: n.imported) for st in tree.body.kids for from in import-from(st)
+   for n in import-names(st) for s in [a.bindings[n.at] ?? -1] if s >= 0}
+
+record Named { at: Int, imported: Text }
+
+fn import-from(st: Node) -> [Node] = match st {
+  Import(_, from, _) => [from]
+  _ => []
+}
+
+fn import-names(st: Node) -> [Named] = match st {
+  Import(clause, _, _) => clause-names(clause)
+  _ => []
+}
+
+fn clause-names(c: Node) -> [Named] = match c {
+  ImportDefault(name) => [Named(at: name.lo, imported: "default")]
+  ImportDefaultAnd(name, rest) => [Named(at: name.lo, imported: "default")] ++ clause-names(rest)
+  ImportNamespace(name) => [Named(at: name.lo, imported: "*")]
+  ImportNamed(List(specs...)) => [x for sp in specs for x in spec-names(sp)]
+  _ => []
+}
+
+fn spec-names(sp: Node) -> [Named] = match sp {
+  ImportName(name) => [Named(at: name.lo, imported: name.text)]
+  ImportAs(imported, name) => [Named(at: name.lo, imported: match imported.kids { [] => unquote-if(imported.text)  _ => imported.text })]
+  _ => []
+}
+
+fn unquote-if(t: Text) -> Text = if starts-with(t, "\"") or starts-with(t, "'") then unquote(t) else t
+
+# A node rewritten: its children first, then itself by the first rewrite that holds of it.
+fn applied(n: Node, c: Ctx) -> Node = (first r in c.ready if not r.empty for found in [made(r, inner, c)] if let some(b) = found:
+                                        sh.instantiated(r.template, b, inner)) ?? inner
+  where inner = match len(n.kids) {
+    0 => n
+    _ => n with { kids: [k for x in n.kids for k in kept(x, c)] }
+  }
+
+# A child, rewritten; or none, when an empty template takes it out.
+fn kept(x: Node, c: Ctx) -> [Node] = match any r in c.ready: r.empty and taken?(r, x, c) {
+  true => []
+  false => [applied(x, c)]
+}
+
+# Whether an empty template takes a statement out: a statement its pattern is, or an expression
+# statement whose expression it is.
+fn taken?(r: Ready, x: Node, c: Ctx) -> Bool = match x {
+  ExprStmt(e) if not r.statement => is-some(made(r, e, c))
+  _ if r.statement => is-some(made(r, x, c))
+  _ => false
+}
+
+# The pattern's variables where it is this node and its conditions hold.
+fn made(r: Ready, n: Node, c: Ctx) -> [sh.Bound]? = match sh.unified(r.pattern, n, c.text, []) {
+  none => none
+  some(b) if len(r.def.body) == 0 => some(b)
+  some(b) => match lint.condition-holds?(c.db, rows-of(b, c), r.def.body, {x.name: x.value for x in b if not x.rest}) {
+    true => some(b)
+    false => none
+  }
+}
+
+# What a match's names are, and where it is, as rows of the relations conditions read.
+fn rows-of(b: [sh.Bound], c: Ctx) -> {Text:[[Text]]} =
+  {"imported": [[x.value, i.spec, i.name] for x in named for s in [symbol-of(x, c)] if s >= 0 for i in c.imports[s]],
+   "global": [[x.value] for x in named if symbol-of(x, c) < 0],
+   "local": [[x.value] for x in named for s in [symbol-of(x, c)] if s >= 0 and not (s in c.imports)],
+   "in-module": [[c.module]],
+   "in-package": [[c.package] for k in [c.package] if k != ""]}
+  where named = [x for x in b if not x.rest and len(x.nodes) == 1 and len(x.nodes[0].kids) == 0]
+
+fn symbol-of(x: sh.Bound, c: Ctx) -> Int = c.analysis.bindings[x.nodes[0].lo] ?? -1

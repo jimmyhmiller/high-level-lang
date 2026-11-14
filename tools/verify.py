@@ -452,6 +452,11 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and " passed, 0 failed" in out, "--lint: "
       + (out.strip().splitlines()[-1] + " (findings and their explanations, outputs unchanged, rule errors, watching, specs, real libraries)" if code == 0 else out[-1800:]))
 
+print("== rewrites and fixes")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rewrite-check.py"), ESB, SPEC], 300)
+check(code == 0 and " passed, 0 failed" in out, "--rewrite and --fix: "
+      + (out.strip().splitlines()[-1] + " (what rewrites make and take with them, names by scope, source maps, rule errors, watching, specs, fixes)" if code == 0 else out[-1800:]))
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "

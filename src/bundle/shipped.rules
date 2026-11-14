@@ -47,7 +47,7 @@ fn relations() -> [Relation] = [
 ]
 
 # What the build is: its ledger, and whether it runs on node.
-record Build { ledger: l.Ledger, node: Bool }
+record Build { ledger: l.Ledger, node: Bool, fix: Bool }
 
 fn module-key(id: Int) -> Text = l.module-key(id)
 
@@ -132,7 +132,9 @@ fn code-rows(pattern: Text, label: Text) -> [[Text]] =
         names = pattern-variables(pattern, label),
         parts = l.part-keys()
 
-record Bound { name: Text, value: Text }
+# What a pattern's variable is: its value as rules read it (a name, a string's value, else the code
+# as written), and the nodes it matched: one for `$X`, the rest of a list for `$$X`.
+record Bound { name: Text, value: Text, nodes: [Node], rest: Bool }
 record Hit { node: Node, bound: [Bound] }
 
 fn value-of(bound: [Bound], name: Text) -> Text = (first b in bound if b.name == name: b.value) ?? panic "code: {} is bound by no match", name
@@ -151,7 +153,7 @@ fn unified(p: Node, t: Node, text: Text, b: [Bound]) -> [Bound]? = match meta?(p
   true => match first x in b if x.name == name: x.value {
     some(v) if v == found => some(b)
     some(_) => none
-    none => some(b ++ [Bound(name: name, value: found)])
+    none => some(b ++ [Bound(name: name, value: found, nodes: [t], rest: false)])
   } where name = p.text[1..len(p.text)],
           found = shown(t, text)
   false if p.kind != t.kind or p.text != t.text => none
@@ -165,12 +167,18 @@ fn rest?(p: Node) -> Bool = len(p.kids) == 0 and starts-with(p.text, "$$")
 # Children alike, in order; `$$X` last in a pattern's list is all the rest, however many.
 fn kids-unified(ps: [Node], ts: [Node], text: Text, b: [Bound]) -> [Bound]? = match ps, ts {
   [], [] => some(b)
-  [r], _ if rest?(r) => some(b)
+  [r], _ if rest?(r) => some(b ++ [Bound(name: r.text[2..len(r.text)], value: span-text(ts, text), nodes: ts, rest: true) for x in [0] if r.text != "$$_"])
   [p, more...], [t, rest...] => match unified(p, t, text, b) {
     some(next) => kids-unified(more, rest, text, next)
     none => none
   }
   _, _ => none
+}
+
+# The code nodes cover, as written: from the first's start to the last's end.
+fn span-text(ns: [Node], text: Text) -> Text = match ns {
+  [] => ""
+  _ => text[from..max(from, min(at(last(ns).hi), len(text)))] where from = min(at(ns[0].lo), len(text))
 }
 
 # What a variable is bound to: a string's value, a name, or else the code as written.
@@ -179,3 +187,91 @@ fn shown(t: Node, text: Text) -> Text = match t {
   _ if len(t.kids) == 0 and len(t.text) > 0 => t.text
   _ => trim(text[from..max(from, min(at(t.hi), len(text)))]) where from = min(at(t.lo), len(text))
 }
+
+# ---------------------------------------------------------------- rewrites and fixes
+
+# A pattern's variables of either kind, `$X` and `$$X`: what a template may put in.
+fn bindable(pattern: Text, label: Text) -> [Text] = [v for v in all-metas(pattern-node(pattern, label)) distinct v]
+
+everywhere fn all-metas(n: Node) -> [Text] = match n {
+  _ if len(n.kids) == 0 and starts-with(n.text, "$$") and n.text != "$$_" => [n.text[2..len(n.text)]]
+  _ if len(n.kids) == 0 and starts-with(n.text, "$") and n.text != "$_" => [n.text[1..len(n.text)]]
+}
+
+# Whether a pattern matches anywhere in a tree.
+fn anywhere?(n: Node, pat: Node, text: Text) -> Bool = is-some(unified(pat, n, text, [])) or (any k in n.kids: anywhere?(k, pat, text))
+
+# A template with its variables put in: `$X` the node X matched, `$$X` in a list the nodes it
+# matched there. Every node the template itself makes is placed where the code it replaces was, so
+# a source map, and what each statement holds, still say where it came from.
+fn instantiated(t: Node, bound: [Bound], at-node: Node) -> Node = match meta?(t) {
+  true => (first b in bound if b.name == t.text[1..len(t.text)] and not b.rest: b.nodes[0]) ?? panic "rewrite: the template's {} is bound by nothing", t.text
+  false => t with { kids: [k for c in t.kids for k in spliced(c, bound, at-node)], lo: at-node.lo, hi: at-node.hi }
+}
+
+fn spliced(c: Node, bound: [Bound], at-node: Node) -> [Node] = match rest?(c) {
+  true => (first b in bound if b.name == c.text[2..len(c.text)] and b.rest: b.nodes) ?? panic "rewrite: the template's {} is bound by nothing", c.text
+  false => [instantiated(c, bound, at-node)]
+}
+
+# An edit to a file's text: what is from `from` to `to` becomes `text`.
+record Edit { path: Text, from: Int, to: Int, text: Text }
+
+# The edits a fix makes to a statement (a part's key): each place in it the pattern matches becomes
+# the template, its variables put in as their code is written. An empty template takes the code out:
+# a statement, or the statement an expression is all of, with its line when it is all the line has.
+# A package's files are not the project's to fix.
+fn fix-edits(part: Text, pattern: Text, template: Text, label: Text) -> [Edit] = match ids[part] {
+  none => []
+  some(p) => [e for id in [mo for m.db.part-of(p, ?mo)] if not contains-text?(m.modules[id].path, "node_modules/")
+              for text in [l.source-of(id)] for s in [an.stmt-of(id, p)] if not (s is None() or s is Flag())
+              for hit in fix-hits(s, pat, text, empty)
+              for e in [edit-of(m.modules[id].path, text, hit, template, empty)]]
+} where ids = {k: i for i in keys(l.part-keys()) for k in [l.part-keys()[i] ?? ""]},
+        pat = pattern-node(pattern, label),
+        empty = trim(template) == ""
+
+# Where a fix's pattern matches: outermost first, and an expression statement as a whole when the
+# template takes the expression out.
+fn fix-hits(n: Node, pat: Node, text: Text, empty: Bool) -> [Hit] = match n, empty {
+  ExprStmt(x), true if is-some(unified(pat, x, text, [])) => [Hit(node: n, bound: unified(pat, x, text, []) ?? [])]
+  _, _ => match unified(pat, n, text, []) {
+    some(b) => [Hit(node: n, bound: b)]
+    none => [h for k in n.kids for h in fix-hits(k, pat, text, empty)]
+  }
+}
+
+fn edit-of(path: Text, text: Text, hit: Hit, template: Text, empty: Bool) -> Edit = match empty {
+  true => Edit(path: path, from: whole.from, to: whole.to, text: "") where whole = line-span(text, at(hit.node.lo), at(hit.node.hi))
+  false => Edit(path: path, from: at(hit.node.lo), to: at(hit.node.hi), text: filled-template(template, hit.bound, text))
+}
+
+record Cut { from: Int, to: Int }
+
+# What taking out from `from` to `to` takes: its line too, when nothing else is on it.
+fn line-span(text: Text, from: Int, to: Int) -> Cut = match blank?(text[start..from]) and blank?(text[to..end]) {
+  true => Cut(from: start, to: min(end + 1, len(text)))
+  false => Cut(from: from, to: to)
+} where start = (last-index-of(text[0..from], "\n") ?? -1) + 1,
+        end = to + ((index-of(text[to..len(text)], "\n")) ?? (len(text) - to))
+
+fn blank?(t: Text) -> Bool = trim(t) == "" or trim(t) == ";"
+
+# A template's text with each variable's code as written: `$$X` first, then the longer names first,
+# so `$X` is not taken out of `$XY`.
+fn filled-template(template: Text, bound: [Bound], text: Text) -> Text = replace-many(template, [w for w in whats], [b for b in bys])
+  where ordered = sort b in bound by 0 - len(b.name) - (if b.rest then 1000 else 0),
+        whats = [(if b.rest then "$$" else "$") ++ b.name for b in ordered],
+        bys = [span-text(b.nodes, text) for b in ordered]
+
+# Edits made to each file, last first, those that would overlap one made already left out.
+record Fixed { path: Text, text: Text, made: Int }
+
+fn fixed-files(edits: [Edit]) -> [Fixed] =
+  [Fixed(path: path, text: applied-edits(read-file(path), chosen), made: len(chosen))
+   for path in [e.path for e in edits distinct e.path]
+   for chosen in [kept-edits(sort e in [e for e in edits if e.path == path distinct int-text(e.from) ++ " " ++ int-text(e.to)] by 0 - e.from)]]
+
+fn kept-edits(es: [Edit]) -> [Edit] = fold kept = [] for e in es: if (any k in kept: e.to > k.from) then kept else kept ++ [e]
+
+fn applied-edits(text: Text, es: [Edit]) -> Text = fold t = text for e in es: t[0..e.from] ++ e.text ++ t[e.to..len(t)]
