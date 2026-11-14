@@ -6,6 +6,7 @@ every route file each leaves behind (both fix route ids and imports in route fil
 Random projects: routes nested in directories and flat (`a.b.tsx`), params, splats, optional params,
 pathless layouts, route groups, index and route tokens, `.lazy` routes and component and loader
 pieces, ignored files, escaped segments, files that are not routes, route ids and imports to fix,
+empty route files the generator fills in from its templates (root ones too, and custom templates),
 long names that cross Prettier's 80 columns; and configurations: quotes, semicolons, types off,
 extensions, headers and footers, formatting off, other directories and tokens, absolute imports,
 the solid and vue targets. A project both reject (a conflict) must be rejected by both.
@@ -117,6 +118,8 @@ def make_project(rng, d):
         config["routeFileIgnorePrefix"] = "~"
     if rng.random() < 0.05:
         config["target"] = rng.choice(["solid", "vue"])
+    if rng.random() < 0.04:
+        config["customScaffolding"] = {"routeTemplate": "%%tsrImports%%\n\n%%tsrExportStart%%{}%%tsrExportEnd%%\n"}
     prefix = config.get("routeFileIgnorePrefix", "-")
     base = os.path.join(d, routes_dir)
     os.makedirs(base)
@@ -156,7 +159,10 @@ def make_project(rng, d):
         else:
             body = route_body(rng, quote, ctor if rng.random() < 0.9 else ("createFileRoute" if lazy else "createLazyFileRoute"))
             body = body.replace("@tanstack/react-router", pkg)
-        files[rel] = body
+        # An empty file: a new route, which the generator fills in from its template.
+        files[rel] = "" if rng.random() < 0.15 else body
+    if rng.random() < 0.1:
+        files["__root.tsx"] = ""
     for _ in range(rng.randint(0, 2)):
         files[prefix + word(rng) + ".tsx"] = "export const helper = 1\n"
     if rng.random() < 0.2:
@@ -181,6 +187,15 @@ def snapshot(d):
             # Absolute imports name the project's own directory, which differs between the copies.
             out[os.path.relpath(p, d)] = open(p, "rb").read().replace(d.encode(), b"<project>")
     return out
+
+
+def comparable(message):
+    """An error as both say it: a route file that does not parse is named, the parser's words left out."""
+    message = message.replace("error error: ", "error ")
+    if "Error transforming route file " in message:
+        head = message[message.index("Error transforming route file "):]
+        return head[:head.index(": ", len("Error transforming route file ")) if ": " in head[len("Error transforming route file "):] else len(head)]
+    return message
 
 
 def run_ours(d):
@@ -220,7 +235,7 @@ def main():
     for (d, theirs, ours, config), status in zip(cases, statuses):
         mine = run_ours(ours)
         if status.startswith("error") or mine.startswith("error"):
-            if status.startswith("error") and mine.startswith("error") and status[len("error "):] == mine[len("error error: "):]:
+            if status.startswith("error") and mine.startswith("error") and comparable(status) == comparable(mine):
                 agree_errors += 1
                 if os.environ.get("SHOW_ERRORS"):
                     print("both reject", os.path.basename(d), "|", status[:150], "|", mine[:150])

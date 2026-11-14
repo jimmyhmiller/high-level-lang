@@ -6,6 +6,7 @@
 rules tanstack.route-files over bundle.js
 use bundle.js as js
 use tanstack.config as cfg
+use tanstack.pretty as pretty
 
 record Edit { path: Text, text: Text }
 # A route file processed: whether it is a route, and its new text when that changed ("" path: none).
@@ -37,10 +38,78 @@ fn scaffolded-root(full-path: Text, c: cfg.Config) -> Edit = match read-file(ful
   _ => no-edit()
 }
 
-fn scaffold(route-path: Text, kind: Text, c: cfg.Config) -> Text =
-  fail-build("tanstack: scaffolding an empty route file (" ++ route-path ++ ") is not implemented yet")
+# The target's templates (template.js), filled in and formatted (fillTemplate).
+record Template { text: Text, imports: Text, start: Text, end: Text }
 
-fn root-scaffold(c: cfg.Config) -> Text = fail-build("tanstack: scaffolding an empty root route file is not implemented yet")
+fn route-template(target: Text, lazy: Bool) -> Template = Template(
+  text: (if target == "vue" then "import { h } from \"vue\"\n" else "") ++ "%%tsrImports%%\n\n%%tsrExportStart%%{\n component: RouteComponent\n }%%tsrExportEnd%%\n\n"
+        ++ (if target == "vue" then "function RouteComponent() { return h(\"div\", {}, \"Hello \\\"%%tsrPath%%\\\"!\") };\n"
+            else "function RouteComponent() { return <div>Hello \"%%tsrPath%%\"!</div> };\n"),
+  imports: "import { " ++ ctor ++ " } from '@tanstack/" ++ target ++ "-router';",
+  start: "export const Route = " ++ ctor ++ "(", end: ");")
+  where ctor = if lazy then "createLazyFileRoute" else "createFileRoute"
+
+fn root-template(target: Text) -> Template = Template(
+  text: match target {
+          "react" => "import * as React from \"react\"\n"
+          "solid" => "import * as Solid from \"solid-js\"\n"
+          _ => "import { h } from \"vue\"\n"
+        } ++ "%%tsrImports%%\n\n%%tsrExportStart%%{\n component: RootComponent\n }%%tsrExportEnd%%\n\n"
+        ++ match target {
+          "react" => "function RootComponent() { return (<React.Fragment><div>Hello \"%%tsrPath%%\"!</div><Outlet /></React.Fragment>) };\n"
+          "solid" => "function RootComponent() { return (<><div>Hello \"%%tsrPath%%\"!</div><Outlet /></>) };\n"
+          _ => "function RootComponent() { return h(\"div\", {}, [\"Hello \\\"%%tsrPath%%\\\"!\", h(Outlet)]) };\n"
+        },
+  imports: "import { Outlet, createRootRoute } from '@tanstack/" ++ target ++ "-router';",
+  start: "export const Route = createRootRoute(", end: ");")
+
+# `%%key%%` replaced by its value (nothing for a key with none).
+fn filled(template: Text, values: {Text:Text}) -> Text = match index-of(template, "%%") {
+  none => template
+  some(i) => match key-end {
+    some(k) if k > 0 => template[0..i] ++ (values[template[i + 2..i + 2 + k]] ?? "") ++ filled(template[i + 4 + k..len(template)], values)
+    _ => template[0..i + 2] ++ filled(template[i + 2..len(template)], values)
+  } where key-end = match span-of(template, i + 2, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") {
+          k if at?(template, i + 2 + k, "%%") => some(k)
+          _ => none
+        }
+}
+
+# JSON.stringify of a string.
+fn json-quoted(s: Text) -> Text = "\"" ++ join([json-char(cp) for cp in code-points-of(s)], "") ++ "\""
+fn json-char(cp: Int) -> Text = match cp {
+  34 => "\\\""
+  92 => "\\\\"
+  8 => "\\b"
+  12 => "\\f"
+  10 => "\\n"
+  13 => "\\r"
+  9 => "\\t"
+  _ if cp < 32 => "\\u00" ++ (if cp < 16 then "0" else "1") ++ byte-text(if cp % 16 < 10 then 48 + cp % 16 else 87 + cp % 16)
+  _ => text-of-points([cp])
+}
+
+# The route path with `{x}` written as x.
+fn unbraced(p: Text) -> Text = match index-of(p, "{") {
+  none => p
+  some(i) => match index-of(p[i + 2..len(p)], "}") {
+    some(k) => p[0..i] ++ p[i + 1..i + 2 + k] ++ unbraced(p[i + 3 + k..len(p)])
+    none => p
+  }
+}
+
+fn formatted-template(text: Text, path: Text, c: cfg.Config) -> Text = pretty.formatted(text, path, c.semicolons, c.single-quote)
+
+fn scaffold(route-path: Text, kind: Text, c: cfg.Config) -> Text = formatted-template(filled(custom ?? t.text, {
+    "tsrImports": t.imports, "tsrPath": unbraced(route-path), "tsrExportStart": t.start ++ json-quoted(route-path) ++ ")(", "tsrExportEnd": t.end}),
+  route-path, c)
+  where lazy = kind == "lazy",
+        t = route-template(c.target, lazy),
+        custom = if lazy then (c.lazy-route-template ?? c.route-template) else c.route-template
+
+fn root-scaffold(c: cfg.Config) -> Text = formatted-template(filled(t.text, {
+    "tsrImports": t.imports, "tsrPath": "__root", "tsrExportStart": t.start, "tsrExportEnd": t.end}), "__root", c)
+  where t = root-template(c.target)
 
 # --- transform.js --------------------------------------------------------------------------------
 
@@ -54,11 +123,14 @@ fn applied(src: Text, changes: [Change]) -> Text = join([c.text for c in changes
         rest = join([src[(if i == 0 then 0 else ordered[i - 1].to)..ordered[i].from] ++ ordered[i].text for i in 0..len(ordered)], "")
                ++ src[(if len(ordered) == 0 then 0 else ordered[len(ordered) - 1].to)..len(src)]
 
-fn parsed(src: Text, path: Text) -> Node = match js.parse-opt(src, path, js.flag-bit("jsx") + js.flag-bit("ts") + js.flag-bit("await")) {
+# Parsed as router-utils' parseAst parses it: TypeScript always, JSX unless the file is plain TypeScript.
+fn parsed(src: Text, path: Text) -> Node = match js.parse-opt(src, path, js.flag-bit("ts") + js.flag-bit("await") + (if plain-typescript?(path) then 0 else js.flag-bit("jsx"))) {
   some(t) => t
   none => fail-build("Error transforming route file " ++ path ++ ": " ++ last-parse-path() ++ ":" ++ int-text(last-parse-line()) ++ ":"
                      ++ int-text(last-parse-col()) ++ ": expected " ++ last-parse-want())
 }
+
+fn plain-typescript?(path: Text) -> Bool = ends-with(path, ".ts") or ends-with(path, ".mts") or ends-with(path, ".cts")
 
 fn statements(t: Node) -> [Node] = match t { Program(_, body) => body.kids }
 
