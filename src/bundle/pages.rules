@@ -1,0 +1,130 @@
+# An HTML page as an entry point, as Vite builds one: the module scripts it loads are the build's
+# entries, and the page is written again loading what the build made of them. Its module scripts
+# are taken out and, at the end of its head, the entry's chunk is loaded, the chunks that chunk
+# imports are preloaded, and its stylesheets linked. A stylesheet the page links is built too, and
+# linked where it was. Every other byte of the page is as it was.
+rules bundle.pages over bundle.markup
+use bundle.markup as mk
+
+# What a page loads that the build makes: where it is in the page, and the file it names.
+record Load { lo: Int, hi: Int, script: Bool, source: Text }
+
+record Page { path: Text, text: Text, loads: [Load], head: Int }
+
+# What the build made of a source the page loads: the file to load, what to preload with it, and its
+# stylesheets.
+record Made { source: Text, file: Text, preload: [Text], styles: [Text] }
+
+# A page, read. A path the page gives from `/` is from the page's directory, the project's root, as
+# Vite has it.
+fn page-of(path: Text) -> Page = Page(path: path, text: text, loads: [l for p in tree.pieces.kids for l in load-of(p, root, text)],
+                                      head: (first p in tree.pieces.kids if p is EndTag(_) and tag-name(p.text) == "head": p.lo) ?? -1)
+  where text = read-file(path),
+        tree = mk.parse(text, path),
+        root = dir-of(path)
+
+fn entries(p: Page) -> [Text] = [l.source for l in p.loads]
+
+fn load-of(p: Node, root: Text, text: Text) -> [Load] = match p {
+  Script(_, List(attrs...), ...) if attr(attrs, "type") is some(t) and t == "module" => match attr(attrs, "src") {
+    some(src) if local?(src) => [Load(lo: p.lo, hi: p.hi, script: true, source: resolved(src, root))]
+    some(_) => []
+    none => fail-build(root ++ ": an inline module script in a page is not built; move it to a file the page's script loads")
+  }
+  Open(tag, List(attrs...), _, _) if tag-name(tag.text) == "link" and lower(attr(attrs, "rel") ?? "") == "stylesheet" => match attr(attrs, "href") {
+    some(href) if local?(href) => [Load(lo: p.lo, hi: p.hi, script: false, source: resolved(href, root))]
+    _ => []
+  }
+  _ => []
+}
+
+fn lower(s: Text) -> Text = ascii-lower(s)
+
+# A tag's name from its text (`<head`, `</head >`), in lower case.
+fn tag-name(t: Text) -> Text = ascii-lower(t[start..start + span-not-of(t, start, " \t\n\r\f/>")])
+  where start = match t {
+    "</" ++ _ => 2
+    _ => 1
+  }
+
+fn attr(attrs: [Node], name: Text) -> Text? =
+  first a in attrs if ascii-lower(a.name.text) == name: match a.value {
+    Value(_, _, v) => unquote-attr(v.text)
+    _ => ""
+  }
+
+fn unquote-attr(v: Text) -> Text = match v {
+  "\"" ++ inner ++ "\"" | "'" ++ inner ++ "'" => inner
+  _ => v
+}
+
+# What the build makes: a file of the project, not another site's or a data URL.
+fn local?(url: Text) -> Bool = not (contains-text?(url, "://") or starts-with(url, "//") or starts-with(url, "data:"))
+
+fn resolved(url: Text, root: Text) -> Text = path-normalize(match url {
+  "/" ++ rest => root ++ "/" ++ rest
+  _ => root ++ "/" ++ url
+})
+
+# ---------------------------------------------------------------- the page written
+
+# An edit to the page's text: from `lo` to `hi` becomes `text`.
+record Edit { lo: Int, hi: Int, text: Text }
+
+# The page, loading what the build made; `base` is what an output's path is given from (`/`).
+fn written(p: Page, made: [Made], base: Text) -> Text = applied(p.text, sort e in edits by e.lo)
+  where edits = [e for l in p.loads for e in load-edits(p, l, made, base)] ++ head-edits(p, made, base)
+
+fn load-edits(p: Page, l: Load, made: [Made], base: Text) -> [Edit] = match l.script {
+  # A module script goes, with its line when it is all the line has; what it loads is at the head.
+  true => [Edit(lo: line-start(p.text, l.lo), hi: line-end(p.text, l.hi), text: "")]
+  false => [Edit(lo: l.lo, hi: l.hi, text: "<link rel=\"stylesheet\" crossorigin href=\"" ++ base ++ style ++ "\">")
+            for m in made if m.source == l.source for style in m.styles]
+}
+
+# Where an edit taking out a tag starts: the start of its line, when only space is before it there.
+fn line-start(text: Text, lo: Int) -> Int = match blank?(text[from..lo]) {
+  true => from
+  false => lo
+} where from = (last-index-of(text[0..lo], "\n") ?? -1) + 1
+
+# And where it ends: past the end of the line, when only space is after it there.
+fn line-end(text: Text, hi: Int) -> Int = match index-of(text[hi..len(text)], "\n") {
+  some(n) if blank?(text[hi..hi + n]) => hi + n + 1
+  _ => hi
+}
+
+fn blank?(s: Text) -> Bool = trim(s) == ""
+
+# The entry scripts' chunks, what they import, and their stylesheets, at the end of the head, each
+# on a line of its own indented a step in from the head's end tag.
+fn head-edits(p: Page, made: [Made], base: Text) -> [Edit] = match p.head {
+  h if h < 0 => match [l for l in p.loads if l.script] {
+    [] => []
+    _ => fail-build(p.path ++ ": a page whose module scripts are built needs a </head> to load them from")
+  }
+  at => [Edit(lo: at, hi: at, text: join([step ++ tag ++ "\n" ++ indent for tag in tags], ""))]
+    where indent = indent-of(p.text, at),
+          step = if indent == "" then "" else "  ",
+          scripts = [m for l in p.loads if l.script for m in made if m.source == l.source],
+          tags = ["<script type=\"module\" crossorigin src=\"" ++ base ++ m.file ++ "\"></script>" for m in scripts]
+                 ++ ["<link rel=\"modulepreload\" crossorigin href=\"" ++ base ++ f ++ "\">" for f in preloads(scripts)]
+                 ++ ["<link rel=\"stylesheet\" crossorigin href=\"" ++ base ++ s ++ "\">" for m in scripts for s in m.styles distinct s]
+}
+
+fn preloads(scripts: [Made]) -> [Text] = [f for m in scripts for f in m.preload if not (any s in scripts: s.file == f) distinct f]
+
+# What the tag at `at` is indented by, when it begins its line: the tags put before `</head>` are
+# a step (two spaces) further in.
+fn indent-of(text: Text, at: Int) -> Text = match blank?(before) {
+  true => before
+  false => ""
+} where before = text[(last-index-of(text[0..at], "\n") ?? -1) + 1..at]
+
+fn applied(text: Text, edits: [Edit]) -> Text =
+  join([text[from..e.lo] ++ e.text for i in 0..len(edits) for e in [edits[i]] for from in [if i == 0 then 0 else edits[i - 1].hi]], "")
+  ++ text[last-hi..len(text)]
+  where last-hi = match edits {
+    [] => 0
+    _ => edits[len(edits) - 1].hi
+  }
