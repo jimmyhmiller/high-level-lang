@@ -1,0 +1,227 @@
+# A build's ledger, for blame (bundle.blame): every statement the build placed, by name, and what
+# of it each route loads, to the byte; and every fact linking stated, by name. Linking numbers
+# modules, statements, symbols and names in the order it meets them, so numbers say nothing outside
+# the build that made them; a ledger says each by what it is (a module by its path, a statement by
+# its module and what it declares, a symbol by its module and name), so two ledgers made by
+# different processes, from different checkouts, speak of the same things in the same words, and
+# their facts can be solved again in one database.
+rules bundle.ledger over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.analysis as an
+use bundle.emit as e
+use bundle.link as link
+use bundle.sourcemap as map
+use bundle.analyze as analyze
+
+# A statement, or what the bundler wrote for a module (`#<written>`), or a stretch of a module's
+# code in no statement (`#<other>`): its module, where it starts and its first line, and a print of
+# its text, which says when it was edited in place.
+record Part { key: Text, module: Text, line: Int, text: Text, digest: Text }
+
+# What a route (an entry, or what `import()` names) loads: its bytes, and of those, each part's,
+# as two lists of the same length. What no part holds is the outputs' own.
+record Route { root: Text, bytes: Int, parts: [Int], bytes-of: [Int] }
+
+# Linking's facts, in the blocks the build gave them: each fact its relation's number (in the
+# ledger's `relations`) then a key (in `keys`) for each column. A block's owner is the module whose
+# block it is, or `<entries>` and `<names>` for the entries' and the name `default`'s.
+record Block { owner: Text, facts: [[Int]] }
+
+# Each module's path and a print of its source, which says whether it was edited.
+record Source { module: Text, digest: Text }
+
+# A module's `import()` of another, which with code splitting is a root of its own: what the
+# entries' block (`<entries>`) is made of besides the entries themselves.
+record Load { module: Text, root: Text }
+
+record Ledger {
+  version: Int, splitting: Bool, relations: [Text], columns: [[Text]], keys: [Text],
+  parts: [Part], routes: [Route], blocks: [Block], sources: [Source], entries: [Text], loads: [Load]
+}
+
+const version: Int = 1
+
+# The ledger read back from the JSON `ledger` writes.
+fn ledger-of(text: Text) -> Ledger = read-json(text)
+
+fn json-of(l: Ledger) -> Text = json(l) ++ "\n"
+
+# ---------------------------------------------------------------- statements
+
+# Where each part's statement is in its module's source, in order, for finding the statement a
+# place in the output came from.
+record Places { starts: [Int], ends: [Int], keys: [Text], whole: Text }
+
+# Every part of the modules in the build: its key, by its number.
+fn part-keys() -> {Int:Text} = {p: key for id in m.order for found in [module-part-keys(id)] for p in keys(found) for key in [found[p] ?? ""]}
+
+# A module's parts' keys. A statement is known by its kind and what it declares; one that declares
+# nothing, by a print of its text. Statements alike in both have their number among them added.
+fn module-part-keys(id: Int) -> {Int:Text} =
+  {parts[i]: path ++ "#" ++ labels[i] ++ alike(seen[i]) for i in 0..len(parts)}
+  where path = module-key(id),
+        parts = e.parts-of(id),
+        labels = [part-label(id, p) for p in parts],
+        seen = before-alike(labels)
+
+# For each text, how many alike come before it.
+fn before-alike(xs: [Text]) -> [Int] = [at[i] ?? 0 for i in 0..len(xs)]
+  where at = {list[j]: j for k in keys(groups) for list in [groups[k] ?? []] for j in 0..len(list)},
+        groups = alike-groups(xs)
+
+fn alike-groups(xs: [Text]) -> {Text:[Int]} = fold g = {} for i in 0..len(xs): g ++ {xs[i]: (g[xs[i]] ?? []) ++ [i]}
+
+# What tells apart the n-th of things alike: nothing for the first, `~2` for the second.
+fn alike(n: Int) -> Text = match n { 0 => ""  _ => "~" ++ int-text(n + 1) }
+
+fn part-label(id: Int, p: Int) -> Text = match an.stmt-of(id, p) {
+  None() => "<namespace>"
+  Flag() if m.modules[id].kind == m.Cjs => "<commonjs>"
+  Flag() => "<init>"
+  s => js.kind-name(s.kind) ++ ":" ++ match declared {
+    [] => hash-text(statement-text(id, s))
+    names => join(names, ",")
+  } where declared = sort x in [sym.symbol-at(m.table, sy).name for sy in [sy for m.db.declares(p, ?sy)] ++ [sy for m.db.cjs-binding(?sy, p)] distinct sy] by x
+}
+
+fn module-key(id: Int) -> Text = m.shown-path(m.modules[id].path)
+
+fn source-of(id: Int) -> Text = match m.modules[id].kind {
+  m.External => ""
+  _ => m.body-of(id).text
+}
+
+fn statement-text(id: Int, s: Node) -> Text = source-of(id)[offset(s.lo)..min(offset(s.hi), len(source-of(id)))]
+
+fn offset(at: Int) -> Int = at % map.module-unit
+
+fn places-of(id: Int, keys: {Int:Text}) -> Places =
+  Places(starts: [x.lo for x in spans], ends: [x.hi for x in spans], keys: [x.key for x in spans],
+         whole: match m.modules[id].kind { m.Cjs => keys[first-part] ?? "" _ => module-key(id) ++ "#<other>" })
+  where spans = sort x in [Span(lo: offset(s.lo), hi: offset(s.hi), key: keys[p] ?? "")
+                           for p in e.parts-of(id) for s in [an.stmt-of(id, p)] if not (s is None() or s is Flag())] by x.lo,
+        first-part = (first p in e.parts-of(id): p) ?? -1
+
+record Span { lo: Int, hi: Int, key: Text }
+
+# The part a place in module `id`'s source belongs to.
+fn part-at(p: Places, at: Int) -> Text = match bisect(p.starts, at) - 1 {
+  i if i >= 0 and at < p.ends[i] => p.keys[i]
+  _ => p.whole
+}
+
+fn parts-of-module(id: Int, keys: {Int:Text}, lines: [Int]) -> [Part] =
+  [Part(key: keys[p] ?? "", module: module-key(id), line: line, text: snippet, digest: digest)
+   for p in e.parts-of(id) for s in [an.stmt-of(id, p)]
+   for line in [match s { None() | Flag() => 0  _ => map.line-at(lines, offset(s.lo)) + 1 }]
+   for snippet in [match s { None() | Flag() => ""  _ => analyze.snippet(source-of(id), offset(s.lo)) }]
+   for digest in [match s { None() | Flag() => ""  _ => hash-text(statement-text(id, s)) }]]
+  ++ [Part(key: module-key(id) ++ "#<written>", module: module-key(id), line: 0, text: "", digest: ""),
+      Part(key: module-key(id) ++ "#<other>", module: module-key(id), line: 0, text: "", digest: "")]
+
+# ---------------------------------------------------------------- bytes
+
+# Each output's bytes by part: from each mark to the next, the part whose statement the mark's
+# place is in, or the module's `#<written>` where the bundler wrote it. Before the first mark and
+# after the last of a module, the output's own.
+fn output-part-bytes(o: analyze.Output, places: {Int:Places}) -> {Text:Int} =
+  fold acc = {} for x in pieces: acc ++ {x.key: (acc[x.key] ?? 0) + x.bytes}
+  where pieces = [Piece(key: key, bytes: end - start)
+                  for i in 0..len(o.marks) for k in [o.marks[i]] for id in [map.mark-module(k)] if id >= 0
+                  for start in [o.base + k.out]
+                  for end in [if i + 1 < len(o.marks) then o.base + o.marks[i + 1].out else len(o.text)]
+                  for key in [match offset(k.src) == map.nowhere {
+                    true => module-key(id) ++ "#<written>"
+                    false => part-at(places[id] ?? (panic "ledger: no places for module {}", id), offset(k.src))
+                  }]]
+
+record Piece { key: Text, bytes: Int }
+
+# The outputs a root loads: its own, and every output those import, statically.
+fn loaded(outputs: [analyze.Output], from: [Int]) -> [Int] = match more {
+  [] => from
+  _ => loaded(outputs, from ++ more)
+} where more = [j for i in from for j in outputs[i].imports if not (j in from) distinct j]
+
+fn route-of(outputs: [analyze.Output], by-output: [{Text:Int}], index: {Text:Int}, r: Int) -> Route =
+  Route(root: module-key(r), bytes: sum o in loads: len(outputs[o].text),
+        parts: [index[k] ?? (panic "ledger: no part {}", k) for k in held], bytes-of: [totals[k] ?? 0 for k in held])
+  where loads = loaded(outputs, [i for i in 0..len(outputs) if outputs[i].root == r]),
+        totals = summed([by-output[o] for o in loads]),
+        held = sort k in [k for k in keys(totals) if (totals[k] ?? 0) > 0] by index[k] ?? 0
+
+# Maps of bytes added up, key by key.
+fn summed(maps: [{Text:Int}]) -> {Text:Int} = fold acc = {} for x in maps for k in keys(x): acc ++ {k: (acc[k] ?? 0) + (x[k] ?? 0)}
+
+# ---------------------------------------------------------------- facts
+
+# What a column of a relation holds, by its name in link.facts: a module, a part, a symbol, a name,
+# or a place in a file (a number). A column of another name is one this ledger cannot say.
+fn column-key(column: Text, v: Int, parts: {Int:Text}, symbols: {Int:Text}) -> Text = match column {
+  "module" | "target" | "root" => "m:" ++ module-key(v)
+  "part" => "p:" ++ (parts[v] ?? panic "ledger: part {} of no module", v)
+  "symbol" => "s:" ++ (symbols[v] ?? panic "ledger: symbol {} has no key", v)
+  "name" | "target-name" => "n:" ++ name-of(m.names, v)
+  "at" => "i:" ++ int-text(v)
+  _ => panic "ledger: a column named {} holds nothing the ledger knows how to name", column
+}
+
+# Each symbol the facts name: its module and name, and where two are alike, their order among them.
+fn symbol-keys(symbols: [Int]) -> {Int:Text} =
+  {symbols[i]: bases[i] ++ alike(seen[i]) for i in 0..len(symbols)}
+  where seen = before-alike(bases),
+        roots = module-scopes(),
+        # What linking made in the bundle's own scope (a `require_x`, an `x_exports`, an `init_x`) is
+        # its owner's.
+        owners = {an.linked.made-ids[i]: x.owner for i in 0..len(an.linked.made) for x in [an.linked.made[i]] if x.scope == m.bundle-scope},
+        bases = [symbol-base(s, roots, owners) for s in symbols]
+
+fn symbol-base(s: Int, roots: {Int:Int}, owners: {Int:Int}) -> Text =
+  module-key(owners[s] ?? module-of-scope(x.scope, roots)) ++ "::" ++ x.name
+  where x = sym.symbol-at(m.table, s)
+
+# Each module's root scope, and a CommonJS module's wrapper's scope around it (its `exports`,
+# `module` and `require`), by the scope.
+fn module-scopes() -> {Int:Int} =
+  {m.modules[id].root: id for id in m.order}
+  ++ {up: id for id in m.order if m.modules[id].kind == m.Cjs for up in [sym.scope-at(m.table, m.modules[id].root).parent] if up >= 0 and up != m.bundle-scope}
+
+# The module a scope is in: the one whose root it is, or is below.
+fn module-of-scope(scope: Int, roots: {Int:Int}) -> Int = match roots[scope] {
+  some(id) => id
+  none if scope < 0 => panic "ledger: a scope of no module"
+  none => module-of-scope(sym.scope-at(m.table, scope).parent, roots)
+}
+
+fn row-keys(row: [Int], parts: {Int:Text}, symbols: {Int:Text}) -> [Text] =
+  [column-key(c[i], row[i + 1], parts, symbols) for c in [link.relation-columns(row[0])] for i in 0..len(c)]
+
+fn block-owners() -> [Text] =
+  ["<entries>"] ++ [module-key(id) for id in m.order] ++ [module-key(id) for id in m.order] ++ ["<names>"]
+
+# ---------------------------------------------------------------- the ledger
+
+fn ledger(outputs: [analyze.Output], roots: [Int]) -> Ledger =
+  Ledger(version: version, splitting: an.linking.splitting, relations: relations,
+         columns: [link.relation-columns(i) for i in 0..len(relations)], keys: all-keys,
+         parts: parts, routes: [route-of(outputs, by-output, index, r) for r in roots],
+         blocks: [Block(owner: owners[b], facts: [[row[0]] ++ [key-index[k] ?? (panic "ledger: no key {}", k) for k in row-keys(row, names, symbols)] for row in rows[b]])
+                  for b in 0..len(blocks)],
+         sources: [Source(module: module-key(id), digest: hash-text(source-of(id))) for id in m.order],
+         entries: [module-key(id) for id in m.entries],
+         loads: [Load(module: module-key(id), root: module-key(x.target)) for id in m.order for x in an.module-link(id).loads
+                 if an.linking.splitting and x.by-import and m.modules[x.target].kind != m.External distinct module-key(id) ++ " " ++ module-key(x.target)])
+  where relations = link.relation-names(),
+        names = part-keys(),
+        places = {id: places-of(id, names) for id in m.order},
+        by-output = [output-part-bytes(o, places) for o in outputs],
+        parts = [x for id in m.order for x in parts-of-module(id, names, map.line-starts(source-of(id)))],
+        index = {parts[i].key: i for i in 0..len(parts)},
+        blocks = an.fact-blocks(),
+        owners = block-owners(),
+        rows = [[link.fact-values(f) for f in b] for b in blocks],
+        symbols = symbol-keys([v for b in rows for row in b for c in [link.relation-columns(row[0])]
+                               for i in 0..len(c) if c[i] == "symbol" for v in [row[i + 1]] distinct v]),
+        all-keys = [k for b in rows for row in b for k in row-keys(row, names, symbols) distinct k],
+        key-index = {all-keys[i]: i for i in 0..len(all-keys)}

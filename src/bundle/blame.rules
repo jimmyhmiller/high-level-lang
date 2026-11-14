@@ -1,0 +1,581 @@
+# Blame: what changed in what each route loads between two builds, to the byte, and which edit did
+# it. Given two ledgers (bundle.ledger), each build's facts are solved again by linking's own rules
+# (bundle.link), in one database's numbers, so a statement both builds have is one part. A statement
+# a route loads after and not before was gained, and one it loaded before and not after was lost.
+#
+# Which edit gained or lost it is decided by counterfactuals, not guessed: an edit is a module whose
+# facts changed (its source, or what it is given, such as a package's `sideEffects`), and the
+# earlier build's facts with that one module's swapped for the later build's are solved again. A
+# statement that such a build reaches, and the earlier did not, was gained by that edit alone; when
+# several edits each would gain it, by any of them; when none alone would, by them together. What
+# the route held before and after but at another size was edited in place, if its module was
+# edited, or else changed by renaming and minifying around it. Each cause's largest statement is
+# explained: the chain that reaches it (`why-reaches`, `why-active-part`), and the facts on that
+# chain that the edit made.
+rules bundle.blame
+use bundle.ledger as l
+use bundle.link as link
+
+# ---------------------------------------------------------------- the two builds, as one
+
+# The keys of both ledgers, numbered once: a key's number is the same in both.
+record Space { ids: {Text:Int}, base: [Int], head: [Int] }
+
+fn space-of(base: l.Ledger, head: l.Ledger) -> Space =
+  Space(ids: ids, base: [ids[k] ?? -1 for k in base.keys], head: [ids[k] ?? -1 for k in head.keys])
+  where known = [k for k in base.keys ++ head.keys distinct k],
+        ids = {known[i]: i for i in 0..len(known)}
+
+# A ledger's blocks as linking's facts, in the shared numbers; only those of `owners`, or all of
+# them but those of `owners`.
+fn blocks-of(x: l.Ledger, tr: [Int], owners: [Text], keep: Bool) -> [[link.Fact]] =
+  [[link.fact-of(row[0], [tr[k] for k in row[1..len(row)]]) for row in b.facts] for b in x.blocks if (b.owner in owners) == keep]
+
+# The earlier build with the later build's blocks of `owners` in place of its own. A module only
+# the later build has is no edit of its own: it matters only through what imports it, so it is
+# there whatever is swapped (`arrivals`), as is the later build's block of the name `default`. One
+# only the earlier build has stays, also with every edit swapped: nothing then imports it.
+# What the entries' block says follows (see `entries-block`).
+fn swapped(base: l.Ledger, head: l.Ledger, s: Space, owners: [Text]) -> [[link.Fact]] =
+  [entries-block(base, head, s, owners, rest)] ++ rest
+  where taken = owners ++ arrivals(base, head),
+        rest = blocks-of(base, s.base, ["<entries>"] ++ taken, false) ++ blocks-of(head, s.head, [o for o in taken if o != "<entries>"], true)
+
+fn arrivals(base: l.Ledger, head: l.Ledger) -> [Text] =
+  ["<names>"] ++ [o for o in owners-of(head) if not (o in mine)]
+  where mine = owners-of(base)
+
+fn departures(base: l.Ledger, head: l.Ledger) -> [Text] = [o for o in owners-of(base) if not (o in theirs)] where theirs = owners-of(head)
+
+# The entries' block of a build made of `blocks`: the entries (the later build's when `<entries>` is
+# one of `owners`), and with code splitting, each root a module of the build loads with `import()`.
+# A module is of the build when the entries reach it by its facts' imports and by `import()`: what
+# an edit stops importing loads nothing, and what it starts importing loads what it loads.
+fn entries-block(base: l.Ledger, head: l.Ledger, s: Space, owners: [Text], blocks: [[link.Fact]]) -> [link.Fact] = match base.splitting {
+  true => [link.fact-of(relation-number(r), [root]) for root in roots for r in ["entry", "chunk-root", "keep-exports"]]
+    where statics = [s.ids["m:" ++ e] ?? (panic "blame: no entry {}", e) for e in (if "<entries>" in owners then head.entries else base.entries)],
+          taken = owners ++ arrivals(base, head),
+          loads = [Edge(from: s.ids["m:" ++ x.module] ?? -1, to: s.ids["m:" ++ x.root] ?? -1) for x in base.loads if not (x.module in taken)]
+                  ++ [Edge(from: s.ids["m:" ++ x.module] ?? -1, to: s.ids["m:" ++ x.root] ?? -1) for x in head.loads if x.module in taken],
+          imports = relation-number("imports"),
+          edges = [Edge(from: v[1], to: v[2]) for b in blocks for f in b for v in [link.fact-values(f)] if v[0] == imports] ++ loads,
+          reached = reachable(statics, edges),
+          roots = [r for r in statics ++ [e.to for e in loads if e.from in reached] distinct r]
+  false => (first b in blocks-of(if "<entries>" in owners then head else base, if "<entries>" in owners then s.head else s.base, ["<entries>"], true): b) ?? []
+}
+
+record Edge { from: Int, to: Int }
+
+# What `from` reaches by `edges`, itself included.
+fn reachable(from: [Int], edges: [Edge]) -> [Int] = match more {
+  [] => from
+  _ => reachable(from ++ more, edges)
+} where seen = {x: true for x in from},
+        more = [e.to for e in edges if (seen[e.from] ?? false) and not (seen[e.to] ?? false) distinct e.to]
+
+fn relation-number(name: Text) -> Int = (first i in 0..len(names) if names[i] == name: i) ?? (panic "blame: linking has no relation {}", name)
+  where names = link.relation-names()
+
+# Both ledgers must say their facts as this bundler's linking does.
+fn problems(base: l.Ledger, head: l.Ledger) -> [Text] =
+  [p for x in [base, head] for p in ledger-problems(x)]
+  ++ [p for x in [0] if base.splitting != head.splitting for p in ["blame: one build split its code and the other did not"]]
+
+# The entries' block as blame makes it must be each build's own: the earlier's with no edit, the
+# later's with every edit.
+fn entries-problems(base: l.Ledger, head: l.Ledger, s: Space, changed: [Text]) -> [Text] =
+  [p for x in [0] if facts-key(first-block(swapped(base, head, s, []))) != facts-key(own-entries(base, s.base))
+     for p in ["blame: the earlier build's entries are not what its ledger's modules load"]]
+  ++ [p for x in [0] if facts-key(first-block(swapped(base, head, s, changed))) != facts-key(own-entries(head, s.head))
+        for p in ["blame: the later build's entries are not what its ledger's modules load"]]
+
+fn first-block(blocks: [[link.Fact]]) -> [link.Fact] = (first b in blocks: b) ?? []
+
+fn own-entries(x: l.Ledger, tr: [Int]) -> [link.Fact] = (first b in blocks-of(x, tr, ["<entries>"], true): b) ?? []
+
+fn facts-key(fs: [link.Fact]) -> Text = join(sort t in [join([int-text(v) for v in link.fact-values(f)], ",") for f in fs] by t, ";")
+
+fn ledger-problems(x: l.Ledger) -> [Text] =
+  [p for v in [x.version] if v != l.version for p in ["blame: a ledger of version " ++ int-text(v) ++ ", where this bundler writes version " ++ int-text(l.version)]]
+  ++ [p for i in 0..max(len(x.relations), len(names)) if i >= len(x.relations) or i >= len(names) or x.relations[i] != names[i] or join(x.columns[i], ",") != join(link.relation-columns(i), ",")
+      for p in ["blame: a ledger made by a bundler whose linking states other facts (relation " ++ int-text(i) ++ ")"]]
+  where names = link.relation-names()
+
+# ---------------------------------------------------------------- edits
+
+# Each module of both builds whose facts are not the same in both, or that loads other roots with
+# `import()`; and `<entries>`, when the entries are not the same.
+fn edits(base: l.Ledger, head: l.Ledger) -> [Text] =
+  [o for o in owners-of(base) if o != "<entries>" and not (o in moved)
+     if facts-text(base, o) != facts-text(head, o) or loads-text(base, o) != loads-text(head, o)]
+  ++ [x for x in ["<entries>"] if join(base.entries, " ") != join(head.entries, " ") or (not base.splitting and facts-text(base, x) != facts-text(head, x))]
+  where moved = arrivals(base, head) ++ departures(base, head)
+
+fn loads-text(x: l.Ledger, module: Text) -> Text = join(sort r in [y.root for y in x.loads if y.module == module] by r, " ")
+
+fn owners-of(x: l.Ledger) -> [Text] = [b.owner for b in x.blocks distinct b.owner]
+
+# What a ledger's blocks of one owner say, as text, the same whatever order its facts are in.
+fn facts-text(x: l.Ledger, owner: Text) -> Text =
+  join(sort t in [join([x.relations[row[0]]] ++ [x.keys[k] for k in row[1..len(row)]], " ") for b in x.blocks if b.owner == owner for row in b.facts] by t, "\n")
+
+fn source-digest(x: l.Ledger, module: Text) -> Text = (first s in x.sources if s.module == module: s.digest) ?? ""
+
+# ---------------------------------------------------------------- what each route gained and lost
+
+# One part in one route, before and after: its bytes in each (0: not loaded).
+record Change { route: Text, part: Text, before: Int, after: Int }
+
+fn bytes-by-part(x: l.Ledger, r: l.Route) -> {Text:Int} = {x.parts[r.parts[i]].key: r.bytes-of[i] for i in 0..len(r.parts)}
+
+fn route-named(x: l.Ledger, root: Text) -> l.Route? = first r in x.routes if r.root == root: r
+
+fn changes-of(base: l.Ledger, head: l.Ledger, root: Text) -> [Change] =
+  [Change(route: root, part: k, before: b[k] ?? 0, after: a[k] ?? 0) for k in keys(b) ++ keys(a) distinct k if (b[k] ?? 0) != (a[k] ?? 0)]
+  where b = match route-named(base, root) { some(r) => bytes-by-part(base, r)  none => {} },
+        a = match route-named(head, root) { some(r) => bytes-by-part(head, r)  none => {} }
+
+# A part a route's database says the route reaches: what is reached from the route's root, when the
+# code is split; else what is live.
+fn in-route(db: link.Db, splitting: Bool, root: Int, part: Int) -> Bool = match splitting {
+  true => db.reaches(root, part)
+  false => db.active-part(part)
+}
+
+# The parts linking knows that a part of the ledger stands for: a statement, itself; what the
+# bundler wrote for a module (`#<written>`), the module's parts with no statement, its namespace
+# object, its wrapper's initializer, its CommonJS wrapper; a stretch in no statement, none.
+fn part-ids(s: Space, key: Text) -> [Int] = match key {
+  m ++ "#<written>" => [i for k in ["<namespace>", "<init>", "<commonjs>"] for i in [s.ids["p:" ++ m ++ "#" ++ k] ?? -1] if i >= 0]
+  _ ++ "#<other>" => []
+  _ => [i for i in [s.ids["p:" ++ key] ?? -1] if i >= 0]
+}
+fn root-id(s: Space, root: Text) -> Int = s.ids["m:" ++ root] ?? -1
+
+# Which of the changes a database's route reaches, in their order.
+fn reached(db: link.Db, splitting: Bool, s: Space, changes: [Change]) -> [Bool] =
+  [r >= 0 and (any p in part-ids(s, c.part): in-route(db, splitting, r, p)) for c in changes for r in [root-id(s, c.route)]]
+
+fn reached-with(base: l.Ledger, head: l.Ledger, s: Space, owners: [Text], changes: [Change]) -> [Bool] =
+  reached(link.solved-blocks(swapped(base, head, s, owners)), base.splitting, s, changes)
+
+# ---------------------------------------------------------------- causes
+
+# What a change is put down to. `kind` is "alone" (one edit gains or loses it by itself), "any"
+# (each of several would), "together" (none alone would, all of them do), "edited" (its module was
+# edited, and the part is in the route before and after), "placement" (the earlier build reached it
+# already, or it is no statement, and where the code was placed changed), or "elsewhere" (it is in
+# the route before and after, its module unedited: renaming and minifying around it).
+record Cause { kind: Text, edits: [Text] }
+
+fn module-of(key: Text) -> Text = match index-of(key, "#") { some(i) => key[0..i]  none => key }
+
+fn cause-of(c: Change, edits: [Text], alone: [[Bool]], at: Int, before: Bool, after: Bool, edited: [Text], restated: Bool) -> Cause = match c.before > 0, c.after > 0 {
+  # In the route before and after, at another size: the statement itself edited, or what the
+  # bundler wrote for an edited module; else the names and minifying around it.
+  true, true if restated => Cause(kind: "edited", edits: [module-of(c.part)])
+  true, true => Cause(kind: "elsewhere", edits: [])
+  # Gained: which edits alone make the earlier build reach it.
+  false, true if before => Cause(kind: "placement", edits: [])
+  false, true => by-edits([edits[i] for i in 0..len(edits) if alone[i][at]], edits, after)
+  # Lost: which edits alone make the earlier build not reach it.
+  true, false if not before => Cause(kind: "placement", edits: [])
+  true, false => by-edits([edits[i] for i in 0..len(edits) if not alone[i][at]], edits, not after)
+  false, false => panic "blame: a change of nothing"
+}
+
+fn by-edits(found: [Text], edits: [Text], whole: Bool) -> Cause = match found {
+  [one] => Cause(kind: "alone", edits: [one])
+  [] if whole => Cause(kind: "together", edits: edits)
+  [] => Cause(kind: "placement", edits: [])
+  several => Cause(kind: "any", edits: several)
+}
+
+# ---------------------------------------------------------------- the report
+
+record Hop { place: Text, text: Text, via: [Text] }
+record Shown { part: Text, line: Int, text: Text, bytes: Int }
+record Moved { module: Text, bytes: Int, parts: Int }
+
+record Group {
+  kind: Text, edits: [Text], sources-edited: [Bool], bytes: Int, added: Int, removed: Int, resized: Int,
+  modules: [Moved], largest: Shown?, chain: [Hop], made: [Text]
+}
+
+record RouteBlame { root: Text, before: Int, after: Int, own: Int, groups: [Group] }
+record Blame { edits: [Text], routes: [RouteBlame] }
+
+fn blame(base: l.Ledger, head: l.Ledger) -> Blame = match problems(base, head) ++ entries-problems(base, head, s, changed) {
+  [] => Blame(edits: changed, routes: [route-blame(base, head, s, changed, edited, root) for root in roots])
+  found => fail-build(join(found, "\n"))
+} where s = space-of(base, head),
+        changed = edits(base, head),
+        edited = [x.module for x in base.sources ++ head.sources if source-digest(base, x.module) != source-digest(head, x.module) distinct x.module],
+        roots = [r.root for r in base.routes ++ head.routes distinct r.root]
+
+fn route-blame(base: l.Ledger, head: l.Ledger, s: Space, changed: [Text], edited: [Text], root: Text) -> RouteBlame =
+  RouteBlame(root: root, before: before, after: after, own: (after - after-parts) - (before - before-parts),
+             groups: sort g in [group-of(base, head, s, cs, ks[i]) for i in 0..len(ks) for cs in [[changes[j] for j in 0..len(changes) if same-cause?(causes[j], ks[i])]]]
+                     by 0 - abs(g.bytes))
+  where changes = changes-of(base, head, root),
+        b = link.solved-blocks(swapped(base, head, s, [])),
+        a = link.solved-blocks(swapped(base, head, s, changed)),
+        in-before = reached(b, base.splitting, s, changes),
+        in-after = reached(a, base.splitting, s, changes),
+        alone = [reached-with(base, head, s, [e], changes) for e in changed],
+        first-causes = [cause-of(changes[j], changed, alone, j, in-before[j], in-after[j], edited, restated?(base, head, changes[j].part, edited)) for j in 0..len(changes)],
+        # What no edit alone does, some edits together do: which, each the fewest found.
+        rest = [j for j in 0..len(changes) if first-causes[j].kind == "together"],
+        sets = minimal-sets(base, head, s, changed, [changes[j] for j in rest]),
+        at = {rest[i]: i for i in 0..len(rest)},
+        causes = [match at[j] { some(i) => Cause(kind: "together", edits: sets[i])  none => first-causes[j] } for j in 0..len(changes)],
+        ks = [c for c in causes distinct cause-key(c)],
+        before = match route-named(base, root) { some(r) => r.bytes  none => 0 },
+        after = match route-named(head, root) { some(r) => r.bytes  none => 0 },
+        before-parts = match route-named(base, root) { some(r) => sum x in r.bytes-of: x  none => 0 },
+        after-parts = match route-named(head, root) { some(r) => sum x in r.bytes-of: x  none => 0 }
+
+# Whether a part in both builds was itself edited: a statement whose text is not the same, or what
+# the bundler wrote for, or left outside statements of, a module whose source is not.
+fn restated?(base: l.Ledger, head: l.Ledger, key: Text, edited: [Text]) -> Bool = match key {
+  m ++ "#<written>" | m ++ "#<other>" => m in edited
+  _ => match part-named(base, key), part-named(head, key) {
+    some(a), some(b) => a.digest != b.digest
+    _, _ => true
+  }
+}
+
+# For each change, edits that together make it, none of which it does without: from all of them,
+# each edit in turn left out where the change is made without it. Each step's sets are tried once
+# each, whatever changes share them.
+fn minimal-sets(base: l.Ledger, head: l.Ledger, s: Space, edits: [Text], cs: [Change]) -> [[Text]] =
+  fold sets = [edits for c in cs] for e in edits: without-where-made(base, head, s, cs, sets, e)
+
+fn without-where-made(base: l.Ledger, head: l.Ledger, s: Space, cs: [Change], sets: [[Text]], e: Text) -> [[Text]] =
+  [match e in sets[i] and made?(cs[i], answers[index[join(fewer[i], "|")] ?? 0][i]) { true => fewer[i]  false => sets[i] } for i in 0..len(cs)]
+  where fewer = [[x for x in u if x != e] for u in sets],
+        tried = [u for u in fewer distinct join(u, "|")],
+        index = {join(tried[k], "|"): k for k in 0..len(tried)},
+        answers = [reached-with(base, head, s, u, cs) for u in tried]
+
+# Whether a build that reaches (or not) a change's part makes the change: reaches it, for a part
+# gained; does not, for one lost.
+fn made?(c: Change, reaches: Bool) -> Bool = if c.after > 0 then reaches else not reaches
+
+fn cause-key(c: Cause) -> Text = c.kind ++ ":" ++ join(c.edits, "|")
+fn same-cause?(a: Cause, b: Cause) -> Bool = cause-key(a) == cause-key(b)
+
+fn abs(x: Int) -> Int = if x < 0 then 0 - x else x
+
+fn part-named(x: l.Ledger, key: Text) -> l.Part? = first p in x.parts if p.key == key: p
+
+fn group-of(base: l.Ledger, head: l.Ledger, s: Space, cs: [Change], cause: Cause) -> Group =
+  Group(kind: cause.kind, edits: cause.edits,
+        sources-edited: [source-digest(base, e) != source-digest(head, e) for e in cause.edits],
+        bytes: net,
+        added: sum c in cs if c.before == 0: c.after,
+        removed: sum c in cs if c.after == 0: c.before,
+        resized: sum c in cs if c.before > 0 and c.after > 0: c.after - c.before,
+        modules: sort x in [Moved(module: mo, bytes: sum c in cs if module-of(c.part) == mo: c.after - c.before,
+                                  parts: count c in cs: module-of(c.part) == mo)
+                            for mo in [module-of(c.part) for c in cs distinct module-of(c.part)]] by 0 - abs(x.bytes),
+        largest: shown, chain: chain, made: made)
+  where net = sum c in cs: c.after - c.before,
+        # The part explained: the largest that moved the way the group did, else the largest.
+        known = [c for c in cs if len(part-ids(s, c.part)) > 0],
+        top = first c in (sort c in [c for c in known if (c.after - c.before) * net >= 0] by 0 - abs(c.after - c.before))
+                         ++ (sort c in [c for c in known if (c.after - c.before) * net < 0] by 0 - abs(c.after - c.before)): c,
+        shown = match top {
+          some(c) => some(Shown(part: c.part, line: (match part-named(if c.after > 0 then head else base, c.part) { some(p) => p.line  none => 0 }),
+                                text: (match part-named(if c.after > 0 then head else base, c.part) { some(p) => p.text  none => "" }),
+                                bytes: c.after - c.before))
+          none => none
+        },
+        explained = match top {
+          some(c) if cause.kind == "alone" or cause.kind == "any" or cause.kind == "together" => explanation(base, head, s, cause, c)
+          _ => []
+        },
+        chain = chain-of(if gained then head else base, if gained then base else head, s, explained),
+        gained = match top { some(c) => c.after > 0  none => true },
+        # What the edit made that the chain goes through, or what it took away.
+        made = if gained then made-of(base, head, s, explained) else made-of(head, base, s, explained)
+
+# Why the route reaches the part: in the earlier build with the cause's edits swapped in when it was
+# gained, in the earlier build when it was lost.
+fn explanation(base: l.Ledger, head: l.Ledger, s: Space, cause: Cause, c: Change) -> [link.Why] =
+  why-in(link.solved-blocks(swapped(base, head, s, if c.after > 0 then applied else [])), base.splitting, root-id(s, c.route), part-ids(s, c.part))
+  where applied = match cause.kind { "together" => cause.edits  _ => [cause.edits[0]] }
+
+# The explanation of the first of the parts the route reaches.
+fn why-in(db: link.Db, splitting: Bool, root: Int, parts: [Int]) -> [link.Why] = match first p in parts if in-route(db, splitting, root, p): p {
+  some(p) if splitting => link.why-reaches(db, root, p)
+  some(p) => link.why-active-part(db, p)
+  none => []
+}
+
+# The parts on an explanation's way from the route to the part, the route's end first, each with
+# the names it is reached by.
+fn chain-of(x: l.Ledger, other: l.Ledger, s: Space, ws: [link.Why]) -> [Hop] =
+  reversed([Hop(place: place-of(found, key), text: text-at(found, key), via: [name-of-key(names[w.b] ?? "") for w in ws if w.relation == "declares" and w.a == p])
+            for p in [part-of-why(w) for w in ws if part-of-why(w) >= 0 distinct part-of-why(w)]
+            for key in [after-prefix(names[p] ?? "")]
+            for found in [if part-named(x, key) is some(_) then x else other]])
+  where names = names-of(s)
+
+fn names-of(s: Space) -> {Int:Text} = {s.ids[k] ?? -1: k for k in keys(s.ids)}
+
+# The part a step of an explanation is about, when it is one of the relations that say a part is
+# in a route.
+fn part-of-why(w: link.Why) -> Int = match w.relation {
+  "reaches" => w.b
+  "active-part" | "live" | "init-live" | "root-part" => w.a
+  _ => -1
+}
+
+fn after-prefix(k: Text) -> Text = match index-of(k, ":") { some(i) => k[i + 1..len(k)]  none => k }
+
+# A key as a reader would say it: a module's path, a name, a symbol's name.
+fn name-of-key(k: Text) -> Text = match k {
+  "s:" ++ rest => match last-index-of(rest, "::") { some(i) => rest[i + 2..len(rest)]  none => rest }
+  _ => after-prefix(k)
+}
+
+# Where a part is: its module and line, or what it is when it is no statement.
+fn place-of(x: l.Ledger, key: Text) -> Text = match part-named(x, key) {
+  some(p) if p.line > 0 => p.module ++ ":" ++ int-text(p.line)
+  _ => module-of(key) ++ " " ++ match key {
+    _ ++ "#<namespace>" => "(its namespace object)"
+    _ ++ "#<init>" => "(its initializer)"
+    _ ++ "#<commonjs>" => "(its CommonJS wrapper)"
+    _ => "(what the bundler wrote for it)"
+  }
+}
+
+fn text-at(x: l.Ledger, key: Text) -> Text = match part-named(x, key) { some(p) => p.text  none => "" }
+
+# The given facts of an explanation in the build `x` that the build `other` does not state, said
+# as a reader of `x` would say them: for a part gained, what the edit made that the chain goes
+# through; for one lost, what it took away.
+fn made-of(other: l.Ledger, x: l.Ledger, s: Space, ws: [link.Why]) -> [Text] =
+  [said for w in ws if w.rule < 0 if not (fact-text(w, names) in old) for said in [fact-said(x, w, names)] distinct said]
+  where names = names-of(s),
+        old = [join([other.relations[row[0]]] ++ [other.keys[k] for k in row[1..len(row)]], " ") for b in other.blocks for row in b.facts]
+
+fn fact-text(w: link.Why, names: {Int:Text}) -> Text =
+  join([w.relation] ++ [names[v] ?? "" for v in [w.a, w.b, w.c, w.d][0..arity]], " ")
+  where arity = link.relation-arity((first i in 0..len(link.relation-names()) if link.relation-names()[i] == w.relation: i) ?? panic "blame: no relation {}", w.relation)
+
+# A fact as a reader would say it. One about a statement is the statement.
+fn fact-said(x: l.Ledger, w: link.Why, names: {Int:Text}) -> Text = match w.relation {
+  "part-of" | "declares" | "mentions" | "uses" | "effect" | "via" | "ns-member" | "import-member" | "root-part" | "ns-part" | "inits" | "initializes" | "init-part" =>
+    place-of(x, part) ++ (match text-at(x, part) { "" => ""  t => "  " ++ t })
+    where part = after-prefix(key-at(names, w.a))
+  "cjs-binding" => place-of(x, part) ++ (match text-at(x, part) { "" => ""  t => "  " ++ t }) where part = after-prefix(key-at(names, w.b))
+  "import-of" => symbol-module(key-at(names, w.a)) ++ " imports " ++ name-of-key(key-at(names, w.c)) ++ " from " ++ name-of-key(key-at(names, w.b)) ++ as-name(key-at(names, w.a), key-at(names, w.c))
+  "ns-import" => symbol-module(key-at(names, w.a)) ++ " imports * from " ++ name-of-key(key-at(names, w.b)) ++ " as " ++ name-of-key(key-at(names, w.a))
+  "reexport" => name-of-key(key-at(names, w.a)) ++ " re-exports " ++ name-of-key(key-at(names, w.d)) ++ " from " ++ name-of-key(key-at(names, w.c)) ++ as-name(key-at(names, w.b), key-at(names, w.d))
+  "star" => name-of-key(key-at(names, w.a)) ++ " re-exports everything from " ++ name-of-key(key-at(names, w.b))
+  "local-export" => name-of-key(key-at(names, w.a)) ++ " exports " ++ name-of-key(key-at(names, w.b))
+  "module-effects" => name-of-key(key-at(names, w.a)) ++ " has side effects as it loads"
+  "imports" => name-of-key(key-at(names, w.a)) ++ " imports " ++ name-of-key(key-at(names, w.b))
+  "entry" | "chunk-root" | "keep-exports" => name-of-key(key-at(names, w.a)) ++ " is a root"
+  _ => fact-text(w, names)
+}
+
+fn key-at(names: {Int:Text}, v: Int) -> Text = names[v] ?? ""
+
+fn symbol-module(k: Text) -> Text = match after-prefix(k) {
+  rest => match last-index-of(rest, "::") { some(i) => rest[0..i]  none => rest }
+}
+
+fn as-name(local: Text, imported: Text) -> Text = match name-of-key(local) == name-of-key(imported) {
+  true => ""
+  false => " as " ++ name-of-key(local)
+}
+
+# ---------------------------------------------------------------- as text
+
+fn text-of(b: Blame) -> Text = join([route-text(r) for r in b.routes if r.before != r.after or len(r.groups) > 0], "\n")
+
+fn route-text(r: RouteBlame) -> Text =
+  "route " ++ r.root ++ ": " ++ int-text(r.before) ++ " -> " ++ int-text(r.after) ++ " bytes (" ++ signed(r.after - r.before) ++ ")\n"
+  ++ join([group-text(g) for g in r.groups], "")
+  ++ (if r.own != 0 then "  " ++ pad(signed(r.own)) ++ "  the outputs' own: imports, exports, the format's wrapper\n" else "")
+
+fn group-text(g: Group) -> Text =
+  "  " ++ pad(signed(g.bytes)) ++ "  " ++ group-title(g) ++ "\n"
+  ++ join(["      " ++ pad(signed(x.bytes)) ++ "  " ++ shorter(x.module) ++ " (" ++ plural(x.parts, "part") ++ ")\n" for x in g.modules[0..min(5, len(g.modules))]], "")
+  ++ (if len(g.modules) > 5 then "      ... and " ++ int-text(len(g.modules) - 5) ++ " more modules\n" else "")
+  ++ (match g.largest {
+        some(x) if len(g.chain) > 0 => "      " ++ (if x.bytes > 0 then "reached" else "was reached") ++ " so:\n"
+                                       ++ join(["        " ++ hop-text(h) ++ "\n" for h in g.chain], "")
+        _ => ""
+      })
+  ++ join(["      " ++ (match g.largest { some(x) if x.bytes < 0 => "gone"  _ => "made" }) ++ ": " ++ shorter(t) ++ "\n" for t in g.made], "")
+
+fn group-title(g: Group) -> Text = match g.kind {
+  "alone" => "edit to " ++ shorter(g.edits[0]) ++ edited-note(g)
+  "any" => "any one of the edits to " ++ join([shorter(e) for e in g.edits], ", ")
+  "together" => "the edits to " ++ join([shorter(e) for e in g.edits], ", ") ++ " together"
+  "edited" => "statements of " ++ shorter(g.edits[0]) ++ " edited in place"
+  "placement" => "placed elsewhere: where code was split or packed changed"
+  "elsewhere" => "renaming and minifying around what changed"
+  k => panic "blame: no kind {}", k
+}
+
+fn edited-note(g: Group) -> Text = match g.sources-edited {
+  [false] => " (its source is the same: what it is given changed)"
+  _ => ""
+}
+
+fn hop-text(h: Hop) -> Text =
+  (if len(h.via) > 0 then "-> " ++ join(h.via, ", ") ++ " in " else "") ++ shorter(h.place) ++ (if len(h.text) > 0 then "  " ++ h.text else "")
+
+# A path as the text shows it: a package's module from its package's name on.
+fn shorter(path: Text) -> Text = match last-index-of(path, "node_modules/") {
+  some(i) => path[i + 13..len(path)]
+  none => path
+}
+
+fn plural(n: Int, what: Text) -> Text = int-text(n) ++ " " ++ what ++ (if n == 1 then "" else "s")
+
+fn signed(n: Int) -> Text = if n > 0 then "+" ++ int-text(n) else int-text(n)
+
+fn pad(t: Text) -> Text = repeated(" ", max(0, 8 - len(t))) ++ t
+
+fn json-of(b: Blame) -> Text = json(b) ++ "\n"
+
+# ---------------------------------------------------------------- what if
+
+# What-if: edits a person could make to one build, each tried by solving the build's facts again
+# without what the edit would take away, and how many bytes each route would then not load. Each
+# number is linking's own answer to the edited facts, not an estimate of it; only the bytes are the
+# build's, each part counted at the size this build printed it.
+#
+# The edits tried: a statement kept for what it does as it loads, had it no side effects (marked
+# `/* @__PURE__ */`, or moved into what calls it); a module, had none of its statements any; a
+# package that says it has none (`"sideEffects": false`); a module's namespace object, had nothing
+# read it whole; and a name a namespace object holds, had its module not exported it.
+record Try { kind: Text, about: Text, place: Text, text: Text, owners: [Text], drops: [Text], chain: [Hop] }
+record Saving { kind: Text, about: Text, place: Text, text: Text, bytes: Int, modules: [Moved], chain: [Hop] }
+record RouteWhatIf { root: Text, bytes: Int, savings: [Saving] }
+record WhatIf { tried: Int, routes: [RouteWhatIf] }
+
+# A ledger fact as text, the same in the ledger and in what an edit drops.
+fn row-text(x: l.Ledger, row: [Int]) -> Text = join([x.relations[row[0]]] ++ [x.keys[k] for k in row[1..len(row)]], " ")
+
+fn what-if(x: l.Ledger, limit: Int) -> WhatIf =
+  WhatIf(tried: len(tries), routes: [RouteWhatIf(root: r.root, bytes: r.bytes,
+                                                 savings: (sort v in [saving-in(x, s, r, t, gone[i]) for i in 0..len(tries) for t in [tries[i]]] by 0 - v.bytes)[0..min(limit, len(tries))])
+                                     for r in x.routes])
+  where s = space-of(x, x),
+        db = link.solved-blocks(blocks-of(x, s.base, [], false)),
+        statements = statement-tries(x, s, db),
+        exports = export-tries(x, s, db),
+        wholes = whole-tries(x, s, db),
+        modules = module-tries(x, statements),
+        tries = statements ++ modules ++ package-tries(x) ++ wholes ++ exports,
+        reached-now = routes-reached(db, x, s),
+        gone = [left-routes(x, s, t, reached-now) for t in tries]
+
+# Each route's parts the build's database says it reaches, by route: a part a route loads only
+# because it was packed with what the route reaches is not let go by any edit.
+fn routes-reached(db: link.Db, x: l.Ledger, s: Space) -> [[Bool]] =
+  [[any p in part-ids(s, x.parts[k].key): in-route(db, x.splitting, root-id(s, r.root), p) for k in r.parts] for r in x.routes]
+
+# For one edit, each route's parts the build reaches and the edited build does not, by route.
+fn left-routes(x: l.Ledger, s: Space, t: Try, now: [[Bool]]) -> [[Bool]] =
+  [[now[i][j] and not after[i][j] for j in 0..len(x.routes[i].parts)] for i in 0..len(x.routes)]
+  where after = routes-reached(link.solved-blocks(dropped(x, s, t)), x, s)
+
+# The build's blocks with what the edit drops taken out of the blocks it is in.
+fn dropped(x: l.Ledger, s: Space, t: Try) -> [[link.Fact]] =
+  [[link.fact-of(row[0], [s.base[k] for k in row[1..len(row)]]) for row in b.facts if not (b.owner in t.owners and row-text(x, row) in t.drops)]
+   for b in x.blocks]
+
+fn saving-in(x: l.Ledger, s: Space, r: l.Route, t: Try, gone: [[Bool]]) -> Saving =
+  Saving(kind: t.kind, about: t.about, place: t.place, text: t.text, chain: t.chain, bytes: sum i in 0..len(r.parts) if left[i]: r.bytes-of[i],
+         modules: sort m in [Moved(module: mo, bytes: 0 - (sum i in 0..len(r.parts) if left[i] and module-of(x.parts[r.parts[i]].key) == mo: r.bytes-of[i]),
+                                  parts: count i in 0..len(r.parts): left[i] and module-of(x.parts[r.parts[i]].key) == mo)
+                             for mo in [module-of(x.parts[r.parts[i]].key) for i in 0..len(r.parts) if left[i] distinct module-of(x.parts[r.parts[i]].key)]]
+                by m.bytes)
+  where left = gone[(first i in 0..len(x.routes) if x.routes[i].root == r.root: i) ?? 0]
+
+# Every statement a route loads that stays for what it does as it loads, but a root's own: what a
+# route's root does is what the route is for. A root's imports are tried, as what they load is not.
+fn statement-tries(x: l.Ledger, s: Space, db: link.Db) -> [Try] =
+  [Try(kind: "pure", about: key, place: place-of(x, key), text: text-at(x, key), owners: [module-of(key)], drops: ["effect p:" ++ key], chain: [])
+   for key in [x.parts[k].key for r in x.routes for k in r.parts distinct k]
+   if not (module-of(key) in roots) or contains-text?(key, "#Import")
+   for p in part-ids(s, key) if db.effect(p) and (match part-named(x, key) { some(q) => q.line > 0  none => false })]
+  where roots = [r.root for r in x.routes]
+
+# Every module with more than one such statement: had none of them side effects. What several of a
+# module's statements each keep (`ShaderLib.physical = …`, `ShaderLib.basic = …`), no one of them
+# alone lets go.
+fn module-tries(x: l.Ledger, statements: [Try]) -> [Try] =
+  [Try(kind: "module", about: module, place: module, text: plural(len(mine), "statement"), owners: [module], drops: [d for t in mine for d in t.drops], chain: [])
+   for module in [t.owners[0] for t in statements distinct t.owners[0]] if not (any r in x.routes: r.root == module)
+   for mine in [[t for t in statements if t.owners[0] == module]] if len(mine) > 1]
+
+# Every package whose modules say they have side effects, and some route loads.
+fn package-tries(x: l.Ledger) -> [Try] =
+  [Try(kind: "package", about: pkg, place: pkg, text: "", owners: owners, drops: ["module-effects m:" ++ o for o in owners], chain: [])
+   for pkg in [package-of(module-of(x.parts[k].key)) for r in x.routes for k in r.parts distinct package-of(module-of(x.parts[k].key))] if pkg != ""
+   for owners in [[o for o in [module-of(x.parts[k].key) for r in x.routes for k in r.parts distinct module-of(x.parts[k].key)]
+                   if package-of(o) == pkg and (any b in x.blocks: b.owner == o and (any row in b.facts: row-text(x, row) == "module-effects m:" ++ o))]]
+   if len(owners) > 0]
+
+fn package-of(path: Text) -> Text = match last-index-of(path, "node_modules/") {
+  none => ""
+  some(at) => match split(path[at + 13..len(path)], "/") {
+    [scope, name, ...] if starts-with(scope, "@") => scope ++ "/" ++ name
+    [name, ...] => name
+    _ => ""
+  }
+}
+
+# Every name a namespace object a route loads holds, that nothing reads by name: had its module
+# not exported it, the object would not hold it. A namespace object read whole (`import * as`
+# passed on, or `import { z }` of `export * as z`) brings everything it holds, which is how one
+# statement can load a whole library; this says which name brings what.
+fn export-tries(x: l.Ledger, s: Space, db: link.Db) -> [Try] =
+  [Try(kind: "export", about: name-of-key(names[n] ?? ""), place: module, text: "", owners: [module], drops: [row-text(x, row)], chain: [])
+   for module in [module-of(x.parts[k].key) for r in x.routes for k in r.parts if ends-with(x.parts[k].key, "#<namespace>") or ends-with(x.parts[k].key, "#<written>")
+                  distinct module-of(x.parts[k].key)]
+   for ns in part-ids(s, module ++ "#<namespace>") if any r in x.routes: in-route(db, x.splitting, root-id(s, r.root), ns)
+   for m in [s.ids["m:" ++ module] ?? -1]
+   for b in x.blocks if b.owner == module for row in b.facts
+   if x.relations[row[0]] == "local-export" or x.relations[row[0]] == "reexport"
+   for n in [s.base[row[2]]] if not (any db.via(_, m, n): true)]
+  where names = names-of(s)
+
+# Every namespace object a route loads: had nothing read its module whole, the object would not be
+# made, nor hold what only it holds. With the chain that reads it whole, from the route.
+fn whole-tries(x: l.Ledger, s: Space, db: link.Db) -> [Try] =
+  [Try(kind: "whole", about: module, place: module, text: "", owners: [module], drops: ["ns-part p:" ++ module ++ "#<namespace> m:" ++ module],
+       chain: chain-of(x, x, s, why-in(db, x.splitting, root-id(s, root), [ns])))
+   for module in [module-of(x.parts[k].key) for r in x.routes for k in r.parts if ends-with(x.parts[k].key, "#<written>") distinct module-of(x.parts[k].key)]
+   for ns in part-ids(s, module ++ "#<namespace>")
+   for root in [(first r in x.routes if in-route(db, x.splitting, root-id(s, r.root), ns): r.root) ?? ""] if root != ""]
+
+fn what-if-json(w: WhatIf) -> Text = json(w) ++ "\n"
+
+fn what-if-text(w: WhatIf) -> Text =
+  join([what-if-route(r) for r in w.routes], "\n") ++ "(" ++ plural(w.tried, "edit") ++ " tried)\n"
+
+fn what-if-route(r: RouteWhatIf) -> Text =
+  "route " ++ r.root ++ ": " ++ int-text(r.bytes) ++ " bytes\n"
+  ++ join(["  " ++ pad(signed(0 - v.bytes)) ++ "  " ++ saving-title(v) ++ "\n"
+           ++ join(["      " ++ pad(signed(m.bytes)) ++ "  " ++ shorter(m.module) ++ " (" ++ plural(m.parts, "part") ++ ")\n" for m in v.modules[0..min(3, len(v.modules))]], "")
+           ++ (if len(v.chain) > 0 then "      read whole so:\n" ++ join(["        " ++ hop-text(h) ++ "\n" for h in v.chain], "") else "")
+           for v in r.savings if v.bytes > 0], "")
+
+fn saving-title(v: Saving) -> Text = match v.kind {
+  "pure" => "if " ++ shorter(v.place) ++ " had no side effects:  " ++ v.text
+  "package" => "if " ++ v.about ++ " said it has no side effects (\"sideEffects\": false)"
+  "module" => "if none of " ++ shorter(v.place) ++ "'s " ++ v.text ++ " that run as it loads had side effects"
+  "whole" => "if nothing read " ++ shorter(v.place) ++ " whole (its namespace object)"
+  "export" => "if " ++ shorter(v.place) ++ " did not export " ++ v.about ++ ", which its namespace object, read whole, holds"
+  k => panic "what-if: no kind {}", k
+}

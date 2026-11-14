@@ -442,6 +442,11 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and out.strip().endswith("all analysis checks passed"), "--analyze: "
       + (f"{sum(l.startswith('ok   ') for l in out.splitlines())} checks (outputs unchanged, bytes attributed, routes, viewer)" if code == 0 else out[-1800:]))
 
+print("== blame and what-if")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "blame-check.py"), ESB], 300)
+check(code == 0 and " passed, 0 failed" in out, "--blame and --what-if: "
+      + (out.strip().splitlines()[-1] + " (identity, accounting, counterfactual trees built, what-if edits built, plans, watching)" if code == 0 else out[-1800:]))
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "

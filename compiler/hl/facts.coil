@@ -28,7 +28,7 @@
 
 (reader-provider "hl.facts" read-facts)
 
-(defstruct Relation [(name (slice u8)) (arity i64) (stratum i64)])
+(defstruct Relation [(name (slice u8)) (arity i64) (stratum i64) (columns (ArrayList (slice u8)))])
 
 (defstruct Atom
   [(rel (slice u8))
@@ -446,7 +446,8 @@
                     (Relation
                       :name (.name r)
                       :arity (.arity r)
-                      :stratum need)))
+                      :stratum need
+                      :columns (.columns r))))
             (when (> need top) (set! top need))
             (set! changed true)))))
     top))
@@ -1085,11 +1086,14 @@
                 n (len (.args a))]
             (when (or (< n 1) (> n 4))
               (dsl/die (mut c) (.tok a) "a relation has 1 to 4 columns"))
-            (push! (mut rels)
-                   (Relation
-                     :name (.rel a)
-                     :arity n
-                     :stratum 0)))
+            (let [(mut columns) (ArrayList::new [(slice u8)] (malloc-allocator))]
+              (for t (.args a) (push! (mut columns) (.text t)))
+              (push! (mut rels)
+                     (Relation
+                       :name (.rel a)
+                       :arity n
+                       :stratum 0
+                       :columns columns))))
           (let [head-node (get (.kids item) 0)
                 head (head-of src head-node)
                 (mut body) (ArrayList::new [Atom] (malloc-allocator))
@@ -1146,6 +1150,10 @@
           (mut decodes) (primitive/code-list-new)
           (mut holds) (primitive/code-list-new)
           (mut why-steps) (primitive/code-list-new)
+          (mut schema-names) (primitive/code-list-new)
+          (mut schema-columns) (primitive/code-list-new)
+          (mut schema-given) (primitive/code-list-new)
+          (mut schema-arity) (primitive/code-list-new)
           (mut index) 0]
       (for r rels
         (let [field (primitive/code-symbol (.name r))
@@ -1209,6 +1217,15 @@
           (push! (mut room)
                  `(when (> (get counts ~index) 0)
                     (rt/rel-reserve! (mut (~access db)) (get counts ~index))))
+          (push! (mut schema-names) `(push! (mut out) ~(.name r)))
+          (let [(mut cols) (primitive/code-list-new)]
+            (for col (.columns r) (push! (mut cols) `(push! (mut out) ~col)))
+            (push! (mut schema-columns) `(= rel ~index))
+            (push! (mut schema-columns) `(do ~@cols 0)))
+          (push! (mut schema-given) `(= rel ~index))
+          (push! (mut schema-given) (if (derived? clauses (.name r)) `false `true))
+          (push! (mut schema-arity) `(= rel ~index))
+          (push! (mut schema-arity) `~(.arity r))
           (set! index (+ index 1))
           (push! (mut reserves) `(= name ~(.name r)))
           (push! (mut reserves) `(rt/rel-reserve! (mut (~access db)) n))))
@@ -1418,6 +1435,43 @@
                          (free! (mut counts)))
                        0)
                      ~@api
+                     ;;; The database's schema, as values: its relations' names, numbered as their facts
+                     ;;; are (`Fact`'s `rel`), each one's columns as declared, and whether it is given (no
+                     ;;; rule derives it), so a program can say what any fact is without naming it.
+                     (defn relation-names [] (-> (ArrayList (slice u8)))
+                       (let [(mut out) (ArrayList::new [(slice u8)] (rt/value-allocator))]
+                         ~@schema-names
+                         out))
+                     (defn relation-columns [(rel i64)] (-> (ArrayList (slice u8)))
+                       (let [(mut out) (ArrayList::new [(slice u8)] (rt/value-allocator))]
+                         (cond ~@schema-columns :else (panic "no relation numbered {}" rel))
+                         out))
+                     (defn relation-given? [(rel i64)] (-> bool)
+                       (cond ~@schema-given :else (panic "no relation numbered {}" rel)))
+                     (defn relation-arity [(rel i64)] (-> i64)
+                       (cond ~@schema-arity :else (panic "no relation numbered {}" rel)))
+                     ;;; A fact as values, its relation's number first, then its columns; and a fact made
+                     ;;; from them, which must have as many columns as its relation.
+                     (defn fact-values [(f Fact)] (-> (ArrayList i64))
+                       (let [(mut out) (ArrayList::new [i64] (rt/value-allocator))
+                             n (relation-arity (cast i64 (.rel f)))]
+                         (push! (mut out) (cast i64 (.rel f)))
+                         (when (> n 0) (push! (mut out) (cast i64 (.a f))))
+                         (when (> n 1) (push! (mut out) (cast i64 (.b f))))
+                         (when (> n 2) (push! (mut out) (cast i64 (.c f))))
+                         (when (> n 3) (push! (mut out) (cast i64 (.d f))))
+                         out))
+                     (defn fact-of [(rel i64) (args (ArrayList i64))] (-> Fact)
+                       (let [n (relation-arity rel)]
+                         (when (!= n (len args))
+                           (panic "a fact of {} has {} columns, not {}" (get (relation-names) rel) n (len args)))
+                         (unless (relation-given? rel)
+                           (panic "facts are given for {}, which rules derive" (get (relation-names) rel)))
+                         (Fact :rel (fact-column rel)
+                               :a (if (> n 0) (fact-column (get args 0)) (: 0 i32))
+                               :b (if (> n 1) (fact-column (get args 1)) (: 0 i32))
+                               :c (if (> n 2) (fact-column (get args 2)) (: 0 i32))
+                               :d (if (> n 3) (fact-column (get args 3)) (: 0 i32)))))
                      ;;; Room in the relation named `name` for `n` more rows, which are known to be coming.
                      (defn reserve! [(db (mut Db)) (name (slice u8)) (n i64)]
                        (-> void)

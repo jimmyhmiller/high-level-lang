@@ -6,6 +6,8 @@ rules tools.esb
 use bundle.api as api
 use bundle.analyze as analyze
 use bundle.view as view
+use bundle.ledger as ledger
+use bundle.blame as blame
 use bundle.modules as m
 use bundle.jsx as jsx
 use bundle.hmr as hmr
@@ -65,6 +67,7 @@ fn with-flag(o: api.Options, a: Text) -> api.Options = match a {
   "--target=" ++ name => api.with-target(o, name)
   "--outdir=" ++ dir => o with { outdir: dir }
   "--analyze=" ++ dir => o with { analyze: dir }
+  "--ledger" => o with { ledger: true }
   "--outbase=" ++ dir => o with { outbase: dir }
   "--entry-names=" ++ pattern => o with { entry-names: pattern }
   "--chunk-names=" ++ pattern => o with { chunk-names: pattern }
@@ -157,10 +160,61 @@ fn repeats() -> Int = (last i in 1..arg-count() for n in [arg-at(i)] if starts-w
 
 fn run() -> Void = match any i in 1..arg-count(): arg-at(i) == "--help" or arg-at(i) == "-h" {
   true => print "{}", join(usage, "\n")
-  false => match view-dir() {
-    some(dir) => viewed(dir)
-    none => for-each-time(repeats(), options(), run-options())
+  false => match view-dir(), blame-dirs(), what-if-dir() {
+    some(dir), _, _ => viewed(dir)
+    none, some(dirs), _ => blamed(dirs, run-options())
+    none, none, some(dir) => what-if-run(dir, run-options())
+    none, none, none => for-each-time(repeats(), options(), run-options())
   }
+}
+
+# `--blame=BASE,HEAD` (`--blame-json=BASE,HEAD`): what changed between the builds whose analyses are
+# in BASE and HEAD (`--analyze=DIR`), route by route, and which edit did it (see bundle.blame).
+fn blame-dirs() -> Blamed? = first i in 1..arg-count() for n in [arg-at(i)]
+  for found in [match n {
+    "--blame=" ++ dirs => some(Blamed(dirs: split-commas(dirs), json: false))
+    "--blame-json=" ++ dirs => some(Blamed(dirs: split-commas(dirs), json: true))
+    _ => none
+  }] if let some(b) = found: b
+
+record Blamed { dirs: [Text], json: Bool }
+
+# What-if's edits are a stage of the pipeline's (`what-if`), so a plan may try them on many threads.
+fn what-if-run(w: Blamed, r: Run) -> Void = match planned(r), w.dirs {
+  _, [dir] => match w.json {
+    true => write-standard-output!(blame.what-if-json(found))
+    false => write-standard-output!(blame.what-if-text(found))
+  } where found = blame.what-if(ledger.ledger-of(read-file(dir ++ "/ledger.json")), 10)
+  _, _ => fail-build("--what-if takes one analysis directory")
+}
+
+# A run that builds nothing, with the plan its command line names.
+fn planned(r: Run) -> Bool {
+  match r.plan, r.threads {
+    "", 0 => true
+    "", n => plans.use-threads!(n)
+    name, _ => plans.use-plan!(name)
+  }
+  plans.run-started!(plans.default-strategy(), "", false)
+}
+
+# `--what-if=DIR` (`--what-if-json=DIR`): for the build whose ledger is in DIR, the edits that would
+# save each route the most.
+fn what-if-dir() -> Blamed? = first i in 1..arg-count() for n in [arg-at(i)]
+  for found in [match n {
+    "--what-if=" ++ dir => some(Blamed(dirs: [dir], json: false))
+    "--what-if-json=" ++ dir => some(Blamed(dirs: [dir], json: true))
+    _ => none
+  }] if let some(b) = found: b
+
+fn blamed(b: Blamed, r: Run) -> Void = match planned(r) { _ => blamed-with(b) }
+
+fn blamed-with(b: Blamed) -> Void = match b.dirs {
+  [base, head] => match b.json {
+    true => write-standard-output!(blame.json-of(found))
+    false => write-standard-output!(match blame.text-of(found) { "" => "no route loads anything other than it did\n"  t => t })
+  } where found = blame.blame(ledger.ledger-of(read-file(base ++ "/ledger.json")), ledger.ledger-of(read-file(head ++ "/ledger.json")))
+  _ => fail-build("--blame takes two analysis directories, BASE,HEAD")
 }
 
 # `--view=DIR`: the page of the analysis a build wrote to DIR (`--analyze=DIR`), made from its JSON.
@@ -177,8 +231,10 @@ const usage: [Text] = [
   "  --splitting --strict-execution-order --format=iife|esm|cjs --global-name=X --platform=node|browser",
   "  --minify --minify-identifiers --minify-syntax --pretty --sourcemap --target=NAME",
   "  --define:KEY=VALUE --external:SPEC --alias:FROM=TO --loader:EXT=KIND --pure:NAME",
-  "  --fragments --chunk-policy=NAME --chunk-min-size=N --chunk-max-size=N --analyze=DIR",
+  "  --fragments --chunk-policy=NAME --chunk-min-size=N --chunk-max-size=N --analyze=DIR --ledger",
   "usage: esb --view=DIR    the page of the analysis in DIR, as DIR/index.html",
+  "usage: esb --blame=BASE,HEAD   what each route gained and lost between two analyses, and which edit did it",
+  "usage: esb --what-if=DIR       the edits that would save each route of the analysis in DIR the most",
   "  --watch --hmr --serve=PORT --cache --no-cache --cache-dir=DIR",
   "  --strategy=NAME --pipeline=NAME --threads=N --size:NAME=N --timing"
 ]
@@ -202,6 +258,7 @@ fn build(o: api.Options, r: Run) -> Void {
 fn builds(o: api.Options, r: Run) -> Void {
   var count = 0
   var going = true
+  var last-ledger = ""
   while going {
     # After the first build, the time since the last lap was spent waiting for an edit (and saving
     # the cache): a lap of its own, so the build's first lap is the build's.
@@ -215,7 +272,8 @@ fn builds(o: api.Options, r: Run) -> Void {
     let faults = page-faults()
     let waited = switches-waiting()
     let forced = switches-forced()
-    timed(o.timing, "write", api.delivered(o, api.files(o)))
+    let files = api.files(o)
+    timed(o.timing, "write", api.delivered(o, files))
     count = count + 1
     let took = now-us() - start
     if r.watch {
@@ -234,6 +292,12 @@ fn builds(o: api.Options, r: Run) -> Void {
     cache-kept(o, r)
     if o.timing and cached?(r) and not r.watch {
       print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100
+    }
+    # Watching with a ledger: what this build changed in each route, and which edit did it.
+    if r.watch and o.ledger {
+      let now = api.ledger-written(o, files)
+      if count > 1 { write-standard-output!(blame.text-of(blame.blame(ledger.ledger-of(last-ledger), ledger.ledger-of(now)))) }
+      last-ledger = now
     }
     if r.watch {
       let changed = wait-for-changes!(r.interval)

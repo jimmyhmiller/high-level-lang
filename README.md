@@ -403,6 +403,121 @@ code before it); and the page has no script, a section for each route and a draw
 every link leads to a section and every button opens a drawer, every chain runs from routes to its
 module, and each treemap's boxes fill it, overlap nowhere and are each as large as their bytes.
 
+## Blame: which edit changed what a route loads
+
+`--ledger` (with `--analyze=DIR`; in a spec, `ledger`) writes `DIR/ledger.json` beside the
+analysis: every statement the build placed, what of each statement each route loads to the byte,
+and every fact linking stated, in the blocks the build gave them (`src/bundle/ledger.rules`).
+Linking numbers modules, statements, symbols and names in the order it meets them, so its numbers
+mean nothing outside the build that made them. The ledger says each by name instead: a module by
+its path, a statement by its module, its kind and what it declares (or a print of its text when it
+declares nothing), a symbol by its module and name. Two ledgers made by different processes, from
+different checkouts, then speak of the same things in the same words. A statement's bytes come
+from the printer's marks, the ones a source map is made from, so `--ledger` prints with them.
+
+`esb --blame=BASE,HEAD` (`--blame-json`) compares two such directories (`src/bundle/blame.rules`).
+Both builds' facts are solved again by `link.facts` itself, in one database's numbers. A statement
+a route loads after and not before was gained, and one it loaded before and not after was lost.
+Which edit did it is decided by counterfactuals, not guessed. An edit is a module whose facts or
+`import()`s changed: its source, or what it is given, such as a package's `sideEffects`. The
+earlier build's facts, with one edit's swapped for the later build's, are solved again. A statement
+the route then reaches, and did not before, was gained by that edit **alone**; when several edits
+each would gain it, by **any** of them. What no edit gains alone, edits gain **together**: which,
+found by leaving each edit out in turn while the statement is still gained. A loss is the same the
+other way. Other changes are put down to other causes:
+
+- A statement in the route before and after, at another size, was **edited in place**, or else
+  changed by renaming and minifying around it.
+- A statement the earlier build reached already was **placed** elsewhere: chunking or packing moved it.
+- What no statement holds belongs to the outputs: their imports, exports and wrappers.
+
+Each route's groups add up to what it changed by. Each group's largest statement is explained:
+the chain that reaches it (`why-reaches`, or `why-active-part` without splitting), and the facts
+on that chain that the edit made, or took away. A module only the later build has is no edit of
+its own: it comes with whatever imports it. With splitting, the roots are worked out again for each
+counterfactual, from what the entries reach by imports and `import()`. A module that stops being
+`import()`ed loses its route to the edit that stopped it, not to "the entries". On the zod
+fixture (`tests/apps/blame/zod`, `import { object, string }` made `import { z }` read whole):
+
+```
+route main.js: 85335 -> 455332 bytes (+369997)
+   +369607  edit to main.js
+        +29309  zod/v4/core/compile.js (81 parts)
+        ...
+      reached so:
+        main.js:3  User = schemas.object({ name: schemas.string().min(2) });
+        -> schemas in main.js:2  schemas = z;
+        -> external_exports in zod/v4/classic/external.js (its namespace object)
+        -> locales_exports in zod/v4/locales/index.js (its namespace object)
+        -> he_default in zod/v4/locales/he.js:217  function () {
+      made: main.js imports z from zod/v4/index.js
+      +392  renaming and minifying around what changed
+```
+
+`--watch --ledger` prints the same after each rebuild, against the build before it.
+
+`esb --what-if=DIR` (`--what-if-json`) asks the other question of one build: which edits would
+save each route the most. Each edit is tried by solving the build's facts again without what the
+edit takes away, and each number is linking's answer, counted at the sizes this build printed. The
+edits it tries are these:
+
+- a statement kept for what it does as it loads, had it no side effects;
+- a module, had none of its statements any;
+- a package that says it has none (`"sideEffects": false`);
+- a namespace object, had nothing read it whole, with the chain that does;
+- a name a namespace object holds, had its module not exported it.
+
+On zod read whole it finds −260,619 bytes if nothing read `zod/v4/locales/index.js` whole, and the
+chain `schemas = z` → `external.js`'s namespace object → the locales'. On three.js it finds
+−168,033 bytes if none of `three.module.js`'s 13 load-time statements had side effects, the 13
+statements `--analyze` showed by hand. The edits are a stage of the pipeline (`stage what-if`), so a
+plan tries them on many threads. Workbench's 445 edits take 4.3 s on one thread and 0.58 s with
+`--pipeline=full`, and say the same.
+
+What the facts language gained for this knows nothing of bundling: a database's schema as values
+(`relation-names`, `relation-columns`, `relation-given?`, `relation-arity`) and facts as values
+(`fact-values`, `fact-of`). So a program can carry any fact without naming its relation, and a
+ledger made by a bundler whose linking states other facts is refused, not misread.
+
+The outputs and `analysis.json` are byte for byte those of the same build without `--ledger`.
+`--ledger` costs 13–19 ms more than `--analyze` alone (interleaved medians, `-O3`):
+
+| App | `--analyze` | with `--ledger` |
+|---|---|---|
+| zod | 55 ms | 71 ms |
+| three | 101 ms | 120 ms |
+| d3 | 63 ms | 81 ms |
+| rxjs | 38 ms | 51 ms |
+
+A ledger is about 1 MB for zod's 90 KB output, and 3.2 MB for Workbench. Blaming zod takes 0.1 s.
+
+`tools/blame-check.py`, part of `tools/verify.py`, checks blame and what-if against builds, not
+against themselves:
+
+- **Identity:** a build blamed against itself changes nothing.
+- **Accounting:** each route's groups add up to its change, both ways.
+- **Duality:** blamed backwards, every cause moves the same bytes the other way. What edits gained
+  only together, any one of them undoes.
+- **Counterfactual trees:** for each edit blame says acts alone (or as any one of several), the
+  earlier tree with only that file taken from the later is built, and every module blame names
+  gained or lost bytes in that route.
+- **What-if edits:** `"sideEffects": false` and `/* @__PURE__ */` are made to a copy of a fixture,
+  and the modules what-if said would go are gone.
+- **Plans and watching:** the answers are the same under `--pipeline=full`, and a watched rebuild
+  prints its blame.
+
+Limits:
+
+- An edit is a whole module. Which statements of it matter shows in the chain and in the facts it
+  made.
+- A statement that declares nothing is known by its text, so editing it is one statement lost and
+  another gained, both put down to the edit.
+- A counterfactual tree may be one the bundler refuses (an import of a name not yet exported).
+  Linking's rules still answer for it, and `blame-check.py` says how many such trees it met.
+- Sets of edits found together are ones none can be left out of, not always the smallest.
+- What-if does not try making an import lazy, which would change the roots, not only the facts.
+- Stylesheets are not in the ledger.
+
 ## Paired client/server builds
 
 A target with `client-outfile` builds one server entry and discovers browser entries from its
