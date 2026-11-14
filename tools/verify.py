@@ -464,6 +464,11 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and " passed, 0 failed" in out, "objects and namespaces read by name: "
       + (out.strip().splitlines()[-1] + " (each case runs as esbuild's; what nothing reads gone; what escapes kept whole)" if code == 0 else out[-1800:]))
 
+print("== random programs against shaking")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "shake-fuzz.py"), "100", "1", ESB], 600)
+check(code == 0 and " 0 where shaking changed what runs" in out, "shake-fuzz: "
+      + (out.strip().splitlines()[-1] if code == 0 else out[-1800:]))
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "

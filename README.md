@@ -730,17 +730,33 @@ app that renders reads `ShaderChunk[name]` and keeps it whole. The held-out libr
 exercisers call nearly every export, change by under 1%.
 
 It costs about 1.5–2% of a cold build where nothing is shaken (zod, d3, lodash-es), and three's is
-faster for printing less. `--property-shaking=false` turns it off. Its output is byte for byte the
-earlier bundler's across all 189 of `tools/same.py`'s outputs, which is how verify's identity
-checks against esbuild run.
+faster for printing less. `--property-shaking=false` (in a spec, `property-shaking off`) turns it
+off. Its output is byte for byte the earlier bundler's across all 189 of `tools/same.py`'s outputs,
+which is how verify's identity checks against esbuild run.
 
 `tools/shake-check.py`, part of `tools/verify.py`, builds each case in `tests/apps/shake` with us
 and with esbuild and runs both. It checks what goes (exports through destructuring and aliases,
 literals' and default objects' properties and what only those read) and what escapes and stays
 whole (`Object.keys`, `for in`, spread, `hasOwnProperty`, passing the object on, reading it through
 a namespace, `this` in a method, a property that does something as it loads). It also checks a split
-build where two routes read different properties. The held-out exercisers' calls and
-`tools/correctness-check.py` pass with it on.
+build where two routes read different properties, one statement reading a property by name and the
+object whole through a namespace alias, and a write through a namespace alias, which throws as
+writing the namespace does: emit never makes a member that is written into a write to the export's
+binding. The held-out exercisers' calls and `tools/correctness-check.py` pass with it on.
+
+`tools/shake-fuzz.py COUNT SEED` writes random programs of a few modules. Their objects' properties
+are methods, arrows, values, shorthands, getters, nested objects, properties that do something as
+they load, properties that read their own object or another, and methods that use `this`. The
+programs reach those objects:
+
+- through imports, `export … from`, `export *`, default exports, namespaces, `const` aliases (chains
+  of them), destructuring, `require` and `import()`;
+- and every way an object escapes: `Object.keys`, `for in`, spread, `in`, `hasOwnProperty`, `?.`,
+  `o[k]`, passing it on, writing, deleting, freezing.
+
+Some programs are split into two entries. Each is built with shaking on, with it off, and by
+esbuild, and run. On and off must print the same, or the run fails and keeps the program; one where
+ours and esbuild differ is counted apart, as shaking did not do it.
 
 ## Paired client/server builds
 
@@ -1176,7 +1192,9 @@ its counters, caches, singletons and open connections. Other modules see the cha
 because they read imports through live namespaces. A class keeps its identity. Its new methods go
 onto the class that already exists (`super` still resolves as before), so the instances it already
 made use them. A function the edit adds goes into the patch's own scope. A function the edit removes
-is fine as long as nothing still names it.
+is fine as long as nothing still names it. `--hmr-patch=false` turns patching off: each changed
+module runs again, as one that cannot be patched does, saying so (`runs again: patching is off`),
+and no module's function hands the runtime an evaluator of its scope.
 
 ```
 [hmr] apps/hmrpatch/counter.js: patched bump

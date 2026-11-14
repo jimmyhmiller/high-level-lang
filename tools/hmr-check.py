@@ -235,5 +235,23 @@ for app, flags in APPS.items():
     check(m is not None and bundled == dev,
           f"{app}: {len(dev.splitlines())} lines the same" if bundled == dev else
           f"{app}: bundle says {bundled[:200]!r}, development build says {dev[:200]!r}")
+# `--hmr-patch=false`: no module's function hands the runtime an evaluator, and an edit that could
+# be patched runs its module again, saying why.
+print("== --hmr-patch=false")
+shutil.rmtree(os.path.join(WORK, "apps", "hmrpatch"))
+shutil.copytree(os.path.join(TESTS, "apps", "hmrpatch"), os.path.join(WORK, "apps", "hmrpatch"))
+p = subprocess.Popen([ESB, f"{P}/main.js", "--hmr", "--hmr-patch=false", "--no-cache", "--outfile=out/off.js"], cwd=WORK,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+said = lines_of(p)
+heard = []
+first = wait_for(said, r"\[watch\] build 1:", 30, heard)
+text = open(os.path.join(WORK, "out", "off.js")).read() if first else ""
+check(first is not None and ".scope((" not in text, "no module hands the runtime an evaluator")
+edit(f"{P}/counter.js", "n += 1;", "n += 10;")
+rerun = wait_for(said, r"counter.js runs again: patching is off", 20, heard)
+check(rerun is not None, "an edit a patch could make runs the module again instead: " + (rerun.group(0) if rerun else " / ".join(heard[-5:])))
+os.killpg(p.pid, 9)
+p.wait()
+
 print("all checks passed" if failures == 0 else f"{failures} failed")
 sys.exit(1 if failures else 0)

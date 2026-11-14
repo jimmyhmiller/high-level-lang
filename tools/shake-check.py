@@ -38,6 +38,10 @@ EXPECT = {
     "case-reexported": (["BETA_UNUSED", "GAMMA_UNUSED"], []),
     "case-prop-import": (["SMOOTH_UNUSED", "VERSION_UNUSED"], ["HEAVY_ONLY_IF_LERP"]),
     "case-default-pattern": ([], ["BETA_UNUSED"]),
+    # One statement reads a property by name and, through a namespace alias, the object whole.
+    "case-mixed": ([], ["LERP_UNUSED", "SMOOTH_UNUSED", "VERSION_UNUSED"]),
+    # Writing through an alias of a namespace throws, as writing the namespace does.
+    "case-write-through": ([], []),
 }
 
 failures = []
