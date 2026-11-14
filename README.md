@@ -729,9 +729,11 @@ Most of three's comes from `ShaderChunk`, an object of about 150 GLSL strings of
 app that renders reads `ShaderChunk[name]` and keeps it whole. The held-out libraries, whose
 exercisers call nearly every export, change by under 1%.
 
-It costs about 1.5–2% of a cold build where nothing is shaken (zod, d3, lodash-es), and three's is
-faster for printing less. `--property-shaking=false` (in a spec, `property-shaking off`) turns it
-off. Its output is byte for byte the earlier bundler's across all 189 of `tools/same.py`'s outputs,
+It costs about 2% more instructions in a cold build where nothing is shaken (zod 1.8%, d3 3.3%,
+date-fns 2.0%, lodash-es 1.9%), and three's is 2.8% less, for printing less.
+`--property-shaking=false` (in a spec, `property-shaking off`) turns it off. That gives back about a
+third of the cost: its facts, rules and records are still there, empty. Of what remains, about half a
+point is the ledger's, lints' and the restart cache's, folded in with it. Its output is byte for byte the earlier bundler's across all 189 of `tools/same.py`'s outputs,
 which is how verify's identity checks against esbuild run.
 
 `tools/shake-check.py`, part of `tools/verify.py`, builds each case in `tests/apps/shake` with us

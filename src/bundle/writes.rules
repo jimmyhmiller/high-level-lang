@@ -14,7 +14,7 @@ rules bundle.writes over bundle.js
 # Something the language forbids: where, what, and whether only an ES module output forbids it.
 record Forbidden { at: Int, message: Text, strict: Bool }
 
-enum MarkKind { Constant, Imported, Namespace, Written, NamespaceWritten, DeletedName, WithStatement, ClassName }
+enum MarkKind { Constant, Imported, Namespace, Written, NamespaceWritten, ThroughWritten, DeletedName, WithStatement, ClassName }
 
 # A place: a declaration of a constant, an import or a class name (`to`: where its class body ends,
 # inside which its name is constant), a write of a name, of a namespace import's property (`name`),
@@ -23,10 +23,20 @@ record Mark { kind: MarkKind, at: Int, name: Text, to: Int }
 
 fn mark(kind: MarkKind, n: Node) -> Mark = Mark(kind: kind, at: n.lo, name: n.text, to: 0)
 
+# What one walk of a file finds: what it forbids, and the names it writes, assigning them or writing
+# through them (`x.p = …`, `x[k]++`, `delete x.p`), which linking reads (link.facts' `written`).
+record Checked { forbidden: [Forbidden], written: [Int] }
+
+fn checked(tree: Node, top: [Node], b: {Int:Int}, strict: Bool) -> Checked =
+  Checked(forbidden: forbidden(marks, b, strict),
+          written: [s for x in marks for at in [match x.kind { Written => x.at  NamespaceWritten | ThroughWritten => x.to  _ => -1 }]
+                    if at >= 0 for s in b[at] distinct s])
+  where marks = marks-in(tree) ++ [x for st in top for x in top-constants(st)]
+
 # What a file forbids. `top`: the program's statements as written, before its top level became
 # `var`s (which says which were `const`s); `b`: which symbol each name leaf is; `strict`: whether
 # the file is an ES module, where `delete x` and `with` are errors already.
-fn forbidden(tree: Node, top: [Node], b: {Int:Int}, strict: Bool) -> [Forbidden] =
+fn forbidden(marks: [Mark], b: {Int:Int}, strict: Bool) -> [Forbidden] =
   [Forbidden(at: w.at, message: "Cannot assign to \"" ++ w.name ++ "\" because it is a constant", strict: false)
    for w in written if (b[w.at] ?? -1) in constants]
   ++ [Forbidden(at: w.at, message: "Cannot assign to \"" ++ c.name ++ "\" because it is a constant", strict: false)
@@ -39,8 +49,7 @@ fn forbidden(tree: Node, top: [Node], b: {Int:Int}, strict: Bool) -> [Forbidden]
       for x in marks if x.kind == DeletedName and not strict]
   ++ [Forbidden(at: x.at, message: "With statements cannot be used with the \"esm\" output format due to strict mode", strict: true)
       for x in marks if x.kind == WithStatement and not strict]
-  where marks = marks-in(tree) ++ [x for st in top for x in top-constants(st)],
-        written = [w for w in marks if w.kind == Written],
+  where written = [w for w in marks if w.kind == Written],
         constants = {s: true for x in marks if x.kind == Constant for s in b[x.at]},
         imported = {s: true for x in marks if x.kind == Imported or x.kind == Namespace for s in b[x.at]},
         namespaces = {s: true for x in marks if x.kind == Namespace for s in b[x.at]},
@@ -85,6 +94,8 @@ everywhere fn marks-in(n: Node) -> [Mark] = match n {
   ForIn(left, right, body) => left-marks(left) ++ marks-in(right) ++ marks-in(body)
   ForOf(_, left, right, body) => left-marks(left) ++ marks-in(right) ++ marks-in(body)
   Delete(Ident(_) as x) => [mark(DeletedName, x)]
+  Delete(Member(Ident(_) as o, _) as t) | Delete(Index(Ident(_) as o, _) as t) =>
+    [Mark(kind: ThroughWritten, at: o.lo, name: "", to: o.lo)] ++ marks-in(t)
   Delete(Paren(Ident(_) as x)) => [mark(DeletedName, x)]
   With(object, body) as w => [Mark(kind: WithStatement, at: w.lo, name: "", to: 0)] ++ marks-in(object) ++ marks-in(body)
 }
@@ -126,5 +137,6 @@ fn target-marks(t: Node) -> [Mark] = match t {
   Paren(x) => target-marks(x)
   Member(Ident(_) as ns, property) => [Mark(kind: NamespaceWritten, at: property.lo, name: property.text, to: ns.lo)]
   Index(Ident(_) as ns, Str(raw)) => [Mark(kind: NamespaceWritten, at: ns.lo, name: unquote(raw), to: ns.lo)] ++ marks-in(t)
+  Index(Ident(_) as o, _) => [Mark(kind: ThroughWritten, at: o.lo, name: "", to: o.lo)] ++ marks-in(t)
   _ => marks-in(t)
 }

@@ -157,16 +157,14 @@ record Mention { reach: Reach, id: Int, name: Text }
 
 # `pure`: whether the statement can go when nothing uses it, which is a walk of it too.
 # `objects`: what the statement's object literals that may lose properties hold (`ObjectOf`).
-record Summary { declares: [Int], mentions: [Mention], pure: Bool, objects: [ObjectSummary], written: [Int] }
-
-record Write { at: Int, through: Bool }
+record Summary { declares: [Int], mentions: [Mention], pure: Bool, objects: [ObjectSummary] }
 
 # An object literal a `const` holds, and each property that may go when nothing reads it: its key,
 # and the symbols its value names, which it alone reads.
 record ObjectSummary { symbol: Int, props: [PropSummary] }
 record PropSummary { key: Text, mentions: [Int] }
 
-fn no-summary() -> Summary = Summary(declares: [], mentions: [], pure: false, objects: [], written: [])
+fn no-summary() -> Summary = Summary(declares: [], mentions: [], pure: false, objects: [])
 
 # One traversal of a statement finds both. A top-level statement declares only its own names:
 # not those inside a function or a block, nor a function's other than its own name. What a
@@ -174,29 +172,8 @@ fn no-summary() -> Summary = Summary(declares: [], mentions: [], pure: false, ob
 input declaring: Bool
 collect declares: [Int]
 collect mentions: [Mention]
-# Names written: assigned, or written through (`x.p = …`), what makes an alias no alias and an
-# object read whole (link.facts' `written`).
-collect writes: [Write]
 inh top: Bool = true
 inh counting: Bool = true
-inh writing: Bool = false
-
-on Assignment(target, _, _) { target.writing = true }
-on PreInc(target) | PreDec(target) | PostInc(target) | PostDec(target) { target.writing = true }
-on Delete(value) { value.writing = true }
-on ForIn(left, _, _) { left.writing = true }
-on ForOf(_, left, _, _) { left.writing = true }
-# A write through a name, or to it; first, so they own what they match. The name is mentioned as
-# any is: a statement that writes it needs its declaration.
-on Member(Ident(_) as o, _) | Index(Ident(_) as o, _) if writing {
-  writes += Write(at: o.lo, through: true)
-  kids.writing = false
-}
-on Member(...) | Index(...) if writing { kids.writing = false }
-on Ident(x) as n if writing {
-  writes += Write(at: n.lo, through: false)
-  mentions ++= [found for y in [x] if counting for found in [name-mention(n, y)] if let some(found) = found]
-}
 
 on FuncDecl(name, ...) | GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) {
   kids.top = false
@@ -211,12 +188,10 @@ on Member(object, property) if counting and namespace-of(body, here, object) is 
   mentions += Mention(reach: Member, id: target, name: property.text)
   object.counting = false
 }
-on Member(Ident(_) as object, PropName(_) as property) if counting and imported-name(body, here, object) is some(s) and not reflective?(property.text) {
-  mentions += Mention(reach: ImportedMember, id: s, name: property.text)
-  object.counting = false
-}
-on Member(Ident(_) as object, PropName(_) as property) if counting and alias-name(body, here, object) is some(s) and not reflective?(property.text) {
-  mentions += Mention(reach: AliasMember, id: s, name: property.text)
+# `z.x` of a named import, or `a.x` of an alias or an object literal's name: one look at which
+# symbol the name is says which.
+on Member(Ident(_) as object, PropName(_) as property) if counting and member-of(body, here, object) is some(found) and not reflective?(property.text) {
+  mentions += found with { name: property.text }
   object.counting = false
 }
 # `const { a, b: c } = ns`, of what may be a namespace object: a read of each name, as `ns.a` is.
@@ -264,12 +239,8 @@ fn name-mention(n: Node, x: Text) -> Mention? = match m.symbol-in(body, here, n.
 
 fn summary-of(n: Node, declares: Bool) -> Summary =
   Summary(declares: a.declares, mentions: once-each-symbol(a.mentions),
-          pure: declares and linking.tree-shaking and pure-stmt?(n), objects: [], written: candidates-written(a.writes))
+          pure: declares and linking.tree-shaking and pure-stmt?(n), objects: [])
   where a = run(n, declares)
-
-# The names among those that may be aliases or objects that a walk wrote.
-fn candidates-written(ws: [Write]) -> [Int] =
-  [s for w in ws for s in m.symbol-in(body, here, w.at) if s in linked.aliases or s in linked.objects distinct s]
 
 # A statement that holds object literals whose properties may go: its summary is of the statement
 # without those properties, and each such property's of itself. A property may go when it can go
@@ -277,22 +248,19 @@ fn candidates-written(ws: [Write]) -> [Int] =
 # property stays as long as the statement does.
 fn object-summary(s: Node, objects: [Node]) -> Summary = match [o for o in found if len(o.props) > 0] {
   [] => summary-of(s, true)
-  kept => match summary-of(without-props(s, {p.at: true for o in kept for p in o.props}), true) {
-    rest => rest with { objects: [o.summary for o in kept], written: [w for w in rest.written ++ [w for o in kept for p in o.props for w in p.written] distinct w] }
-  }
+  kept => summary-of(without-props(s, {p.at: true for o in kept for p in o.props}), true) with { objects: [o.summary for o in kept] }
 } where found = [Found(summary: ObjectSummary(symbol: symbol-of-declarator(x), props: [p.summary for p in ps]), props: ps)
                  for x in objects for ps in [shakeable-props(x)]]
 
 record Found { summary: ObjectSummary, props: [Shakeable] }
-record Shakeable { at: Int, summary: PropSummary, written: [Int] }
+record Shakeable { at: Int, summary: PropSummary }
 
 fn symbol-of-declarator(d: Node) -> Int = m.symbol-in(body, here, d.target.lo) ?? panic "{}: an object's const has no symbol", here.path
 
 # The properties of an object literal that may go: those that can go unread and read only symbols.
 fn shakeable-props(d: Node) -> [Shakeable] = match d.init {
-  ObjectLit(List(props...)) => [Shakeable(at: p.lo, summary: PropSummary(key: object-key(p), mentions: [x.id for x in once-each-symbol(r.mentions)]),
-                                          written: candidates-written(r.writes))
-                                for p in props if pure?(p) for r in [run(p, false)] if all x in r.mentions: x.reach == Symbol]
+  ObjectLit(List(props...)) => [Shakeable(at: p.lo, summary: PropSummary(key: object-key(p), mentions: [x.id for x in once-each-symbol(ms)]))
+                                for p in props if pure?(p) for ms in [run(p, false).mentions] if all x in ms: x.reach == Symbol]
   _ => []
 }
 
@@ -330,10 +298,13 @@ fn summaries-of(id: Int) -> [Summary] = with here = m.modules[id], body = m.body
   }
 }
 
-fn statement-summary(s: Node) -> Summary = match walked?(s), [d for d in object-declarators(s) if symbol-of-declarator(d) in linked.objects] {
-  true, [] => summary-of(s, true)
-  true, ds => object-summary(s, ds)
+fn statement-summary(s: Node) -> Summary = match walked?(s), len(linked.objects) > 0 {
   false, _ => no-summary()
+  true, false => summary-of(s, true)
+  true, true => match [d for d in object-declarators(s) if symbol-of-declarator(d) in linked.objects] {
+    [] => summary-of(s, true)
+    ds => object-summary(s, ds)
+  }
 }
 
 # The declarators of a top-level statement that give a name an object literal.
@@ -357,6 +328,14 @@ fn imported-name(b: m.Body, mo: m.Module, n: Node) -> Int? = first s in m.symbol
 # are defined. Read so, an object is read whole.
 fn reflective?(name: Text) -> Bool = name in ["hasOwnProperty", "propertyIsEnumerable", "__lookupGetter__", "__lookupSetter__",
                                               "__defineGetter__", "__defineSetter__", "__proto__", "toJSON"]
+
+# What a member read of a name is a read of by name: a named import's, or an alias's or an object
+# literal's name's; none for any other name.
+fn member-of(b: m.Body, mo: m.Module, n: Node) -> Mention? = match m.symbol-in(b, mo, n.lo) {
+  some(s) if s in linked.named-imports => some(Mention(reach: ImportedMember, id: s, name: ""))
+  some(s) if s in linked.aliases or s in linked.objects => some(Mention(reach: AliasMember, id: s, name: ""))
+  _ => none
+}
 
 # A `const` that is another name's value (`linked.aliases`).
 fn alias-name(b: m.Body, mo: m.Module, n: Node) -> Int? = first s in m.symbol-in(b, mo, n.lo) if s in linked.aliases or s in linked.objects: s
@@ -1010,6 +989,7 @@ fn facts-of(id: Int, summaries: [Summary], start: Int) -> [link.Fact] = module-f
 # whose only symbol is its `require_x`; its dependencies are whatever it `require`s.
 fn module-facts(mo: m.Module, summaries: [Summary], start: Int) -> [link.Fact] =
   [link.fact-module-effects(id) for id in [mo.id] if mo.side-effects]
+  ++ [link.fact-written(g) for s in mo.written for g in [s + mo.symbol-shift] if g in linked.aliases or g in linked.objects]
   ++ [link.fact-script(id) for id in [mo.id] if mo.script]
   ++ [link.fact-typescript(id) for id in [mo.id] if m.loader-of(mo.path) == "ts" or m.loader-of(mo.path) == "tsx"]
   ++ [link.fact-wrapped(mo.id) for id in [mo.id] if wrapped?(mo)]
@@ -1068,7 +1048,7 @@ fn entry-namespace(mo: m.Module, part: Int) -> [link.Fact] = match linking.entry
 # The facts a summary stands for, in `part`.
 fn summary-facts(mo: m.Module, part: Int, sm: Summary) -> [link.Fact] =
   [link.fact-declares(part, s) for s in sm.declares] ++ [mention-facts(mo, part, x)... for x in sm.mentions]
-  ++ [link.fact-written(s) for s in sm.written]
+
   ++ [f for o in sm.objects for f in [link.fact-object-literal(o.symbol, part)]
                                      ++ [link.fact-shakeable-prop(o.symbol, m.name-id(p.key)) for p in o.props]
                                      ++ [link.fact-prop-mentions(part, m.name-id(p.key), x) for p in o.props for x in p.mentions]]
