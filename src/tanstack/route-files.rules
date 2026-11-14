@@ -1,0 +1,260 @@
+# What TanStack's generator does to route files themselves (generator.js's processRouteNodeFile,
+# transform/transform.js): an empty file gets the target's template; a file that does not export
+# `Route` is no route; and a route's `createFileRoute('/id')` is made to say its id, with the right
+# constructor (`createLazyFileRoute` in a `.lazy` file) imported from the router package. Edits are
+# made to the text where theirs (MagicString) makes them, so the file comes out the same.
+rules tanstack.route-files over bundle.js
+use bundle.js as js
+use tanstack.config as cfg
+
+record Edit { path: Text, text: Text }
+# A route file processed: whether it is a route, and its new text when that changed ("" path: none).
+record Processed { route: Bool, edit: Edit }
+
+fn no-edit() -> Edit = Edit(path: "", text: "")
+
+const piece-kinds: [Text] = ["component", "pendingComponent", "errorComponent", "notFoundComponent", "loader"]
+
+fn package-of(c: cfg.Config) -> Text = "@tanstack/" ++ c.target ++ "-router"
+
+fn processed(full-path: Text, file-path: Text, route-path: Text, kind: Text, c: cfg.Config) -> Processed = match content {
+  # An empty piece is no route, and is not written.
+  "" if kind != "lazy" and kind != "layout" and kind != "static" and kind in piece-kinds => Processed(route: false, edit: no-edit())
+  _ => match ends-with(file-path, ".vue") {
+    true => Processed(route: true, edit: if text != content then Edit(path: full-path, text: text) else no-edit())
+      where text = start
+    false => match transformed(start, full-path, route-path, kind == "lazy", c) {
+      Outcome(kind: "no-route-export", text: _) => Processed(route: false, edit: if start != content then Edit(path: full-path, text: start) else no-edit())
+      Outcome(kind: _, text: t) => Processed(route: true, edit: if t != content then Edit(path: full-path, text: t) else no-edit())
+    }
+  }
+} where content = read-file(full-path),
+        start = if content == "" then scaffold(route-path, kind, c) else content
+
+# An empty root route file gets the root template.
+fn scaffolded-root(full-path: Text, c: cfg.Config) -> Edit = match read-file(full-path) {
+  "" => Edit(path: full-path, text: root-scaffold(c))
+  _ => no-edit()
+}
+
+fn scaffold(route-path: Text, kind: Text, c: cfg.Config) -> Text =
+  fail-build("tanstack: scaffolding an empty route file (" ++ route-path ++ ") is not implemented yet")
+
+fn root-scaffold(c: cfg.Config) -> Text = fail-build("tanstack: scaffolding an empty root route file is not implemented yet")
+
+# --- transform.js --------------------------------------------------------------------------------
+
+record Outcome { kind: Text, text: Text }
+
+# A change to the text: [from, to) replaced; `from` -1 puts it before everything.
+record Change { from: Int, to: Int, text: Text }
+
+fn applied(src: Text, changes: [Change]) -> Text = join([c.text for c in changes if c.from < 0], "") ++ rest
+  where ordered = sort c in [c for c in changes if c.from >= 0] by c.from,
+        rest = join([src[(if i == 0 then 0 else ordered[i - 1].to)..ordered[i].from] ++ ordered[i].text for i in 0..len(ordered)], "")
+               ++ src[(if len(ordered) == 0 then 0 else ordered[len(ordered) - 1].to)..len(src)]
+
+fn parsed(src: Text, path: Text) -> Node = match js.parse-opt(src, path, js.flag-bit("jsx") + js.flag-bit("ts") + js.flag-bit("await")) {
+  some(t) => t
+  none => fail-build("Error transforming route file " ++ path ++ ": " ++ last-parse-path() ++ ":" ++ int-text(last-parse-line()) ++ ":"
+                     ++ int-text(last-parse-col()) ++ ": expected " ++ last-parse-want())
+}
+
+fn statements(t: Node) -> [Node] = match t { Program(_, body) => body.kids }
+
+# The local names exported as `Route`, from a declaration or a specifier.
+fn exported-route-names(body: [Node]) -> [Text] =
+  [n for s in body for n in (match s {
+     ExportLexical(decl) => [d.target.text for d in declarators-of(decl) if d.target is BindName(...) and d.target.text == "Route"]
+     ExportVar(ds) => [d.target.text for d in ds.kids if d.target is BindName(...) and d.target.text == "Route"]
+     ExportNamed(specs) => [local for x in specs.kids for local in exported-as-route(x)]
+     _ => []
+   }) distinct n]
+
+fn declarators-of(decl: Node) -> [Node] = match decl {
+  ConstDecl(ds) | LetDecl(ds) => ds.kids
+  _ => []
+}
+
+fn module-name(n: Node) -> Text = match n { Str(raw) => unquote(raw)  _ => n.text }
+
+fn exported-as-route(x: Node) -> [Text] = match x {
+  ExportAs(local, exported) if module-name(exported) == "Route" and not (local is Str(...)) => [local.text]
+  ExportName(local) if module-name(local) == "Route" and not (local is Str(...)) => [local.text]
+  _ => []
+}
+
+# The variable declarations of a statement (exported or not).
+fn variable-declarators(s: Node) -> [Node] = match s {
+  ExportLexical(decl) => declarators-of(decl)
+  ExportVar(ds) => ds.kids
+  ConstDecl(ds) | LetDecl(ds) | VarDecl(ds) => ds.kids
+  _ => []
+}
+
+const constructors: [Text] = ["createFileRoute", "createLazyFileRoute"]
+
+record RouteCall { callee: Node, id: Node }
+record Calls { calls: [RouteCall], unsupported: Bool, malformed: Bool }
+
+fn args-of(call: Node) -> [Node] = match call { CallExpr(_, args) => args.items.kids  _ => [] }
+
+# `createFileRoute(id)(options)`: the inner call's callee and its id.
+fn route-call(init: Node) -> RouteCall? = match init {
+  CallExpr(CallExpr(callee, inner), _) if callee is Ident(...) and callee.text in constructors =>
+    some(RouteCall(callee: callee, id: if len(inner.items.kids) > 0 then inner.items.kids[0] else callee))
+  _ => none
+}
+
+fn direct-call?(init: Node) -> Bool = match init {
+  CallExpr(callee, _) => callee is Ident(...) and callee.text in constructors
+  _ => false
+}
+
+fn supported-id?(c: RouteCall) -> Bool = c.id.lo != c.callee.lo and (c.id is Str(...) or c.id is TemplateFull(...))
+
+fn route-calls(body: [Node], names: [Text]) -> Calls = Calls(
+    calls: [c for d in candidates if let some(c) = route-call(init-of(d)) if supported-id?(c)],
+    unsupported: any d in candidates: (match route-call(init-of(d)) { some(c) => not supported-id?(c)  none => false }),
+    malformed: any d in candidates: is-none(route-call(init-of(d))) and direct-call?(init-of(d)))
+  where candidates = [d for s in body for d in variable-declarators(s) if d.target is BindName(...) and d.target.text in names]
+
+fn init-of(d: Node) -> Node = match d { Declarator(_, init) => init }
+
+# An import of the router package (not `import type`).
+record Specifier { imported: Text, local: Text, type-only: Bool, node: Node, imported-node: Node, local-node: Node, string: Bool }
+record TargetImport { decl: Node, default: Text, namespace: Text, named: [Specifier], quote: Text, semicolon: Bool }
+
+fn target-imports(body: [Node], src: Text, module: Text) -> [TargetImport] =
+  [TargetImport(decl: s, default: default-of(clause), namespace: namespace-of(clause), named: named-of(clause, src), quote: from.text[0..1],
+                semicolon: ends-with(trim(src[s.lo..s.hi]), ";"))
+   for s in body if target-import?(s, module) for clause in [import-clause(s)] for from in [import-from(s)]]
+
+fn target-import?(s: Node, module: Text) -> Bool = match s {
+  Import(_, from, _) => unquote(from.text) == module
+  _ => false
+}
+
+fn import-clause(s: Node) -> Node = match s { Import(clause, _, _) => clause }
+fn import-from(s: Node) -> Node = match s { Import(_, from, _) => from }
+
+fn default-of(clause: Node) -> Text = match clause {
+  ImportDefault(name) => name.text
+  ImportDefaultAnd(name, _) => name.text
+  _ => ""
+}
+fn namespace-of(clause: Node) -> Text = match clause {
+  ImportNamespace(name) => name.text
+  ImportDefaultAnd(_, ImportNamespace(name)) => name.text
+  _ => ""
+}
+fn named-of(clause: Node, src: Text) -> [Specifier] = match clause {
+  ImportNamed(specs) => [specifier-of(x, src) for x in specs.kids]
+  ImportDefaultAnd(_, ImportNamed(specs)) => [specifier-of(x, src) for x in specs.kids]
+  _ => []
+}
+
+# A specifier; an erased `type X [as Y]` is read from its text.
+fn specifier-of(x: Node, src: Text) -> Specifier = match x {
+  ImportAs(imported, local) => Specifier(imported: module-name(imported), local: local.text, type-only: false, node: x, imported-node: imported, local-node: local, string: imported is Str(...))
+  ImportName(name) => Specifier(imported: name.text, local: name.text, type-only: false, node: x, imported-node: name, local-node: name, string: false)
+  _ => Specifier(imported: words[1], local: if len(words) == 4 then words[3] else words[1], type-only: true, node: x, imported-node: x, local-node: x, string: false)
+    where words = [w for w in split(replace-all(replace-all(trim(src[x.lo..x.hi]), "\n", " "), "\t", " "), " ") if w != ""]
+}
+
+fn other-constructor(c: Text) -> Text = if c == "createFileRoute" then "createLazyFileRoute" else "createFileRoute"
+
+fn line-ending(src: Text) -> Text = match src {
+  _ if contains-text?(src, "\r\n") => "\r\n"
+  _ if contains-text?(src, "\n") => "\n"
+  _ if contains-text?(src, "\r") => "\r"
+  _ => "\n"
+}
+
+# transform(): the outcome and the text after it.
+fn transformed(src: Text, path: Text, route-path: Text, lazy: Bool, c: cfg.Config) -> Outcome = match len(names) {
+  0 => Outcome(kind: "no-route-export", text: src)
+  _ => match len(found.calls) {
+    0 if found.malformed => fail-build("Error transforming route file " ++ path ++ ": Error: expected Route export in " ++ route-path ++ " to use createFileRoute('/path')({...}) or createLazyFileRoute('/path')({...})")
+    0 if found.unsupported => fail-build("Error transforming route file " ++ path ++ ": Error: expected route id to be a string literal or plain template literal in " ++ route-path)
+    0 => Outcome(kind: "not-modified", text: src)
+    1 => match route-changes(found.calls[0], body, src, route-path, lazy, c) {
+      [] => Outcome(kind: "not-modified", text: src)
+      changes => Outcome(kind: "modified", text: applied(src, changes))
+    }
+    _ => fail-build("Error transforming route file " ++ path ++ ": Error: expected exactly one createFileRoute/createLazyFileRoute call in " ++ route-path)
+  }
+} where body = statements(parsed(src, path)),
+        names = exported-route-names(body),
+        found = route-calls(body, names)
+
+fn route-changes(call: RouteCall, body: [Node], src: Text, route-path: Text, lazy: Bool, c: cfg.Config) -> [Change] =
+  (if call.callee.text != expected then [Change(from: call.callee.lo, to: call.callee.hi, text: expected)] else [])
+  ++ (if src[call.id.lo..call.id.hi] != expected-id then [Change(from: call.id.lo, to: call.id.hi, text: expected-id)] else [])
+  ++ import-changes(target-imports(body, src, package-of(c)), src, package-of(c), expected)
+  where quote = match src[call.id.lo] { 39 => "'"  34 => "\""  _ => "`" },
+        expected = if lazy then "createLazyFileRoute" else "createFileRoute",
+        expected-id = quote ++ route-path ++ quote
+
+# updateRouteImports: fine as they are; one import of the other constructor renamed; or each
+# import of the package written again with what it should hold.
+fn import-changes(imports: [TargetImport], src: Text, module: Text, required: Text) -> [Change] = match analysis {
+  "ok" => []
+  "rename" => [Change(from: r.imported-node.lo, to: r.imported-node.hi, text: required)]
+    ++ (if r.local-node.lo != r.imported-node.lo then [Change(from: r.local-node.lo, to: r.local-node.hi, text: required)] else [])
+    where r = (last s in all-specs if s.imported == other-constructor(required): s) ?? panic "tanstack: no import to rename"
+  _ => normalized(imports, src, module, required)
+} where all-specs = [s for i in imports for s in i.named],
+        # Type specifiers count as theirs counts them: babel gives them as import specifiers too.
+        analysis = match first s in all-specs if s.string or (s.imported in constructors and s.local != s.imported): s {
+          some(_) => "normalize"
+          none => match len([s for s in all-specs if s.imported == required]),
+                        len([s for s in all-specs if s.imported == other-constructor(required)]) {
+            1, 0 => "ok"
+            0, 1 => "rename"
+            _, _ => "normalize"
+          }
+        }
+
+fn owns-required?(i: TargetImport, required: Text) -> Bool = any s in i.named: s.imported == required and s.local == required and not s.type-only
+
+fn normalized(imports: [TargetImport], src: Text, module: Text, required: Text) -> [Change] =
+  [ch for k in 0..len(imports) for ch in rewritten(imports[k], k == owner, src, required)]
+  ++ (if owner == -1 then [Change(from: -1, to: -1, text: "import { " ++ required ++ " } from " ++ q ++ module ++ q ++ (if semi then ";" else "") ++ line-ending(src))] else [])
+  where owner = (first k in 0..len(imports) if owns-required?(imports[k], required): k) ?? ((first k in 0..len(imports) if imports[k].namespace == "": k) ?? -1),
+        q = if len(imports) > 0 then imports[0].quote else "'",
+        semi = len(imports) > 0 and imports[0].semicolon
+
+fn spec-key(s: Specifier) -> Text = (if s.type-only then "type" else "value") ++ ":" ++ s.imported ++ ":" ++ s.local
+
+# normalizeNamedImports, and the declaration written again when that changed it.
+fn rewritten(i: TargetImport, owner: Bool, src: Text, required: Text) -> [Change] = match same {
+  true => []
+  false => match render(i, named) {
+    "" => [Change(from: i.decl.lo, to: removal-end(src, i.decl.hi), text: "")]
+    text => [Change(from: i.decl.lo, to: i.decl.hi, text: text)]
+  }
+} where kept = [s for s in i.named if s.imported != other-constructor(required)
+                 if not (s.local == required and (s.imported != required or not owner))],
+        deduped = [kept[k] for k in 0..len(kept) if ((first j in 0..len(kept) if spec-key(kept[j]) == spec-key(kept[k]): j) ?? -1) == k],
+        named = if owner and not (any s in deduped: s.imported == required and s.local == required and not s.type-only)
+                then deduped ++ [Specifier(imported: required, local: required, type-only: false, node: i.decl, imported-node: i.decl, local-node: i.decl, string: false)]
+                else deduped,
+        same = len(named) == len(i.named) and (all k in 0..len(named): spec-key(named[k]) == spec-key(i.named[k]))
+
+fn render(i: TargetImport, named: [Specifier]) -> Text = match len(parts) {
+  0 => ""
+  _ => "import " ++ join(parts, ", ") ++ " from " ++ i.quote ++ module-text(i) ++ i.quote ++ (if i.semicolon then ";" else "")
+} where parts = (if i.default != "" then [i.default] else []) ++ (if i.namespace != "" then ["* as " ++ i.namespace] else [])
+                ++ (if len(named) > 0 then ["{ " ++ join([(if s.type-only then "type " else "") ++ (if s.imported == s.local then s.imported else s.imported ++ " as " ++ s.local) for s in named], ", ") ++ " }"] else [])
+
+fn module-text(i: TargetImport) -> Text = unquote(import-from(i.decl).text)
+
+# getRemovalEnd: spaces and tabs after, and one newline.
+fn removal-end(src: Text, end: Int) -> Int = match at-byte(src, pos) {
+  13 if at-byte(src, pos + 1) == 10 => pos + 2
+  10 | 13 => pos + 1
+  _ => end
+} where pos = end + span-of(src, end, " \t")
+
+fn at-byte(s: Text, i: Int) -> Int = if i >= 0 and i < len(s) then s[i] else -1

@@ -1,0 +1,658 @@
+# TanStack Router's route tree, made from the routes directory as @tanstack/router-generator 1.169
+# makes it (generator.js, utils.js, filesystem/physical/getRouteNodes.js), so that what is written
+# is the file theirs writes, byte for byte. Files become route nodes by their names; nodes find
+# their parents; the tree is written as their generator's templates write it, then formatted as
+# Prettier formats it (tanstack.pretty), unless formatting is off.
+rules tanstack.routes
+use tanstack.config as cfg
+use tanstack.pretty as pretty
+use tanstack.route-files as files
+
+# The generator's configuration, for what reads it below.
+setting config: cfg.Config
+
+# A literal or escaped underscore at either end of a segment (metadata per segment of a path).
+record Seg { lead: Bool, trail: Bool }
+
+# A route file as getRouteNodes reads it.
+record RouteNode {
+  file-path: Text,
+  full-path: Text,
+  route-path: Text,
+  original: Text,
+  variable: Text,
+  # static, layout, pathless_layout, lazy, loader, component, pendingComponent, errorComponent,
+  # notFoundComponent, __root
+  kind: Text,
+  meta: [Seg],
+  virtual: Bool
+}
+
+# --- utils.js ------------------------------------------------------------------------------------
+
+fn clean-path(p: Text) -> Text = match index-of(p, "//") {
+  none => p
+  some(_) => clean-path(replace-all(p, "//", "/"))
+}
+
+fn trim-path-left(p: Text) -> Text = if p == "/" then p else p[span-of(p, 0, "/")..len(p)]
+fn without-trailing-slash(p: Text) -> Text = if ends-with(p, "/") then p[0..len(p) - 1] else p
+fn replace-first(s: Text, what: Text, by: Text) -> Text = match index-of(s, what) {
+  some(i) => s[0..i] ++ by ++ s[i + len(what)..len(s)]
+  none => s
+}
+fn last-segment(p: Text) -> Text = segs[len(segs) - 1] where segs = split(p, "/")
+fn non-empty-segments(p: Text) -> [Text] = [s for s in split(p, "/") if s != ""]
+fn last-of(segs: [Text]) -> Text = if len(segs) == 0 then "" else segs[len(segs) - 1]
+
+# The parts of a flat file name: split at each `.` not right after `[` nor right before `]`.
+fn flat-parts(p: Text) -> [Text] = match first i in 0..len(p) if p[i] == 46 and not (i > 0 and p[i - 1] == 91) and not (i + 1 < len(p) and p[i + 1] == 93): i {
+  none => [p]
+  some(i) => [p[0..i]] ++ flat-parts(p[i + 1..len(p)])
+}
+
+# `[x]` escapes x: the brackets go, lazily matched.
+fn unbracketed(part: Text) -> Text = match index-of(part, "[") {
+  none => part
+  some(i) => match index-of(part[i + 1..len(part)], "]") {
+    none => part
+    some(j) => part[0..i] ++ part[i + 1..i + 1 + j] ++ unbracketed(part[i + 2 + j..len(part)])
+  }
+}
+
+fn bracket-contents(part: Text) -> [Text] = match index-of(part, "[") {
+  none => []
+  some(i) => match index-of(part[i + 1..len(part)], "]") {
+    none => []
+    some(j) => [part[i + 1..i + 1 + j]] ++ bracket-contents(part[i + 2 + j..len(part)])
+  }
+}
+
+const disallowed-escapes: [Text] = ["/", "\\", "?", "#", ":", "*", "<", ">", "|", "!", "$", "%"]
+
+record Initial { route-path: Text, original: Text }
+
+# determineInitialRoutePath
+fn initial-route-path(route-path: Text) -> Initial = match first c in [c for part in parts for c in bracket-contents(part)] if c in disallowed-escapes: c {
+  some(c) => fail-build("Error: Disallowed character \"" ++ c ++ "\" found in square brackets in route path \"" ++ route-path
+                        ++ "\".\nYou cannot use any of the following characters in square brackets: " ++ join(disallowed-escapes, ", ")
+                        ++ "\nPlease remove and/or replace them.")
+  none => Initial(route-path: clean-path("/" ++ join([unbracketed(part) for part in parts], "/")),
+                  original: clean-path("/" ++ clean-path(join(parts, "/"))))
+} where parts = flat-parts(route-path)
+
+fn fully-escaped?(o: Text) -> Bool = starts-with(o, "[") and ends-with(o, "]") and len(o) >= 2
+  and not contains-text?(o[1..len(o) - 1], "[") and not contains-text?(o[1..len(o) - 1], "]")
+fn escaped-leading-underscore?(o: Text) -> Bool = starts-with(o, "[_]") or (starts-with(o, "[_") and fully-escaped?(o))
+fn escaped-trailing-underscore?(o: Text) -> Bool = ends-with(o, "[_]") or (ends-with(o, "_]") and fully-escaped?(o))
+fn segment-pathless?(segment: Text, original: Text) -> Bool = starts-with(segment, "_") and not escaped-leading-underscore?(original)
+
+fn count-segments(p: Text) -> Int = len(non-empty-segments(p))
+fn count-slash-parts(p: Text) -> Int = 1 + count-byte(p, 0, len(p), 47)
+
+fn has-meta?(m: Seg) -> Bool = m.lead or m.trail
+fn no-seg() -> Seg = Seg(lead: false, trail: false)
+fn meta-at(meta: [Seg], i: Int) -> Seg = if i >= 0 and i < len(meta) then meta[i] else no-seg()
+
+# createRoutePathSegmentMetadata: per segment, an underscore at either end kept literally because
+# the original escaped it. None at all is no metadata.
+fn segment-meta(route-path: Text, original: Text) -> [Seg] = if any m in made: has-meta?(m) then made else []
+  where rs = split(route-path, "/"),
+        os = split(original, "/"),
+        made = [Seg(lead: starts-with(rs[i], "_") and escaped-leading-underscore?(if i < len(os) then os[i] else ""),
+                    trail: ends-with(rs[i], "_") and escaped-trailing-underscore?(if i < len(os) then os[i] else ""))
+                for i in 0..len(rs)]
+
+fn without-segment-underscores(segment: Text, m: Seg) -> Text = match segment {
+  _ if starts-with(segment, "_") and not m.lead => without-segment-underscores(segment[1..len(segment)], m with { lead: true })
+  _ if ends-with(segment, "_") and not m.trail => segment[0..len(segment) - 1]
+  _ => segment
+}
+
+# removeUnderscores: a leading and a trailing `_` go, and `/_` and `_/` become `/`.
+fn without-underscores(s: Text) -> Text = slashed(ended(started(s)), 0)
+fn started(s: Text) -> Text = if starts-with(s, "_") then s[1..len(s)] else s
+fn ended(s: Text) -> Text = if ends-with(s, "_") then s[0..len(s) - 1] else s
+fn slashed(s: Text, i: Int) -> Text = match i {
+  _ if i + 1 >= len(s) => s[i..len(s)]
+  _ if (s[i] == 47 and s[i + 1] == 95) or (s[i] == 95 and s[i + 1] == 47) => "/" ++ slashed(s, i + 2)
+  _ => s[i..i + 1] ++ slashed(s, i + 1)
+}
+
+fn without-layout-segments(p: Text) -> Text = join([s for s in split(p, "/") if not starts-with(s, "_")], "/")
+
+# removeLayoutSegmentsAndUnderscoresWithEscape
+fn without-layouts(route-path: Text, original: Text, meta: [Seg]) -> Text = match original {
+  "" => without-underscores(without-layout-segments(route-path))
+  _ => join([without-segment-underscores(rs[i], meta-at(m, i)) for i in 0..len(rs)
+             if meta-at(m, i).lead or not segment-pathless?(rs[i], if i < len(os) then os[i] else "")], "/")
+} where m = if len(meta) > 0 then meta else segment-meta(route-path, original),
+        rs = split(route-path, "/"),
+        os = split(original, "/")
+
+# removeGroups: `(…)` up to its last `)` before the next `/`, and that `/`.
+fn without-groups(s: Text) -> Text = match index-of(s, "(") {
+  none => s
+  some(i) => match last-index-of(s[i + 1..segment-end], ")") {
+    some(k) if k >= 1 => s[0..i] ++ without-groups(s[i + 2 + k + (if i + 2 + k < len(s) and s[i + 2 + k] == 47 then 1 else 0)..len(s)])
+    _ => s[0..i + 1] ++ without-groups(s[i + 1..len(s)])
+  } where segment-end = i + 1 + span-not-of(s, i + 1, "/")
+}
+
+# /\(.+\)/
+fn has-group?(s: Text) -> Bool = match index-of(s, "(") {
+  none => false
+  some(i) => any j in i + 2..len(s): s[j] == 41
+}
+
+# --- Names --------------------------------------------------------------------------------------
+
+# routePathToVariable
+fn variable-of(route-path: Text) -> Text = match cleaned {
+  "" => ""
+  _ => r-digit(join([safe(if i > 0 then capitalized(parts[i]) else parts[i]) for i in 0..len(parts)], ""))
+} where cleaned = without-underscores(route-path),
+        splatted = replace-all(replace-all(trailing-splat(replace-all(cleaned, "/$/", "/splat/")), "${$}", "splat"), "$", ""),
+        parts = split-dash(splatted)
+
+fn trailing-splat(s: Text) -> Text = if ends-with(s, "$") then s[0..len(s) - 1] ++ "splat" else s
+fn split-dash(s: Text) -> [Text] = [q for p in split(s, "/") for q in split(p, "-")]
+fn r-digit(s: Text) -> Text = if len(s) > 0 and s[0] >= 48 and s[0] <= 57 then "R" ++ s else s
+
+# Each UTF-16 unit made safe in a name: letters, digits and `_` stay; `.` `-` `@` are spelled;
+# parentheses and spaces go; anything else is its code.
+fn safe(s: Text) -> Text = join([unit-name(u) for u in utf16-units(s)], "")
+fn unit-name(u: Int) -> Text = match u {
+  _ if (u >= 48 and u <= 57) or (u >= 65 and u <= 90) or (u >= 97 and u <= 122) or u == 95 => byte-text(u)
+  46 => "Dot"
+  45 => "Dash"
+  64 => "At"
+  40 | 41 | 32 => ""
+  _ => "Char" ++ int-text(u)
+}
+
+fn utf16-units(s: Text) -> [Int] = [u for cp in code-points-of(s) for u in (if cp >= 65536 then [55296 + (cp - 65536) / 1024, 56320 + (cp - 65536) % 1024] else [cp])]
+
+# capitalize: the first UTF-16 unit upper-cased as JavaScript's toUpperCase does.
+fn capitalized(s: Text) -> Text = match code-points-of(s) {
+  [] => ""
+  [first, ...] => upper(first) ++ s[len(text-of-points([first]))..len(s)]
+}
+
+fn upper(cp: Int) -> Text = match cp {
+  _ if cp >= 97 and cp <= 122 => byte-text(cp - 32)
+  _ if cp < 128 => byte-text(cp)
+  223 => "SS"
+  _ if (cp >= 224 and cp <= 254 and cp != 247) => text-of-points([cp - 32])
+  255 => text-of-points([376])
+  _ if cp >= 256 and cp <= 383 and cp % 2 == 1 and cp != 305 and cp != 312 and not (cp >= 313 and cp <= 328) and not (cp >= 377 and cp <= 382) => text-of-points([cp - 1])
+  _ if ((cp >= 313 and cp <= 328) or (cp >= 377 and cp <= 382)) and cp % 2 == 0 => text-of-points([cp - 1])
+  _ if cp >= 945 and cp <= 969 and cp != 962 => text-of-points([cp - 32])
+  _ if cp >= 1072 and cp <= 1103 => text-of-points([cp - 32])
+  _ if cp >= 1104 and cp <= 1119 => text-of-points([cp - 80])
+  _ if unicode-category(cp) != "Ll" => text-of-points([cp])
+  _ => fail-build("a route segment starts with " ++ text-of-points([cp]) ++ ", which this generator cannot upper-case as JavaScript does (only Latin, Greek and Cyrillic letters)")
+}
+
+# --- Reading the routes directory (getRouteNodes) -------------------------------------------------
+
+fn token-at-end?(segment: Text, token: Text) -> Bool = segment == token
+# createTokenRegex for a file name: the token between `.` or `/` and `.`.
+fn file-token?(file-path: Text, token: Text) -> Bool = contains-text?(file-path, "." ++ token ++ ".") or contains-text?(file-path, "/" ++ token ++ ".")
+
+const piece-kinds: [Text] = ["component", "errorComponent", "notFoundComponent", "pendingComponent", "loader", "lazy"]
+const lazy-kinds: [Text] = ["lazy", "loader", "component", "pendingComponent", "errorComponent", "notFoundComponent"]
+
+fn suffix-escaped?(last-original: Text, suffix: Text) -> Bool = starts-with(last-original, "[") and ends-with(last-original, "]") and unwrap(last-original) == suffix
+
+fn unwrap(s: Text) -> Text = if starts-with(s, "[") and ends-with(s, "]") and len(s) >= 2 then s[1..len(s) - 1] else s
+
+# getRouteMeta
+record Meta { kind: Text, variable: Text }
+fn route-meta(route-path: Text, original: Text) -> Meta = Meta(kind: kind, variable: variable-of(if any s in osegs: fully-escaped?(s) then original else route-path))
+  where osegs = non-empty-segments(original),
+        last-original = last-of(osegs),
+        last-route = last-of(non-empty-segments(route-path)),
+        token-escaped = last-original != unwrap(last-original) and unwrap(last-original) == config.route-token,
+        kind = match first k in ["lazy", "loader", "component", "pendingComponent", "errorComponent", "notFoundComponent"]
+                 if ends-with(route-path, "/" ++ k) and not suffix-escaped?(last-original, k): k {
+          _ if last-route == config.route-token and not token-escaped => "layout"
+          some(k) => k
+          none => "static"
+        }
+
+# isValidPathlessLayoutRoute
+fn pathless-layout?(route-path: Text, original: Text, kind: Text) -> Bool = match kind {
+  "lazy" => false
+  _ if len(segs) == 0 => false
+  _ if last == "__root" => false
+  _ if last == config.route-token and len(segs) >= 2 and len(osegs) >= 2 =>
+    not escaped-leading-underscore?(osegs[len(osegs) - 2]) and starts-with(segs[len(segs) - 2], "_")
+  _ if escaped-leading-underscore?(last-of(osegs)) => false
+  _ => last != config.index-token and last != config.route-token and starts-with(last, "_")
+} where segs = non-empty-segments(route-path), osegs = non-empty-segments(original), last = last-of(segs)
+
+fn without-end(p: Text, segment: Text) -> Text = if ends-with(p, "/" ++ segment) then p[0..len(p) - len(segment) - 1] else p
+
+# A file named in the routes directory, as a route node.
+fn route-node(file-path: Text, full-path: Text, name: Text) -> RouteNode = match disallowed-group?(name) {
+  true => fail-build("A route configuration for a route group was found at `" ++ file-path ++ "`. This is not supported. Did you mean to use a layout/pathless route instead?")
+  false => RouteNode(file-path: file-path, full-path: full-path, route-path: route-path, original: original, variable: meta.variable,
+                     kind: kind, meta: segment-meta(route-path, original), virtual: false)
+} where initial = initial-route-path(without-ext(file-path, "")),
+        prefix = config.route-file-prefix,
+        rp0 = if prefix != "" then replace-all(initial.route-path, prefix, "") else initial.route-path,
+        op0 = if prefix != "" then replace-all(initial.original, prefix, "") else initial.original,
+        meta = route-meta(rp0, op0),
+        rp1 = if meta.kind == "lazy" then without-end(rp0, "lazy") else rp0,
+        op1 = if meta.kind == "lazy" then without-end(op0, "lazy") else op0,
+        kind = if pathless-layout?(rp1, op1, meta.kind) then "pathless_layout" else meta.kind,
+        # A piece's suffix, or the route token, goes from the end.
+        osegs = non-empty-segments(op1),
+        last-original = last-of(osegs),
+        rsegs = non-empty-segments(rp1),
+        last-route = last-of(rsegs),
+        suffix = first s in piece-kinds if ends-with(rp1, "/" ++ s)
+                   and not (starts-with(last-original, "[") and ends-with(last-original, "]") and unwrap(last-original) == s): s,
+        token-escaped = last-original != unwrap(last-original) and unwrap(last-original) == config.route-token,
+        strip-token = last-route == config.route-token and not token-escaped,
+        stripped = suffix ?? (if strip-token then last-route else ""),
+        rp2 = if stripped != "" then without-end(rp1, stripped) else rp1,
+        op2 = if stripped != "" then without-end(op1, stripped) else op1,
+        # An index's name becomes `/`.
+        last-o2 = last-of(non-empty-segments(op2)),
+        index-escaped = last-o2 != unwrap(last-o2) and unwrap(last-o2) == config.index-token,
+        last-r2 = last-of(non-empty-segments(rp2)),
+        is-index = not index-escaped and last-r2 == config.index-token,
+        rp3 = if is-index and len(rsegs) == 1 then "/" else rp2,
+        layout = kind == "layout",
+        route-path = if is-index then or-else(without-end-slash(rp3, last-r2), if layout then "" else "/") else rp2,
+        original = if is-index then or-else(without-end-slash(op2, unwrap(last-o2)), if layout then "" else "/") else op2
+
+fn or-else(s: Text, other: Text) -> Text = if s == "" then other else s
+# `/x` at the end becomes `/`.
+fn without-end-slash(p: Text, segment: Text) -> Text = if ends-with(p, "/" ++ segment) then p[0..len(p) - len(segment)] else p
+
+# /\(([^)]+)\).(ts|js|tsx|jsx|vue)/
+fn disallowed-group?(name: Text) -> Bool = any i in 0..len(name) if name[i] == 40:
+  (match index-of(name[i + 1..len(name)], ")") {
+    some(k) if k >= 1 => any e in ["ts", "js", "tsx", "jsx", "vue"]: at?(name, i + 1 + k + 2, e) and i + 1 + k + 1 < len(name)
+    _ => false
+  })
+
+# removeExt
+fn without-ext(d: Text, add: Text) -> Text = match add {
+  "*" => d
+  "" => match last-index-of(d, ".") { some(i) if i > 0 => d[0..i]  _ => d }
+  ext => match last-index-of(d, ".") { some(i) => d[0..i] ++ ext  none => d }
+}
+
+fn route-extension?(name: Text) -> Bool = any e in [".tsx", ".ts", ".jsx", ".js", ".vue"]: ends-with(name, e)
+
+record Entry { name: Text, kind: Int }
+
+# A directory's entries in byte order, as libuv's scandir sorts them, without hidden and ignored ones.
+fn entries(dir: Text) -> [Entry] =
+  sort e in [Entry(name: line[1..len(line)], kind: line[0]) for line in split(dir-listing(dir), "\n") if line != ""
+             if not starts-with(line[1..len(line)], ".")
+             if not (config.ignore-prefix != "" and starts-with(line[1..len(line)], config.ignore-prefix))
+             if config.route-file-prefix == "" or starts-with(line[1..len(line)], config.route-file-prefix)] by e.name
+
+fn virtual-config?(name: Text) -> Bool = any e in ["ts", "js", "mts", "cts", "mjs", "cjs"]: name == "__virtual." ++ e
+
+# The route nodes of the routes directory: each directory's files in order, directories after,
+# level by level, as getRouteNodes' readdirs finish.
+fn read-nodes(dirs: [Text]) -> [RouteNode] = match len(dirs) {
+  0 => []
+  _ => [n for d in dirs for n in files-of(d)] ++ read-nodes([sub for d in dirs for e in entries(dir-path(d)) if e.kind == 100 for sub in [join-rel(d, e.name)]])
+}
+
+fn dir-path(rel: Text) -> Text = if rel == "" then config.routes-dir else config.routes-dir ++ "/" ++ rel
+fn join-rel(dir: Text, name: Text) -> Text = if dir == "" then name else dir ++ "/" ++ name
+
+fn files-of(rel: Text) -> [RouteNode] = match first e in es if e.kind != 100 and virtual-config?(e.name): e.name {
+  some(name) => fail-build(dir-path(rel) ++ "/" ++ name ++ ": virtual route configuration files are not supported by this generator (they need JavaScript run)")
+  none => [route-node(join-rel(rel, e.name), dir-path(rel) ++ "/" ++ e.name, e.name) for e in es if e.kind != 100 and route-extension?(e.name)]
+} where es = entries(dir-path(rel))
+
+# --- Sorting (multiSortBy) ------------------------------------------------------------------------
+
+# JavaScript compares strings by UTF-16 unit: a key whose bytes sort the same way (ASCII as it is,
+# anything else as its units in hex after a byte above ASCII).
+fn utf16-key(s: Text) -> Text = match ascii-text?(s) {
+  true => s
+  false => join([if u < 128 then byte-text(u) else byte-text(255) ++ hex4(u) for u in utf16-units(s)], "")
+}
+fn hex4(u: Int) -> Text = join([byte-text(hex-digit(u / 4096 % 16)), byte-text(hex-digit(u / 256 % 16)), byte-text(hex-digit(u / 16 % 16)), byte-text(hex-digit(u % 16))], "")
+fn hex-digit(d: Int) -> Int = if d < 10 then 48 + d else 87 + d
+
+# A sort key of numbers from -1 to 99999 and then a string: stable, as multiSortBy is.
+fn num-key(n: Int) -> Text = byte-text(48 + (n + 1) / 10000 % 10) ++ byte-text(48 + (n + 1) / 1000 % 10) ++ byte-text(48 + (n + 1) / 100 % 10) ++ byte-text(48 + (n + 1) / 10 % 10) ++ byte-text(48 + (n + 1) % 10)
+
+fn sign(b: Bool) -> Int = if b then -1 else 1
+
+# The order route files are processed in (generator.js's preRouteNodes).
+fn pre-sorted(nodes: [RouteNode]) -> [RouteNode] = [nodes[i] for i in order]
+  where order = sort i in [k for k in 0..len(nodes)] by pre-key(nodes[i], i)
+
+fn pre-key(n: RouteNode, i: Int) -> Text =
+  num-key(sign(n.route-path == "/")) ++ num-key(count-slash-parts(n.route-path))
+  ++ num-key(-sign(file-token?(n.file-path, config.index-token)))
+  ++ num-key(-sign(file-piece?(n.file-path)))
+  ++ num-key(sign(file-token?(n.file-path, config.route-token)))
+  ++ num-key(sign(ends-with(n.route-path, "/")))
+  ++ utf16-key(n.route-path) ++ byte-text(0) ++ num-key(i)
+
+fn file-piece?(p: Text) -> Bool = any k in piece-kinds: contains-text?(p, "." ++ k ++ ".") or contains-text?(p, "/" ++ k ++ ".")
+
+# sortRouteNodes
+fn tree-sorted(hs: [Handled]) -> [Handled] = [hs[i] for i in order]
+  where order = sort i in [k for k in 0..len(hs)] by tree-key(hs[i].node.route-path, i)
+
+fn tree-key(rp: Text, i: Int) -> Text =
+  num-key(sign(contains-text?(rp, "/__root"))) ++ num-key(count-slash-parts(rp))
+  ++ num-key(sign(last-of(non-empty-segments(rp)) == config.index-token))
+  ++ utf16-key(rp) ++ byte-text(0) ++ num-key(i)
+
+# --- Placing nodes in the tree (Generator.handleNode) ---------------------------------------------
+
+# A node placed: its parent (an id: a route file's index, or a virtual node's after them), and what
+# handleNode works out.
+record Handled { node: RouteNode, id: Int, parent: Int, path: Text, cleaned: Text, non-path: Bool }
+
+record Acc {
+  handled: [Handled],
+  by-path: {Text:Int},
+  pieces: {Text:{Text:RouteNode}},
+  virtuals: Int
+}
+
+# RoutePrefixMap: each route file's path to it, pieces left out (the last of a path wins).
+fn prefix-map(nodes: [RouteNode]) -> {Text:Int} =
+  {nodes[i].route-path: i for i in 0..len(nodes) if nodes[i].route-path != "" and nodes[i].route-path != "/__root" and not (nodes[i].kind in lazy-kinds)}
+
+# The longer paths a path is under, longest first.
+fn prefixes(p: Text) -> [Text] = match last-index-of(p, "/") {
+  some(i) if i > 0 => [p[0..i]] ++ prefixes(p[0..i])
+  _ => []
+}
+
+record Parent { id: Int, route-path: Text, original: Text }
+
+fn no-parent() -> Parent = Parent(id: -1, route-path: "", original: "")
+
+fn placed(nodes: [RouteNode]) -> Acc = fold acc = Acc(handled: [], by-path: {}, pieces: {}, virtuals: 0) for i in 0..len(nodes):
+  handle(acc, nodes[i], i, nodes, prefix-map(nodes), no-parent())
+
+fn parent-of(acc: Acc, nodes: [RouteNode], prefix: {Text:Int}, n: RouteNode, inherited: Parent) -> Parent = match from-handled {
+  some(h) if from-prefix.id == -1 or len(h.node.route-path) > len(from-prefix.route-path) => if h.id == from-prefix.id then from-prefix else Parent(id: h.id, route-path: h.node.route-path, original: h.node.original)
+  _ => if from-prefix.id != -1 then from-prefix else inherited
+} where from-prefix = match n.route-path {
+          "" | "/" => no-parent()
+          _ => match first p in prefixes(n.route-path) if is-some(prefix[p]) and nodes[prefix[p] ?? 0].route-path != n.route-path: prefix[p] ?? 0 {
+            some(k) => Parent(id: k, route-path: nodes[k].route-path, original: nodes[k].original)
+            none => no-parent()
+          }
+        },
+        from-handled = first p in (if n.route-path == "" then [] else prefixes(n.route-path)) if is-some(acc.by-path[p]): acc.handled[acc.by-path[p] ?? 0]
+
+# getRoutePathSegmentMetadataForPath
+fn meta-for-path(n: RouteNode, route-path: Text, parent-path: Text) -> [Seg] = match len(n.meta) {
+  0 => []
+  _ => if any m in result: has-meta?(m) then result else []
+} where segs = split(route-path, "/"),
+        base = count-segments(parent-path),
+        result = [if segs[i] == "" then no-seg() else meta-at(n.meta, base + len([s for s in segs[0..i] if s != ""]) + 1) for i in 0..len(segs)]
+
+fn handle(acc: Acc, n: RouteNode, id: Int, nodes: [RouteNode], prefix: {Text:Int}, inherited: Parent) -> Acc = match n {
+  # A piece: kept for its route, which, missing, is made as a virtual node of its own.
+  _ if not n.virtual and n.kind in lazy-kinds =>
+    match is-none(acc.by-path[n.route-path]) and n.route-path != "/__root" {
+      true => handle(recorded with { virtuals: acc.virtuals + 1 }, n with { virtual: true, kind: "static" }, len(nodes) + acc.virtuals, nodes, prefix, parent)
+      false => recorded
+    } where recorded = acc with { pieces: acc.pieces ++ {n.route-path: (acc.pieces[n.route-path] ?? {}) ++ {n.kind: n}} }
+  _ => acc with { handled: acc.handled ++ [h], by-path: if n.route-path != "" then acc.by-path ++ {n.route-path: len(acc.handled)} else acc.by-path }
+} where parent = parent-of(acc, nodes, prefix, n, inherited),
+        path = if parent.id != -1 then or-else(replace-first(n.route-path, parent.route-path, ""), "/") else n.route-path,
+        original-path = if n.original != "" and parent.original != "" then or-else(replace-first(n.original, parent.original, ""), "/") else n.original,
+        path-meta = meta-for-path(n, path, parent.route-path),
+        trimmed = trim-path-left(path),
+        split-path = split(trimmed, "/"),
+        last-route = split-path[len(split-path) - 1],
+        osplit = split(trim-path-left(original-path), "/"),
+        last-original = osplit[len(osplit) - 1],
+        non-path = (not meta-at(path-meta, len(split(path, "/")) - 1).lead and segment-pathless?(last-route, last-original))
+                   or (all part in split-path: has-group?(part)),
+        cleaned0 = without-groups(without-layouts(path, original-path, path-meta)),
+        cleaned1 = if n.kind == "layout" or n.kind == "pathless_layout" then without-trailing-slash(cleaned0) else cleaned0,
+        # A pathless layout with a path of its own is under the nearest real route above it.
+        relayout = if not n.virtual and n.kind == "pathless_layout" and cleaned1 != "" then layout-parent(acc, n) else none,
+        h = match relayout {
+          some(c) => Handled(node: n, id: id, parent: c.id, path: or-else(replace-first(n.route-path, c.node.route-path, ""), "/"),
+                             cleaned: without-groups(without-layouts(rel, orel, meta-for-path(n, rel, c.node.route-path))), non-path: non-path)
+            where immediate = or-else(without-last-segment(n.route-path), "/"),
+                  immediate-original = or-else(without-last-segment(n.original), "/"),
+                  rel = or-else(replace-first(immediate, c.node.route-path, ""), "/"),
+                  orel = or-else(replace-first(immediate-original, c.node.original, ""), "/")
+          none => Handled(node: n, id: id, parent: parent.id, path: path, cleaned: cleaned1, non-path: non-path)
+        }
+
+fn without-last-segment(p: Text) -> Text = match last-index-of(p, "/") { some(i) => p[0..i]  none => "" }
+
+fn layout-parent(acc: Acc, n: RouteNode) -> Handled? =
+  first p in search-paths(or-else(without-last-segment(n.route-path), "/"))
+    if (match acc.by-path[p] { some(k) => not acc.handled[k].node.virtual and acc.handled[k].path != "/"  none => false }):
+    acc.handled[acc.by-path[p] ?? 0]
+
+fn search-paths(p: Text) -> [Text] = match p {
+  "/" => ["/"]
+  "" => []
+  _ => [p] ++ search-paths(or-else(without-last-segment(p), "/"))
+}
+
+# --- The tree's text (Generator.buildRouteTree) ----------------------------------------------------
+
+record Tree { acc: Acc, nodes: [RouteNode], root: RouteNode }
+
+fn children-of(t: Tree, id: Int) -> [Handled] = [h for h in t.acc.handled if h.parent == id]
+fn top-level(t: Tree) -> [Handled] = [h for h in t.acc.handled if h.parent == -1]
+fn has-children?(t: Tree, h: Handled) -> Bool = any x in t.acc.handled: x.parent == h.id
+fn resolved-name(t: Tree, h: Handled) -> Text = h.node.variable ++ (if has-children?(t, h) then "RouteWithChildren" else "Route")
+
+fn parent-variable(t: Tree, h: Handled) -> Text = if h.parent == -1 then "rootRouteImport" else variable-of-id(t, h.parent) ++ "Route"
+fn variable-of-id(t: Tree, id: Int) -> Text = if id < len(t.nodes) then t.nodes[id].variable else ((first h in t.acc.handled if h.id == id: h.node.variable) ?? (panic "tanstack.routes: no node {}", id))
+
+# A route file's path from the tree's directory, without its extension unless configured.
+fn relative(file-path: Text) -> Text = relative-path(dir-of(config.tree-path), config.routes-dir ++ "/" ++ file-path)
+fn import-path(file-path: Text) -> Text = without-ext(relative(file-path), config.add-extensions)
+fn piece-path(n: RouteNode) -> Text = if ends-with(n.file-path, ".vue") then relative(n.file-path) else import-path(n.file-path)
+
+# path.relative between absolute paths.
+fn relative-path(from: Text, to: Text) -> Text = join([".." for s in fs[common..len(fs)]] ++ ts[common..len(ts)], "/")
+  where fs = non-empty-segments(path-normalize(from)),
+        ts = non-empty-segments(path-normalize(to)),
+        common = (first i in 0..min(len(fs), len(ts)) if fs[i] != ts[i]: i) ?? min(len(fs), len(ts))
+
+fn import-source(n: RouteNode) -> Text = match config.absolute-imports {
+  true => without-ext(path-normalize(config.routes-dir ++ "/" ++ n.file-path), config.add-extensions)
+  false => "./" ++ import-path(n.file-path)
+}
+
+fn full-package() -> Text = "@tanstack/" ++ config.target ++ "-router"
+
+# stripFullPath, inferFullPath, inferTo, inferPath
+fn strip-full-path(n: RouteNode) -> Text = match full {
+  "" => "/"
+  _ if ends-with(n.route-path, "/") => full
+  _ => without-trailing-slash(full)
+} where full = without-groups(without-layouts(n.route-path, n.original, n.meta))
+fn full-path-of(n: RouteNode) -> Text = or-else(strip-full-path(n), "/")
+fn to-of(n: RouteNode) -> Text = if full-path-of(n) == "/" then "/" else without-trailing-slash(full-path-of(n))
+fn path-of(h: Handled) -> Text = if h.cleaned == "/" then "/" else without-trailing-slash(h.cleaned)
+
+record Keyed { key: Text, h: Handled }
+
+# A JavaScript Map built by setting keys in order: each key where it was first set, its last value.
+fn map-order(entries: [Keyed]) -> [Keyed] = [Keyed(key: entries[i].key, h: last-for[entries[i].key] ?? entries[i].h) for i in 0..len(entries)
+                                            if ((first j in 0..len(entries) if entries[j].key == entries[i].key: j) ?? -1) == i]
+  where last-for = {e.key: e.h for e in entries}
+
+fn pathless?(h: Handled) -> Bool = h.node.kind == "pathless_layout"
+fn index-node?(h: Handled) -> Bool = ends-with(h.node.route-path, "/")
+
+# createRouteNodesByFullPath: the first that may stand for a full path, unless a later one replaces it.
+fn by-full-path(hs: [Handled]) -> [Keyed] = map-order(fold kept = [] for h in hs:
+  match (last k in kept if k.key == full-path-of(h.node): k) {
+    _ if full-path-of(h.node) == "/" and (match (last k in kept if k.key == "/": k) { some(e) => e.h.cleaned == "/" and h.cleaned != "/"  none => false }) => kept
+    some(e) if pathless?(h) != pathless?(e.h) and pathless?(h) => kept
+    _ => kept ++ [Keyed(key: full-path-of(h.node), h: h)]
+  })
+
+# createRouteNodesByTo, over the nodes without an index child.
+fn by-to(t: Tree, hs: [Handled]) -> [Keyed] = map-order(fold kept = [] for h in hs if not (any c in children-of(t, h.id): c.cleaned == "/"):
+  match (last k in kept if k.key == to-of(h.node): k) {
+    some(e) if index-node?(h) != index-node?(e.h) and not index-node?(h) => kept
+    some(e) if index-node?(h) == index-node?(e.h) and pathless?(h) != pathless?(e.h) and pathless?(h) => kept
+    _ => kept ++ [Keyed(key: to-of(h.node), h: h)]
+  })
+
+fn by-id(hs: [Handled]) -> [Keyed] = map-order([Keyed(key: h.node.route-path, h: h) for h in hs])
+
+fn interface-entries(t: Tree, ks: [Keyed], all: Bool) -> Text = join(["'" ++ k.key ++ "': typeof " ++ resolved-name(t, k.h) for k in ks if all or k.key != ""], ",")
+
+# buildRouteTreeConfig
+fn tree-config(t: Tree, hs: [Handled]) -> [Text] = [part for h in hs if h.node.kind != "__root" and has-children?(t, h)
+  for part in [join([join(tree-config(t, children-of(t, h.id)), "\n"),
+                     if config.disable-types then "" else "interface " ++ h.node.variable ++ "RouteChildren {\n  " ++ child-entries(t, h, true) ++ "\n}",
+                     "const " ++ h.node.variable ++ "RouteChildren" ++ (if config.disable-types then "" else ": " ++ h.node.variable ++ "RouteChildren")
+                       ++ " = {\n  " ++ child-entries(t, h, false) ++ "\n}",
+                     "const " ++ h.node.variable ++ "RouteWithChildren = " ++ h.node.variable ++ "Route._addFileChildren(" ++ h.node.variable ++ "RouteChildren)"], "\n\n")]]
+
+fn child-entries(t: Tree, h: Handled, typed: Bool) -> Text =
+  join([c.node.variable ++ "Route: " ++ (if typed then "typeof " else "") ++ resolved-name(t, c) for c in children-of(t, h.id)], ",")
+
+fn pieces-of(t: Tree, route-path: Text) -> {Text:RouteNode} = t.acc.pieces[route-path] ?? {}
+
+fn component-pieces(ps: {Text:RouteNode}, separator: Text) -> Text =
+  join([k ++ ": lazyRouteComponent(() => import('./" ++ piece-path(p) ++ "'), '" ++ (if ends-with(p.file-path, ".vue") then "default" else k) ++ "')"
+        for k in ["component", "errorComponent", "notFoundComponent", "pendingComponent"] if let some(p) = ps[k]], separator)
+
+fn has-component-pieces?(ps: {Text:RouteNode}) -> Bool = any k in ["component", "errorComponent", "notFoundComponent", "pendingComponent"]: is-some(ps[k])
+
+fn update-route(t: Tree, h: Handled) -> Text =
+  "const " ++ v ++ "Route = " ++ v ++ "RouteImport.update({\n            "
+  ++ join(["id: '" ++ h.path ++ "'"] ++ (if not h.non-path or (pathless?(h) and h.cleaned != "") then ["path: '" ++ h.cleaned ++ "'"] else [])
+          ++ ["getParentRoute: () => " ++ parent-variable(t, h)], ",")
+  ++ "\n          }" ++ (if config.disable-types then "" else "as any") ++ ")"
+  ++ (match ps["loader"] { some(l) => ".updateLoader({ loader: lazyFn(() => import('./" ++ import-path(l.file-path) ++ "'), 'loader') })"  none => "" })
+  ++ (if has-component-pieces?(ps) then ".update({\n                " ++ component-pieces(ps, "\n,") ++ "\n              })" else "")
+  ++ (match ps["lazy"] {
+        some(l) => ".lazy(() => import('./" ++ piece-path(l) ++ "').then((d) => " ++ (if ends-with(l.file-path, ".vue") then "d.default" else "d.Route") ++ "))"
+        none => ""
+      })
+  where v = h.node.variable, ps = pieces-of(t, h.node.route-path)
+
+fn root-route-update(t: Tree) -> Text? = match has-component-pieces?(root-pieces) {
+  false => none
+  true => some("export const routeTree = rootRouteImport.update({\n              " ++ component-pieces(root-pieces, "\n,") ++ "\n            })._addFileChildren(rootRouteChildren)"
+               ++ (if config.disable-types then "" else "._addFileTypes<FileRouteTypes>()"))
+} where root-pieces = pieces-of(t, "/__root")
+
+fn by-path-interface(t: Tree, sorted: [Handled]) -> Text =
+  "declare module '" ++ full-package() ++ "' {\n  interface FileRoutesByPath {\n    "
+  ++ join(["'" ++ h.node.route-path ++ "': {\n          id: '" ++ h.node.route-path ++ "'\n          path: '" ++ path-of(h)
+           ++ "'\n          fullPath: '" ++ full-path-of(h.node) ++ "'\n          preLoaderRoute: typeof " ++ h.node.variable
+           ++ "RouteImport\n          parentRoute: typeof " ++ parent-variable(t, h) ++ "\n        }" for h in sorted], "\n")
+  ++ "\n  }\n}"
+
+fn type-interfaces(t: Tree) -> Text = join([
+  "export interface FileRoutesByFullPath {\n" ++ interface-entries(t, full, false) ++ "\n}",
+  "export interface FileRoutesByTo {\n" ++ interface-entries(t, tos, false) ++ "\n}",
+  "export interface FileRoutesById {\n'__root__': typeof rootRouteImport,\n" ++ interface-entries(t, ids, true) ++ "\n}",
+  "export interface FileRouteTypes {\nfileRoutesByFullPath: FileRoutesByFullPath\nfullPaths: " ++ alternatives(hs, full)
+    ++ "\nfileRoutesByTo: FileRoutesByTo\nto: " ++ alternatives(hs, tos)
+    ++ "\nid: " ++ join(["'__root__'"] ++ ["'" ++ k.key ++ "'" for k in ids], "|") ++ "\nfileRoutesById: FileRoutesById\n}",
+  "export interface RootRouteChildren {\n" ++ join([h.node.variable ++ "Route: typeof " ++ resolved-name(t, h) for h in top-level(t)], ",") ++ "\n}"], "\n")
+  where hs = t.acc.handled, full = by-full-path(hs), tos = by-to(t, hs), ids = by-id(hs)
+
+fn alternatives(hs: [Handled], ks: [Keyed]) -> Text = match len(hs) {
+  0 => "never"
+  _ => join(["'" ++ k.key ++ "'" for k in ks if k.key != ""], "|")
+}
+
+record Import { source: Text, names: [Text] }
+
+fn import-text(i: Import) -> Text = if len(i.names) == 0 then "" else "import { " ++ join(i.names, ", ") ++ " } from '" ++ i.source ++ "'"
+
+# The tree's text before formatting (buildRouteTree).
+fn unformatted(t: Tree) -> Text = join([x for x in config.header ++ [
+    "// This file was automatically generated by TanStack Router.\n// You should NOT make any changes in this file as it will be overwritten.\n// Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.",
+    import-text(Import(source: full-package(), names: (if len(virtuals) > 0 then ["createFileRoute"] else [])
+                                                      ++ (if has-components then ["lazyRouteComponent"] else []) ++ (if has-loaders then ["lazyFn"] else []))),
+    join([import-text(Import(source: import-source(t.root), names: ["Route as rootRouteImport"]))]
+         ++ [import-text(Import(source: import-source(h.node), names: ["Route as " ++ h.node.variable ++ "RouteImport"])) for h in sorted if not h.node.virtual], "\n"),
+    join(["const " ++ h.node.variable ++ "RouteImport = createFileRoute('" ++ h.node.route-path ++ "')()" for h in virtuals], "\n"),
+    join([update-route(t, h) for h in sorted], "\n"),
+    if config.disable-types then "" else type-interfaces(t),
+    if config.disable-types then "" else by-path-interface(t, sorted),
+    join(tree-config(t, top-level(t)), "\n"),
+    "const rootRouteChildren" ++ (if config.disable-types then "" else ": RootRouteChildren") ++ " = {\n  "
+      ++ join([h.node.variable ++ "Route: " ++ resolved-name(t, h) for h in top-level(t)], ",") ++ "\n}\n"
+      ++ (root-route-update(t) ?? "export const routeTree = rootRouteImport._addFileChildren(rootRouteChildren)" ++ (if config.disable-types then "" else "._addFileTypes<FileRouteTypes>()"))
+  ] ++ config.footer if x != ""], "\n\n")
+  where sorted = tree-sorted(t.acc.handled),
+        virtuals = [h for h in sorted if h.node.virtual],
+        piece-sets = [pieces-of(t, h.node.route-path) for h in sorted],
+        has-components = any ps in piece-sets: has-component-pieces?(ps),
+        has-loaders = any ps in piece-sets: is-some(ps["loader"])
+
+# checkRouteFullPathUniqueness, over the leaves.
+fn unique(t: Tree) -> Bool = match first h in leaves if h.node.route-path == "": h {
+  some(_) => fail-build("Invalid route path \"\" was found. Root routes must be defined via __root.tsx (createRootRoute), not createFileRoute('') or a route file that resolves to an empty path.\nConflicting files: \n "
+                        ++ join([config.routes-dir ++ "/" ++ h.node.file-path for h in leaves if h.node.route-path == ""], "\n ") ++ "\n")
+  none => match len(conflicting) {
+    0 => true
+    n => fail-build("Conflicting configuration paths were found for the following route" ++ (if n > 1 then "s" else "") ++ ": "
+                    ++ join(["\"" ++ strip-full-path(h.node) ++ "\"" for h in conflicting], ", ")
+                    ++ ".\nPlease ensure each Route has a unique full path.\nConflicting files: \n "
+                    ++ join([config.routes-dir ++ "/" ++ h.node.file-path for h in conflicting], "\n ") ++ "\n")
+  }
+} where leaves = [h for h in tree-sorted(t.acc.handled) if not has-children?(t, h) and h.node.kind != "lazy"],
+        conflicting = [h for h in leaves if len([x for x in leaves if strip-full-path(x.node) == strip-full-path(h.node)]) > 1]
+
+# --- The generator ------------------------------------------------------------------------------
+
+# What generating writes: the tree's path and text, and the route files it changed (scaffolded or
+# fixed), each a path and its new text.
+record Generated { path: Text, text: Text, edits: [files.Edit] }
+
+fn root-node(nodes: [RouteNode]) -> RouteNode = match first n in nodes if n.route-path == "/__root" and not (n.kind in piece-kinds): n {
+  some(n) => n with { kind: "__root", variable: "root" }
+  none => match first n in nodes if n.route-path == "/__root": n {
+    some(n) => n with { kind: "__root", variable: "root" }
+    none => fail-build("rootRouteNode must not be undefined. Make sure you've added your root route into the route-tree.\nMake sure that you add a \"__root."
+                       ++ (if config.disable-types then "js" else "tsx") ++ "\" file to your routes directory.\nAdd the file in: \""
+                       ++ config.routes-dir ++ "/__root." ++ (if config.disable-types then "js" else "tsx") ++ "\"")
+  }
+}
+
+# The route tree for the project at `root`, and the route files to change, worked out without
+# writing anything.
+fn generated(root: Text) -> Generated = with config = c { generated-with(c) } where c = cfg.read(root)
+
+fn generated-with(c: cfg.Config) -> Generated = Generated(path: c.tree-path, text: text, edits: [e for e in root-edit ++ [r.edit for r in results] if e.path != ""])
+  where all-nodes = read-nodes([""]),
+        root = root-node(all-nodes),
+        root-edit = [files.scaffolded-root(root.full-path, c)],
+        pre = [n for n in pre-sorted(all-nodes) if n.route-path != "/__root" or n.kind in piece-kinds],
+        results = [files.processed(n.full-path, n.file-path, n.route-path, n.kind, c) for n in pre],
+        nodes = [pre[i] for i in 0..len(pre) if results[i].route],
+        t = Tree(acc: placed(nodes), nodes: nodes, root: root),
+        raw = if unique(t) then unformatted(t) else "",
+        text = if c.formatting then pretty.formatted(raw, c.tree-path, c.semicolons, c.single-quote) else raw
+
+# Generate: write the route files changed and the tree, each only when its text changed.
+fn generate!(root: Text) -> Void = write-files!([w.path for w in changed], [w.text for w in changed], ["" for w in changed])
+  where g = generated(root),
+        changed = [w for w in g.edits ++ [files.Edit(path: g.path, text: g.text)] if not readable-file?(w.path) or read-file(w.path) != w.text]
+
