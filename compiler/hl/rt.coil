@@ -6210,7 +6210,10 @@
    (stacks (ArrayList (ArrayList DepFrame)))
    (computed i64)
    (tracking bool)
-   (untracked i64)])
+   (untracked i64)
+   ;; How many nodes with text the cache held when it was read: those numbered below are an earlier
+   ;; run's, whose answers, made again while all they read is unchanged, are what they were.
+   (before i64)])
 
 (defn deps [] (-> (ptr Deps))
   (let [d (primitive/alloc-static Deps)]
@@ -7218,6 +7221,17 @@
                 (when (dep-tracing-checks?)
                   (println "[deps] checked {}, {} reads" node (len reads)))
                 true))))))
+
+;;; Whether a memo's answer is an earlier run's (read with the cache) and all it read is unchanged:
+;;; then it is what it was, whether or not its value was saved. An answer kept only in memory is
+;;; not saved, and after a restart need not be made again for what read it to be current; made again
+;;; when its value is asked for, it is the same, and changes nothing that read it.
+(defn dep-earlier-current? [(me i64)] (-> bool)
+  (let [d (deps)]
+    (deps-lock! d)
+    (let [earlier (and (not (numbered? me)) (< me (.before d)))]
+      (deps-unlock! d)
+      (and earlier (dep-still-id? me)))))
 
 ;;; Whether a node is a memo's answer, which bringing up to date may compute: one whose text names
 ;;; its function and key.
@@ -8747,6 +8761,7 @@
   (atomic/store (field d revision) (take-int r))
   (set! (.computed d) (take-int r))
   (set! (.texts d) (take-texts r))
+  (set! (.before d) (len (.texts d)))
   (set! (.changed d) (take-ints r))
   (set! (.verified d) (take-ints r))
   (set! (.reads d) (take-int-lists r))
@@ -8890,9 +8905,12 @@
   (set! (mut (.pending (loading-state))) name 1)
   0)
 
-;;; Memo answers' nodes of `name` (or, with "", of every memo not pending) no store claimed: their
-;;; key cannot be made again, so nothing finds them by text, and they count as changed to whatever
-;;; checks what read them, which nothing does unless something else it read changed.
+;;; Memo answers' nodes of `name` (or, with "", of every memo not pending) no store claimed, of a
+;;; memo whose arguments cannot be made again from its key: nothing finds them by text, and they
+;;; count as changed to whatever checks what read them, which nothing does unless something else it
+;;; read changed. A memo whose key is its one argument keeps its unclaimed nodes, what they read
+;;; and when they changed: an answer not saved (kept only in memory) is then current after a restart
+;;; while all it read is, and what read it with it (see `dep-earlier-current?`).
 (defn dep-unclaimed-of! [(name (slice u8))] (-> void)
   (let [d (deps)
         l (loading-state)]
@@ -8904,6 +8922,7 @@
                 (let [owner (subslice t 0 cut)]
                   (when (and (< i (len (.claimed l)))
                              (not (get (.claimed l) i))
+                             (match (get (.by-argument l) owner) (Some [_] false) (None [] true))
                              (if (= (len name) 0)
                                  (match (get (.pending l) owner)
                                    (Some [_] false)
@@ -8923,6 +8942,10 @@
 (defstruct Loading
   [(claimed (ArrayList bool))
    (pending (HashMap (slice u8) i64))
+   ;; Memos whose key is their one argument, a number or text, as their nodes' texts write it: an
+   ;; answer's node no store claimed is still found by its text, and made again from it (see
+   ;; `dep-unclaimed-of!`).
+   (by-argument (HashMap (slice u8) i64))
    (log-end i64)
    (compacted i64)
    (kept-revision i64)
@@ -8936,8 +8959,16 @@
       (set! (.claimed l) (ArrayList::new [bool] (malloc-allocator)))
       (set! (.pending l)
             (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
+      (set! (.by-argument l)
+            (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
       (set! (.ready l) true))
     l))
+
+;;; A memo whose key is its one argument, read from the cache: its answers' nodes are found by text,
+;;; and an answer not saved is made again from its key.
+(defn memo-keyed-by-argument! [(name (slice u8))] (-> void)
+  (set! (mut (.by-argument (loading-state))) name 1)
+  0)
 
 ;;; What wrote the cache and what reads it must be the same build of the program: the executable,
 ;;; by where it is and its size and time.
