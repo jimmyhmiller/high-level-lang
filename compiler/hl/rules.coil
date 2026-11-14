@@ -9816,6 +9816,13 @@
 ;;; A value's text, as a key: see `keyable?`.
 ;;; What a memo is looked up by: its one argument when that is an Int or Text, or else its
 ;;; arguments' text joined.
+;;; Whether a memo's key is its one argument, a number or text: an answer's node then says, by its
+;;; text, all the answer is made from, and it can be made again from that alone.
+(defn key-is-argument? [(f Func)] (-> bool)
+  (and (= (len (.params f)) 1)
+       (or (= (.ty (get (.params f) 0)) "Int")
+           (= (.ty (get (.params f) 0)) "Text"))))
+
 (defn memo-key-type [(f Func)] (-> (slice u8))
   (if (and (= (len (.params f)) 1)
            (or (= (.ty (get (.params f) 0)) "Int")
@@ -10498,7 +10505,9 @@
                        (when ~any-change (rt/dep-any-change-node! id))
                        (push! (mut (.pending s)) id)
                        (push! (mut (.pending s)) at))))
-                `(for _ (range 0 n)
+                `(do
+                   ~(if (key-is-argument? f) `(rt/memo-keyed-by-argument! ~qname) `0)
+                   (for _ (range 0 n)
                    (let [key ~(if int-key `(rt/take-int r) `(rt/take-text r))
                          id (rt/take-int r)
                          at (rt/take-varint r)]
@@ -10506,7 +10515,7 @@
                      (when ~any-change (rt/dep-any-change-node! id))
                      (set! (mut (.lazy s)) key at)
                      (set! (mut (.node-ids s)) key id)
-                     (rt/dep-claim! id))))
+                     (rt/dep-claim! id)))))
            (when (rt/take-bool r)
              ~(if tree
                   `(panic "memo fn {} saved a last answer by a key that holds trees"
@@ -11274,14 +11283,26 @@
                 ;; Checking an answer asks only whether it is current: one the cache holds and this
                 ;; run has not read, all of whose inputs are unchanged, is, and stays unread. Only
                 ;; an answer checked by its reads has them noted; any other the entry checks.
-                (if (and unread
-                         (or (rt/dep-current-id? id)
-                             (and ~(if (>= (kept-number (mut k) name) 0)
-                                       `(= (rt/kept-check ~(kept-number (mut k)
-                                                                        name))
-                                           0)
-                                       `true)
-                                  (rt/dep-still-id? id))))
+                (if (or (and unread
+                             (or (rt/dep-current-id? id)
+                                 (and ~(if (>= (kept-number (mut k) name) 0)
+                                           `(= (rt/kept-check ~(kept-number (mut k)
+                                                                            name))
+                                               0)
+                                           `true)
+                                      (rt/dep-still-id? id))))
+                        ;; An earlier run's answer this run holds nowhere (one kept only in memory):
+                        ;; current, while all it read is, without being made again.
+                        (and (not unread)
+                             (do
+                               (rt/spin-lock! word)
+                               (let [held (match (get (.args s) key) (Some [_] true) (None [] false))]
+                                 (rt/spin-unlock! word)
+                                 (not held)))
+                             ~(if (>= (kept-number (mut k) name) 0)
+                                  `(= (rt/kept-check ~(kept-number (mut k) name)) 0)
+                                  `true)
+                             (rt/dep-earlier-current? id)))
                     0
                     (do
                       (~(sym (cat "memo-fault--" name)) s key)
@@ -11290,10 +11311,14 @@
                         (rt/spin-unlock! word)
                         (match found
                           (Some [a] (do (~entry ~@stored) 0))
+                          ;; An answer not saved, of an earlier run (see `dep-earlier-current?`): its
+                          ;; key is its one argument, so it is made again from that.
                           (None []
-                                (panic "memo fn {} has no arguments for {}"
-                                       ~name
-                                       text)))))))))
+                                ~(if (key-is-argument? f)
+                                     `(do (~entry key) 0)
+                                     `(panic "memo fn {} has no arguments for {}"
+                                             ~name
+                                             text))))))))))
     ;; Its answers forgotten, when a setting it reads is given again while nothing is tracked:
     ;; said now (`stale`), and done when the store is next asked or read whole (`memo-forgotten--`),
     ;; so a build's last answers, which nothing asks for again, are not emptied one by one as its
@@ -11792,7 +11817,11 @@
                                                                                 old
                                                                                 fresh)))))))
                                                         (None []
-                                                              (do
+                                                              (let [;; An earlier run's answer, not saved, all it read unchanged: made
+                                                                    ;; again, it is what it was (see `dep-earlier-current?`).
+                                                                    was-current (and tracking
+                                                                                     (= check 0)
+                                                                                     (rt/dep-earlier-current? node))]
                                                                 ~(made-check (mut k)
                                                                              name)
                                                                 (when tracking
@@ -11812,7 +11841,7 @@
                                                                     (if (= check
                                                                            0)
                                                                         (rt/dep-end-id! node
-                                                                                        false)
+                                                                                        was-current)
                                                                         (rt/dep-end-ignoring-reads! node
                                                                                                     false
                                                                                                     (or (= check
