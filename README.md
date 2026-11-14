@@ -828,6 +828,90 @@ changed are sent; `hmr.facts` (Datalog, 4 rules) finds which modules run again, 
 that call `import.meta.hot.accept()`, and reloads when an entry that does not accept changed.
 `import.meta.hot.dispose` and `hot.data` carry state across a replacement.
 
+### Patching statements in place
+
+Most edits don't re-run a module at all. If an edit changes only a function, an inert value (a
+literal, an arrow function, an object of them), or a class's methods, `--hmr` sends a patch. The
+patch gives those names their new values inside the running module, so the module keeps its state:
+its counters, caches, singletons and open connections. Other modules see the change straight away,
+because they read imports through live namespaces. A class keeps its identity. Its new methods go
+onto the class that already exists (`super` still resolves as before), so the instances it already
+made use them. A function the edit adds goes into the patch's own scope. A function the edit removes
+is fine as long as nothing still names it.
+
+```
+[hmr] apps/hmrpatch/counter.js: patched bump
+[hmr] apps/hmrpatch/shapes.js: patched Counter.prototype.inc
+[hmr] apps/hmrpatch/store.js runs again: statement 3 (`export const store = createStore(reducer);`) captured `reducer` when it ran, and the edit changed it
+[hmr] apps/hmrpatch/store.js runs again: statement 6 (`export const initial = start();`) ran `start` when it ran, and the edit changed `base`
+[hmr] three.core.js runs again: statement 258 (`const MathUtils = {`) captured `clamp` when it ran, and the edit changed it
+```
+
+A patch is only sent when it gives the same result as running the module again would have, apart
+from the state it keeps. Otherwise the module runs again, as before, and the client is told which
+statement made that necessary. Two kinds of facts make the decision.
+
+**What changed** is worked out per module by comparing the two builds statement by statement
+(`plan-of` in `hmr.attrs`). A statement's role depends on whether it runs anything when defined,
+using the same test fragments use (`evaluation.rules`' `inert-stmt`):
+
+- *Declares*: a function, or an inert value. A patch can give it a new value.
+- *Methods*: a class. A patch can replace its methods.
+- *Runs*: anything else. It already ran when the module loaded, and can't be undone.
+
+If a Runs statement changes, appears or disappears, the module runs again. It also runs again if:
+
+- its imports changed;
+- it accepts its own updates (its author asked for a re-run);
+- it is CommonJS;
+- a class's constructor, fields, heritage or static members changed;
+- a class whose methods changed has private names, which the new methods could not reach on old
+  instances;
+- a removed name is still mentioned somewhere;
+- a Runs statement mentions a name the edit adds.
+
+**What already ran with the old value** is Datalog (`hmr.facts`), fed from the shape the
+development format already computes for each module. For each statement that ran, the facts record
+what it read, what it called or constructed, and which properties it used by name. For each
+function, class constructor and method, they record the same about its code. `provides` follows
+exports through `export … from` and `export *`. `spoiled` holds every name whose code, if run now,
+would read or call something the patch changes. `stale` holds every statement that read a changed
+name as it ran (it *captured* the old value), or ran spoiled code. A module with a stale statement,
+in any module, runs again, and the usual rules then decide whether that propagates up to a module
+that accepts updates or to a page reload. `why-stale` gives the derivation, and the client's note
+prints it as the chain of code the statement ran.
+
+What counts as "ran" follows fragments' rule: a function passed as a value (`render(App)`,
+`addEventListener("click", f)`) has not run, but a call has. A function called where it is written
+counts as run, and so does one passed to an array method that calls it immediately (`forEach`,
+`map`, …). `x.m()` and `x.m` may run any method or getter named `m` on any class.
+
+To patch, each ES module's function first gives the runtime an evaluator for its own scope
+(`(c) => eval(c)`). A patch is code evaluated there, so its assignments reach the module's own
+bindings. Each patch returns the evaluator for the scope it created, so a function it added is
+visible to later patches. It then gives the module's namespace its exports again. A patch that
+throws reloads the page.
+
+Limits:
+
+- A getter or method reached through a computed key (`x[k]`) is not counted as run.
+- A function value captured inside another value, and called later, keeps the old code.
+- What a stored callback did before the edit stays as it was. The page shows old output until
+  something calls the code again.
+- Modules that accept their own updates are always re-run, never patched.
+
+`tools/hmr-check.py` checks each of these behaviours on `tests/apps/hmrpatch`. On every edit it also
+checks that nothing that should have kept running ran again, and that the bundle the watcher wrote
+matches a fresh build.
+
+What it costs: each module's statements are now analysed and printed one at a time, and every
+update solves the facts for the whole graph. On three.js (`three.module.js` and `three.core.js`,
+1.1 MB, -O3, macOS, interleaved with the build before), a development build's first run goes from
+about 61 to about 90 ms. An edit to a `Vector3` method goes from about 40 ms, which ended in a
+reload, to about 62 ms, which ends in a patch. On the small apps the check uses, an update takes
+0.5 ms either way. Normal bundles are unchanged: `tools/same.py` finds all 189 outputs byte for
+byte the same.
+
 ### Memory while watching
 
 A run that builds once keeps every value until it exits. A watcher lets go of what its builds no
