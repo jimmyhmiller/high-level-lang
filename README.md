@@ -518,6 +518,108 @@ Limits:
 - What-if does not try making an import lazy, which would change the roots, not only the facts.
 - Stylesheets are not in the ledger.
 
+## Lints over what ships
+
+`--lint=FILE` (in a spec, `lint "FILE"`) runs rules over what the build ships. The rules file is
+a project's own `.lint`, read when the build runs, as a spec is; changing it needs no new bundler.
+Rules are Datalog with negation, comparisons, tests of text (`starts-with`, `ends-with`,
+`contains`) and `count`, `sum`, `min` and `max`. JavaScript patterns are atoms:
+`code(P, `process.env.$N`)` holds for every statement `P` with code the pattern matches, and binds
+`N`. The relations are the build's own (`esb --lint-relations` lists them, `src/bundle/shipped.rules`
+gives them):
+
+- what each route ships and to the byte (`ships`, `bytes`, `route-bytes`);
+- what it needs, from its root, by what statements read (`reaches`);
+- what each statement needs, in its module or through an import (`needs`), and what it reads of
+  other modules, by name or whole (`reads`, `reads-whole`);
+- what stays for its side effects (`effect`), and what is in the output (`live`);
+- modules, packages and the copy each comes from, imports, `import()`s, exports, and the project's
+  dependencies.
+
+They are what linking and tree shaking decided, not the import graph of the source, so an import
+nothing uses is no finding, and code that ships through a re-export is.
+
+```
+public-prefix("PUBLIC_");
+env-read(P, N) :- code(P, `process.env.$N`) ;
+public(N) :- env-read(_, N), public-prefix(X), starts-with(N, X) ;
+lint secret-shipped error at P "process.env.{N} is in code {R} sends to the browser" :-
+  platform("browser"), ships(R, P), env-read(P, N), !public(N) ;
+```
+
+A finding says where it is and why, row by row. Each row was made by rows that came before it, so
+an explanation ends. For a route that ships a statement, the explanation goes on into linking's own
+chain from the route's root:
+
+```
+src/config.js:1: error [secret-shipped] process.env.STRIPE_SECRET is in code src/main.js sends to the browser
+    export const config = {
+  because
+    platform(browser)
+    ships(src/main.js, src/config.js:1)
+      src/main.js:6  render(config, label("main"));
+      -> config in src/config.js:1  export const config = {
+    env-read(src/config.js:1, STRIPE_SECRET)
+      `process.env.$N` at src/config.js:2, STRIPE_SECRET
+    no public(STRIPE_SECRET)
+```
+
+An error stops the build before it writes anything. Warnings are said beside what it writes. While
+watching, both are said after each build and the watcher goes on, and the rules file is watched as
+any input is (`keep bundle.lint/file-program`). Lints change nothing a build writes.
+
+`examples/ship.lint` is a library of such rules:
+
+- **Secrets:** `process.env` reads, not public, in what a browser route ships.
+- **Left from debugging:** `debugger` statements, and the project's own `console.log`s.
+- **Layering:** what `src/ui` needs, at any distance, must not be `src/db`'s.
+- **Budgets:** per route, and per package in a route.
+- **Packages:** a package shipped in two copies, with the chain that ships each; dependencies of
+  which nothing ships; the project reading a package's module whole.
+- **At load:** I/O in code that may run as its module loads.
+- **Splitting:** an `import()` whose module the entry ships anyway.
+- **Exports:** the project's exports that nothing shipped reads.
+- **Kept only for side effects:** a package's statements that ship only because they run as their
+  module loads, and all only they need. On three.js it finds three.module.js keeping 171,467
+  bytes for 13 such statements, what the analysis's page showed by hand.
+
+The rules are checked before anything is solved, each error at its place in the file:
+
+- every relation named is the build's or derived by a rule, at its arity;
+- every variable is bound;
+- nothing is negated or aggregated through recursion;
+- every pattern is one js.syntax reads;
+- no rule adds to what the build gives;
+- every name a message uses is bound.
+
+Literals are solved in the order written, each test as soon as what it tests is bound. A variable
+of a negated atom that nothing else binds stands for any value.
+
+The engine (`src/bundle/lint.rules`) solves stratum by stratum, semi-naively: each round joins only
+what the last added. It indexes what a stratum reads of those below once for all its rounds, and
+explains from indexes of the final rows. The whole library adds about 80 ms to zod's build and
+110 ms to three.js's at `-O1`.
+
+`tools/lint-check.py`, part of `tools/verify.py`, checks:
+
+- the fixture `tests/apps/lint`'s findings, exactly, and their explanations;
+- that lints change no output;
+- each kind of rule error;
+- watching, and a spec's `lint`;
+- the library over real libraries, which finds no error.
+
+Limits:
+
+- `needs` is reading, not calling, so a rule about what runs says "may".
+- A pattern matches the source as parsed (before defines and minifying), node for node: `$X` is
+  anything, and `$$X` the rest of a list. A pattern holds no backquote.
+- A statement is a top-level one: a pattern's match inside a function is that function's
+  statement.
+- Values are text, compared as numbers only by `<`, `<=`, `>` and `>=`.
+- An aggregate's explanation shows the first five rows it counted.
+- Dependencies are read from the `package.json` where the build runs.
+- Stylesheets are not in the relations.
+
 ## Paired client/server builds
 
 A target with `client-outfile` builds one server entry and discovers browser entries from its

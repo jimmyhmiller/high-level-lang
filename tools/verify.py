@@ -447,6 +447,11 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and " passed, 0 failed" in out, "--blame and --what-if: "
       + (out.strip().splitlines()[-1] + " (identity, accounting, counterfactual trees built, what-if edits built, plans, watching)" if code == 0 else out[-1800:]))
 
+print("== lints over what ships")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lint-check.py"), ESB, SPEC], 300)
+check(code == 0 and " passed, 0 failed" in out, "--lint: "
+      + (out.strip().splitlines()[-1] + " (findings and their explanations, outputs unchanged, rule errors, watching, specs, real libraries)" if code == 0 else out[-1800:]))
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "

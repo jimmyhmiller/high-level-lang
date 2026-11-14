@@ -25,7 +25,9 @@ use bundle.finish as fin
 use bundle.hmr as hmr
 use bundle.chunking as packing
 use bundle.analyze as analyze
-use bundle.ledger as ledger
+use bundle.ledger as led
+use bundle.lint as lint
+use bundle.shipped as shipped
 use bundle.inline as inline
 
 quote stmt at 1 0 ;
@@ -102,6 +104,8 @@ boxed record Options {
   analyze: Text,
   # `--ledger`: with the analysis, the build's ledger, which blame compares (see bundle.ledger).
   ledger: Bool,
+  # `--lint=FILE`: rules over what the build ships (see bundle.lint); an error found fails the build.
+  lints: [Text],
   jsx: jsx.Options,
   target: Int,
   on-resolve: [Fn(Text,Text)->Text?],
@@ -123,7 +127,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           defines: [], main-fields: ["browser", "module", "main"], conditions: none,
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, strict-execution-order: false, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
-          packages-external: false, public-path: "", tsconfig: "", legal-comments: "eof", analyze: "", ledger: false, jsx: jsx.options-new(), target: lower.no-lowering,
+          packages-external: false, public-path: "", tsconfig: "", legal-comments: "eof", analyze: "", ledger: false, lints: [], jsx: jsx.options-new(), target: lower.no-lowering,
           on-resolve: [], on-load: [],
           transform: keep-as-is, optimize: default-optimize)
 
@@ -361,7 +365,7 @@ fn linking-of(o: Options, entry-namespace: Bool, splitting: Bool, f: Format) -> 
 
 fn emitting-of(o: Options, f: Format) -> e.Emitting =
   e.Emitting(void-undefined: o.minify-syntax, native-require: f.native-require,
-             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, files: len(o.analyze) > 0,
+             drop-unused-imports: o.minify-syntax, sourcemap: o.sourcemap, files: analyzed?(o),
              # Lowered, a private name is a variable lowering names.
              private-names: o.minify-identifiers and o.target >= 2022,
              drop-unused-names: o.minify-identifiers)
@@ -418,13 +422,18 @@ fn checked-files(files: [Written]) -> [Written] = match first w in files
   none => [w for w in files distinct m.from-root(w.path)]
 } where contents = {m.from-root(w.path): w.text for w in files}
 
-fn written(ws: [Written]) -> Void = write-files!([w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
+fn written(ws: [Written]) -> Void = write-files!([if message?(w) then "" else w.path for w in ws], [w.text for w in ws], [w.said for w in ws])
+
+# What lints found is said where files are, and written nowhere: its path is none a file has.
+const message-path: Text = "<lint>"
+fn message?(w: Written) -> Bool = w.path == message-path
 
 # With no output file or directory, one entry's bundle goes to standard output, as esbuild's does:
 # its source map inline, and nothing that needs a file of its own.
 fn printing?(o: Options) -> Bool = not o.splitting and o.outdir == "" and o.outfile == "" and len(o.entries) == 1
 
 fn printable(o: Options) -> Options = match printing?(o), o.legal-comments {
+  true, _ if len(o.lints) > 0 => panic "what lints find is said beside the files a build writes: give --outfile or --outdir"
   true, "linked" | "external" => panic "linked or external legal comments need an output path: give --outfile or --outdir"
   true, _ if "file" in [l.value for l in o.loaders] => panic "the file loader needs an output path: give --outfile or --outdir"
   _, _ => o
@@ -548,11 +557,15 @@ fn dev-graph-built(before: hmr.Dev, events: Text, g: m.Graph) -> DevStep =
 
 fn dev-step(before: hmr.Dev, now: hmr.Dev, entries: [Int]) -> DevStep = DevStep(dev: now, sent: hmr.update(before, now, entries))
 
-fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: tracked?(o), ascii: o.charset-ascii, files: len(o.analyze) > 0)
+fn printing-of(o: Options) -> Printing = Printing(pretty: o.pretty, maps: tracked?(o), ascii: o.charset-ascii, files: analyzed?(o))
 
 # Whether the printer marks where each leaf landed: for a source map, and for a ledger, which says
 # what of each statement each output holds (see bundle.ledger).
-fn tracked?(o: Options) -> Bool = o.sourcemap or o.ledger
+fn tracked?(o: Options) -> Bool = o.sourcemap or o.ledger or len(o.lints) > 0
+
+# Whether what is emitted says which module each statement is of: for an analysis, and for lints,
+# which read what of each statement each route loads.
+fn analyzed?(o: Options) -> Bool = len(o.analyze) > 0 or len(o.lints) > 0
 
 # A build once it is set up: load, link, name, and the rest.
 fn loaded-built(o: Options, f: Format) -> [Written] =
@@ -656,7 +669,7 @@ fn spec-optimized(o: Options, stmts: [Node]) -> [Node] = dropped-of(o, steps).bo
 fn run-printed(stmts: [Node]) -> Rendered = rendered-of(building.options, stmts)
 
 fn rendered-of(o: Options, stmts: [Node]) -> Rendered =
-  printed(ascii-of(o, program-of(None(), stmts)), o.pretty, tracked?(o), len(o.analyze) > 0)
+  printed(ascii-of(o, program-of(None(), stmts)), o.pretty, tracked?(o), analyzed?(o))
 
 # With the bundler's own optimiser and nothing to lower, the output is made group by group (see
 # `e.groups`), each group's text from its own units alone, on many threads at once, and the texts
@@ -726,7 +739,7 @@ fn chunk-program(o: Options, c: chunks.Chunk, all: [chunks.Chunk], selected: [e.
           false => fold.run(emission.tree)
         }),
         stmts = chunks.imports-of(c, all) ++ p.body.kids ++ chunk-root-statements(c) ++ chunks.exports-of(c, all),
-        r = printed(Program(None(), List(stmts...)), o.pretty, tracked?(o), len(o.analyze) > 0)
+        r = printed(Program(None(), List(stmts...)), o.pretty, tracked?(o), analyzed?(o))
 
 # With the bundler's own optimiser and nothing to lower (see `grouped?`), a chunk's whole body is
 # its own work: the chunks are made at once, each giving the settings that say which chunk it is
@@ -886,15 +899,45 @@ fn text-written(ws: [Written], path: Text) -> Text = (first w in ws if w.path ==
 
 # With `--analyze=DIR`: the analysis as JSON. The page is made from the JSON
 # when asked (`esb --view=DIR`, bundle.view), not by the build.
-fn analysis-written(o: Options, outputs: [analyze.Output], roots: [Int]) -> [Written] = match o.analyze, o.ledger {
-  "", true => fail-build("a ledger is written beside an analysis: --ledger needs --analyze=DIR")
-  "", false => []
-  dir, false => [Written(path: dir ++ "/analysis.json", text: r.json, said: said-of(r.json, dir ++ "/analysis.json"))]
+fn analysis-written(o: Options, outputs: [analyze.Output], roots: [Int]) -> [Written] = match o.ledger or len(o.lints) > 0 {
+  false => analysis-json(o, outputs, roots)
+  true => analysis-json(o, outputs, roots) ++ ledgered(o, led.ledger(outputs, roots))
+}
+
+# What is made of the ledger: itself, written, and what the lints find in it.
+fn ledgered(o: Options, made: led.Ledger) -> [Written] = ledger-files(o, made) ++ lint-written(o, made)
+
+fn analysis-json(o: Options, outputs: [analyze.Output], roots: [Int]) -> [Written] = match o.analyze {
+  "" => []
+  dir => [Written(path: dir ++ "/analysis.json", text: r.json, said: said-of(r.json, dir ++ "/analysis.json"))]
     where r = analyze.report(outputs, roots)
-  dir, true => [Written(path: dir ++ "/analysis.json", text: r.json, said: said-of(r.json, dir ++ "/analysis.json")),
-                Written(path: ledger-path(o), text: l, said: said-of(l, ledger-path(o)))]
-    where r = analyze.report(outputs, roots),
-          l = ledger.json-of(ledger.ledger(outputs, roots))
+}
+
+fn ledger-files(o: Options, made: led.Ledger) -> [Written] = match o.ledger {
+  false => []
+  true => ledger-file(o, made)
+}
+
+fn ledger-file(o: Options, made: led.Ledger) -> [Written] = match o.analyze {
+  "" => fail-build("a ledger is written beside an analysis: --ledger needs --analyze=DIR")
+  _ => [Written(path: ledger-path(o), text: t, said: said-of(t, ledger-path(o)))] where t = led.json-of(made)
+}
+
+# What the lints found: a message (`message-path`), whose text is how many errors it holds.
+fn lint-written(o: Options, made: led.Ledger) -> [Written] = match o.lints {
+  [] => []
+  files => lint-message(lint.linted(files, shipped.Build(ledger: made, node: o.platform-node)))
+}
+
+fn lint-message(r: lint.Linted) -> [Written] = [Written(path: message-path, text: int-text(r.errors), said: r.text)]
+
+fn lint-errors(ws: [Written]) -> Int = sum w in ws if message?(w): parse-int(w.text)
+fn lint-report(ws: [Written]) -> Text = join([w.said for w in ws if message?(w)], "\n")
+
+# The files written, unless a lint found an error, when the build fails saying what.
+fn published(ws: [Written]) -> Void = match lint-errors(ws) {
+  0 => written(ws)
+  n => fail-build("the build stops, for what its lints found:\n\n" ++ lint-report(ws))
 }
 
 # Where the ledger is written: beside the analysis.

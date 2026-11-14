@@ -1,0 +1,106 @@
+# Rules over what a build ships (bundle.lint): `esb ... --lint=examples/ship.lint`, or `lint "…"` in a
+# build spec. Each is Datalog over what the bundler knows of the build (`esb --lint-relations` lists
+# the relations), with JavaScript patterns as atoms. A finding is explained by the rows that made it,
+# down to linking's own chain from a route to the statement. An error stops the build.
+
+# ---------------------------------------------------------------- secrets
+
+# `process.env.X` is whatever the server had; in the browser it is what was written into the code.
+# Names that are meant to be public say so.
+public-prefix("PUBLIC_");
+public-prefix("VITE_");
+public-env("NODE_ENV");
+
+env-read(P, N) :- code(P, `process.env.$N`) ;
+env-read(P, N) :- code(P, `process.env[$N]`) ;
+public(N) :- public-env(N) ;
+public(N) :- env-read(_, N), public-prefix(X), starts-with(N, X) ;
+
+lint secret-shipped error at P "process.env.{N} is in code {R} sends to the browser" :-
+  platform("browser"), ships(R, P), env-read(P, N), !public(N) ;
+
+# ---------------------------------------------------------------- what is left from debugging
+
+lint debugger-shipped error at P "a debugger statement ships in {R}" :-
+  ships(R, P), code(P, `debugger`) ;
+
+# The project's own `console.log`s, not a package's; `console.error` and `console.warn` are meant.
+own(P) :- statement(P, M, _), !package(M, _, _) ;
+lint console-shipped warning at P "console.{F} ships in {R}" :-
+  ships(R, P), own(P), code(P, `console.$F($$A)`), F != "error", F != "warn" ;
+
+# ---------------------------------------------------------------- layers
+
+# What the browser's views need, at any distance, must not be the database's: by what statements
+# read, not by what files import, so an import nothing uses is no finding and a re-export is.
+in-ui(P) :- statement(P, M, _), starts-with(M, "src/ui/") ;
+in-db(P) :- statement(P, M, _), starts-with(M, "src/db/") ;
+ui-needs(P, Q) :- in-ui(P), needs(P, Q, _) ;
+ui-needs(P, Q) :- ui-needs(P, X), needs(X, Q, _), !in-db(X) ;
+lint layering error at P "{P} in src/ui needs {Q} in src/db" :-
+  ships(_, P), ui-needs(P, Q), in-db(Q) ;
+
+# ---------------------------------------------------------------- budgets
+
+lint route-budget warning at R "{R} loads {B} bytes, over its budget of 250000" :-
+  route-bytes(R, B), B > 250000 ;
+
+package-bytes(R, K, sum B) :- bytes(R, P, B), statement(P, M, _), package(M, K, _) ;
+lint package-budget warning at R "{K} is {B} bytes of {R}" :-
+  package-bytes(R, K, B), B > 50000 ;
+
+# ---------------------------------------------------------------- packages
+
+# Two copies of one package, both shipped: two versions, or one installed twice.
+copy(K, D) :- ships(_, P), statement(P, M, _), package(M, K, D) ;
+copies(K, count D) :- copy(K, D) ;
+lint duplicate-package error "{K} ships {N} copies" :- copies(K, N), N > 1 ;
+
+used-package(K) :- ships(_, P), statement(P, M, _), package(M, K, _) ;
+lint unused-dependency warning "{K} is a dependency, and nothing of it ships" :-
+  dependency(K), !used-package(K) ;
+
+# A statement of the project's that reads a package's module whole (`import * as x` passed on, or a
+# namespace re-exported as a name), which ships all that module exports.
+lint package-read-whole warning at P "{P} reads all of {M}" :-
+  ships(_, P), own(P), reads-whole(P, M), package(M, _, _) ;
+
+# ---------------------------------------------------------------- what runs as a module loads
+
+# What a statement that runs as its module loads may run: what it reads, at any distance. Reading a
+# function is not calling it, so this says "may".
+at-load(P) :- live(P), effect(P) ;
+at-load(Q) :- at-load(P), needs(P, Q, _) ;
+io(P) :- code(P, `fetch($$A)`) ;
+io(P) :- code(P, `new WebSocket($$A)`) ;
+io(P) :- code(P, `new XMLHttpRequest()`) ;
+lint io-at-load warning at P "{P} may do I/O as its module loads" :-
+  at-load(P), own(P), io(P) ;
+
+# ---------------------------------------------------------------- code splitting
+
+# A route an `import()` starts whose own module the entry also ships: the split saves nothing.
+lint lazy-wasted warning at L "{L} is loaded with import(), and {E} ships it anyway" :-
+  lazy(L), entry(E), ships(E, P), statement(P, L, _) ;
+
+# ---------------------------------------------------------------- exports
+
+# What the project's modules export that nothing shipped reads, by name or as a namespace object.
+read-export(M, N) :- ships(_, P), reads(P, M, N) ;
+read-whole(M) :- ships(_, P), reads-whole(P, M) ;
+lint dead-export warning at M "{M} exports {N}, and nothing that ships reads it" :-
+  exports(M, N), module(M), kind(M, "esm"), !package(M, _, _), !entry(M), !lazy(M), !read-export(M, N), !read-whole(M) ;
+
+# ---------------------------------------------------------------- what is kept only for what it does
+
+# A package's statements that ship only because they run as their module loads, and everything
+# only they need: nothing the project's own code needs, at any distance, is among it. Tree shaking
+# cannot drop it; a package that wrote it as functions, or marked it `/* @__PURE__ */`, would let it.
+by-app(P) :- live(P), own(P) ;
+by-app(Q) :- by-app(P), needs(P, Q, _) ;
+effect-root(P) :- live(P), effect(P), statement(P, M, _), package(M, _, _), !by-app(P) ;
+held(M, P) :- effect-root(P), statement(P, M, _) ;
+held(M, Q) :- held(M, P), needs(P, Q, _), !by-app(Q) ;
+held-bytes(R, M, sum B) :- held(M, P), bytes(R, P, B) ;
+lint kept-for-effects warning at R "{M} keeps {B} bytes of {R} for what its statements do as it loads, and nothing of the project's needs them" :-
+  held-bytes(R, M, B), B > 2000 ;

@@ -1,0 +1,580 @@
+# What a `.lint` file means (lint.syntax): rules, solved as Datalog over what the build gives
+# (bundle.shipped), and lints, whose rows are findings. Read when the build runs, so a project's
+# rules change without the bundler changing.
+#
+# Rules have negation, comparisons, a few tests of text, and the aggregates `count`, `sum`, `min`
+# and `max`. A variable of a negated atom that no other literal binds says "any": `!reads(P, _, _)`
+# and `!reads(P, M, N)` with M and N bound nowhere else say the same. Literals are solved in the
+# order written, each test as soon as what it tests is bound. Every rule is checked before
+# anything is solved: relations named and of the right arity, variables bound, no negation or
+# aggregate through recursion, patterns that js.syntax reads; an error says where.
+#
+# A finding is explained by the rows that made it, each made by rows before it, down to what the
+# build gave: for a route that ships or reaches a statement, linking's own chain from the route's
+# root; for a pattern, where it matched.
+rules bundle.lint over bundle.lint-file
+use bundle.lint-file as lf
+use bundle.shipped as sh
+use bundle.ledger as l
+use bundle.link as link
+use bundle.analysis as an
+use bundle.modules as m
+
+# ---------------------------------------------------------------- programs
+
+record Spot { path: Text, line: Int, col: Int }
+# A term: a variable, a constant (text; numbers are text too), or `_`.
+record Term { kind: Text, text: Text }
+# A literal: an atom, a negated atom, a test (`ne`, `eq`, `lt`, `le`, `gt`, `ge`), or a test of text.
+record Lit { kind: Text, rel: Text, args: [Term], spot: Spot }
+record Clause { rel: Text, head: [Term], aggs: [Text], body: [Lit], spot: Spot }
+record LintDef { name: Text, severity: Text, at: Text, message: Text, vars: [Text], spot: Spot }
+# A JavaScript pattern, its relation (`code` of it): the statement, the place it matched, and its
+# variables' values.
+record Pattern { rel: Text, text: Text, label: Text, vars: [Text] }
+record Program { clauses: [Clause], lints: [LintDef], patterns: [Pattern] }
+
+# The file being read, for where its errors are.
+setting path: Text
+setting source: Text
+
+fn program-of(files: [Text]) -> Program = checked(joined([file-program(f) for f in files]))
+
+fn joined(ps: [Program]) -> Program =
+  Program(clauses: [c for p in ps for c in p.clauses], lints: [x for p in ps for x in p.lints],
+          patterns: [x for p in ps for x in p.patterns distinct x.rel])
+
+# A file's rules, read: an answer the pipeline keeps (build.pipeline), so a watcher reads the file
+# again when it changes.
+fn file-program(f: Text) -> Program = with path = f, source = text { read-program(lf.parse(text, f)) } where text = read-file(f)
+
+fn spot(n: Node) -> Spot = Spot(path: path, line: line-of(source, n.lo), col: col-of(source, n.lo))
+
+fn fail-at(s: Spot, message: Text) -> Never = fail-build(s.path ++ ":" ++ int-text(s.line) ++ ":" ++ int-text(s.col) ++ ": " ++ message)
+
+fn read-program(f: Node) -> Program =
+  Program(clauses: [clause-of(i) for i in f.items.kids], lints: [lint-of(i) for i in f.items.kids if i is Lint(...)],
+          patterns: [p for i in f.items.kids for p in patterns-in(i)])
+
+fn clause-of(i: Node) -> Clause = match i {
+  Rule(head, body) => Clause(rel: head.name.text, head: [head-term(a) for a in head.args.kids], aggs: [agg-of(a) for a in head.args.kids],
+                             body: [lit-of(x) for x in body.kids], spot: spot(i))
+  Fact(head) => Clause(rel: head.name.text, head: [constant(head-term(a), a) for a in head.args.kids], aggs: ["" for a in head.args.kids],
+                       body: [], spot: spot(i))
+  Lint(name, _, _, _, body) => Clause(rel: "lint:" ++ name.text, head: [Term(kind: "var", text: v) for v in vars], aggs: ["" for v in vars],
+                                     body: lits, spot: spot(i))
+    where lits = [lit-of(x) for x in body.kids],
+          vars = bound-vars(lits)
+}
+
+fn lint-of(i: Node) -> LintDef = match i {
+  Lint(name, severity, at, message, body) => LintDef(name: name.text, severity: match severity { Error() => "error"  _ => "warning" },
+                                                     at: match at { At(v) => v.text  _ => "" }, message: unquote(message.text),
+                                                     vars: bound-vars([lit-of(x) for x in body.kids]), spot: spot(i))
+}
+
+# The variables a body's atoms bind, in the order they first come.
+fn bound-vars(lits: [Lit]) -> [Text] = [t.text for x in lits if x.kind == "atom" for t in x.args if t.kind == "var" distinct t.text]
+
+fn constant(t: Term, n: Node) -> Term = match t.kind {
+  "const" => t
+  _ => fail-at(spot(n), "a fact's columns are values")
+}
+
+fn agg-of(a: Node) -> Text = match a {
+  Count(_) => "count"
+  Sum(_) => "sum"
+  Min(_) => "min"
+  Max(_) => "max"
+  _ => ""
+}
+
+fn head-term(a: Node) -> Term = match a {
+  Count(v) | Sum(v) | Min(v) | Max(v) => Term(kind: "var", text: v.text)
+  _ => term-of(a)
+}
+
+fn term-of(t: Node) -> Term = match t {
+  Variable(n) => Term(kind: "var", text: n.text)
+  Text(s) => Term(kind: "const", text: unquote(s.text))
+  Number(n) => Term(kind: "const", text: n.text)
+  Anything() => Term(kind: "any", text: "")
+  Code(_) => fail-at(spot(t), "a pattern is the second column of `code`")
+  _ => fail-at(spot(t), "not a term")
+}
+
+# The tests of text, which every column of is bound.
+const tests: [Text] = ["starts-with", "ends-with", "contains"]
+
+fn lit-of(n: Node) -> Lit = match n {
+  Not(a) => atom-lit(a, true)
+  Ne(a, b) => Lit(kind: "ne", rel: "", args: [term-of(a), term-of(b)], spot: spot(n))
+  Eq(a, b) => Lit(kind: "eq", rel: "", args: [term-of(a), term-of(b)], spot: spot(n))
+  Lt(a, b) => Lit(kind: "lt", rel: "", args: [term-of(a), term-of(b)], spot: spot(n))
+  Le(a, b) => Lit(kind: "le", rel: "", args: [term-of(a), term-of(b)], spot: spot(n))
+  Gt(a, b) => Lit(kind: "gt", rel: "", args: [term-of(a), term-of(b)], spot: spot(n))
+  Ge(a, b) => Lit(kind: "ge", rel: "", args: [term-of(a), term-of(b)], spot: spot(n))
+  _ => atom-lit(n, false)
+}
+
+fn atom-lit(a: Node, negated: Bool) -> Lit = match a.name.text {
+  "code" => match a.args.kids {
+    [p, Code(t)] => Lit(kind: if negated then "not" else "atom", rel: pattern-rel(t), spot: spot(a),
+                        args: [term-of(p), Term(kind: "any", text: "")] ++ [Term(kind: "var", text: v) for v in pattern-vars(t)])
+    _ => fail-at(spot(a), "code takes a statement and a pattern: code(P, `…`)")
+  }
+  r if r in tests => Lit(kind: if negated then "not-test" else "test", rel: r, args: [term-of(x) for x in a.args.kids], spot: spot(a))
+  r => Lit(kind: if negated then "not" else "atom", rel: r, args: [term-of(x) for x in a.args.kids], spot: spot(a))
+}
+
+fn pattern-text(t: Node) -> Text = t.text[1..len(t.text) - 1]
+fn pattern-rel(t: Node) -> Text = "code`" ++ pattern-text(t) ++ "`"
+# Where a pattern is, for js.syntax's errors, which say where in the pattern.
+fn pattern-label(t: Node) -> Text = path ++ ":" ++ int-text(line-of(source, t.lo)) ++ " " ++ t.text
+fn pattern-vars(t: Node) -> [Text] = sh.pattern-variables(pattern-text(t), pattern-label(t))
+
+fn patterns-in(i: Node) -> [Pattern] =
+  [Pattern(rel: pattern-rel(t), text: pattern-text(t), label: pattern-label(t), vars: pattern-vars(t)) for t in codes(i)]
+
+everywhere fn codes(n: Node) -> [Node] = match n {
+  Code(t) => [t]
+}
+
+# ---------------------------------------------------------------- checks
+
+fn given-arity(name: Text) -> Int = (first r in sh.relations() if r.name == name and name != "code": len(r.columns)) ?? -1
+
+fn checked(p: Program) -> Program = match problems {
+  [] => p
+  [x, ...] => fail-at(x.spot, x.message)
+} where problems = arity-problems(p) ++ head-problems(p) ++ binding-problems(p) ++ message-problems(p)
+                   ++ [x for s in [strata(p)] if s.cycle != "" for x in [Problem(spot: s.spot, message: s.cycle)]]
+
+record Problem { spot: Spot, message: Text }
+
+# Each relation a rule derives has one arity; each the build gives, its own; each pattern's, two.
+fn arity-of(p: Program, rel: Text) -> Int = match given-arity(rel) >= 0, starts-with(rel, "code`") {
+  true, _ => given-arity(rel)
+  false, true => 2 + len((first x in p.patterns if x.rel == rel: x.vars) ?? [])
+  false, false => (first c in p.clauses if c.rel == rel: len(c.head)) ?? -1
+}
+
+fn arity-problems(p: Program) -> [Problem] =
+  [Problem(spot: x.spot, message: problem) for c in p.clauses for x in c.body if x.kind == "atom" or x.kind == "not" or x.kind == "test" or x.kind == "not-test"
+   for problem in [match x.kind {
+     "test" | "not-test" if len(x.args) != 2 => x.rel ++ " takes 2 columns, not " ++ int-text(len(x.args))
+     "test" | "not-test" => ""
+     _ if arity-of(p, x.rel) < 0 => "no relation " ++ x.rel ++ ": the build gives " ++ join([r.name for r in sh.relations()], ", ") ++ ", and no rule derives it"
+     _ if arity-of(p, x.rel) != len(x.args) and starts-with(x.rel, "code`") => "code takes a statement and a pattern"
+     _ if arity-of(p, x.rel) != len(x.args) => x.rel ++ " has " ++ int-text(arity-of(p, x.rel)) ++ " columns, not " ++ int-text(len(x.args))
+     _ => ""
+   }] if problem != ""]
+
+fn head-problems(p: Program) -> [Problem] =
+  [Problem(spot: c.spot, message: problem) for c in p.clauses
+   for problem in [match given-arity(c.rel) >= 0 {
+     true => c.rel ++ " is the build's: no rule adds to it"
+     false if len(c.head) != arity-of(p, c.rel) => c.rel ++ " has " ++ int-text(arity-of(p, c.rel)) ++ " columns elsewhere, and " ++ int-text(len(c.head)) ++ " here"
+     false if any t in c.head: t.kind == "any" => "a rule's head says what each column is: no `_`"
+     false => ""
+   }] if problem != ""]
+
+# A clause's literals in the order they are solved, or the first that can never be.
+fn binding-problems(p: Program) -> [Problem] =
+  [x for c in p.clauses for x in plan(c, []).problems]
+  ++ [Problem(spot: c.spot, message: "the head's " ++ t.text ++ " is bound by nothing in the body") for c in p.clauses
+      for t in c.head if t.kind == "var" and not (t.text in bound-vars(c.body))]
+
+fn message-problems(p: Program) -> [Problem] =
+  [Problem(spot: x.spot, message: "the message names {" ++ v ++ "}, which the lint's atoms do not bind")
+   for x in p.lints for v in placeholders(x.message) if not (v in x.vars)]
+  ++ [Problem(spot: x.spot, message: "at " ++ x.at ++ ", which the lint's atoms do not bind") for x in p.lints if x.at != "" and not (x.at in x.vars)]
+
+# The `{X}`s of a message.
+fn placeholders(t: Text) -> [Text] = match index-of(t, "{") {
+  none => []
+  some(i) => match index-of(t[i..len(t)], "}") {
+    none => []
+    some(j) => [t[i + 1..i + j]] ++ placeholders(t[i + j + 1..len(t)])
+  }
+}
+
+# ---------------------------------------------------------------- order
+
+# A literal, and the variables bound before it is solved.
+record Step { lit: Lit, bound: [Text] }
+record Plan { steps: [Step], problems: [Problem] }
+
+fn vars-of(x: Lit) -> [Text] = [t.text for t in x.args if t.kind == "var"]
+
+# The atoms in the order written, each test as soon as all it tests is bound. A negated atom waits
+# for its variables that the body's atoms bind; the rest of its variables are any.
+fn plan(c: Clause, given: [Text]) -> Plan = placed(c, [x for x in c.body if x.kind == "atom"], [x for x in c.body if x.kind != "atom"], given, [])
+
+fn placed(c: Clause, atoms: [Lit], tests: [Lit], bound: [Text], steps: [Step]) -> Plan = match atoms {
+  [] => Plan(steps: steps ++ [Step(lit: x, bound: bound) for x in now], problems: [unbound(x, bound, c) for x in later])
+  [a, rest...] => placed(c, rest, later, bound ++ [v for v in vars-of(a) if not (v in bound) distinct v], steps ++ [Step(lit: x, bound: bound) for x in now] ++ [Step(lit: a, bound: bound)])
+} where now = [x for x in tests if ready?(x, bound, c)],
+        later = [x for x in tests if not ready?(x, bound, c)]
+
+fn ready?(x: Lit, bound: [Text], c: Clause) -> Bool = match x.kind {
+  "not" => all v in vars-of(x): v in bound or not (v in bound-vars(c.body))
+  _ => all v in vars-of(x): v in bound
+}
+
+fn unbound(x: Lit, bound: [Text], c: Clause) -> Problem =
+  Problem(spot: x.spot, message: join([v for v in vars-of(x) if not (v in bound) distinct v], ", ") ++ " is bound by no atom of the rule")
+
+# ---------------------------------------------------------------- strata
+
+record Strata { of: {Text:Int}, top: Int, cycle: Text, spot: Spot }
+
+# Each relation a rule derives, in a stratum at least its atoms', and above its negated atoms' and
+# what it aggregates: solved after them. One above as many strata as there are relations depends
+# on its own negation.
+fn strata(p: Program) -> Strata = strata-from(p, {c.rel: 0 for c in p.clauses}, 0)
+
+fn strata-from(p: Program, of: {Text:Int}, rounds: Int) -> Strata = match first c in p.clauses if (needed[c.rel] ?? 0) > (of[c.rel] ?? 0): c {
+  none => Strata(of: of, top: most([of[k] ?? 0 for k in keys(of)], 0), cycle: "", spot: Spot(path: "", line: 0, col: 0))
+  some(c) if rounds > len(keys(of)) + 1 => Strata(of: of, top: 0, cycle: c.rel ++ " depends on its own negation, or aggregates what depends on it", spot: c.spot)
+  some(_) => strata-from(p, of ++ needed, rounds + 1)
+} where needed = {c.rel: most([need(of, c, x) for x in c.body], of[c.rel] ?? 0) for c in p.clauses}
+
+fn need(of: {Text:Int}, c: Clause, x: Lit) -> Int = match x.kind {
+  "atom" if any a in c.aggs: a != "" => (of[x.rel] ?? -1) + 1
+  "atom" => of[x.rel] ?? 0
+  "not" => (of[x.rel] ?? -1) + 1
+  _ => 0
+}
+
+# ---------------------------------------------------------------- solving
+
+# What joins a row's values into one key: a byte no value holds.
+fn sep() -> Text = byte-text(1)
+
+fn most(xs: [Int], start: Int) -> Int = fold m = start for x in xs: max(m, x)
+fn least(xs: [Int], start: Int) -> Int = fold m = start for x in xs: min(m, x)
+
+record Env { vals: {Text:Text}, used: [Row] }
+record Row { rel: Text, row: [Text] }
+# Every relation's rows, and when each row a rule derived came: a round's rows are made from those
+# that came before them.
+record Db { rows: {Text:[[Text]]}, times: {Text:Int}, clock: Int }
+
+fn row-key(rel: Text, row: [Text]) -> Text = rel ++ sep() ++ join(row, sep())
+
+fn solved(p: Program, given: {Text:[[Text]]}) -> Db =
+  fold db = Db(rows: given, times: {}, clock: 1) for s in 0..st.top + 1: stratum-solved(p, db, [c for c in p.clauses if (st.of[c.rel] ?? 0) == s], st.of, s)
+  where st = strata(p)
+
+# A stratum's relations solved. What its rules read of the strata below stays as it is while they
+# are solved, so it is indexed once for all the rounds.
+fn stratum-solved(p: Program, db: Db, cs: [Clause], of: {Text:Int}, s: Int) -> Db = rounds(p, start.db, cs, of, s, start.delta, fixed)
+  where fixed = {ix-name(x.lit, cols): indexed(db.rows[x.lit.rel] ?? [], cols)
+                 for c in cs for x in plan(c, []).steps if (x.lit.kind == "atom" or x.lit.kind == "not") and (of[x.lit.rel] ?? -1) < s
+                 for cols in [key-cols(x.lit, x.bound)] distinct ix-name(x.lit, cols)},
+        start = added(db, [r for c in cs for r in head-rows(c, db, {}, -1, fixed)])
+
+fn ix-name(x: Lit, cols: [Int]) -> Text = x.rel ++ "/" ++ join([int-text(c) for c in cols], ",")
+
+record Added { db: Db, delta: {Text:[[Text]]} }
+
+# Rounds until one adds nothing: each clause's atoms of this stratum, each in turn reading only
+# what the last round added.
+fn rounds(p: Program, db: Db, cs: [Clause], of: {Text:Int}, s: Int, delta: {Text:[[Text]]}, fixed: {Text:Index}) -> Db = match len(keys(delta)) {
+  0 => db
+  _ => rounds(p, next.db, cs, of, s, next.delta, fixed)
+} where next = added(db, [r for c in cs if not (any a in c.aggs: a != "") for steps in [plan(c, []).steps]
+                          for i in 0..len(steps) if steps[i].lit.kind == "atom" and (of[steps[i].lit.rel] ?? -1) == s and steps[i].lit.rel in delta
+                          for r in head-rows(c, db, delta, i, fixed)])
+
+fn added(db: Db, rows: [Row]) -> Added =
+  Added(db: Db(rows: db.rows ++ {rel: (db.rows[rel] ?? []) ++ [x.row for x in fresh if x.rel == rel] for rel in [x.rel for x in fresh distinct x.rel]},
+               times: db.times ++ {row-key(x.rel, x.row): db.clock for x in fresh}, clock: db.clock + 1),
+        delta: {rel: [x.row for x in fresh if x.rel == rel] for rel in [x.rel for x in fresh distinct x.rel]})
+  where fresh = [x for x in rows if not (row-key(x.rel, x.row) in db.times) distinct row-key(x.rel, x.row)]
+
+fn head-rows(c: Clause, db: Db, delta: {Text:[[Text]]}, use: Int, fixed: {Text:Index}) -> [Row] = match any a in c.aggs: a != "" {
+  true => aggregated(c, envs)
+  false => [Row(rel: c.rel, row: [value(t, e) for t in c.head]) for e in envs]
+} where envs = envs-of(plan(c, []).steps, db, delta, use, Env(vals: {}, used: []), 0, false, fixed)
+
+fn value(t: Term, e: Env) -> Text = match t.kind {
+  "var" => e.vals[t.text] ?? panic "lint: {} unbound", t.text
+  _ => t.text
+}
+
+# A group's rows for each value of the head's other columns: `count` the values of its variable,
+# `sum` them, the least or the greatest.
+fn aggregated(c: Clause, envs: [Env]) -> [Row] =
+  [Row(rel: c.rel, row: [match c.aggs[i] {
+     "" => value(c.head[i], group[0])
+     "count" => int-text(len([value(c.head[i], e) for e in group distinct value(c.head[i], e)]))
+     "sum" => int-text(sum e in group: number(value(c.head[i], e), c.spot))
+     "min" => int-text(least(ns, ns[0])) where ns = [number(value(c.head[i], e), c.spot) for e in group]
+     "max" => int-text(most(ns, ns[0])) where ns = [number(value(c.head[i], e), c.spot) for e in group]
+     a => panic "lint: no aggregate {}", a
+   } for i in 0..len(c.head)])
+   for k in keys distinct k for group in [[envs[j] for j in 0..len(envs) if keys[j] == k]]]
+  where keys = [join([value(c.head[i], e) for i in 0..len(c.head) if c.aggs[i] == ""], sep()) for e in envs]
+
+fn number(t: Text, s: Spot) -> Int = parse-int-opt(t) ?? fail-at(s, "a sum, least or greatest of " ++ t ++ ", which is not a number")
+
+# What a body's steps make of the environments `start`: each atom from the database (from `delta`
+# at step `use`), only rows before time `limit` when it is above 0; with `track`, the rows used.
+fn envs-of(steps: [Step], db: Db, delta: {Text:[[Text]]}, use: Int, start: Env, limit: Int, track: Bool, fixed: {Text:Index}) -> [Env] =
+  fold es = [start] for i in 0..len(steps): stepped(es, steps[i], index-for(steps[i], db, delta, i == use, limit, fixed), track, db, limit)
+
+# The rows a step reads, indexed by what is known before it: from those indexed for the stratum
+# when it reads the whole of a relation below it.
+fn index-for(s: Step, db: Db, delta: {Text:[[Text]]}, from-delta: Bool, limit: Int, fixed: {Text:Index}) -> Index = match s.lit.kind {
+  "atom" | "not" => match from-delta {
+    false => fixed[ix-name(s.lit, cols)] ?? indexed(rows-of(s.lit, db, delta, false, 0), cols)
+    true => indexed(rows-of(s.lit, db, delta, true, 0), cols)
+  } where cols = key-cols(s.lit, s.bound)
+  _ => Index(rows: [], at: {})
+}
+
+fn rows-of(x: Lit, db: Db, delta: {Text:[[Text]]}, from-delta: Bool, limit: Int) -> [[Text]] = match from-delta, limit > 0 {
+  true, _ => delta[x.rel] ?? []
+  false, false => db.rows[x.rel] ?? []
+  false, true => [r for r in db.rows[x.rel] ?? [] if (db.times[row-key(x.rel, r)] ?? 0) < limit]
+}
+
+# An atom's rows, from those before `limit` when it is above 0: what an explanation may use.
+fn stepped(es: [Env], s: Step, ix: Index, track: Bool, db: Db, limit: Int) -> [Env] = match s.lit.kind {
+  "atom" => [b for e in es for r in matching(ix, key-of(s.lit, cols, e)) if limit == 0 or (db.times[row-key(s.lit.rel, r)] ?? 0) < limit
+             for found in [bound-by(s.lit, r, e, track)] if let some(b) = found]
+    where cols = key-cols(s.lit, s.bound)
+  "not" => [e for e in es if len(matching(ix, key-of(s.lit, cols, e))) == 0]
+    where cols = key-cols(s.lit, s.bound)
+  "test" => [e for e in es if tested(s.lit, e)]
+  "not-test" => [e for e in es if not tested(s.lit, e)]
+  _ => [e for e in es if compared(s.lit, e)]
+}
+
+# The columns of an atom whose values are known before it is solved.
+fn key-cols(x: Lit, bound: [Text]) -> [Int] = [j for j in 0..len(x.args) if x.args[j].kind == "const" or (x.args[j].kind == "var" and x.args[j].text in bound)]
+
+fn key-of(x: Lit, cols: [Int], e: Env) -> Text = join([value(x.args[j], e) for j in cols], sep())
+
+# Rows sorted by the values of some columns, and where each run of the same values is.
+record Index { rows: [[Text]], at: {Text:Span} }
+record Span { from: Int, to: Int }
+
+fn indexed(rows: [[Text]], cols: [Int]) -> Index =
+  Index(rows: sorted, at: {keys[starts[k]]: Span(from: starts[k], to: if k + 1 < len(starts) then starts[k + 1] else len(sorted)) for k in 0..len(starts)})
+  where order = sort i in [i for i in 0..len(rows)] by spread[i],
+        sorted = [rows[i] for i in order],
+        keys = [written-keys[i] for i in order],
+        written-keys = [join([r[j] for j in cols], sep()) for r in rows],
+        # Sorted by a print of the key and then the key: alike keys together, and most comparisons
+        # settled by the print's first bytes, where keys share long beginnings (paths).
+        spread = [hash-text(k) ++ k for k in written-keys],
+        starts = [i for i in 0..len(keys) if i == 0 or keys[i] != keys[i - 1]]
+
+fn matching(ix: Index, key: Text) -> [[Text]] = match ix.at[key] {
+  some(s) => ix.rows[s.from..s.to]
+  none => []
+}
+
+# An environment with a row's values given to the atom's variables, if the row agrees with it.
+fn bound-by(x: Lit, r: [Text], e: Env, track: Bool) -> Env? =
+  match fold acc = some(e.vals) for j in 0..len(x.args): agreed(acc, x.args[j], r[j]) {
+    some(vals) => some(Env(vals: vals, used: if track then e.used ++ [Row(rel: x.rel, row: r)] else e.used))
+    none => none
+  }
+
+fn agreed(acc: {Text:Text}?, t: Term, v: Text) -> {Text:Text}? = match acc, t.kind {
+  none, _ => none
+  some(vals), "var" => match vals[t.text] {
+    some(w) if w == v => some(vals)
+    some(_) => none
+    none => some(vals ++ {t.text: v})
+  }
+  some(vals), "const" if t.text != v => none
+  some(vals), _ => some(vals)
+}
+
+fn tested(x: Lit, e: Env) -> Bool = match x.rel {
+  "starts-with" => starts-with(a, b)
+  "ends-with" => ends-with(a, b)
+  "contains" => contains-text?(a, b)
+  r => panic "lint: no test {}", r
+} where a = value(x.args[0], e),
+        b = value(x.args[1], e)
+
+fn compared(x: Lit, e: Env) -> Bool = match x.kind, parse-int-opt(a), parse-int-opt(b) {
+  "eq", _, _ => a == b
+  "ne", _, _ => a != b
+  "lt", some(i), some(j) => i < j
+  "le", some(i), some(j) => i <= j
+  "gt", some(i), some(j) => i > j
+  "ge", some(i), some(j) => i >= j
+  _, _, _ => fail-at(x.spot, "compares " ++ a ++ " and " ++ b ++ ", which are not both numbers")
+} where a = value(x.args[0], e),
+        b = value(x.args[1], e)
+
+# ---------------------------------------------------------------- findings
+
+record Finding { lint: Text, severity: Text, place: Text, text: Text, message: Text, why: [Text] }
+record Linted { findings: [Finding], errors: Int, warnings: Int, text: Text }
+
+# What the build gives the rules: the relations they read, each pattern's matches.
+fn given-of(p: Program, b: sh.Build) -> {Text:[[Text]]} =
+  {name: sh.rows-of(name, b) for name in [x.rel for c in p.clauses for x in c.body if given-arity(x.rel) >= 0 distinct x.rel]}
+  ++ {x.rel: sh.code-rows(x.text, x.label) for x in p.patterns}
+
+fn linted(files: [Text], b: sh.Build) -> Linted =
+  Linted(findings: findings, errors: count f in findings: f.severity == "error", warnings: count f in findings: f.severity == "warning",
+         text: report-text(findings))
+  where p = program-of(files),
+        db = solved(p, given-of(p, b)),
+        parts = {x.key: x for x in b.ledger.parts},
+        rows = [Found(lint: x, row: r) for x in p.lints for r in db.rows["lint:" ++ x.name] ?? []],
+        chains = if len(rows) > 0 then chains-of(link.solved-blocks(an.fact-blocks()), l.part-keys()) else chains-of(link.new-db(), {}),
+        db-ix = explaining(p, db, len(rows) > 0),
+        findings = sort f in [finding(p, db, db-ix, chains, parts, x.lint, x.row) for x in rows] by f.severity ++ " " ++ f.lint ++ " " ++ f.place
+
+record Found { lint: LintDef, row: [Text] }
+
+# What explanations read, indexed once: each rule's atoms as solved with its head's values known.
+fn explaining(p: Program, db: Db, any: Bool) -> {Text:Index} = match any {
+  false => {}
+  true => {ix-name(x.lit, cols): indexed(db.rows[x.lit.rel] ?? [], cols)
+           for c in p.clauses for x in plan(c, [t.text for t in c.head if t.kind == "var"]).steps ++ plan(group-head(c), [t.text for t in group-head(c).head if t.kind == "var"]).steps
+           if x.lit.kind == "atom" or x.lit.kind == "not" for cols in [key-cols(x.lit, x.bound)] distinct ix-name(x.lit, cols)}
+}
+# What a chain from a route is read from: linking's database solved afresh (one brought up to date
+# in place cannot say how its rows came), and parts' and roots' keys and numbers.
+record Chains { db: link.Db, parts: {Int:Text}, ids: {Text:Int}, roots: {Text:Int} }
+
+fn chains-of(db: link.Db, parts: {Int:Text}) -> Chains =
+  Chains(db: db, parts: parts, ids: {parts[k] ?? "": k for k in keys(parts)}, roots: {l.module-key(id): id for id in m.order})
+
+fn finding(p: Program, db: Db, db-ix: {Text:Index}, chains: Chains, parts: {Text:l.Part}, x: LintDef, row: [Text]) -> Finding =
+  Finding(lint: x.name, severity: x.severity, place: match x.at { "" => ""  v => shown(vals[v] ?? "", parts) },
+          text: match x.at { "" => ""  v => (match parts[vals[v] ?? ""] { some(q) => q.text  none => "" }) },
+          message: filled(x.message, vals, parts),
+          why: after-first([w for c in p.clauses if c.rel == "lint:" ++ x.name for w in explained(p, db, db-ix, chains, parts, c.rel, row, 0, [])]))
+  where vals = {x.vars[i]: row[i] for i in 0..len(x.vars)}
+
+fn filled(t: Text, vals: {Text:Text}, parts: {Text:l.Part}) -> Text = match index-of(t, "{") {
+  none => t
+  some(i) => match index-of(t[i..len(t)], "}") {
+    none => t
+    some(j) => t[0..i] ++ shown(vals[t[i + 1..i + j]] ?? "", parts) ++ filled(t[i + j + 1..len(t)], vals, parts)
+  }
+}
+
+# A value as a finding says it: a statement where it is, and else itself.
+fn shown(v: Text, parts: {Text:l.Part}) -> Text = match parts[v] {
+  some(q) if q.line > 0 => q.module ++ ":" ++ int-text(q.line)
+  some(q) => q.module
+  none => v
+}
+
+fn row-shown(rel: Text, row: [Text], parts: {Text:l.Part}) -> Text = match starts-with(rel, "code`") {
+  true => rel[4..len(rel)] ++ " at " ++ row[1] ++ join([", " ++ v for v in row[2..len(row)]], "")
+  false => rel ++ "(" ++ join([shown(v, parts) for v in row], ", ") ++ ")"
+}
+
+# Why a row is: itself, then what made it, one deeper. A row a rule made is made by the first of
+# its clauses whose body holds with rows that came before it; one the build gave says what the
+# build knows of it.
+fn explained(p: Program, db: Db, db-ix: {Text:Index}, chains: Chains, parts: {Text:l.Part}, rel: Text, row: [Text], depth: Int, seen: [Text]) -> [Text] =
+  [indent(depth) ++ row-shown(rel, row, parts)]
+  ++ match time, row-key(rel, row) in seen {
+    _, true => []
+    0, _ => given-why(chains, parts, rel, row, depth + 1)
+    _, _ => match first w in [w for c in p.clauses if c.rel == rel for w in made-of(p, db, db-ix, parts, c, row, time)]: w {
+      some(w) => [line for u in w.used[0..min(len(w.used), shown-rows)] for line in explained(p, db, db-ix, chains, parts, u.rel, u.row, depth + 1, seen ++ [row-key(rel, row)])]
+                 ++ [indent(depth + 1) ++ "... and " ++ int-text(len(w.used) - shown-rows) ++ " more rows like these" for x in [0] if len(w.used) > shown-rows]
+                 ++ [indent(depth + 1) ++ t for t in w.tests]
+      none => []
+    }
+  }
+  where time = db.times[row-key(rel, row)] ?? 0
+
+record Made { used: [Row], tests: [Text] }
+
+# How many of the rows that made a row are explained in turn: a rule's body has fewer; a group an
+# aggregate adds up may have thousands, and these are what it says of them.
+const shown-rows: Int = 5
+
+fn made-of(p: Program, db: Db, db-ix: {Text:Index}, parts: {Text:l.Part}, c: Clause, row: [Text], time: Int) -> [Made] = match any a in c.aggs: a != "" {
+  # A group is made by all its rows: each, under the group's values.
+  true => match head-vals(group-head(c), group-row(c, row)) {
+    some(vals) => [Made(used: [u for e in envs-of(steps, db, {}, -1, Env(vals: vals, used: []), time, true, db-ix) for u in e.used distinct row-key(u.rel, u.row)],
+                        tests: [join([a for a in c.aggs if a != ""], ", ") ++ " of these"])]
+                  where steps = plan(c, [k for k in keys(vals)]).steps
+    none => []
+  }
+  false => match start {
+    some(vals) => [Made(used: e.used, tests: [test-shown(s.lit, e, parts) for s in steps if s.lit.kind != "atom"])
+                   for e in envs-of(steps, db, {}, -1, Env(vals: vals, used: []), time, true, db-ix)]
+                  where steps = plan(c, [k for k in keys(vals)]).steps
+    none => []
+  }
+} where start = head-vals(c, row)
+
+# A clause's head given a row: what its variables are, if the row is one the head can be.
+fn head-vals(c: Clause, row: [Text]) -> {Text:Text}? = fold acc = some(no-vals()) for i in 0..len(c.head): agreed(acc, c.head[i], row[i])
+
+fn no-vals() -> {Text:Text} = {}
+
+# An aggregate's head and row without their aggregated columns: what names its group.
+fn group-head(c: Clause) -> Clause = c with { head: [c.head[i] for i in 0..len(c.head) if c.aggs[i] == ""] }
+fn group-row(c: Clause, row: [Text]) -> [Text] = [row[i] for i in 0..len(row) if c.aggs[i] == ""]
+
+fn test-shown(x: Lit, e: Env, parts: {Text:l.Part}) -> Text = match x.kind {
+  "not" | "not-test" => "no " ++ x.rel ++ "(" ++ join([match t.kind { "any" => "_"  "var" => shown(e.vals[t.text] ?? "_", parts)  _ => t.text } for t in x.args], ", ") ++ ")"
+  "test" => x.rel ++ "(" ++ join([shown(value(t, e), parts) for t in x.args], ", ") ++ ")"
+  k => shown(value(x.args[0], e), parts) ++ " " ++ op-of(k) ++ " " ++ shown(value(x.args[1], e), parts)
+}
+
+fn op-of(k: Text) -> Text = match k { "eq" => "="  "ne" => "!="  "lt" => "<"  "le" => "<="  "gt" => ">"  "ge" => ">="  _ => k }
+
+fn after-first(xs: [Text]) -> [Text] = xs[min(1, len(xs))..len(xs)]
+
+fn indent(depth: Int) -> Text = repeated("  ", depth)
+
+# What the build knows of a row it gave: for a route that ships or reaches a statement, linking's
+# chain from the route's root to it.
+fn given-why(chains: Chains, parts: {Text:l.Part}, rel: Text, row: [Text], depth: Int) -> [Text] = match rel {
+  "ships" | "reaches" | "bytes" => [indent(depth) ++ h for h in reach-chain(chains, parts, row[0], row[1])]
+  _ => []
+}
+
+fn reach-chain(chains: Chains, parts: {Text:l.Part}, root: Text, part: Text) -> [Text] = match chains.ids[part], chains.roots[root] {
+  some(p), some(r) => match whys {
+    [] => ["(placed with what the route needs)"]
+    _ => reversed([hop(parts, names, w, whys) for w in whys if part-of-why(w) >= 0 distinct part-of-why(w)])
+  } where whys = match an.linking.splitting {
+            true => if chains.db.reaches(r, p) then link.why-reaches(chains.db, r, p) else []
+            false => if chains.db.active-part(p) then link.why-active-part(chains.db, p) else []
+          }
+  _, _ => []
+} where names = chains.parts
+
+fn part-of-why(w: link.Why) -> Int = match w.relation {
+  "reaches" => w.b
+  "active-part" | "live" | "init-live" | "root-part" => w.a
+  _ => -1
+}
+
+fn hop(parts: {Text:l.Part}, names: {Int:Text}, w: link.Why, whys: [link.Why]) -> Text =
+  (match via { [] => ""  vs => "-> " ++ join(vs, ", ") ++ " in " }) ++ shown(key, parts) ++ (match parts[key] { some(q) if q.text != "" => "  " ++ q.text  _ => "" })
+  where key = names[part-of-why(w)] ?? "",
+        via = [sym.symbol-at(m.table, x.b).name for x in whys if x.relation == "declares" and x.a == part-of-why(w) distinct x.b]
+
+# Each finding where it is, as a compiler says it, the statement there, and why; then how many.
+fn report-text(fs: [Finding]) -> Text = match fs {
+  [] => ""
+  _ => join([(if f.place != "" then f.place ++ ": " else "") ++ f.severity ++ " [" ++ f.lint ++ "] " ++ f.message ++ "\n"
+             ++ (if f.text != "" then "    " ++ f.text ++ "\n" else "")
+             ++ "  because\n" ++ join(["  " ++ w ++ "\n" for w in f.why], "") for f in fs], "\n")
+       ++ "\n" ++ plural(count f in fs: f.severity == "error", "error") ++ ", " ++ plural(count f in fs: f.severity == "warning", "warning") ++ "\n"
+}
+
+fn plural(n: Int, what: Text) -> Text = int-text(n) ++ " " ++ what ++ (if n == 1 then "" else "s")

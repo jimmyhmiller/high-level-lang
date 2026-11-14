@@ -1,0 +1,181 @@
+# What a build gives lint rules (bundle.lint): its own relations, by name, as text. A statement is
+# known as the ledger knows it (bundle.ledger: its module and what it declares), a module by its
+# path, a route by its root's path; numbers are written out. What each relation holds is read
+# from what the build made: the ledger's routes and bytes, and linking's database, which says what
+# each statement needs and why it is kept. And `code`: JavaScript patterns, read by js.syntax and
+# matched against every statement of every module.
+rules bundle.shipped over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.analysis as an
+use bundle.emit as e
+use bundle.link as link
+use bundle.ledger as l
+use bundle.analyze as analyze
+use bundle.sourcemap as map
+use bundle.resolve as res
+use bundle.package as pkg
+
+# A relation the build gives: its name, its columns, and what a row says.
+record Relation { name: Text, columns: [Text], about: Text }
+
+fn relations() -> [Relation] = [
+  Relation(name: "route", columns: ["root"], about: "an entry, or what an `import()` names, which loads files of its own"),
+  Relation(name: "entry", columns: ["root"], about: "a route that is an entry"),
+  Relation(name: "lazy", columns: ["root"], about: "a route an `import()` starts"),
+  Relation(name: "route-bytes", columns: ["root", "bytes"], about: "how many bytes a route loads before it runs"),
+  Relation(name: "ships", columns: ["root", "statement"], about: "a route loads the statement's code"),
+  Relation(name: "bytes", columns: ["root", "statement", "bytes"], about: "how many of a route's bytes are the statement's"),
+  Relation(name: "reaches", columns: ["root", "statement"], about: "the route needs the statement: from its root, by what statements read (not what was only packed with it)"),
+  Relation(name: "live", columns: ["statement"], about: "the statement is in the output"),
+  Relation(name: "effect", columns: ["statement"], about: "the statement stays for what it does as its module loads"),
+  Relation(name: "statement", columns: ["statement", "module", "line"], about: "a statement of a module, and the line it starts on (0: what the bundler wrote for the module)"),
+  Relation(name: "needs", columns: ["statement", "other", "name"], about: "the statement reads a name the other declares, in its module or through an import"),
+  Relation(name: "reads", columns: ["statement", "module", "name"], about: "the statement reads an export of a module by name"),
+  Relation(name: "reads-whole", columns: ["statement", "module"], about: "the statement reads a module's namespace object, which holds all its exports"),
+  Relation(name: "exports", columns: ["module", "name"], about: "a module exports a name"),
+  Relation(name: "module", columns: ["module"], about: "a module of the build"),
+  Relation(name: "kind", columns: ["module", "kind"], about: "esm, commonjs, runtime or other"),
+  Relation(name: "size", columns: ["module", "bytes"], about: "the module's source, in bytes"),
+  Relation(name: "package", columns: ["module", "package", "dir"], about: "a module of an installed package, and the directory of the copy it is in"),
+  Relation(name: "imports", columns: ["module", "target"], about: "a module imports (or requires) another"),
+  Relation(name: "loads", columns: ["module", "target"], about: "a module loads another with `import()`"),
+  Relation(name: "dependency", columns: ["package"], about: "a package ./package.json lists under dependencies"),
+  Relation(name: "dev-dependency", columns: ["package"], about: "a package ./package.json lists under devDependencies"),
+  Relation(name: "platform", columns: ["platform"], about: "browser or node"),
+  Relation(name: "code", columns: ["statement", "pattern"], about: "a statement holds code the JavaScript pattern matches; each `$X` binds X, `$_` matches anything, `$$X` any number of list items")
+]
+
+# What the build is: its ledger, and whether it runs on node.
+record Build { ledger: l.Ledger, node: Bool }
+
+fn module-key(id: Int) -> Text = l.module-key(id)
+
+fn rows-of(name: Text, b: Build) -> [[Text]] = match name {
+  "route" => [[r.root] for r in x.routes]
+  "entry" => [[module-key(id)] for id in m.entries]
+  "lazy" => [[r.root] for r in x.routes if not (r.root in entries)] where entries = [module-key(id) for id in m.entries]
+  "route-bytes" => [[r.root, int-text(r.bytes)] for r in x.routes]
+  "ships" => [[r.root, x.parts[k].key] for r in x.routes for k in r.parts]
+  "bytes" => [[r.root, x.parts[r.parts[i]].key, int-text(r.bytes-of[i])] for r in x.routes for i in 0..len(r.parts)]
+  "reaches" => match an.linking.splitting {
+    true => [[module-key(r), parts[p] ?? ""] for m.db.reaches(?r, ?p) if p in parts]
+    false => [[module-key(m.entry), parts[p] ?? ""] for m.db.active-part(?p) if p in parts]
+  }
+  "live" => [[parts[p] ?? ""] for m.db.active-part(?p) if p in parts]
+  "effect" => [[parts[p] ?? ""] for m.db.effect(?p) if p in parts]
+  "statement" => [[p.key, p.module, int-text(p.line)] for p in x.parts]
+  "needs" => [[parts[p] ?? "", parts[q] ?? "", sym.symbol-at(m.table, s).name] for row in reading() for p in [row.part] for s in [row.symbol]
+              for q in declarers(s) if p in parts and q in parts distinct int-text(p) ++ " " ++ int-text(q) ++ " " ++ int-text(s)]
+  "reads" => [[parts[p] ?? "", module-key(d), name-of(m.names, n)] for m.db.via(?p, ?d, ?n) if p in parts]
+  "reads-whole" => [[parts[p] ?? "", module-key(mo)] for m.db.ns-symbol(?mo, ?s) for row in reading() if row.symbol == s for p in [row.part] if p in parts
+                    distinct int-text(p) ++ " " ++ int-text(mo)]
+  "exports" => [[module-key(mo), name-of(m.names, n)] for m.db.exported(?mo, ?n) distinct int-text(mo) ++ " " ++ int-text(n)]
+  "module" => [[module-key(id)] for id in m.order]
+  "kind" => [[module-key(id), analyze.kind-name(m.modules[id])] for id in m.order]
+  "size" => [[module-key(id), int-text(len(l.source-of(id)))] for id in m.order]
+  "package" => [[module-key(id), name, dir] for id in m.order for path in [module-key(id)] for at in [last-index-of(path, "node_modules/")]
+                if let some(i) = at for name in [analyze.package-of(path)] if name != "" for dir in [path[0..i + 13] ++ name]]
+  "imports" => [[module-key(a), module-key(d)] for m.db.imports(?a, ?d) distinct int-text(a) ++ " " ++ int-text(d)]
+  "loads" => [[module-key(id), module-key(x.target)] for id in m.order for x in an.module-link(id).loads if x.by-import
+              distinct int-text(id) ++ " " ++ int-text(x.target)]
+  "dependency" => [[k] for k in package-keys("dependencies")]
+  "dev-dependency" => [[k] for k in package-keys("devDependencies")]
+  "platform" => [[if b.node then "node" else "browser"]]
+  _ => panic "shipped: no relation {}", name
+} where x = b.ledger,
+        parts = l.part-keys()
+
+# Every statement's read of a symbol: what it mentions, and what reading an import resolves to.
+record Reading { part: Int, symbol: Int }
+
+fn reading() -> [Reading] =
+  [Reading(part: p, symbol: s) for m.db.mentions(?p, ?s)] ++ [Reading(part: p, symbol: s) for m.db.uses(?p, ?s)]
+
+# The statements that declare a symbol, or hold it (an import variable of CommonJS's).
+fn declarers(s: Int) -> [Int] = [q for m.db.declares(?q, s)] ++ [q for m.db.cjs-binding(s, ?q)]
+
+# The names a member of ./package.json lists.
+fn package-keys(member: Text) -> [Text] = match res.package-doc(".") {
+  none => []
+  some(doc) => match res.member(doc, member) {
+    some(pkg.Object(List(ms...))) => [unquote(x.key.text) for x in ms]
+    _ => []
+  }
+}
+
+# ---------------------------------------------------------------- code
+
+# A pattern's variables, in the order they come: `$X` is X; `$_`, and `$$X` in a list, bind nothing.
+fn pattern-variables(pattern: Text, label: Text) -> [Text] = [v for v in metas(pattern-node(pattern, label)) distinct v]
+
+everywhere fn metas(n: Node) -> [Text] = match n {
+  _ if len(n.kids) == 0 and starts-with(n.text, "$") and not starts-with(n.text, "$$") and n.text != "$_" => [n.text[1..len(n.text)]]
+}
+
+# A pattern, read by js.syntax: the expression a statement of one expression holds, or else the statement.
+fn pattern-node(pattern: Text, label: Text) -> Node = match js.parse(pattern ++ ";", label).body.kids {
+  [ExprStmt(x)] => x
+  [s] => s
+  _ => fail-build(label ++ ": a pattern is one expression or one statement")
+}
+
+# Each statement of each module, every place in it the pattern matches: the statement, the place
+# (`path:line`), and the value of each of the pattern's variables, in `pattern-variables` order.
+fn code-rows(pattern: Text, label: Text) -> [[Text]] =
+  [[parts[p] ?? "", module-key(id) ++ ":" ++ int-text(map.line-at(lines, at(hit.node.lo)) + 1)] ++ [value-of(hit.bound, v) for v in names]
+   for id in m.order if m.modules[id].kind == m.Esm or m.modules[id].kind == m.Cjs
+   for text in [l.source-of(id)] for lines in [map.line-starts(text)]
+   for p in e.parts-of(id) if p in parts for s in [an.stmt-of(id, p)] if not (s is None() or s is Flag())
+   for hit in hits(s, pat, text)]
+  where pat = pattern-node(pattern, label),
+        names = pattern-variables(pattern, label),
+        parts = l.part-keys()
+
+record Bound { name: Text, value: Text }
+record Hit { node: Node, bound: [Bound] }
+
+fn value-of(bound: [Bound], name: Text) -> Text = (first b in bound if b.name == name: b.value) ?? panic "code: {} is bound by no match", name
+
+# Everywhere in `n` the pattern matches, outermost first.
+fn hits(n: Node, pat: Node, text: Text) -> [Hit] =
+  [Hit(node: n, bound: b) for found in [unified(pat, n, text, [])] if let some(b) = found]
+  ++ [h for k in n.kids for h in hits(k, pat, text)]
+
+fn at(lo: Int) -> Int = lo % map.module-unit
+
+# The bindings under which the pattern `p` is the node `t`, if any: a variable is anything (the same
+# each time it comes), and else the two have the same kind, the same text and children alike.
+fn unified(p: Node, t: Node, text: Text, b: [Bound]) -> [Bound]? = match meta?(p) {
+  true if p.text == "$_" => some(b)
+  true => match first x in b if x.name == name: x.value {
+    some(v) if v == found => some(b)
+    some(_) => none
+    none => some(b ++ [Bound(name: name, value: found)])
+  } where name = p.text[1..len(p.text)],
+          found = shown(t, text)
+  false if p.kind != t.kind or p.text != t.text => none
+  false => kids-unified(p.kids, t.kids, text, b)
+}
+
+fn meta?(p: Node) -> Bool = len(p.kids) == 0 and starts-with(p.text, "$") and not starts-with(p.text, "$$")
+
+fn rest?(p: Node) -> Bool = len(p.kids) == 0 and starts-with(p.text, "$$")
+
+# Children alike, in order; `$$X` last in a pattern's list is all the rest, however many.
+fn kids-unified(ps: [Node], ts: [Node], text: Text, b: [Bound]) -> [Bound]? = match ps, ts {
+  [], [] => some(b)
+  [r], _ if rest?(r) => some(b)
+  [p, more...], [t, rest...] => match unified(p, t, text, b) {
+    some(next) => kids-unified(more, rest, text, next)
+    none => none
+  }
+  _, _ => none
+}
+
+# What a variable is bound to: a string's value, a name, or else the code as written.
+fn shown(t: Node, text: Text) -> Text = match t {
+  Str(_) => unquote(t.text)
+  _ if len(t.kids) == 0 and len(t.text) > 0 => t.text
+  _ => trim(text[from..max(from, min(at(t.hi), len(text)))]) where from = min(at(t.lo), len(text))
+}
