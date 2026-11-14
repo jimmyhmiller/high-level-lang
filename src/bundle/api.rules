@@ -30,6 +30,7 @@ use bundle.lint as lint
 use bundle.shipped as shipped
 use bundle.rewrites as rw
 use bundle.inline as inline
+use bundle.pages as pages
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
@@ -60,6 +61,9 @@ record DefineText { key: Text, value: Text }
 boxed record Options {
   entry: Text,
   entries: [Text],
+  # An HTML page the build is of (`esb index.html`): its module scripts are the entries, and it is
+  # written again, loading what they became (bundle.pages).
+  page: Text,
   outfile: Text,
   outdir: Text,
   outbase: Text,
@@ -120,6 +124,8 @@ boxed record Options {
   target: Int,
   on-resolve: [Fn(Text,Text)->Text?],
   on-load: [Fn(Text)->Text?],
+  # A framework's transforms of each module's tree as it loads (see `Loading.transforms`).
+  transforms: [Fn(Node,Text,Text)->Node],
   transform: Fn(Node)->Node,
   optimize: Fn(Node)->Node
 }
@@ -129,8 +135,20 @@ fn keep-as-is(n: Node) -> Node = n
 # What `minify syntax` means unless a build says otherwise.
 fn default-optimize(n: Node) -> Node = fin.finished(minify.run(n), false)
 
+# A build of an HTML page (bundle.pages): its module scripts and stylesheets are the entries, split
+# into ES module chunks named, as Vite names them, under `assets/`.
+fn paged(o: Options) -> Options = match o.entry {
+  page ++ ".html" => match pages.entries(pages.page-of(o.entry)) {
+    [] => fail-build(o.entry ++ ": the page loads no module script or stylesheet of the project's to build")
+    entries => o with { page: o.entry, entry: entries[0], entries: entries, splitting: true, format: esm-format(),
+                        entry-names: "assets/[name]-[hash]", chunk-names: "assets/[name]-[hash]",
+                        outdir: match o.outdir { "" => fail-build("a page is built to a directory: give --outdir")  d => d } }
+  }
+  _ => o
+}
+
 fn options-new(entry: Text, outfile: Text) -> Options =
-  Options(entry: entry, entries: [entry], outfile: outfile, outdir: "", outbase: "", splitting: false,
+  Options(entry: entry, entries: [entry], page: "", outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]", chunking: packing.options(),
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
@@ -138,7 +156,7 @@ fn options-new(entry: Text, outfile: Text) -> Options =
           extensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".mjs", ".cjs", ".json"], external: [], platform-node: false,
           aliases: [], loaders: [], banner: "", footer: "", tree-shaking: true, strict-execution-order: false, has-transform: false, has-optimize: false, charset-ascii: true, drop-console: false, drop-debugger: false, pure: [],
           packages-external: false, public-path: "", tsconfig: "", legal-comments: "eof", analyze: "", ledger: false, lints: [], fix: false, rewrites: [], property-shaking: true, hmr-patch: true, jsx: jsx.options-new(), target: lower.no-lowering,
-          on-resolve: [], on-load: [],
+          on-resolve: [], on-load: [], transforms: [],
           transform: keep-as-is, optimize: default-optimize)
 
 # Node's module system: builtins stay external, and packages resolve for node.
@@ -364,7 +382,8 @@ fn with-node-env(o: Options) -> Options = match o {
 # How the build loads, links and emits, as the modules that do it are told.
 fn loading-of(o: Options, out-dir: Text) -> m.Loading =
   m.Loading(defines: [m.Define(key: d.key, value: define-value(d.value)) for d in o.defines], transform: o.transform,
-            has-transform: o.has-transform or len(o.rewrites) > 0, rewrites: o.rewrites, rewrite: rw.rewritten, aliases: o.aliases, loaders: o.loaders, on-resolve: o.on-resolve,
+            has-transform: o.has-transform or len(o.rewrites) > 0 or len(o.transforms) > 0, rewrites: o.rewrites, rewrite: rw.rewritten,
+            transforms: o.transforms, aliases: o.aliases, loaders: o.loaders, on-resolve: o.on-resolve,
             on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir,
             packages-external: o.packages-external, public-path: o.public-path, inline-constants: o.minify-syntax)
 
@@ -395,8 +414,10 @@ fn below(dir: Text, path: Text) -> Text = match dir {
   _ => path[len(dir) + 1..len(path)]
 }
 
-fn entry-output(o: Options, entry: Text, base: Text) -> Text =
-  o.outdir ++ "/" ++ chunks.pattern-path(o.entry-names, match dir-of(rel) { "." => ""  d => d }, path-stem(rel), "") ++ ".js"
+fn entry-output(o: Options, entry: Text, base: Text) -> Text = entry-output-hashed(o, entry, base, "")
+
+fn entry-output-hashed(o: Options, entry: Text, base: Text, hash: Text) -> Text =
+  o.outdir ++ "/" ++ chunks.pattern-path(o.entry-names, match dir-of(rel) { "." => ""  d => d }, path-stem(rel), hash) ++ ".js"
   where rel = below(base, entry)
 
 fn base-dir(o: Options) -> Text = match o.outbase {
@@ -792,7 +813,7 @@ fn chunk-programs(o: Options, all: [chunks.Chunk], selected: [[e.Unit]]) -> [Pri
 
 fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text = match c.root {
   r if r < 0 => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"
-  r if r in static-roots => entry-output(o, (first entry in o.entries if real-path(entry) == m.modules[r].path: entry) ?? m.modules[r].path, base)
+  r if r in static-roots => entry-output-hashed(o, (first entry in o.entries if real-path(entry) == m.modules[r].path: entry) ?? m.modules[r].path, base, hash)
   r => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(m.modules[r].path), hash) ++ ".js"
 }
 
@@ -865,7 +886,7 @@ record RootStylesheet { root: Int, path: Text, bundle: cssb.Bundled }
 fn root-stylesheet(o: Options, root: Int, sheets: [Text]) -> RootStylesheet =
   RootStylesheet(root: root, path: path, bundle: cssb.bundle(sheets, path, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments))
   where bundled = cssb.bundle(sheets, o.outdir ++ "/style.css", o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments),
-        path = match root in m.entries {
+        path = match root in m.entries and o.page == "" {
           true => with-extension(entry-output(o, (first entry in o.entries if real-path(entry) == m.modules[root].path: entry)
                                                   ?? m.modules[root].path, base-dir(o)), ".css")
           false => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(m.modules[root].path), host.content-hash(bundled.text)) ++ ".css"
@@ -878,6 +899,7 @@ fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> 
                          ++ [analyze.Output(path: s.path, kind: "css", text: s.bundle.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for s in styles],
                       m.entries ++ an.linked.dynamic-roots)
   ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
+  ++ page-written(o, all, paths, styles)
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
         printed = chunk-programs(o, all, [chunk-units(c, unit-index) for c in all]),
         js = [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths, homes) for i in 0..len(all)],
@@ -889,6 +911,46 @@ fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> 
         paths = [chunk-path-of(o, all[i], hashes[i], base, m.entries) for i in 0..len(all)]
                 ++ [s.path for s in styles],
         homes = legal-homes(all)
+
+# With a page as the entry, the page written again (bundle.pages): for each script or stylesheet it
+# loads, the chunk the build made of it, the chunks that one imports, all the way down, to preload,
+# and its stylesheets; paths from the output directory, given from the public path (`/`). And the
+# project's `public` directory, copied, as Vite copies it.
+fn page-written(o: Options, all: [chunks.Chunk], paths: [Text], styles: [RootStylesheet]) -> [Written] = match o.page {
+  "" => []
+  page => [Written(path: out, text: t, said: said-of(t, out))] ++ public-written(dir-of(page) ++ "/public", o.outdir)
+    where out = o.outdir ++ "/" ++ path-base(page),
+          t = pages.written(pages.page-of(page), made, match o.public-path { "" => "/"  p => p }),
+          made = [pages.Made(source: entry, file: below(o.outdir, paths[i]), preload: [below(o.outdir, paths[j]) for j in imported-closure(all, i)],
+                             styles: [below(o.outdir, s.path) for s in styles if s.root == r])
+                  for k in 0..len(o.entries) for entry in [o.entries[k]] for r in [m.entries[k]] for i in [first-chunk(all, r)]]
+}
+
+fn first-chunk(all: [chunks.Chunk], root: Int) -> Int = (first i in 0..len(all) if all[i].root == root: i) ?? panic "{} has no chunk", m.modules[root].path
+
+# The chunks a chunk imports, and what those import, in the order a walk first meets them.
+fn imported-closure(all: [chunks.Chunk], i: Int) -> [Int] = [j for j in reached([chunk-imports(all, k) for k in 0..len(all)], [i], []) if j != i]
+
+fn reached(edges: [[Int]], todo: [Int], seen: [Int]) -> [Int] = match todo {
+  [] => seen
+  [x, rest...] if x in seen => reached(edges, rest, seen)
+  [x, rest...] => reached(edges, rest ++ edges[x], seen ++ [x])
+}
+
+fn chunk-imports(all: [chunks.Chunk], i: Int) -> [Int] =
+  [other.id for other in all if other.id != c.id if other.id in c.needs or (c.root >= 0 and c.root in other.roots)]
+  where c = all[i]
+
+# Every file under a directory, copied to the same place under the output directory.
+fn public-written(dir: Text, out: Text) -> [Written] =
+  [Written(path: out ++ "/" ++ rel, text: read-file(dir ++ "/" ++ rel), said: "") for rel in files-under(dir, "")]
+
+fn files-under(dir: Text, rel: Text) -> [Text] =
+  [f for line in split(dir-listing(dir ++ rel), "\n") if line != "" for name in [line[1..len(line)]]
+   for f in (match line[0] {
+     'd' => files-under(dir, rel ++ "/" ++ name)
+     _ => [(rel ++ "/" ++ name)[1..len(rel) + 1 + len(name)]]
+   })]
 
 # Join a chunk's part ids through an inverted index, then restore the original emission order.
 # Asking every module about every chunk creates mostly-empty memo answers and graph-sized
