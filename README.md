@@ -678,6 +678,70 @@ findings so.
 - that `--fix` edits only what it should (whole lines, a filled template, no package files), and
   that linting again finds what was fixed gone.
 
+## What an object holds, read by name
+
+Bundlers drop what nothing reads statement by statement and export by export. An object, once
+read, ships whole. esbuild, Rollup 4 and this bundler before this all kept every property of:
+
+- `export const Utils = { clamp, lerp, … }` read as `Utils.clamp`;
+- `export default { parse, stringify }` read as `csv.parse`;
+- a namespace read through a `const` alias (`const api = ns; api.alpha()`).
+
+All but Rollup also kept everything of a destructured namespace (`const { alpha } = ns`).
+
+Linking now follows such objects in `link.facts`. Two kinds of object qualify:
+
+- **Object literals:** one a top-level `const` (or `export default`) gives a name, with no spread,
+  computed key, `__proto__`, repeated key, `this` or `super`.
+- **Namespace objects** reached through `const` aliases (`api`), through imports and re-exports of
+  those, and through simple destructuring.
+
+The rules:
+
+- **Read whole:** an object is read whole when it is named as a value, here or through an import;
+  when it is read as another namespace's export or with a name that tells more than one property
+  (`hasOwnProperty` and its kind); when it is exported from an entry or written through; or when
+  anything else reads it.
+- **Kept properties:** a property is kept when its object is read whole, or when a live statement
+  reads it by name (`O.k`, here or through an import or an alias). What a kept property reads is
+  read by its statement, so its dependencies stay too.
+- **Which properties may go:** only those that can go unread (`pure?`) and read only names. A
+  property whose value does something as it loads, or reads a namespace member, always stays.
+
+The declaring statement is still one part. Each property's reads are found by the statement's own
+summary walk run on its value; emit prints only the kept properties; and destructuring of a
+namespace object is printed as one declarator per name, each the export itself. The relations
+`object`, `object-read-whole` and `prop-kept` let lints say why an object ships whole, and
+`examples/ship.lint` has a rule that points at the project's statement keeping a package's object
+whole.
+
+On the apps, with output the same:
+
+| App | before | after | change |
+|---|---|---|---|
+| three (math only) | 263,187 | 139,590 | −47% |
+| date-fns | 23,098 | 22,896 | −0.9% |
+| all of lodash-es | 93,389 | 93,195 | −0.2% |
+| zod read through `const schemas = z; schemas.object(…)` | 455,332 | 85,353 | −81% |
+
+Most of three's comes from `ShaderChunk`, an object of about 150 GLSL strings of which the
+`ShaderLib` entries this app keeps name 34, and from `MathUtils`, of which it reads `clamp`. An
+app that renders reads `ShaderChunk[name]` and keeps it whole. The held-out libraries, whose
+exercisers call nearly every export, change by under 1%.
+
+It costs about 1.5–2% of a cold build where nothing is shaken (zod, d3, lodash-es), and three's is
+faster for printing less. `--property-shaking=false` turns it off. Its output is byte for byte the
+earlier bundler's across all 189 of `tools/same.py`'s outputs, which is how verify's identity
+checks against esbuild run.
+
+`tools/shake-check.py`, part of `tools/verify.py`, builds each case in `tests/apps/shake` with us
+and with esbuild and runs both. It checks what goes (exports through destructuring and aliases,
+literals' and default objects' properties and what only those read) and what escapes and stays
+whole (`Object.keys`, `for in`, spread, `hasOwnProperty`, passing the object on, reading it through
+a namespace, `this` in a method, a property that does something as it loads). It also checks a split
+build where two routes read different properties. The held-out exercisers' calls and
+`tools/correctness-check.py` pass with it on.
+
 ## Paired client/server builds
 
 A target with `client-outfile` builds one server entry and discovers browser entries from its

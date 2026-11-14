@@ -112,7 +112,7 @@ fn symbol-read(s: Int) -> Node = match an.linked.cjs-imports[t] {
 fn namespace-property(target: Int, name: Text) -> Node = Member(Ident(final-of(an.ns-sym(m.modules[target]))), PropName(name))
 
 # `ns.name` when `ns` is `import * as` of an ES module: the export itself.
-fn namespace-read(n: Node) -> Node? = match an.namespace-of(body, here, n.object) ?? imported-namespace(n) {
+fn namespace-read(n: Node) -> Node? = match an.namespace-of(body, here, n.object) ?? imported-namespace(n) ?? alias-namespace(n.object) {
   none => none
   some(target) => match exported(target, n.property.text) {
     some(s) => some(symbol-read(s))
@@ -125,6 +125,26 @@ fn namespace-read(n: Node) -> Node? = match an.namespace-of(body, here, n.object
 fn imported-namespace(n: Node) -> Int? = match n.object, n.property {
   Ident(_), PropName(_) => first s in m.symbol-in(body, here, n.object.lo) for m.db.namespace-of-import(s, ?mo): mo
   _, _ => none
+}
+
+# `a.x` of a `const a` that linking found is a namespace object (`an.AliasOf`): that module.
+fn alias-namespace(n: Node) -> Int? = match n {
+  Ident(_) => first s in an.alias-name(body, here, n) for m.db.namespace-symbol(s, ?mo): mo
+  _ => none
+}
+
+# What a destructuring's value is a namespace object of, when it is one.
+fn destructured-namespace(n: Node) -> Int? = match n {
+  Ident(_) => an.namespace-of(body, here, n) ?? (first s in m.symbol-in(body, here, n.lo) if s in an.linked.named-imports for m.db.namespace-of-import(s, ?mo): mo)
+              ?? alias-namespace(n)
+  _ => none
+}
+
+# A name of a namespace object read: the export itself, as `namespace-read` makes `ns.name`.
+fn namespace-name-read(target: Int, name: Text) -> Node = match exported(target, name) {
+  some(s) => symbol-read(s)
+  none if m.db.dynamic(target) => namespace-property(target, name)
+  none => void-zero()
 }
 
 # What a module exports under a name. A name never interned is in no fact, so nothing exports it.
@@ -221,6 +241,14 @@ rewrite ExprStmt(CallExpr(...) as call) as n => match an.known-require-target(bo
 }
 rewrite Member(object, property) as n =>
   namespace-read(n) ?? Member(object.out, property) with { lo: object.out.lo, hi: property.hi }
+# `const O = { … }` whose properties may go (an.objects-of): those no live part reads, and nothing
+# reads whole, gone.
+rewrite Declarator(BindName(_) as name, ObjectLit(List(props...)) as obj) as d if is-some(object-symbol(name)) =>
+  Declarator(name.out, ObjectLit(List(kept-props(object-symbol(name) ?? -1, props, obj.out.props.kids)...)) with { lo: obj.lo, hi: obj.hi }) with { lo: d.lo, hi: d.hi }
+# `const { a, b: c } = ns` of a namespace object: each name its export, `a = …, c = …`, and no object.
+rewrite Declarator(ObjectPattern(List(props...)) as pattern, Ident(_) as init) as d
+    if an.linking.shake-properties and (all x in props: an.simple-prop?(x)) and is-some(destructured-namespace(init)) =>
+  destructured-declarators(d, props, pattern.out.props.kids, destructured-namespace(init) ?? -1)
 rewrite ImportCall(...) as n => match an.known-import-call-target(here, n) {
   some(t) if m.modules[t].kind == External => n
   some(t) if an.linking.splitting => import-chunk(m.modules[t])
@@ -236,6 +264,23 @@ rewrite Num(t) as n if not strict-file?() and host.legacy-number?(t) => Num(host
 rewrite Str(raw) as n if not strict-file?() and host.octal-escaped?(raw) => Str(host.without-octal-escapes(raw)) with { lo: n.lo, hi: n.hi }
 # An empty statement in a statement list does nothing.
 rewrite List(...) as n => without-empty(n.out)
+
+fn destructured-declarators(d: Node, props: [Node], outs: [Node], target: Int) -> [Node] =
+  [Declarator(bound-name(outs[i]), namespace-name-read(target, an.prop-key(props[i]))) with { lo: d.lo, hi: d.hi } for i in 0..len(props)]
+
+fn object-symbol(name: Node) -> Int? = first s in m.symbol-in(body, here, name.lo) if s in an.linked.objects for m.db.object-literal(s, _): s
+
+# An object's properties as emitted: each that may not go, and each that may and stays.
+fn kept-props(o: Int, props: [Node], outs: [Node]) -> [Node] =
+  [outs[i] for i in 0..len(props) for k in [known-name(m.names, an.object-key-of(props[i]))]
+   if not (k >= 0 and m.db.shakeable-prop(o, k)) or m.db.kept-prop(o, k)]
+
+# The name a simple destructuring property binds, as emitted.
+fn bound-name(x: Node) -> Node = match x {
+  PatShort(name, _) => name
+  PatProp(_, BindElement(name, _)) => name
+  _ => panic "bound-name of a property that is not simple"
+}
 
 fn without-empty(l: Node) -> Node = l with { kids: [k for k in l.kids if not (k is Empty())] }
 
@@ -420,7 +465,7 @@ fn import-spec(imported: Node, local: Text) -> Node = match imported {
   _ => ImportAs(imported, BindName(local))
 }
 
-fn wanted?(b: Node) -> Bool = not emitting.drop-unused-imports or (any m.db.mentions(?p, binding-sym(b)): live?(p))
+fn wanted?(b: Node) -> Bool = not emitting.drop-unused-imports or (any m.db.mentions(?p, binding-sym(b)): live?(p)) or (any m.db.prop-reads(?p, binding-sym(b)): live?(p))
 
 fn binding-sym(b: Node) -> Int = m.symbol-in(body, here, b.lo) ?? panic "{}: no symbol for import {}", here.path, b.text
 
@@ -925,7 +970,7 @@ fn dynamic-module?(id: Int) -> Bool = sym.scope-at(m.table, m.modules[id].root).
 # function is no export kept for an entry: its own, or one re-exporting it however far.
 fn single-reader(id: Int, x: Declared) -> [Candidate] =
   [Candidate(part: x.part, symbol: x.symbol, module: id, reader: q)
-   for readers in [[q for q in [q for m.db.mentions(?q, x.symbol)] ++ [q for m.db.uses(?q, x.symbol)] if live?(q) distinct q]]
+   for readers in [[q for q in [q for m.db.mentions(?q, x.symbol)] ++ [q for m.db.uses(?q, x.symbol)] ++ [q for m.db.prop-reads(?q, x.symbol)] if live?(q) distinct q]]
    if len(readers) == 1 and readers[0] != x.part and not entry-export?(x.symbol)
    for q in readers for mo in [first m.db.part-of(q, ?mo): mo] for r in mo
    if m.modules[r].kind == Esm and not dynamic-module?(r)]

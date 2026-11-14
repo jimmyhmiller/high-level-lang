@@ -46,6 +46,7 @@ relation uses(part, symbol)
 # A part mentions a name it imports from a module. Found from the imports, which are fewer.
 relation via(part, module, name)
 via(P, D, N) :- import-of(S, D, N), mentions(P, S) ;
+via(P, D, N) :- prop-reads(P, S), import-of(S, D, N) ;
 uses(P, T) :- via(P, D, N), resolved(D, N, T) ;
 
 # Namespace objects. A namespace part reads every export of its module. `ns.name`
@@ -57,6 +58,7 @@ relation ns-member(part, module, name)
 resolved(M, N, T) :- local-export(M, N, S), ns-import(S, D), ns-symbol(D, T) ;
 uses(P, S) :- ns-part(P, M), resolved(M, N, S) ;
 uses(P, T) :- ns-import(S, M), mentions(P, S), ns-symbol(M, T) ;
+uses(P, T) :- prop-reads(P, S), ns-import(S, M), ns-symbol(M, T) ;
 uses(P, T) :- ns-member(P, M, N), resolved(M, N, T) ;
 
 # `export *` from CommonJS: names only known at run time, read from the namespace object.
@@ -67,12 +69,66 @@ uses(P, T) :- ns-member(P, M, N), resolved(M, N, T) ;
 relation import-member(part, symbol, name)
 relation namespace-of-import(symbol, module)
 relation namespace-import(symbol)
-namespace-of-import(S, M) :- import-of(S, D, N), resolved(D, N, X), ns-symbol(M, X) ;
 namespace-import(S) :- namespace-of-import(S, M) ;
 via(P, D, DN) :- import-member(P, S, N), import-of(S, D, DN), !namespace-import(S) ;
 # It reads `x` of that module: what it resolves to, and what reading a module's name brings with
 # it (that module's evaluation, for one, top-level `await` included).
 via(P, M, N) :- import-member(P, S, N), namespace-of-import(S, M) ;
+
+# A `const` that is another name's value (`const api = ns`), and `api.x` read in a part. Where the
+# name is a namespace object, through any `const`s, imports and re-exports, so is the `const`, and
+# reading `api.x` is reading that module's `x`, as `ns.x` is; else it reads `api`, as before.
+relation const-alias(symbol, aliased)
+# A name its module assigns or writes through: no alias of a namespace, and an object read whole.
+relation written(symbol)
+relation alias-member(part, symbol, name)
+relation namespace-symbol(symbol, module)
+relation aliased-namespace(symbol)
+namespace-symbol(S, M) :- ns-import(S, M) ;
+namespace-symbol(X, M) :- ns-symbol(M, X) ;
+namespace-symbol(S, M) :- namespace-of-import(S, M) ;
+namespace-symbol(A, M) :- const-alias(A, R), namespace-symbol(R, M), !written(A) ;
+namespace-of-import(S, M) :- import-of(S, D, N), resolved(D, N, X), namespace-symbol(X, M) ;
+aliased-namespace(A) :- namespace-symbol(A, M) ;
+via(P, M, N) :- alias-member(P, A, N), namespace-symbol(A, M) ;
+uses(P, A) :- alias-member(P, A, N), !aliased-namespace(A) ;
+# What a `const` is the value of, through `const`s: reading a member of it passes through what that
+# name passes through, as reading the member of the name would.
+relation alias-root(symbol, of)
+alias-root(A, R) :- const-alias(A, R) ;
+alias-root(A, S) :- alias-root(A, R), const-alias(R, S) ;
+
+# Object literals whose properties may go (`const O = { … }`): the part that declares O, each
+# property that may go, and the symbols each reads. A property stays when the object is read whole
+# (named as a value, here or through an import; read as a namespace's export; exported from an
+# entry; or anything else that reads it besides a member by name), or when a live part reads it by
+# name (`O.k`, here or through an import). What a property that stays reads is read by the part.
+relation object-literal(symbol, part)
+relation shakeable-prop(symbol, name)
+relation prop-mentions(part, name, symbol)
+relation object-symbol(symbol, object)
+object-symbol(O, O) :- object-literal(O, P) ;
+object-symbol(S, O) :- object-symbol(X, O), resolved(D, N, X), import-of(S, D, N) ;
+relation member-path(part, object)
+member-path(Q, O) :- object-symbol(A, O), alias-member(Q, A, K) ;
+member-path(Q, O) :- object-symbol(S, O), import-member(Q, S, K) ;
+relation whole-path(part, object)
+whole-path(Q, O) :- object-symbol(S, O), mentions(Q, S) ;
+whole-path(Q, O) :- object-symbol(S, O), prop-reads(Q, S) ;
+whole-path(Q, O) :- object-literal(O, P), resolved(M, N, O), ns-member(Q, M, N) ;
+whole-path(Q, O) :- object-literal(O, P), uses(Q, O), !member-path(Q, O) ;
+relation member-read(object, name)
+member-read(O, K) :- object-symbol(A, O), alias-member(Q, A, K), live(Q) ;
+member-read(O, K) :- object-symbol(S, O), import-member(Q, S, K), live(Q) ;
+relation whole-read(object)
+whole-read(O) :- whole-path(Q, O), live(Q) ;
+whole-read(O) :- object-literal(O, P), resolved(M, N, O), keep-exports(M) ;
+whole-read(O) :- object-literal(O, P), written(O) ;
+relation kept-prop(object, name)
+kept-prop(O, K) :- shakeable-prop(O, K), whole-read(O) ;
+kept-prop(O, K) :- shakeable-prop(O, K), member-read(O, K) ;
+relation prop-reads(part, symbol)
+prop-reads(P, S) :- object-literal(O, P), kept-prop(O, K), prop-mentions(P, K, S) ;
 
 relation dyn-star(module, target)
 relation dynamic(module)
@@ -85,6 +141,7 @@ uses(P, T) :- ns-member(P, M, N), dynamic(M), ns-symbol(M, T) ;
 # statement declares; a CommonJS statement's own names are its statement's too.
 relation cjs-binding(symbol, part)
 live(P) :- live(Q), mentions(Q, S), cjs-binding(S, P) ;
+live(P) :- prop-reads(Q, S), live(Q), cjs-binding(S, P) ;
 live(P) :- live(Q), uses(Q, S), cjs-binding(S, P) ;
 live(P) :- keep-exports(M), resolved(M, N, S), cjs-binding(S, P) ;
 
@@ -115,6 +172,8 @@ visits(D, N) :- live(P), via(P, D, N), forwards(D) ;
 # namespace object is not used.
 visits(D, DN) :- live(P), import-member(P, S, N), import-of(S, D, DN), forwards(D) ;
 visits(M, N) :- live(P), ns-member(P, M, N), forwards(M) ;
+visits(D, DN) :- alias-member(P, A, N), live(P), alias-root(A, S), import-of(S, D, DN), forwards(D) ;
+visits(M, N) :- alias-member(P, A, N), live(P), alias-root(A, S), ns-import(S, M), aliased-namespace(A), forwards(M) ;
 visits(M, N) :- live(P), ns-part(P, M), forwards(M), resolved(M, N, S) ;
 visits(M, N) :- keep-exports(M), forwards(M), resolved(M, N, S) ;
 visits(T, TN) :- visits(M, N), reexport(M, N, T, TN), forwards(T) ;
@@ -134,6 +193,7 @@ relation delayed(module)
 live(P) :- included(M), part-of(P, M), inits(P, T), included(T) ;
 included(M) :- visits(M, N), delayed(M) ;
 live(P) :- live(Q), mentions(Q, S), declares(P, S) ;
+live(P) :- prop-reads(Q, S), live(Q), declares(P, S) ;
 live(P) :- live(Q), uses(Q, S), declares(P, S) ;
 
 # Code splitting. Each root (an entry, or what `import()` names) reaches statements exactly as the
@@ -151,14 +211,18 @@ entered(R, M) :- reaches(R, P), part-of(P, M) ;
 reaches(R, P) :- entered(R, M), part-of(P, M), effect(P) ;
 reaches(R, P) :- entered(R, M), part-of(P, M), inits(P, T), entered(R, T) ;
 reaches(R, P) :- reaches(R, Q), mentions(Q, S), declares(P, S) ;
+reaches(R, P) :- prop-reads(Q, S), reaches(R, Q), declares(P, S) ;
 reaches(R, P) :- reaches(R, Q), uses(Q, S), declares(P, S) ;
 reaches(R, P) :- reaches(R, Q), mentions(Q, S), cjs-binding(S, P) ;
+reaches(R, P) :- prop-reads(Q, S), reaches(R, Q), cjs-binding(S, P) ;
 reaches(R, P) :- reaches(R, Q), uses(Q, S), cjs-binding(S, P) ;
 reaches(R, P) :- chunk-root(R), keep-exports(R), resolved(R, N, S), declares(P, S) ;
 reaches(R, P) :- chunk-root(R), keep-exports(R), resolved(R, N, S), cjs-binding(S, P) ;
 root-visits(R, D, N) :- reaches(R, P), via(P, D, N) ;
 root-visits(R, D, DN) :- reaches(R, P), import-member(P, S, N), import-of(S, D, DN) ;
 root-visits(R, M, N) :- reaches(R, P), ns-member(P, M, N) ;
+root-visits(R, D, DN) :- alias-member(P, A, N), reaches(R, P), alias-root(A, S), import-of(S, D, DN) ;
+root-visits(R, M, N) :- alias-member(P, A, N), reaches(R, P), alias-root(A, S), ns-import(S, M), aliased-namespace(A) ;
 root-visits(R, M, N) :- reaches(R, P), ns-part(P, M), resolved(M, N, S) ;
 root-visits(R, R, N) :- chunk-root(R), keep-exports(R), resolved(R, N, S) ;
 root-visits(R, T, TN) :- root-visits(R, M, N), reexport(M, N, T, TN) ;
@@ -174,6 +238,7 @@ entered(R, M) :- root-visits(R, M, N), local-export(M, N, S), import-of(S, D, DN
 relation module-consumer(root, module)
 module-consumer(R, M) :- entered(R, M) ;
 module-consumer(R, D) :- module-consumer(R, M), part-of(P, M), active-part(P), mentions(P, S), declares(Q, S), part-of(Q, D) ;
+module-consumer(R, D) :- prop-reads(P, S), part-of(P, M), module-consumer(R, M), active-part(P), declares(Q, S), part-of(Q, D) ;
 module-consumer(R, D) :- module-consumer(R, M), part-of(P, M), active-part(P), uses(P, S), declares(Q, S), part-of(Q, D) ;
 
 # Fragment demand starts at observable entry exports. Initialization islands seed their own
@@ -198,8 +263,10 @@ init-live(P) :- init-part(P, M), init-needed(M) ;
 init-live(P) :- included(M), part-of(P, M), initializes(P, D), init-needed(D) ;
 init-live(P) :- init-needed(M), part-of(P, M), initializes(P, D), init-needed(D) ;
 init-live(P) :- init-live(Q), mentions(Q, S), declares(P, S) ;
+init-live(P) :- prop-reads(Q, S), init-live(Q), declares(P, S) ;
 init-live(P) :- init-live(Q), uses(Q, S), declares(P, S) ;
 init-live(P) :- init-live(Q), mentions(Q, S), cjs-binding(S, P) ;
+init-live(P) :- prop-reads(Q, S), init-live(Q), cjs-binding(S, P) ;
 init-live(P) :- init-live(Q), uses(Q, S), cjs-binding(S, P) ;
 active-part(P) :- live(P) ;
 active-part(P) :- init-live(P) ;

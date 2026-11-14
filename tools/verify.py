@@ -81,11 +81,13 @@ for a in "named all cjs features three zod rx datefns preact immer react d3 reex
     check(code == 0 and got == expected, f"{a}: minified output same; size {o} vs {e} ({(o-e)*100/e:+.1f}%), gzip {len(gzip.compress(open(ours,'rb').read())) if code==0 else 0} vs {len(gzip.compress(open(theirs,'rb').read()))}")
 
 print("== normalized identity with esbuild (unminified)")
+# esbuild reads an object whole when it is read; ours leaves what nothing reads (shake-check.py), so
+# identity is checked with that off.
 norm = "const e=require('esbuild'),fs=require('fs');const n=f=>e.transformSync(fs.readFileSync(f,'utf8'),{loader:'js',legalComments:'none',minifyWhitespace:true,logLevel:'silent'}).code;console.log(n(process.argv[1])===n(process.argv[2]))"
 for a in ["named", "all", "three", "datefns", "preact", "exdate", "exes", "cjsret", "lib"]:
     theirs, ours = f"{SCRATCH}/{a}.esb.js", f"{SCRATCH}/{a}.js"
     sh([E, f"apps/{a}.js", "--bundle", "--format=iife", f"--outfile={theirs}", "--log-level=silent"])
-    sh([ESB, f"apps/{a}.js", f"--outfile={ours}"], 60)
+    sh([ESB, f"apps/{a}.js", f"--outfile={ours}", "--property-shaking=false"], 60)
     check(sh(["node", "-e", norm, ours, theirs])[1].strip() == "true", f"{a}: byte-identical after normalizing")
 
 print("== whole-API differential")
@@ -456,6 +458,11 @@ print("== rewrites and fixes")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rewrite-check.py"), ESB, SPEC], 300)
 check(code == 0 and " passed, 0 failed" in out, "--rewrite and --fix: "
       + (out.strip().splitlines()[-1] + " (what rewrites make and take with them, names by scope, source maps, rule errors, watching, specs, fixes)" if code == 0 else out[-1800:]))
+
+print("== shaking what objects hold")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "shake-check.py"), ESB], 300)
+check(code == 0 and " passed, 0 failed" in out, "objects and namespaces read by name: "
+      + (out.strip().splitlines()[-1] + " (each case runs as esbuild's; what nothing reads gone; what escapes kept whole)" if code == 0 else out[-1800:]))
 
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
