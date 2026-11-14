@@ -3,20 +3,23 @@
 # keeps its exports on one namespace object. An import becomes a variable holding the namespace it
 # imports from, and a read of what it bound a read of that namespace, so it stays live when the
 # module it reads is run again. What changed between two builds is sent as new functions for those
-# modules; `hmr.facts` says which modules run again.
+# modules; `hmr.facts` says which modules run again, and which are patched in place: a module's
+# function registers an evaluator of its own scope, and a patch is code run there, giving the names
+# of the statements that changed their new values without running the module again.
 attrs bundle.hmr over bundle.js
 use bundle.js as js
 use bundle.modules as m
 use bundle.early as early
 use bundle.analysis as an
 use bundle.hmr-plan as plan
+use bundle.evaluation as ev
 
 quote stmt at 1 0 ;
 quote exp at 1 0 0 ;
 
-# What an import binds: the variable holding the namespace it reads, and the name it reads there,
-# or "*" for the namespace itself.
-record Imported { space: Text, name: Text }
+# What an import binds: the variable holding the namespace it reads, the name it reads there, or
+# "*" for the namespace itself, and the module it reads it from ("" outside the bundle).
+record Imported { space: Text, name: Text, from: Text }
 
 # The module being emitted, the path each specifier it names leads to ("" for one outside the
 # bundle), what each of its imports binds by symbol, and the name its context goes by in its function.
@@ -59,12 +62,17 @@ fn space-read(i: Imported) -> Node = match i.name {
 fn plain-name?(s: Text) -> Bool =
   len(s) > 0 and not digit-byte?(s[0]) and all c in s: (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or digit-byte?(c) or c == '_' or c == '$'
 
+
 # ---------------------------------------------------------------- one module
 
 # A module's function, as the runtime is given it: `__hmr.define(id, ` these `)`: what each
 # specifier leads to, the function, and whether it is an ES module. Made from what loading made of
 # the file, and so kept until it changes, or until the module becomes CommonJS or stops being it.
-fn dev-function(path: Text, cjs: Int) -> Text = with leads = leads-of(l), body = m.file-body(l) { define-args(dev-module(l, cjs == 1)) }
+fn dev-function(path: Text, cjs: Int) -> Text = dev-shape(path, cjs).code
+
+# The module's function, and what a patch needs to know of the module: its statements, each as it
+# runs, and its exports.
+fn dev-shape(path: Text, cjs: Int) -> Shape = with leads = leads-of(l), body = m.file-body(l) { shape-of(dev-module(l, cjs == 1)) }
   where l = m.loaded(path)
 
 fn dev-accepts(path: Text) -> Bool = accepts?(m.loaded(path).analysis.tree)
@@ -77,12 +85,40 @@ fn leads-of(l: m.Loaded) -> {Text:Text} = {m.request-key(l.requests[k]): match l
   path => path
 } for k in 0..len(l.requests)}
 
-fn define-args(mo: m.Module) -> Text = match mo.kind {
-  m.Cjs => deps-text(mo) ++ ", function (module, exports, require, " ++ p ++ ") {\n"
-           ++ rendered(Program(None(), List([rewritten(mo, s, no-imports(), p) for s in statements(body.tree)]...))) ++ "}, false"
-  _ => deps-text(mo) ++ ", function (" ++ p ++ ") {\n\"use strict\";\n"
-       ++ rendered(Program(None(), List(es-body(mo, p)...))) ++ "}, true"
-} where p = context-name(mo)
+# A module as the development format has it. `code`: what follows its id in `__hmr.define(`. For an
+# ES module, `ctx` is the name its function gives its context, `pieces` its statements in order,
+# `exported` what each of its exports reads, `stars` what its `export *` passes on, and `exports`
+# the statement that gives its namespace those exports again, for a patch.
+record Shape { code: Text, esm: Bool, ctx: Text, pieces: [Piece], exported: [Export], stars: [Text], exports: Text }
+
+# An export: what its name reads, one of the module's own names (`from` "") or a name another
+# module exports (`from` its path).
+record Export { name: Text, from: Text, local: Text }
+
+fn shape-of(mo: m.Module) -> Shape = match mo.kind {
+  m.Cjs => Shape(code: deps-text(mo) ++ ", function (module, exports, require, " ++ p ++ ") {\n"
+                       ++ rendered(Program(None(), List([rewritten(mo, s, no-imports(), p) for s in statements(body.tree)]...))) ++ "}, false",
+                 esm: false, ctx: p, pieces: [], exported: [], stars: [], exports: "")
+  _ => Shape(code: deps-text(mo) ++ ", function (" ++ p ++ ") {\n\"use strict\";\n" ++ scope-text(p)
+                   ++ join([one(x) for x in exports-stmt(p, "export", gs)], "")
+                   ++ join([x.text for x in pieces if x.role == Imports], "")
+                   ++ join([x.text for x in pieces if x.role != Imports], "") ++ "}, true",
+             esm: true, ctx: p, pieces: pieces, exported: exported-of(mo, spaced, by-name),
+             stars: [from-of(s) for s in spaced if s is ExportAll(...)],
+             exports: join([one(x) for x in exports-stmt(p, "exportOnly", gs)], ""))
+    where pieces = with own = own-names(stmts), bound = imported { [piece(mo, p, k, stmts[k], imported, spaces) for k in 0..len(stmts)] },
+          gs = getters(mo, p, by-name, spaces)
+} where p = context-name(mo),
+        stmts = statements(body.tree),
+        spaced = [s for s in stmts if ev.static-import?(s)],
+        spaces = {spaced[i].lo: space-name(p, i) for i in 0..len(spaced)},
+        imported = imports-of(p, spaced),
+        by-name = {b.local: Imported(space: space-name(p, i), name: b.name, from: from-of(spaced[i]))
+                   for i in 0..len(spaced) for b in bound-by(spaced[i])}
+
+# What a module's function does first: hands the runtime an evaluator of its own scope, which runs a
+# patch's code where the module's names are, and answers an evaluator of the scope that code made.
+fn scope-text(p: Text) -> Text = p ++ ".scope((" ++ p ++ "code) => eval(" ++ p ++ "code));\n"
 
 fn no-imports() -> {Int:Imported} = {}
 
@@ -111,13 +147,16 @@ fn prefix(i: Int) -> Text = match i {
   _ => "__hmr" ++ int-text(i) ++ "_"
 }
 
-# What each import statement binds, by the symbol of the name it binds, its namespace the `k`th.
-fn imports-of(mo: m.Module, p: Text) -> {Int:Imported} =
-  {s: Imported(space: space-name(p, k), name: b.name)
-   for k in 0..len(stmts) for b in bound-by(stmts[k]) if let some(s) = body.bindings[b.at]}
-  where stmts = statements(body.tree)
+# What each import statement binds, by the symbol of the name it binds, its namespace the `i`th.
+# Imports are numbered among themselves, so a statement added elsewhere renames no namespace.
+fn imports-of(p: Text, spaced: [Node]) -> {Int:Imported} =
+  {s: Imported(space: space-name(p, i), name: b.name, from: from-of(spaced[i]))
+   for i in 0..len(spaced) for b in bound-by(spaced[i]) if let some(s) = body.bindings[b.at]}
 
 fn space-name(p: Text, k: Int) -> Text = p ++ int-text(k)
+
+# The module an import statement reads: its path, or "" outside the bundle.
+fn from-of(s: Node) -> Text = (first r in m.statement-request(s) for path in leads[m.request-key(r)]: path) ?? ""
 
 # A name an import statement binds: where its leaf starts, and the name it reads.
 record Bound { at: Int, name: Text, local: Text }
@@ -141,18 +180,9 @@ fn spec-bound(x: Node) -> [Bound] = match x {
   _ => []
 }
 
-# An ES module's body: its exports' getters, then what it imports in order, then its statements.
-fn es-body(mo: m.Module, p: Text) -> [Node] =
-  exports-stmt(p, getters(mo, p, by-name))
-  ++ [x for k in 0..len(stmts) for x in import-stmts(stmts[k], p, space-name(p, k))]
-  ++ [rewritten(mo, out, imported, p) for s in stmts for out in own-stmt(s)]
-  where stmts = statements(body.tree),
-        imported = imports-of(mo, p),
-        by-name = {b.local: Imported(space: space-name(p, k), name: b.name) for k in 0..len(stmts) for b in bound-by(stmts[k])}
-
-fn exports-stmt(p: Text, gs: [Getter]) -> [Node] = match gs {
-  [] => []
-  _ => [stmt`$c.export($o);`] where c = Ident(p), o = ObjectLit(List([getter(g) for g in gs]...))
+fn exports-stmt(p: Text, how: Text, gs: [Getter]) -> [Node] = match gs {
+  [] if how == "export" => []
+  _ => [stmt`$c.$f($o);`] where c = Ident(p), f = PropName(how), o = ObjectLit(List([getter(g) for g in gs]...))
 }
 
 # What a module statement that imports leaves: its namespace, read once it has run.
@@ -184,10 +214,9 @@ record Getter { name: Text, value: Node }
 
 fn getter(g: Getter) -> Node = Prop(Str(quote-text(g.name)), exp`() => $v`) where v = g.value
 
-fn getters(mo: m.Module, p: Text, by-name: {Text:Imported}) -> [Getter] =
-  [g for k in 0..len(stmts) for g in stmt-getters(stmts[k], space-name(p, k), by-name)]
+fn getters(mo: m.Module, p: Text, by-name: {Text:Imported}, spaces: {Int:Text}) -> [Getter] =
+  [g for s in statements(body.tree) for g in stmt-getters(s, spaces[s.lo] ?? "", by-name)]
   ++ [Getter(name: "default", value: Ident(local-default(mo, name))) for s in body.source for name in m.default-of(s)]
-  where stmts = statements(body.tree)
 
 fn local-default(mo: m.Module, name: Text) -> Text = match name {
   "" => mo.base ++ "_default"
@@ -200,8 +229,29 @@ fn stmt-getters(s: Node, space: Text, by-name: {Text:Imported}) -> [Getter] = ma
   ExportFunction(d) | ExportClass(d) => [Getter(name: d.name.text, value: Ident(d.name.text))]
   ExportNamed(List(specs...)) => [Getter(name: exported-name(x), value: local-read(m.module-name(x.local), by-name)) for x in specs]
   ExportFrom(List(specs...), _, _) =>
-    [Getter(name: exported-name(x), value: space-read(Imported(space: space, name: m.module-name(x.local)))) for x in specs]
+    [Getter(name: exported-name(x), value: space-read(Imported(space: space, name: m.module-name(x.local), from: ""))) for x in specs]
   ExportAllAs(name, _, _) => [Getter(name: m.module-name(name), value: Ident(space))]
+  _ => []
+}
+
+# What each export reads: a name of the module's own, or another module's export. A namespace
+# passed on (`export * as ns`, an imported `* as ns`) is read where it is used, and stays live.
+fn exported-of(mo: m.Module, spaced: [Node], by-name: {Text:Imported}) -> [Export] =
+  [x for s in statements(body.tree) for x in stmt-exported(s, by-name)]
+  ++ [Export(name: "default", from: "", local: local-default(mo, name)) for s in body.source for name in m.default-of(s)]
+
+fn stmt-exported(s: Node, by-name: {Text:Imported}) -> [Export] = match s {
+  ExportVar(list) => [Export(name: x, from: "", local: x) for x in early.bound-names(list)]
+  ExportLexical(d) => [Export(name: x, from: "", local: x) for x in early.bound-names(d)]
+  ExportFunction(d) | ExportClass(d) => [Export(name: d.name.text, from: "", local: d.name.text)]
+  ExportNamed(List(specs...)) =>
+    [e for x in specs for e in match by-name[m.module-name(x.local)] {
+      some(i) if i.name == "*" or i.from == "" => []
+      some(i) => [Export(name: exported-name(x), from: i.from, local: i.name)]
+      none => [Export(name: exported-name(x), from: "", local: m.module-name(x.local))]
+    }]
+  ExportFrom(List(specs...), _, _) if from-of(s) != "" =>
+    [Export(name: exported-name(x), from: from-of(s), local: m.module-name(x.local)) for x in specs]
   _ => []
 }
 
@@ -221,10 +271,282 @@ fn accepts?(n: Node) -> Bool = match n {
   _ => any k in n.kids: accepts?(k)
 }
 
+# ---------------------------------------------------------------- statements, as a patch sees them
+
+# What a top-level statement is to a patch. `Imports`: it imports. `Exports`: it only says what the
+# module exports. `Declares`: it declares names and runs nothing as it is defined (a function, an
+# inert value), so giving its names new values is all a change to it does. `Methods`: a class,
+# whose methods a patch can put on the class there is. `Runs`: anything else, which ran as the
+# module loaded and cannot be taken back.
+enum Role { Imports, Exports, Declares, Methods, Runs }
+
+# One top-level statement. `number`, from 1, and `shown`, the start of its source, name it. `names`:
+# the top-level names it declares; `text`: what the module's function runs for it, and `tree` that
+# code as a tree, from which a patch is made only for what changed. `ran`: what it read and called as the module
+# ran; `codes`: what running the code of each name it declares reads and calls. `mentions`: the
+# module's own names anywhere in it, `fixed` those in what a patch cannot run again, and `frees`
+# the names in it that the module does not declare. For a class: `shape`, the class without its
+# `methods`, its methods (`#m`, or `.m` when static); whether it has `private` names. What of a class
+# changed, its methods or the rest, is asked of its tree, and only when its text changed.
+record Piece {
+  number: Int, shown: Text, role: Role, inert: Bool, names: [Text], text: Text, tree: Node,
+  ran: [Use], codes: [Entity], mentions: [Text], fixed: [Text], frees: [Text],
+  methods: [Text], private: Bool
+}
+
+# How a patch gives a declared name its value: assigned, where the module declares it already, or
+# declared afresh in the patch's own scope.
+record Init { name: Text, assign: Text, fresh: Text }
+
+# A name the code uses: how, and of what: one of the module's own names (`from` ""), an export of a
+# module it imports (`from` its path), or, for `Member`, a property of anything by that name.
+enum How { Read, Call, Member }
+record Use { how: How, from: Text, name: Text }
+
+# The code of a name the module declares, and what running it reads and calls. A class's method is
+# a name of its own (`C#m`, `C.m`), `member` its property's name.
+record Entity { name: Text, uses: [Use], member: Text }
+
+# The module's own top-level names, by symbol; and what its imports bind.
+context own: {Int:Text} = {}
+context bound: {Int:Imported} = {}
+
+fn own-names(stmts: [Node]) -> {Int:Text} =
+  {s: d.text for st in stmts for t in own-stmt(st) for d in declared(t) for s in body.bindings[d.lo]}
+
+# The names a top-level statement declares.
+fn declared(s: Node) -> [Node] = match s {
+  FuncDecl(name, ...) | GenDecl(name, ...) | AsyncFuncDecl(name, ...) | AsyncGenDecl(name, ...) | ClassDecl(name, ...) => [name]
+  VarDecl(List(ds...)) | LetDecl(List(ds...)) | ConstDecl(List(ds...)) => [n for d in ds for n in bind-names(d.target)]
+  _ => []
+}
+
+everywhere fn bind-names(n: Node) -> [Node] = match n {
+  BindName(_) => [n]
+  Computed(_) => []
+}
+
+fn piece(mo: m.Module, p: Text, k: Int, s: Node, imported: {Int:Imported}, spaces: {Int:Text}) -> Piece = match role {
+  Imports => base with { text: join([one(x) for x in import-stmts(s, p, spaces[s.lo] ?? "")], "") }
+  Exports => base
+  _ => match [d for d in own-stmt(s)] {
+    [d] => declaration-piece(base with { text: one(r), tree: r }, role, d, r, p)
+      where r = rewritten(mo, d, imported, p)
+    _ => base
+  }
+} where role = role-of(s),
+        base = Piece(number: number-of(s, k), shown: shown-of(s), role: role, inert: ev.inert-stmt(s), names: [], text: "",
+                     tree: None(), ran: [], codes: [], mentions: [], fixed: [], frees: [],
+                     methods: [], private: false)
+
+fn role-of(s: Node) -> Role = match s {
+  _ if ev.static-import?(s) => Imports
+  ExportNamed(_) => Exports
+  _ => match [d for d in own-stmt(s)] {
+    [d] if is-some(class-of(d)) => Methods
+    [d] if ev.inert-stmt(d) and len(declared(d)) > 0 => Declares
+    _ => Runs
+  }
+}
+
+fn declaration-piece(base: Piece, role: Role, d: Node, r: Node, p: Text) -> Piece = match role {
+  Declares => with-names with { codes: [Entity(name: n, uses: uses-in(d, true), member: "") for n in names] }
+  Methods => match class-of(d), class-of(r) {
+    some(c), some(rc) => with-names with {
+        codes: [Entity(name: c.name, uses: constructed-uses(c), member: "")]
+               ++ [Entity(name: c.name ++ key, uses: uses-in(x, true), member: key[1..len(key)])
+                   for x in c.body.members.kids for key in method-key(x)],
+        fixed: mentioned(shape-of-class(c)),
+        methods: [key for x in rc.body.members.kids for key in method-key(x)],
+        private: has-private?(d)
+      }
+    _, _ => panic "{}: a class statement whose class the patch could not find", base.shown
+  }
+  _ => with-names with { codes: [Entity(name: n, uses: uses-in(d, true), member: "") for n in names], fixed: mentioned(d) }
+} where names = [n.text for n in declared(d)],
+        with-names = base with { names: names, ran: uses-in(d, false), mentions: mentioned(d), frees: frees-in(d) }
+
+# A statement's code, ended, so pieces can follow one another.
+fn one(s: Node) -> Text = rendered(Program(None(), List([s]...))) ++ ";\n"
+
+# Where the statement stands among the module's own, from 1, and the start of its source: of the
+# statement it was written as, which loading may have made something else (`export class C {…}`
+# is `var C = class {…}`).
+fn number-of(s: Node, k: Int) -> Int = (first i in source-at(s): i + 1) ?? k + 1
+
+fn source-at(s: Node) -> [Int] = [i for i in first i in 0..len(body.source) if body.source[i].lo <= s.lo and s.lo < body.source[i].hi: i]
+
+fn shown-of(s: Node) -> Text = (first i in source-at(s): source-shown(body.source[i])) ?? source-shown(s)
+
+fn source-shown(s: Node) -> Text = match s.hi > s.lo and s.hi <= len(body.text) {
+  true => match len(line) > 60 {
+    true => line[0..57] ++ "..."
+    false => line
+  } where line = trim(text-before(body.text[s.lo..s.hi] ++ "\n", "\n"))
+  false => "?"
+}
+
+# How a patch gives each name of a declaration its value.
+fn inits-of(r: Node) -> [Init] = match r {
+  FuncDecl(name, params, body) => [function-init(name.text, r, FuncExpr(None(), params, body))]
+  GenDecl(name, params, body) => [function-init(name.text, r, GenExpr(None(), params, body))]
+  AsyncFuncDecl(name, params, body) => [function-init(name.text, r, AsyncFuncExpr(None(), params, body))]
+  AsyncGenDecl(name, params, body) => [function-init(name.text, r, AsyncGenExpr(None(), params, body))]
+  VarDecl(List(ds...)) | LetDecl(List(ds...)) | ConstDecl(List(ds...)) =>
+    [Init(name: d.target.text, assign: assign-text(d.target.text, value-of(d.init)), fresh: one(VarDecl(List([d]...)))) for d in ds]
+  _ => panic "{}: a declaration a patch cannot give values", one(r)
+}
+
+fn function-init(name: Text, decl: Node, value: Node) -> Init = Init(name: name, assign: assign-text(name, value), fresh: one(decl))
+
+fn assign-text(name: Text, value: Node) -> Text = one(stmt`$x = $v;`) where x = Ident(name), v = value
+
+fn value-of(init: Node) -> Node = match init {
+  None() => exp`void 0`
+  _ => init
+}
+
+# What puts a class's methods on the class there is.
+fn patch-call(c: ClassAt, p: Text) -> Text = one(stmt`$f($a, $k);`)
+  where f = Member(Ident(p), PropName("patchClass")), a = Ident(c.name), k = methods-class(c, p)
+
+# A class a statement declares: its name, heritage and body.
+record ClassAt { name: Text, heritage: Node, body: Node }
+
+fn class-of(s: Node) -> ClassAt? = match s {
+  ClassDecl(name, heritage, cls) => some(ClassAt(name: name.text, heritage: heritage, body: cls))
+  VarDecl(List(d)) | LetDecl(List(d)) | ConstDecl(List(d)) => match d.target, d.init {
+    BindName(_), ClassExpr(_, heritage, cls) => some(ClassAt(name: d.target.text, heritage: heritage, body: cls))
+    _, _ => none
+  }
+  _ => none
+}
+
+# A method a patch can put on a class: one with a name written out, not the constructor. `#m` on
+# the prototype, `.m` on the class.
+fn method-key(x: Node) -> [Text] = match x {
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...) | AsyncGenMethod(key, ...) =>
+    ["#" ++ k for k in plain-key(key) if k != "constructor"]
+  StaticMethod(method) => ["." ++ k[1..len(k)] for k in method-key(method)]
+  _ => []
+}
+
+fn plain-key(key: Node) -> [Text] = match key {
+  PropName(_) => [key.text]
+  Str(raw) => [unquote(raw)]
+  _ => []
+}
+
+# The class without the methods a patch can replace: its heritage, constructor, fields and static
+# members, which ran as it was defined or run as it constructs.
+fn shape-of-class(c: ClassAt) -> Node = ClassExpr(None(), c.heritage, ClassBody(List([x for x in c.body.members.kids if len(method-key(x)) == 0]...)))
+
+# A class of the methods alone, extending what the class there extends, so `super` in them finds
+# what it found.
+fn methods-class(c: ClassAt, p: Text) -> Node = ClassExpr(None(), heritage, ClassBody(List([x for x in c.body.members.kids if len(method-key(x)) > 0]...)))
+  where heritage = match c.heritage {
+    None() => None()
+    _ => ClassHeritage(exp`$f($a)`) where f = Member(Ident(p), PropName("parentOf")), a = Ident(c.name)
+  }
+
+everywhere fn has-private?(n: Node) -> Bool = match n { PrivateName(_) => true }
+
+# What constructing a class runs: what it extends, its fields' values, and its constructor.
+fn constructed-uses(c: ClassAt) -> [Use] =
+  (match c.heritage {
+    ClassHeritage(e) => invoked(e) ++ uses-in(e, false)
+    _ => []
+  }) ++ [u for x in c.body.members.kids for u in match x {
+    Field(key, init) => uses-in(key, false) ++ uses-in(init, false)
+    Method(PropName("constructor"), ...) => uses-in(x, true)
+    _ => []
+  }]
+
+# The module's own names a piece of code mentions, anywhere in it.
+everywhere fn mentioned(n: Node) -> [Text] = match n {
+  Ident(_) => [x for s in body.bindings[n.lo] for x in own[s]]
+}
+
+# The names code mentions that nothing in the module declares.
+everywhere fn frees-in(n: Node) -> [Text] = match n {
+  Ident(_) if is-none(body.bindings[n.lo]) => [n.text]
+}
+
+# What code reads, calls and uses by name. `deep`: all of it, as when it is called; otherwise only
+# what runs as it is defined, and not the bodies of the functions and methods it defines, nor what
+# its instance fields hold. A function called where it is written (`(() => …)()`), or handed to an
+# array's method that calls it there and then (`forEach`, `map`, …), runs now.
+fn uses-in(n: Node, deep: Bool) -> [Use] = match n {
+  FuncDecl(...) | GenDecl(...) | AsyncFuncDecl(...) | AsyncGenDecl(...) | FuncExpr(...) | GenExpr(...)
+    | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) if not deep => []
+  Method(key, ...) | Getter(key, ...) | Setter(key, ...) | GenMethod(key, ...) | AsyncMethod(key, ...)
+    | AsyncGenMethod(key, ...) | Field(key, _) if not deep => uses-in(key, false)
+  Ident(_) => named-of(n, Read)
+  CallExpr(callee, args) | NewExpr(callee, args) =>
+    invoked(callee) ++ uses-in(callee, deep) ++ [u for a in args.items.kids for u in argument-uses(callee, a, deep)]
+  NewNoArgs(callee) => invoked(callee) ++ uses-in(callee, deep)
+  Tagged(tag, template) => invoked(tag) ++ uses-in(tag, deep) ++ uses-in(template, deep)
+  Member(object, PropName(_) as key) | OptMember(object, PropName(_) as key) => member-uses(object, key.text, deep)
+  Index(object, Str(raw)) | OptIndex(object, Str(raw)) => member-uses(object, unquote(raw), deep)
+  _ => [u for k in n.kids for u in uses-in(k, deep)]
+}
+
+# A property read by name: of an imported namespace, that export; of anything else, the thing, and
+# whatever method or accessor of that name it may run.
+fn member-uses(object: Node, name: Text, deep: Bool) -> [Use] = match space-of(object) {
+  some(i) => [Use(how: Read, from: i.from, name: name)]
+  none => uses-in(object, deep) ++ [Use(how: Member, from: "", name: name)]
+}
+
+# The namespace an import binds, where a name reads it.
+fn space-of(n: Node) -> Imported? = match n {
+  Ident(_) => first s in body.bindings[n.lo] for i in bound[s] if i.name == "*" and i.from != "": i
+  _ => none
+}
+
+# What calling something runs: a name's code; an export, called by its namespace; for a property
+# of something called (`x.m()`, `x.y.m()`), any code of the name it starts from; `f.call(…)` and
+# `f.apply(…)`, `f`; a function called where it is written, its body.
+fn invoked(callee: Node) -> [Use] = match callee {
+  Ident(_) => named-of(callee, Call)
+  Paren(x) => invoked(x)
+  FuncExpr(...) | GenExpr(...) | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) => uses-in(callee, true)
+  Member(object, PropName(_) as key) if key.text == "call" or key.text == "apply" => invoked(object)
+  Member(object, PropName(_) as key) | OptMember(object, PropName(_) as key) if is-some(space-of(object)) =>
+    [Use(how: Call, from: i.from, name: key.text) for i in space-of(object)]
+  _ => [Use(how: Call, from: u.from, name: u.name) for r in chain-root(callee) for u in named-of(r, Read)]
+}
+
+# The name a chain of property reads and calls starts from.
+fn chain-root(n: Node) -> [Node] = match n {
+  Ident(_) => [n]
+  Member(object, _) | Index(object, _) | OptMember(object, _) | OptIndex(object, _) | Paren(object)
+    | CallExpr(object, _) | OptCall(object, _) | NewExpr(object, _) | NewNoArgs(object) => chain-root(object)
+  _ => []
+}
+
+# Array methods that call the function they are given before they return.
+const calls-now: [Text] = ["forEach", "map", "filter", "reduce", "reduceRight", "some", "every", "find", "findIndex",
+                           "findLast", "findLastIndex", "flatMap", "sort", "toSorted", "from", "replace", "replaceAll"]
+
+fn argument-uses(callee: Node, a: Node, deep: Bool) -> [Use] = match callee {
+  Member(_, PropName(_) as key) if key.text in calls-now => invoked(a) ++ uses-in(a, deep)
+  Ident(_) if callee.text == "Promise" and is-none(body.bindings[callee.lo]) => invoked(a) ++ uses-in(a, deep)
+  _ => uses-in(a, deep)
+}
+
+fn named-of(n: Node, how: How) -> [Use] = [u for s in body.bindings[n.lo] for u in symbol-use(s, how)]
+
+fn symbol-use(s: Int, how: How) -> [Use] = match own[s] {
+  some(x) => [Use(how: how, from: "", name: x)]
+  none => [Use(how: how, from: i.from, name: i.name) for i in bound[s] if i.from != "" and i.name != "*"]
+}
+
 # ---------------------------------------------------------------- builds and updates
 
-# A development build: the bundle, and what defines each module by id, to compare with the next.
-record Dev { text: Text, functions: {Text:Text} }
+# A development build: the bundle, what defines each module by id, and each module's shape, to
+# compare with the next.
+record Dev { text: Text, functions: {Text:Text}, shapes: {Text:Shape} }
 
 fn files(mods: [m.Module]) -> [m.Module] = [mo for mo in mods if mo.kind == m.Esm or mo.kind == m.Cjs]
 
@@ -236,27 +558,229 @@ fn dev-build(entry: Int, events: Text) -> Dev =
             ++ join(["__hmr.define(" ++ id-text(mo) ++ ", " ++ (functions[mo.path] ?? "") ++ ");\n" for mo in files(m.modules)], "")
             ++ match events { "" => ""  url => "__hmr.connect(" ++ quote-text(url) ++ ", __hmr_apply);\n" }
             ++ "__hmr.start(" ++ id-text(m.modules[entry]) ++ ");\n})();\n",
-      functions: functions)
-  where functions = {mo.path: dev-function(mo.path, match mo.kind { m.Cjs => 1  _ => 0 }) for mo in files(m.modules)}
+      functions: functions, shapes: shapes)
+  where shapes = {mo.path: dev-shape(mo.path, match mo.kind { m.Cjs => 1  _ => 0 }) for mo in files(m.modules)},
+        functions = {mo.path: s.code for mo in files(m.modules) for s in shapes[mo.path]}
 
 # What the runtime is sent after a build: an update of the modules whose functions changed, with
-# the modules to run again; or a reload, when an entry that does not accept it changed. None when
-# nothing did.
-record Sent { event: Text, text: Text, changed: [Text] }
+# the modules to run again and the patches; or a reload, when an entry that does not accept it
+# runs again. None when nothing changed. `notes` say what was patched, and why what runs again does.
+record Sent { event: Text, text: Text, changed: [Text], notes: [Text] }
 
 fn update(before: Dev, now: Dev, entries: [Int]) -> Sent? = match changed {
   [] => none
-  _ => match [x for db.unaccepted(?x)] {
-    [] => some(Sent(event: "update", changed: [m.modules[i].path for i in changed],
-                    text: "__hmr.update({" ++ join([quote-text(m.modules[i].path) ++ ": [" ++ (now.functions[m.modules[i].path] ?? "") ++ "]"
-                                                   for i in changed], ", ")
-                          ++ "}, " ++ id-list([x for db.dirty(?x)]) ++ ", " ++ id-list([x for db.boundary(?x)]) ++ ");"))
-    xs => some(Sent(event: "reload", changed: [m.modules[i].path for i in changed],
-                    text: join([m.shown-path(m.modules[x].path) for x in xs], ", ") ++ " changed, and does not accept updates"))
-  } where db = plan.solved([plan.fact-changed(i) for i in changed]
-                           ++ [plan.fact-imports(mo.id, d) for mo in files(m.modules) for d in mo.deps]
-                           ++ [plan.fact-accepts(mo.id) for mo in files(m.modules) if dev-accepts(mo.path)]
-                           ++ [plan.fact-entry(e) for e in entries])
+  _ => some(sent-of(before, now, entries, changed))
 } where changed = [mo.id for mo in files(m.modules) if (before.functions[mo.path] ?? "") != (now.functions[mo.path] ?? "")]
 
+# What a patch of a changed module would be: why none can be (`blocked`), else the names it gives
+# new values (`swapped`; a class's methods as `C#m`), what it says it did, and its code.
+record Plan { blocked: [Text], swapped: [Text], did: [Text], patch: Text }
+
+# A statement of a module that ran: the module, and the statement.
+record Ran { module: Int, piece: Piece }
+
+fn sent-of(before: Dev, now: Dev, entries: [Int], changed: [Int]) -> Sent =
+  match [x for db.unaccepted(?x)] {
+    [] => Sent(event: "update", changed: [m.modules[i].path for i in changed], notes: notes,
+               text: "__hmr.update({" ++ join([quote-text(m.modules[i].path) ++ ": [" ++ (now.functions[m.modules[i].path] ?? "") ++ "]"
+                                              for i in changed], ", ")
+                     ++ "}, " ++ id-list([x for db.dirty(?x)]) ++ ", " ++ id-list([x for db.boundary(?x)])
+                     ++ ", {" ++ join([quote-text(m.modules[i].path) ++ ": " ++ json(plan-at(plans, i).patch) for i in patched if plan-at(plans, i).patch != ""], ", ") ++ "}"
+                     ++ ", [" ++ join([json(n) for n in notes], ", ") ++ "]);")
+    xs => Sent(event: "reload", changed: [m.modules[i].path for i in changed], notes: notes,
+               text: join([m.shown-path(m.modules[x].path) for x in xs], ", ") ++ " changed, and does not accept updates" ++ match reruns { [] => ""  rs => ": " ++ join(rs, "; ") })
+  } where plans = {i: plan-of(before.shapes[m.modules[i].path], (now.shapes[m.modules[i].path] ?? panic "{} has no shape", m.modules[i].path),
+                              dev-accepts(m.modules[i].path)) for i in changed},
+          mods = files(m.modules),
+          ran = [Ran(module: mo.id, piece: x) for mo in mods for s in now.shapes[mo.path] for x in s.pieces],
+          reasons = [r for i in changed for r in plan-at(plans, i).blocked],
+          names = [x for x in ["default"] ++ [n for i in changed for n in plan-at(plans, i).swapped] ++ [n for r in ran for n in piece-names(r.piece)]
+                     ++ [n for mo in mods for s in now.shapes[mo.path] for e in s.exported for n in [e.name, e.local]] distinct x],
+          ids = {names[i]: i for i in 0..len(names)},
+          db = plan.solved(
+            [plan.fact-changed(i) for i in changed]
+            ++ [plan.fact-imports(mo.id, d) for mo in mods for d in mo.deps]
+            ++ [plan.fact-accepts(mo.id) for mo in mods if dev-accepts(mo.path)]
+            ++ [plan.fact-entry(e) for e in entries]
+            ++ [plan.fact-opaque(mo.id) for mo in mods if mo.kind == m.Cjs]
+            ++ [plan.fact-blocked(i, k) for i in changed for k in reason-ids(reasons, plan-at(plans, i).blocked)]
+            ++ [plan.fact-swapped(i, ids[x] ?? -1) for i in changed for x in plan-at(plans, i).swapped]
+            ++ [plan.fact-default-name(ids["default"] ?? -1)]
+            ++ [f for mo in mods for s in now.shapes[mo.path] for f in export-facts(mo.id, s, ids)]
+            ++ [f for mo in mods for s in now.shapes[mo.path] for x in s.pieces for c in x.codes for f in code-facts(mo.id, c, ids)]
+            ++ [f for k in 0..len(ran) for f in [plan.fact-stmt-of(k, ran[k].module)] ++ ran-facts(k, ran[k].piece, ids)]),
+          patched = [x for db.patched(?x)],
+          notes = [m.shown-path(m.modules[i].path) ++ ": patched " ++ join(plan-at(plans, i).did, ", ") for i in patched if len(plan-at(plans, i).did) > 0]
+                  ++ reruns,
+          reruns = [m.shown-path(m.modules[i].path) ++ " runs again: " ++ why-rerun(db, i, plan-at(plans, i), ran, names)
+                    for i in sort i in [x for db.rerun(?x)] by i]
+
+fn plan-at(plans: {Int:Plan}, i: Int) -> Plan = plans[i] ?? no-plan()
+
+fn no-plan() -> Plan = Plan(blocked: [], swapped: [], did: [], patch: "")
+
+fn reason-ids(reasons: [Text], mine: [Text]) -> [Int] = [k for r in mine for k in first k in 0..len(reasons) if reasons[k] == r: k]
+
+fn piece-names(x: Piece) -> [Text] =
+  x.names ++ [u.name for u in x.ran] ++ [n for c in x.codes for n in [c.name, c.member] ++ [u.name for u in c.uses]]
+
+fn module-id(path: Text) -> [Int] = [i for i in m.by-path[path]]
+
+fn export-facts(id: Int, s: Shape, ids: {Text:Int}) -> [plan.Fact] =
+  [match e.from {
+     "" => plan.fact-exported(id, ids[e.name] ?? -1, id, ids[e.local] ?? -1)
+     _ => plan.fact-reexport(id, ids[e.name] ?? -1, t, ids[e.local] ?? -1)
+   } for e in s.exported for t in (if e.from == "" then [id] else module-id(e.from))]
+  ++ [plan.fact-star(id, t) for from in s.stars for t in module-id(from)]
+
+fn code-facts(id: Int, c: Entity, ids: {Text:Int}) -> [plan.Fact] =
+  (if c.member != "" then [plan.fact-member-of(id, x, ids[c.member] ?? -1)] else [])
+  ++ [plan.fact-code-reads(id, x, ids[u.name] ?? -1) for u in c.uses if u.how == Read and u.from == ""]
+  ++ [plan.fact-code-reads-import(id, x, t, ids[u.name] ?? -1) for u in c.uses if u.how == Read and u.from != "" for t in module-id(u.from)]
+  ++ [plan.fact-code-calls(id, x, ids[u.name] ?? -1) for u in c.uses if u.how == Call and u.from == ""]
+  ++ [plan.fact-code-calls-import(id, x, t, ids[u.name] ?? -1) for u in c.uses if u.how == Call and u.from != "" for t in module-id(u.from)]
+  ++ [plan.fact-code-member(id, x, ids[u.name] ?? -1) for u in c.uses if u.how == Member]
+  where x = ids[c.name] ?? -1
+
+fn ran-facts(k: Int, x: Piece, ids: {Text:Int}) -> [plan.Fact] =
+  [plan.fact-ran-reads(k, ids[u.name] ?? -1) for u in x.ran if u.how == Read and u.from == ""]
+  ++ [plan.fact-ran-reads-import(k, t, ids[u.name] ?? -1) for u in x.ran if u.how == Read and u.from != "" for t in module-id(u.from)]
+  ++ [plan.fact-ran-calls(k, ids[u.name] ?? -1) for u in x.ran if u.how == Call and u.from == ""]
+  ++ [plan.fact-ran-calls-import(k, t, ids[u.name] ?? -1) for u in x.ran if u.how == Call and u.from != "" for t in module-id(u.from)]
+  ++ [plan.fact-ran-member(k, ids[u.name] ?? -1) for u in x.ran if u.how == Member]
+
 fn id-list(ids: [Int]) -> Text = "[" ++ join([quote-text(m.modules[i].path) for i in sort i in ids by i], ", ") ++ "]"
+
+# Why a module runs again: what kept a patch from it, or the first statement that ran with what the
+# patch changes, and how it reached it.
+fn why-rerun(db: plan.Db, i: Int, p: Plan, ran: [Ran], names: [Text]) -> Text = match p.blocked {
+  [r, ...] => r
+  _ => (first r in sort r in [r for db.stale(?r, ?h, ?x)] by r if ran[r].module == i
+           for h in [h for db.stale(r, ?h, ?x)] for x in [x for db.stale(r, h, ?x)]:
+           stale-text(db, r, h, x, ran, names, i))
+        ?? "it imports a module that runs again"
+}
+
+# A statement that read the changed name captured it; one that ran code that reads it ran that code,
+# which the explanation of the `stale` row names, step by step.
+fn stale-text(db: plan.Db, r: Int, h: Int, x: Int, ran: [Ran], names: [Text], i: Int) -> Text = match chain {
+  [] => statement-text(ran[r].piece) ++ " captured " ++ name-text(names, x, h, i) ++ " when it ran, and the edit changed it"
+  _ => statement-text(ran[r].piece) ++ " ran " ++ join([name-text(names, w.b, w.a, i) for w in chain], " → ")
+       ++ " when it ran, and the edit changed " ++ join([name-text(names, w.b, w.a, i) for w in changed], ", ")
+} where why = plan.why-stale(db, r, h, x),
+        changed = [w for w in why if w.relation == "swapped" and w.depth == (max-depth([w for w in why if w.relation == "swapped"]))],
+        chain = [w for w in why if w.relation == "spoiled" and not (any c in changed: c.a == w.a and c.b == w.b)]
+
+fn max-depth(ws: [plan.Why]) -> Int = fold d = 0 for w in ws: max(d, w.depth)
+
+fn statement-text(x: Piece) -> Text = "statement " ++ int-text(x.number) ++ " (`" ++ x.shown ++ "`)"
+
+# A name as a note shows it: a method as `C.prototype.m`, another module's name with its path.
+fn name-text(names: [Text], x: Int, home: Int, here: Int) -> Text =
+  "`" ++ shown-name(names[x]) ++ "`" ++ (if home == here then "" else " of " ++ m.shown-path(m.modules[home].path))
+
+fn shown-name(n: Text) -> Text = match index-of(n, "#") {
+  some(k) => n[0..k] ++ ".prototype." ++ n[k + 1..len(n)]
+  none => n
+}
+
+# ---------------------------------------------------------------- what a patch of a module is
+
+fn plan-of(before: Shape?, now: Shape, accepts: Bool) -> Plan = match before {
+  # A module new to the build is running nowhere: its function is all it needs.
+  none => no-plan()
+  some(b) => match blocked {
+    [] => Plan(blocked: [], swapped: swapped, did: did, patch: patch)
+    _ => Plan(blocked: blocked, swapped: [], did: [], patch: "")
+  } where pieces = now.pieces,
+          bnames = {x: true for q in b.pieces for x in q.names},
+          nnames = {x: true for q in pieces for x in q.names},
+          added = {x: true for q in pieces for x in q.names if not (x in bnames)},
+          removed = {x: true for q in b.pieces for x in q.names if not (x in nnames)},
+          btext = {x: q.text for q in b.pieces if q.role == Declares for x in q.names},
+          bclass = {q.names[0]: q for q in b.pieces if q.role == Methods and len(q.names) > 0},
+          declares = [k for k in 0..len(pieces) if pieces[k].role == Declares and changed-declaration?(pieces[k], bnames, btext, added)],
+          classes = [k for k in 0..len(pieces) if pieces[k].role == Methods and len(pieces[k].names) > 0],
+          patched-classes = [k for k in classes for old in bclass[pieces[k].names[0]]
+                               if methods-changed?(pieces[k], old) or any x in pieces[k].mentions: x in added],
+          new-classes = [k for k in classes if not (pieces[k].names[0] in bnames)],
+          blocked = whole-blocked(b, now, accepts)
+                    ++ [statement-text(q) ++ " reads `" ++ x ++ "`, which the edit took out" for q in pieces for x in q.frees if x in removed]
+                    ++ [statement-text(q) ++ " reads `" ++ x ++ "`, which the edit adds, and it ran before `" ++ x ++ "` was there"
+                        for q in pieces for x in q.fixed if x in added]
+                    ++ [r for k in classes for r in class-blocked(pieces[k], bclass[pieces[k].names[0]], bnames)],
+          swapped = [x for k in declares for x in pieces[k].names if x in bnames]
+                    ++ [pieces[k].names[0] ++ key for k in patched-classes for old in bclass[pieces[k].names[0]] for key in changed-methods(pieces[k], old)],
+          did = [x for k in declares for x in pieces[k].names]
+                ++ [shown-name(pieces[k].names[0] ++ key) for k in patched-classes for old in bclass[pieces[k].names[0]] for key in changed-methods(pieces[k], old)]
+                ++ [pieces[k].names[0] for k in new-classes],
+          patch = join([declaration-patch(pieces[k], bnames) for k in declares]
+                       ++ [class-patch(pieces[k], old, now.ctx) for k in patched-classes for old in bclass[pieces[k].names[0]]]
+                       ++ [pieces[k].text for k in new-classes], "")
+                  ++ now.exports
+                  ++ "(" ++ now.ctx ++ "code) => eval(" ++ now.ctx ++ "code);\n"
+}
+
+# A declaration a patch gives values: it changed, it is new, or it mentions a name the edit adds,
+# which where it was made meant something else.
+fn changed-declaration?(q: Piece, bnames: {Text:Bool}, btext: {Text:Text}, added: {Text:Bool}) -> Bool =
+  (any x in q.names: not (x in bnames) or (btext[x] ?? "") != q.text) or (any x in q.mentions: x in added)
+
+# A declaration's names given their values: assigned where the module declares them, declared in
+# the patch's own scope where it does not.
+fn declaration-patch(q: Piece, bnames: {Text:Bool}) -> Text = join([if x.name in bnames then x.assign else x.fresh for x in inits-of(q.tree)], "")
+
+# A class's methods put on the class there is, and those taken out deleted from it.
+fn class-patch(q: Piece, old: Piece, p: Text) -> Text =
+  ((first c in class-of(q.tree): patch-call(c, p)) ?? (panic "{}: a class a patch could not find", q.shown))
+  ++ match [k for k in old.methods if not (k in q.methods)] {
+  [] => ""
+  gone => p ++ ".unpatchClass(" ++ q.names[0] ++ ", [" ++ join([quote-text(k) for k in gone], ", ") ++ "]);\n"
+}
+
+# What keeps any patch from a module: it is CommonJS, it takes its own updates, its function names
+# its context otherwise, it declares a name a patch's evaluation needs, its imports changed, or a
+# statement that ran as it loaded changed.
+fn whole-blocked(b: Shape, now: Shape, accepts: Bool) -> [Text] =
+  (if not now.esm or not b.esm then ["it is CommonJS, whose code a patch cannot take apart"] else [])
+  ++ (if accepts then ["it accepts its own updates"] else [])
+  ++ (if now.ctx != b.ctx then ["its function names its context otherwise"] else [])
+  ++ ["it declares `" ++ x ++ "`, which a patch needs" for q in now.pieces for x in q.names if x == "eval" or x == "arguments"]
+  ++ (if not same-texts?([q.text for q in b.pieces if q.role == Imports], [q.text for q in now.pieces if q.role == Imports]) then ["its imports changed"] else [])
+  ++ runs-blocked([q for q in b.pieces if q.role == Runs], [q for q in now.pieces if q.role == Runs])
+
+# The statements that ran as the module loaded, before and now, in order: the first that differs.
+fn runs-blocked(before: [Piece], now: [Piece]) -> [Text] =
+  [match k < len(now) {
+     true => statement-text(now[k]) ++ " runs as the module loads, and the edit changed it"
+     false => "the edit took out " ++ statement-text(before[k]) ++ ", which ran as the module loaded"
+   } for k in first k in 0..max(len(before), len(now)) if k >= len(before) or k >= len(now) or before[k].text != now[k].text: k]
+
+fn class-blocked(q: Piece, old: Piece?, bnames: {Text:Bool}) -> [Text] = match old {
+  none if q.names[0] in bnames => [statement-text(q) ++ " makes `" ++ q.names[0] ++ "` a class, which it was not"]
+  none if not q.inert => [statement-text(q) ++ " is a new class, and defining it runs code"]
+  none => []
+  some(o) if o.text != q.text and shape-text(o) != shape-text(q) => [statement-text(q) ++ ": the constructor, fields, heritage or static members of `" ++ q.names[0] ++ "` changed"]
+  some(o) if q.private and methods-changed?(q, o) =>
+    [statement-text(q) ++ ": `" ++ q.names[0] ++ "` has private names, which methods put on it again could not reach"]
+  some(_) => []
+}
+
+fn methods-changed?(q: Piece, old: Piece) -> Bool =
+  q.text != old.text and (not same-texts?(q.methods, old.methods) or not same-texts?(method-texts(q), method-texts(old)))
+
+# A class without its methods, and each of its methods, as code, to tell which changed.
+fn shape-text(q: Piece) -> Text = (first c in class-of(q.tree): one(ExprStmt(Paren(shape-of-class(c))))) ?? ""
+
+fn method-texts(q: Piece) -> [Text] =
+  [one(ExprStmt(Paren(ClassExpr(None(), None(), ClassBody(List([x]...)))))) for c in class-of(q.tree) for x in c.body.members.kids for key in method-key(x)]
+
+fn same-texts?(a: [Text], b: [Text]) -> Bool = len(a) == len(b) and all k in 0..len(a): a[k] == b[k]
+
+# The methods a patch changes: changed, added or taken out.
+fn changed-methods(q: Piece, old: Piece) -> [Text] =
+  [q.methods[k] for k in 0..len(q.methods)
+     if not (any j in 0..len(old.methods): old.methods[j] == q.methods[k] and before[j] == now[k])]
+  ++ [k for k in old.methods if not (k in q.methods)]
+  where now = method-texts(q), before = method-texts(old)
+

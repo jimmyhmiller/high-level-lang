@@ -1,5 +1,7 @@
 // The development runtime: modules by id, each run once and its exports kept on one namespace
-// object, which hot updates refill in place, so what imported it reads the new values.
+// object, which hot updates refill in place, so what imported it reads the new values. A module's
+// function first hands over an evaluator of its own scope; a patch is code run there, giving the
+// names of the statements that changed their new values while the module keeps its state.
 var __hmr = (() => {
   var defined = Object.create(null);
   var running = Object.create(null);
@@ -60,6 +62,26 @@ var __hmr = (() => {
       export(getters) {
         for (var name in getters) Object.defineProperty(rec.ns, name, { get: getters[name], enumerable: true, configurable: true });
       },
+      // A patch's exports: these, and no others of the module's own.
+      exportOnly(getters) {
+        for (var name of Reflect.ownKeys(rec.ns)) if (name !== Symbol.toStringTag && !(name in getters)) delete rec.ns[name];
+        this.export(getters);
+      },
+      scope(evaluate) { rec.scope = evaluate; },
+      // A class's methods, from a class of them alone, put on the class there is, so the instances
+      // it made have them; and methods taken out (`#m` on the prototype, `.m` on the class) deleted.
+      patchClass(target, fresh) {
+        for (var key of Reflect.ownKeys(fresh.prototype)) if (key !== "constructor") Object.defineProperty(target.prototype, key, Reflect.getOwnPropertyDescriptor(fresh.prototype, key));
+        for (var key of Reflect.ownKeys(fresh)) if (key !== "prototype" && key !== "length" && key !== "name") Object.defineProperty(target, key, Reflect.getOwnPropertyDescriptor(fresh, key));
+      },
+      unpatchClass(target, keys) {
+        for (var key of keys) delete (key[0] === "#" ? target.prototype : target)[key.slice(1)];
+      },
+      // What a class extends, for a class of its methods to extend too.
+      parentOf(c) {
+        var parent = Object.getPrototypeOf(c);
+        return parent === Function.prototype ? null : parent;
+      },
       star(ns) {
         (stars[id] || (stars[id] = [])).push(ns);
       },
@@ -98,7 +120,7 @@ var __hmr = (() => {
     if (running[id]) return running[id];
     var def = defined[id];
     if (!def) throw new Error("[hmr] no module " + id);
-    var rec = running[id] = { id, esm: def.esm, ns: space(id), module: null, accepted: null, disposers: [] };
+    var rec = running[id] = { id, esm: def.esm, ns: space(id), module: null, accepted: null, disposers: [], scope: null };
     rec.hot = hotFor(id, rec);
     for (var name of Reflect.ownKeys(rec.ns)) if (name !== Symbol.toStringTag) delete rec.ns[name];
     stars[id] = [];
@@ -124,11 +146,23 @@ var __hmr = (() => {
     else if (typeof __hmr_reloaded === "function") __hmr_reloaded(why);
   };
 
-  // New code for `changed`; `stale` modules to run again, which the build found between what
-  // changed and the modules that accept it, `boundaries`. Each stale module's disposers run first,
-  // and what they put in `hot.data` goes to the module's next run.
-  var update = (changed, stale, boundaries) => {
+  // New code for `changed`; `patches`, code run in the scopes of modules that keep running; `stale`
+  // modules to run again, which the build found between what changed and the modules that accept
+  // it, `boundaries`. Each stale module's disposers run first, and what they put in `hot.data` goes
+  // to the module's next run. `notes` say what was patched, and why what runs again does.
+  var update = (changed, stale, boundaries, patches, notes) => {
     for (var id in changed) define(id, ...changed[id]);
+    for (var note of notes) log(note);
+    for (var id in patches) {
+      var rec = running[id];
+      if (!rec || !rec.scope) continue;
+      try {
+        rec.scope = rec.scope(patches[id]);
+      } catch (e) {
+        reload("patching " + display(id) + " failed: " + (e && e.message));
+        return;
+      }
+    }
     for (var id of stale) {
       var rec = running[id];
       if (!rec) continue;
@@ -141,7 +175,7 @@ var __hmr = (() => {
       var rec = load(id);
       if (rec.accepted) rec.accepted(rec.ns);
     }
-    log("updated " + boundaries.map(display).join(", "));
+    if (boundaries.length > 0) log("updated " + boundaries.map(display).join(", "));
   };
 
   // Each update is a script, run by `apply`, which the bundle gives from its own top level: where
