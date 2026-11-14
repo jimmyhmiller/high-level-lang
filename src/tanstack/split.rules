@@ -1,0 +1,235 @@
+# TanStack Router's automatic code splitting, as a bundler that places statements, not files, sees it.
+#
+# A route file says what its route is with `createFileRoute('/path')({ loader, component, … })`.
+# TanStack's plugin makes two files of it: the route, with each split option replaced by a lazy
+# import of a virtual module, and that module, the file again with every other option taken out;
+# what both read it moves to a third module, so it is made once. Here there is one module and one
+# virtual module that only names a value of it:
+#
+#   - in the route file, each split option's value becomes an export of its own, and the option
+#     `lazyRouteComponent(() => import('route.tsx?tsr-split=component'), 'component')`;
+#   - `route.tsx?tsr-split=component` is `export { <that export> as component } from 'route.tsx'`.
+#
+# Which statements load with the route and which with the component is then the bundler's own
+# placement of statements (`--fragments`): what only the component reads goes with it, what the
+# route also reads stays, and nothing is made twice, whatever the file's options read or export.
+rules tanstack.split over bundle.js
+use bundle.js as js
+use bundle.minhost as host
+
+# What the plugin is told: the routes directory (absolute, no trailing `/`), the files in it it
+# leaves alone (those a name of whose path starts with `ignore`), the router's package, the groups of
+# options split together, and options taken out of every route.
+record Options { routes: Text, ignore: Text, package: Text, groupings: [[Text]], delete: [Text] }
+
+setting options: Options
+
+fn default-groupings() -> [[Text]] = [["component"], ["errorComponent"], ["notFoundComponent"]]
+
+# The options TanStack splits, how each is made lazy, and the name its importer has.
+record Splittable { key: Text, lazy: Text, importer: Text }
+
+fn splittable(key: Text) -> Splittable? = match key {
+  "loader" => some(Splittable(key: key, lazy: "lazyFn", importer: "$$splitLoaderImporter"))
+  "component" => some(Splittable(key: key, lazy: "lazyRouteComponent", importer: "$$splitComponentImporter"))
+  "pendingComponent" => some(Splittable(key: key, lazy: "lazyRouteComponent", importer: "$$splitPendingComponentImporter"))
+  "errorComponent" => some(Splittable(key: key, lazy: "lazyRouteComponent", importer: "$$splitErrorComponentImporter"))
+  "notFoundComponent" => some(Splittable(key: key, lazy: "lazyRouteComponent", importer: "$$splitNotFoundComponentImporter"))
+  _ => none
+}
+
+# ---------------------------------------------------------------- which files
+
+# A route file: under the routes directory, a script, and no name on its way there ignored.
+fn route-file?(path: Text) -> Bool = match path {
+  _ if not starts-with(path, options.routes ++ "/") => false
+  _ if contains-text?(path, "?") => false
+  _ => script?(path) and (all part in split(path[len(options.routes) + 1..len(path)], "/"):
+                            not starts-with(part, ".") and not (options.ignore != "" and starts-with(part, options.ignore)))
+}
+
+fn script?(path: Text) -> Bool = match path-ext(path) {
+  ".js" | ".jsx" | ".ts" | ".tsx" | ".mjs" | ".cjs" | ".mts" | ".cts" => true
+  _ => false
+}
+
+# ---------------------------------------------------------------- the virtual module
+
+# `FILE?tsr-split=GROUP`: the split options of GROUP, as the route file exports them.
+fn split-spec?(spec: Text) -> Bool = contains-text?(spec, "?tsr-split=")
+
+fn resolved(spec: Text, importer: Text) -> Text? = match split-spec?(spec) {
+  true => some(spec)
+  false => none
+}
+
+fn loaded(path: Text) -> Text? = match path {
+  base ++ "?tsr-split=" ++ group => some("export { " ++ join([exported-as(base, key) ++ " as " ++ key for key in split(group, "---")], ", ")
+                                          ++ " } from " ++ host.js-string(base) ++ ";\n")
+  _ => none
+}
+
+# The name a route file exports a split option's value by: one its source has nowhere in it.
+fn exported-as(path: Text, key: Text) -> Text = fresh-name("$$tsrSplit_" ++ key, read-file(path))
+
+fn fresh-name(base: Text, source: Text) -> Text = match contains-text?(source, base) {
+  false => base
+  true => first n in 1.. if not contains-text?(source, base ++ "_" ++ int-text(n)): base ++ "_" ++ int-text(n)
+}
+
+# What names a group, as TanStack's `createIdentifier` does: its options in order, by `---`.
+fn group-id(group: [Text]) -> Text = join(sort k in group by k, "---")
+
+# ---------------------------------------------------------------- the route file
+
+# An option of the route that is split: its key, the group it goes with, and its value.
+record Split { what: Splittable, group: Text, value: Node }
+
+# The route file, with each split option an export of its own and a lazy import in its place.
+fn split-route(tree: Node, path: Text, src: Text) -> Node = match route-file?(path) {
+  false => tree
+  true => match [x for s in tree.body.kids for x in splits-in(s)] {
+    [] => tree
+    splits => placed(Program(tree.hashbang, List(made...)) with { lo: tree.lo, hi: tree.hi }, lowest(tree) - 1).node
+      where made = lead(splits, path, src) ++ [x for s in tree.body.kids for x in with-exports(s, splits, path, src)]
+  }
+}
+
+# The statement declaring the route, the options of it that are split.
+fn splits-in(s: Node) -> [Split] = match s {
+  ExportLexical(d) => splits-in(d)
+  ConstDecl(List(ds...)) | LetDecl(List(ds...)) | VarDecl(List(ds...)) => [x for d in ds for x in declarator-splits(d)]
+  _ => []
+}
+
+fn declarator-splits(d: Node) -> [Split] = match d {
+  Declarator(_, CallExpr(CallExpr(Ident("createFileRoute"), _), Args(List(ObjectLit(List(props...)), ...)))) =>
+    [x for p in props for x in prop-split(p, groupings-of(props))]
+  _ => []
+}
+
+# The groups of a route: its own `codeSplitGroupings`, or the plugin's.
+fn groupings-of(props: [Node]) -> [[Text]] =
+  (first p in props if key-of(p) is some(k) and k == "codeSplitGroupings": written-groupings(p)) ?? options.groupings
+
+fn written-groupings(p: Node) -> [[Text]] = match p {
+  Prop(_, ArrayLit(List(groups...))) => [[option-name(e) for e in group-items(g)] for g in groups]
+  _ => fail-build("codeSplitGroupings is an array of arrays of option names")
+}
+
+fn group-items(g: Node) -> [Node] = match element(g) {
+  ArrayLit(List(xs...)) => xs
+  _ => fail-build("codeSplitGroupings: each group is an array of option names")
+}
+
+fn option-name(e: Node) -> Text = match element(e) {
+  Str(raw) => unquote(raw)
+  _ => fail-build("codeSplitGroupings: each group is an array of option names, as strings")
+}
+
+fn element(e: Node) -> Node = match e {
+  Elem(v) | ElemLast(v) => v
+  _ => e
+}
+
+# A property's name, when it is written as a name or a string.
+fn key-of(p: Node) -> Text? = match p {
+  Prop(PropName(k), _) => some(k)
+  Prop(Str(raw), _) => some(unquote(raw))
+  Shorthand(Ident(k)) => some(k)
+  _ => none
+}
+
+fn value-of(p: Node) -> Node = match p {
+  Prop(_, v) => v
+  Shorthand(name) => name
+  _ => p
+}
+
+# A property split: one TanStack splits (a key of a group, with a value that is not a constant).
+fn prop-split(p: Node, groups: [[Text]]) -> [Split] =
+  [Split(what: what, group: group-id(g), value: value-of(p))
+   for key in key-of(p) for what in splittable(key) for g in groups if key in g
+   if not constant?(value-of(p)) distinct key]
+
+fn constant?(v: Node) -> Bool = match v {
+  True() | False() | Null() | Ident("undefined") => true
+  _ => false
+}
+
+# What goes first: the lazy helpers' imports, and each split option's importer.
+fn lead(splits: [Split], path: Text, src: Text) -> [Node] =
+  [made("import { " ++ lazy ++ " as " ++ local(lazy, src) ++ " } from " ++ host.js-string(options.package) ++ ";")
+   for lazy in sort l in [s.what.lazy for s in splits distinct s.what.lazy] by l]
+  ++ [made("const " ++ fresh-name(s.what.importer, src) ++ " = () => import(" ++ host.js-string(path ++ "?tsr-split=" ++ s.group) ++ ");")
+      for s in splits]
+
+fn local(lazy: Text, src: Text) -> Text = fresh-name("$$" ++ lazy, src)
+
+# A statement of the file, its route's split options made lazy, and their values exported after it.
+fn with-exports(s: Node, splits: [Split], path: Text, src: Text) -> [Node] = match splits-in(s) {
+  [] => [s]
+  mine => [made-lazy(s, src)] ++ [exported(x, path, src) for x in mine]
+}
+
+# A split option's value, exported. A name is exported as it is, which adds no statement that
+# computes anything: the module's own placement then puts what it names with what reads it.
+fn exported(x: Split, path: Text, src: Text) -> Node = match x.value {
+  Ident(name) => match made("export { " ++ name ++ " as " ++ exported-as(path, x.what.key) ++ " };") {
+    ExportNamed(List(ExportAs(local, out))) => ExportNamed(List(ExportAs(local with { lo: x.value.lo, hi: x.value.hi }, out)))
+    _ => panic "tanstack.split: an export made of a template is not an export"
+  }
+  value => match made("export const " ++ exported-as(path, x.what.key) ++ " = 0;") {
+    ExportLexical(ConstDecl(List(Declarator(name, _)))) => ExportLexical(ConstDecl(List(Declarator(name, value))))
+    _ => panic "tanstack.split: an export made of a template is not a declaration"
+  }
+}
+
+everywhere fn made-lazy(n: Node, src: Text) -> Node = match n {
+  Declarator(target, CallExpr(CallExpr(Ident("createFileRoute") as callee, id), Args(List(ObjectLit(List(props...)) as o, rest...))) as call) as d =>
+    Declarator(target, CallExpr(CallExpr(callee, id), Args(List(([ObjectLit(List(kept...)) with { lo: o.lo, hi: o.hi }] ++ rest)...)))
+               with { lo: call.lo, hi: call.hi }) with { lo: d.lo, hi: d.hi }
+    where groups = groupings-of(props),
+          kept = [lazy-prop(p, groups, src) for p in props if not (key-of(p) is some(k) and k in options.delete)]
+}
+
+# A property, its value the lazy import of the module it was split into.
+fn lazy-prop(p: Node, groups: [[Text]], src: Text) -> Node = match prop-split(p, groups) {
+  [x] => Prop(PropName(x.what.key), lazy-call(x, src)) with { lo: p.lo, hi: p.hi }
+  _ => p
+}
+
+fn lazy-call(x: Split, src: Text) -> Node = match made(local(x.what.lazy, src) ++ "(" ++ fresh-name(x.what.importer, src) ++ ", "
+                                                      ++ host.js-string(x.what.key) ++ ");") {
+  ExprStmt(call) => call
+  _ => panic "tanstack.split: a lazy call made of a template is not an expression"
+}
+
+# ---------------------------------------------------------------- made code
+
+# A statement made here, every node of it not yet given a place.
+fn made(text: Text) -> Node = unplaced-all(js.parse(text, "<tanstack.split>").body.kids[0])
+
+fn unplaced-all(n: Node) -> Node = n with { lo: unplaced, hi: unplaced, kids: [unplaced-all(k) for k in n.kids] }
+
+const unplaced: Int = -1999999999
+
+# The lowest offset the tree has: made nodes go below it, where no other node is.
+fn lowest(n: Node) -> Int = fold low = min(n.lo, -500000000) for k in n.kids: min(low, lowest(k))
+
+# Scope analysis knows a name by its offset, so every node made here takes an offset of its own,
+# counting down from `next` in the order a walk meets them; the nodes the file had keep theirs.
+record Placed { node: Node, next: Int }
+record Placing { nodes: [Node], next: Int }
+
+fn placed(n: Node, next: Int) -> Placed = match n.lo == unplaced {
+  true => kids-placed(n with { lo: next, hi: next }, next - 1)
+  false => kids-placed(n, next)
+}
+
+fn kids-placed(n: Node, next: Int) -> Placed = match n.kids {
+  [] => Placed(node: n, next: next)
+  kids => Placed(node: n with { kids: all.nodes }, next: all.next)
+    where all = fold a = Placing(nodes: [], next: next) for k in kids:
+                  (a with { nodes: a.nodes ++ [q.node], next: q.next } where q = placed(k, a.next))
+}
