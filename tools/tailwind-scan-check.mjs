@@ -6,7 +6,12 @@
 //   node tools/tailwind-scan-check.mjs sources BASE PATTERN [--not BASE PATTERN]...
 //                                                           one set of sources scanned by both
 //   node tools/tailwind-scan-check.mjs projects [NAME...]   the apps, the TanStack examples and the
-//                                                           fixtures under out/scan-fixtures
+//                                                           fixtures (tools/tailwind-scan-fixtures.mjs)
+//
+// The apps (each with @tailwindcss/oxide installed, whose scanner is the oracle) are in
+// out/real/apps, or $TAILWIND_SCAN_APPS; TanStack Router's React examples in
+// out/real/router/examples/react, or $TAILWIND_SCAN_EXAMPLES. Each app's sources are what
+// @tailwindcss/vite gives the scanner for its stylesheet; each example's, its directory and `**/*`.
 //
 // A check passes when the candidate sets are identical, and for sources when the files read are
 // too. The first differences are printed otherwise. Exits non-zero when any check fails.
@@ -16,12 +21,13 @@ import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
 import { pathToFileURL } from 'node:url'
+import { makeFixtures } from './tailwind-scan-fixtures.mjs'
 
 const here = path.dirname(new URL(import.meta.url).pathname)
 const repo = path.resolve(here, '..')
 const twc = path.join(repo, 'out/bin/twc')
-const apps = '/Users/jimmyhmiller/Documents/Code/projects/high-level-lang/.claude/worktrees/agent-a64d0cb41475d4d5e/out/real/apps'
-const examples = '/Users/jimmyhmiller/Documents/Code/projects/high-level-lang/.worktrees/tanstack/out/real/router/examples/react'
+const apps = process.env.TAILWIND_SCAN_APPS ?? path.join(repo, 'out/real/apps')
+const examples = process.env.TAILWIND_SCAN_EXAMPLES ?? path.join(repo, 'out/real/router/examples/react')
 const fixtures = path.join(repo, 'out/scan-fixtures')
 const oracleApp = path.join(apps, 'start-tailwind-v4')
 
@@ -100,11 +106,7 @@ async function projects() {
     const dir = path.join(examples, name)
     if (fs.statSync(dir).isDirectory()) list.push({ name: `example ${name}`, sources: [{ base: dir, pattern: '**/*', negated: false }] })
   }
-  if (fs.existsSync(path.join(fixtures, 'fixtures.json'))) {
-    for (const f of JSON.parse(fs.readFileSync(path.join(fixtures, 'fixtures.json'), 'utf8'))) {
-      list.push({ name: `fixture ${f.name}`, sources: f.sources.map((s) => ({ ...s, base: path.resolve(fixtures, s.base) })) })
-    }
-  }
+  for (const f of makeFixtures(fixtures)) list.push({ name: `fixture ${f.name}`, sources: f.sources })
   return list
 }
 
