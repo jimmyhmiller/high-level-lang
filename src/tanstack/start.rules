@@ -8,7 +8,8 @@
 # route files (tanstack.split): in both, components load lazily; the browser's route options lose
 # `ssr`, `server` and `headers`. The server leaves packages to Node but Start's own, which the
 # compiler and Start's modules (`#tanstack-start-…`) apply to.
-rules tanstack.start
+rules tanstack.start over bundle.js
+use bundle.js as js
 use bundle.api as api
 use bundle.modules as m
 use bundle.package as pkg
@@ -28,7 +29,7 @@ record Entries { router: Text, start: Text, client: Text, server: Text }
 
 # What a build of the application's is told: the project, its entries, which side it is, and for the
 # server, Start's manifest module.
-record Build { root: Text, entries: Entries, client: Bool, manifest: Text }
+record Build { root: Text, entries: Entries, client: Bool, manifest: Text, tree-path: Text, tree-config: cfg.Config, generated: routes.Generated }
 
 setting build: Build
 
@@ -68,6 +69,8 @@ fn resolved(spec: Text, importer: Text) -> Text? = match spec {
 }
 
 fn loaded(path: Text) -> Text? = match path {
+  # The browser's route tree is not the one on disk (see `client-tree`).
+  _ if build.client and path == build.tree-path => some(client-tree(build.tree-config, build.generated))
   _ if path == manifest-module => some(match build.client {
     true => "export const tsrStartManifest = () => ({ routes: {} });\n"
     false => build.manifest
@@ -223,6 +226,37 @@ fn relative(from: Text, to: Text) -> Text = join([".." for i in common..len(a)] 
 fn generator-config(root: Text, e: Entries) -> cfg.Config = c with { footer: [footer(root, c, e)] ++ c.footer, auto-code-splitting: true }
   where c = cfg.read(root)
 
+# ---------------------------------------------------------------- the browser's route tree
+
+# The browser's route tree, as Start's client-tree plugin makes it in place of the file: no types,
+# no formatting, no header or footer, and without each route only the server has (a route whose
+# options are `server` alone, and whose children are all such routes too).
+fn client-tree(c: cfg.Config, g: routes.Generated) -> Text =
+  with routes.config = client-config { routes.generated-with(client-config).text }
+  where client-config = c with { disable-types: true, formatting: false, header: [], footer: [], pruned: pruned-files(g.manifest) }
+
+fn pruned-files(info: [routes.RouteInfo]) -> [Text] = [r.file for r in info if r.id != "__root__" and pruned?(r, info)]
+
+fn pruned?(r: routes.RouteInfo, info: [routes.RouteInfo]) -> Bool =
+  r.file != "" and server-only?(r.file) and (all c in r.children: (first x in info if x.id == c: pruned?(x, info)) ?? false)
+
+# A route file whose route's options are `server` alone.
+fn server-only?(file: Text) -> Bool = any s in m.parsed-of(file).tree.body.kids: option-keys(s) is some(keys) and len(keys) == 1 and keys[0] == "server"
+
+fn option-keys(s: Node) -> [Text]? = match s {
+  ExportLexical(d) => option-keys(d)
+  ConstDecl(List(Declarator(_, CallExpr(CallExpr(Ident("createFileRoute"), _), Args(List(ObjectLit(List(props...)), ...)))))) =>
+    some([k for p in props for k in key-of(p)])
+  _ => none
+}
+
+fn key-of(p: Node) -> [Text] = match p {
+  Prop(PropName(k), _) => [k]
+  Prop(Str(raw), _) => [unquote(raw)]
+  Shorthand(Ident(k)) => [k]
+  _ => ["…"]
+}
+
 # One build's options, from what the command line gave. The browser's is minified, as Vite's is.
 fn side-options(o: api.Options, root: Text, e: Entries, client: Bool) -> api.Options =
   vite.compatible(envd with { defines: envd.defines ++ [d for d in start-defines() if not api.has-define?(envd, d.key)] })
@@ -249,15 +283,15 @@ fn split-options(g: routes.Generated, delete: [Text]) -> split.Options =
   split.Options(files: {real-path(f): true for f in g.routes}, ids: {real-path(g.routes[i]): g.ids[i] for i in 0..len(g.routes)},
                 package: "@tanstack/react-router", groupings: split.default-groupings(), delete: delete)
 
-fn client-build(o: api.Options, root: Text, e: Entries, g: routes.Generated) -> [api.Written] =
+fn client-build(o: api.Options, root: Text, e: Entries, g: routes.Generated, c: cfg.Config) -> [api.Written] =
   with split.options = split-options(g, ["ssr", "server", "headers"]), compiler.side = compiler.Side(client: true, root: real-path(root)),
-       build = Build(root: root, entries: e, client: true, manifest: "") {
+       build = Build(root: root, entries: e, client: true, manifest: "", tree-path: real-path(c.tree-path), tree-config: c, generated: g) {
     api.files(side-options(o, root, e, true))
   }
 
-fn server-build(o: api.Options, root: Text, e: Entries, g: routes.Generated, manifest: Text) -> [api.Written] =
+fn server-build(o: api.Options, root: Text, e: Entries, g: routes.Generated, c: cfg.Config, manifest: Text) -> [api.Written] =
   with split.options = split-options(g, []), compiler.side = compiler.Side(client: false, root: real-path(root)),
-       build = Build(root: root, entries: e, client: false, manifest: manifest) {
+       build = Build(root: root, entries: e, client: false, manifest: manifest, tree-path: "", tree-config: c, generated: g) {
     api.files(side-options(o, root, e, false))
   }
 
@@ -265,9 +299,10 @@ fn server-build(o: api.Options, root: Text, e: Entries, g: routes.Generated, man
 # it), then the server's.
 fn built(o: api.Options, root: Text) -> [api.Written] = client-files ++ public ++ server-files
   where e = entries-of(root),
-        g = generated!(generator-config(root, e)),
-        client-all = client-build(o, root, e, g),
+        c = generator-config(root, e),
+        g = generated!(c),
+        client-all = client-build(o, root, e, g, c),
         manifest-json = (first w in client-all if ends-with(w.path, "/.vite/manifest.json"): w.text) ?? fail-build("tanstack.start: the browser's build has no manifest"),
         client-files = [w for w in client-all if not ends-with(w.path, "/.vite/manifest.json")],
         public = api.public-written(path-normalize(root ++ "/public"), path-normalize(root ++ "/dist/client")),
-        server-files = server-build(o, root, e, g, manifest-text(chunks-of(manifest-json), g.manifest, root))
+        server-files = server-build(o, root, e, g, c, manifest-text(chunks-of(manifest-json), g.manifest, root))

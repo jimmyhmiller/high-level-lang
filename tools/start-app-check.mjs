@@ -79,6 +79,9 @@ try {
 
   check(!browserCode.includes('SERVER_ONLY_SECRET_ROW') && !browserCode.includes('users[id]'),
         'the browser\'s code has none of the server-only module');
+  const api = await fetch(base + '/api/hello');
+  check(api.status === 200 && (await api.json()).hello === 'SERVER_ROUTE_SECRET', 'a route only the server has answers its request with its handler');
+  check(!browserCode.includes('SERVER_ROUTE_SECRET'), '... and the browser\'s code has none of it');
   check(errors.length === 0, 'no errors: ' + errors.join(' | '));
 } catch (e) {
   failures.push(String(e));
