@@ -482,6 +482,9 @@ if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
     code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tanstack-check.py"), ESB], 900)
     check(code == 0 and " 0 failed" in out, "a TanStack Router application from its page: "
           + (out.strip().splitlines()[-1] + " (its route tree, its page, routes split, run in a browser, size against Vite's)" if code == 0 else out[-1800:]))
+    code, out = sh(["node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "router-dev-check.mjs"), ESB], 300)
+    check(code == 0 and " 0 failed" in out, "a TanStack Router application in development: "
+          + (out.strip().splitlines()[-1] + " (served from its page; components refreshed with their state, routes updated in place, stylesheets replaced, a route added)" if code == 0 else out[-1800:]))
 else:
     check(False, "TanStack Router application: benchmarks/tanstack-router has no node_modules (npm ci --prefix benchmarks/tanstack-router --ignore-scripts)")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "split-fuzz.py"), "100", "1", ESB], 900)

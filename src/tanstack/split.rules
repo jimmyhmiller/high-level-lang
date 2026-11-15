@@ -20,10 +20,11 @@ rules tanstack.split over bundle.js
 use bundle.js as js
 use bundle.minhost as host
 use bundle.evaluation as ev
+use bundle.made as mk
 
-# What the plugin is told: the route files (by real path), the router's package, the groups of
-# options split together, and options taken out of every route.
-record Options { files: {Text:Bool}, package: Text, groupings: [[Text]], delete: [Text] }
+# What the plugin is told: the route files (by real path), with their routes' ids, the router's
+# package, the groups of options split together, and options taken out of every route.
+record Options { files: {Text:Bool}, ids: {Text:Text}, package: Text, groupings: [[Text]], delete: [Text] }
 
 setting options: Options
 
@@ -83,7 +84,7 @@ fn split-route(tree: Node, path: Text, src: Text) -> Node = match route-file?(pa
   false => tree
   true => match [x for s in tree.body.kids for x in splits-in(s)] {
     [] => tree
-    splits => placed(Program(tree.hashbang, List(made...)) with { lo: tree.lo, hi: tree.hi }, lowest(tree) - 1).node
+    splits => mk.placed(Program(tree.hashbang, List(made...)) with { lo: tree.lo, hi: tree.hi }, mk.lowest(tree) - 1).node
       where made = lead(splits, path, src) ++ [x for s in tree.body.kids for x in with-exports(s, splits, path, src)]
   }
 }
@@ -155,11 +156,11 @@ fn constant?(v: Node) -> Bool = match v {
 
 # What goes first: the lazy helpers' imports, and each split option's importer.
 fn lead(splits: [Split], path: Text, src: Text) -> [Node] =
-  [made("import { " ++ lazy ++ " as " ++ local(lazy, src) ++ " } from " ++ host.js-string(options.package) ++ ";")
+  [mk.made("import { " ++ lazy ++ " as " ++ local(lazy, src) ++ " } from " ++ host.js-string(options.package) ++ ";")
    for lazy in sort l in [s.what.lazy for s in splits distinct s.what.lazy] by l]
-  ++ [made("const " ++ fresh-name(s.what.importer, src) ++ " = () => import(" ++ host.js-string(path ++ "?tsr-split=" ++ s.group) ++ ");")
+  ++ [mk.made("const " ++ fresh-name(s.what.importer, src) ++ " = () => import(" ++ host.js-string(path ++ "?tsr-split=" ++ s.group) ++ ");")
       for s in splits]
-  ++ [made("export let " ++ exported-as(path, s.what.key) ++ ";") for s in splits if computes?(s.value)]
+  ++ [mk.made("export let " ++ exported-as(path, s.what.key) ++ ";") for s in splits if computes?(s.value)]
 
 # A value that computes something as it is made (a call, say): it is computed where it was.
 fn computes?(v: Node) -> Bool = not (v is Ident(_)) and not ev.inert(v)
@@ -175,11 +176,11 @@ fn with-exports(s: Node, splits: [Split], path: Text, src: Text) -> [Node] = mat
 # A split option's value, exported. A name is exported as it is, which adds no statement that
 # computes anything: the module's own placement then puts what it names with what reads it.
 fn exported(x: Split, path: Text, src: Text) -> Node = match x.value {
-  Ident(name) => match made("export { " ++ name ++ " as " ++ exported-as(path, x.what.key) ++ " };") {
+  Ident(name) => match mk.made("export { " ++ name ++ " as " ++ exported-as(path, x.what.key) ++ " };") {
     ExportNamed(List(ExportAs(local, out))) => ExportNamed(List(ExportAs(local with { lo: x.value.lo, hi: x.value.hi }, out)))
     _ => panic "tanstack.split: an export made of a template is not an export"
   }
-  value => match made("export const " ++ exported-as(path, x.what.key) ++ " = 0;") {
+  value => match mk.made("export const " ++ exported-as(path, x.what.key) ++ " = 0;") {
     ExportLexical(ConstDecl(List(Declarator(name, _)))) => ExportLexical(ConstDecl(List(Declarator(name, value))))
     _ => panic "tanstack.split: an export made of a template is not a declaration"
   }
@@ -202,44 +203,16 @@ fn lazy-prop(p: Node, groups: [[Text]], props: [Node], path: Text, src: Text) ->
 
 # `(S = value, lazy(…))`: the value computed where it was, and given to its export.
 fn assigned(x: Split, path: Text, src: Text) -> Node =
-  match made("(" ++ exported-as(path, x.what.key) ++ " = 0, 0);") {
+  match mk.made("(" ++ exported-as(path, x.what.key) ++ " = 0, 0);") {
     ExprStmt(Paren(Seq(Assignment(target, op, _), _) as seq) as paren) =>
       Paren(Seq(Assignment(target, op, x.value) with { lo: seq.kids[0].lo, hi: seq.kids[0].hi }, lazy-call(x, src)) with { lo: seq.lo, hi: seq.hi })
       with { lo: paren.lo, hi: paren.hi }
     _ => panic "tanstack.split: an assignment made of a template is not one"
   }
 
-fn lazy-call(x: Split, src: Text) -> Node = match made(local(x.what.lazy, src) ++ "(" ++ fresh-name(x.what.importer, src) ++ ", "
+fn lazy-call(x: Split, src: Text) -> Node = match mk.made(local(x.what.lazy, src) ++ "(" ++ fresh-name(x.what.importer, src) ++ ", "
                                                       ++ host.js-string(x.what.key) ++ ");") {
   ExprStmt(call) => call
   _ => panic "tanstack.split: a lazy call made of a template is not an expression"
 }
 
-# ---------------------------------------------------------------- made code
-
-# A statement made here, every node of it not yet given a place.
-fn made(text: Text) -> Node = unplaced-all(js.parse(text, "<tanstack.split>").body.kids[0])
-
-fn unplaced-all(n: Node) -> Node = n with { lo: unplaced, hi: unplaced, kids: [unplaced-all(k) for k in n.kids] }
-
-const unplaced: Int = -1999999999
-
-# The lowest offset the tree has: made nodes go below it, where no other node is.
-fn lowest(n: Node) -> Int = fold low = min(n.lo, -500000000) for k in n.kids: min(low, lowest(k))
-
-# Scope analysis knows a name by its offset, so every node made here takes an offset of its own,
-# counting down from `next` in the order a walk meets them; the nodes the file had keep theirs.
-record Placed { node: Node, next: Int }
-record Placing { nodes: [Node], next: Int }
-
-fn placed(n: Node, next: Int) -> Placed = match n.lo == unplaced {
-  true => kids-placed(n with { lo: next, hi: next }, next - 1)
-  false => kids-placed(n, next)
-}
-
-fn kids-placed(n: Node, next: Int) -> Placed = match n.kids {
-  [] => Placed(node: n, next: next)
-  kids => Placed(node: n with { kids: all.nodes }, next: all.next)
-    where all = fold a = Placing(nodes: [], next: next) for k in kids:
-                  (a with { nodes: a.nodes ++ [q.node], next: q.next } where q = placed(k, a.next))
-}

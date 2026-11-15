@@ -1,0 +1,183 @@
+# React Fast Refresh in a development build, as React's Babel plugin and Vite's plugin-react make
+# it: each module of the project registers its components with the refresh runtime, under ids that
+# are the same each time it runs; a component or hook whose hooks are called says them as its
+# signature, so an edit that changes them remounts it and one that does not keeps its state; and a
+# module whose exports are all components accepts its own updates, asking the runtime to refresh
+# what React rendered (and one whose exports are not is invalidated, and the page reloads).
+#
+# Components are a module's top-level functions, and `const`s whose value is a function or a call
+# (`memo(…)`, `forwardRef(…)`), named as components are: with a capital first letter. Hooks are
+# functions named `use` and a capital (or `use` alone). The runtime is React's, as plugin-react
+# ships it (refresh_runtime.js), a module of the build's own; the entries import its preamble
+# first, which hooks it into React before React loads.
+rules react.refresh over bundle.js
+use bundle.js as js
+use bundle.made as mk
+use bundle.minhost as host
+
+# What the build is told: its entries (real paths), whose preamble goes first.
+record Options { entries: [Text] }
+
+setting options: Options
+
+const runtime-module: Text = "esb:react-refresh/runtime"
+const preamble-module: Text = "esb:react-refresh/preamble"
+
+fn resolved(spec: Text, importer: Text) -> Text? = match spec {
+  _ if spec == runtime-module or spec == preamble-module => some(spec)
+  _ => none
+}
+
+fn loaded(path: Text) -> Text? = match path {
+  _ if path == runtime-module => some(include-text("refresh_runtime.js"))
+  _ if path == preamble-module =>
+    some("import { injectIntoGlobalHook } from " ++ host.js-string(runtime-module) ++ ";\n"
+         ++ "if (typeof window !== \"undefined\") {\n  injectIntoGlobalHook(window);\n"
+         ++ "  window.$RefreshReg$ = () => {};\n  window.$RefreshSig$ = () => (type) => type;\n}\n")
+  _ => none
+}
+
+# A module of the project's own, which the build parsed as a script.
+fn refreshable?(path: Text) -> Bool =
+  not contains-text?(path, "/node_modules/") and not contains-text?(path, "?") and not starts-with(path, "esb:")
+  and (path-ext(path) in [".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts"])
+
+# ---------------------------------------------------------------- what a module has
+
+fn component-name?(n: Text) -> Bool = len(n) > 0 and n[0] >= 'A' and n[0] <= 'Z'
+fn hook-name?(n: Text) -> Bool = n == "use" or (starts-with(n, "use") and len(n) > 3 and n[3] >= 'A' and n[3] <= 'Z')
+
+# React's own hooks: a signature names the others as the custom hooks it calls, whose own
+# signatures change it.
+const builtin-hooks: [Text] = ["useState", "useReducer", "useEffect", "useLayoutEffect", "useInsertionEffect", "useMemo",
+  "useCallback", "useRef", "useContext", "useImperativeHandle", "useDebugValue", "useDeferredValue", "useTransition",
+  "useId", "useSyncExternalStore", "useOptimistic", "useActionState", "useFormStatus", "use"]
+
+# A function of the module's top level that the runtime is told of: its name, whether it is a
+# component (registered) or only a hook, and the hooks its body calls, each as its call is written.
+record Found { name: Text, component: Bool, hooks: [Node] }
+
+fn found-in(s: Node, src: Text) -> [Found] = match s {
+  FuncDecl(BindName(name), _, body) | AsyncFuncDecl(BindName(name), _, body) => found(name, body)
+  ExportFunction(d) => found-in(d, src)
+  ExportDefaultDecl(FuncExpr(BindName(name), _, body)) => found(name, body)
+  ConstDecl(List(ds...)) | LetDecl(List(ds...)) | VarDecl(List(ds...)) => [f for d in ds for f in declared(d)]
+  ExportLexical(d) | ExportVar(d) => found-in(d, src)
+  _ => []
+}
+
+fn declared(d: Node) -> [Found] = match d {
+  Declarator(BindName(name), Arrow(_, body)) | Declarator(BindName(name), FuncExpr(_, _, body)) => found(name, body)
+  Declarator(BindName(name), CallExpr(...)) if component-name?(name) => [Found(name: name, component: true, hooks: [])]
+  _ => []
+}
+
+fn found(name: Text, body: Node) -> [Found] = match component-name?(name), hook-name?(name) {
+  true, _ => [Found(name: name, component: true, hooks: hooks-in(body))]
+  false, true => [Found(name: name, component: false, hooks: hooks-in(body)) for h in [hooks-in(body)] if len(h) > 0]
+  _, _ => []
+}
+
+# The hooks a function's own body calls, in order: not those of functions inside it.
+fn hooks-in(n: Node) -> [Node] = match n {
+  CallExpr(Ident(callee), args) if hook-name?(callee) => [n] ++ hooks-in(args)
+  CallExpr(Member(_, PropName(callee)), args) if hook-name?(callee) => [n] ++ hooks-in(args)
+  FuncExpr(...) | AsyncFuncExpr(...) | GenExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) | FuncDecl(...) | AsyncFuncDecl(...) => []
+  _ => [h for k in n.kids for h in hooks-in(k)]
+}
+
+fn hook-callee(call: Node) -> Text = match call {
+  CallExpr(Ident(c), _) => c
+  CallExpr(Member(_, PropName(c)), _) => c
+  _ => ""
+}
+
+# A signature's key, as React's plugin makes one: each hook, and how it is called.
+fn signature-key(f: Found, src: Text) -> Text = join([hook-callee(h) ++ "{" ++ src[h.lo..h.hi] ++ "}" for h in f.hooks], "\n")
+
+# The custom hooks it calls that the module can name: their signatures are part of its own.
+fn custom-hooks(f: Found) -> [Text] = [hook-callee(h) for h in f.hooks if not (hook-callee(h) in builtin-hooks)
+                                       for h2 in [h] if h2 is CallExpr(Ident(_), _) distinct hook-callee(h)]
+
+# ---------------------------------------------------------------- the module
+
+# The module, its components registered, its signatures said, and its updates accepted; an entry
+# imports the preamble first. A module with no component and no hook is as it was, but an entry.
+fn refreshed(tree: Node, path: Text, src: Text) -> Node = match refreshable?(path) {
+  false => tree
+  true => match [f for s in tree.body.kids for f in found-in(s, src)] {
+    [] if not entry? => tree
+    [] => mk.placed-program(Program(tree.hashbang, List(([preamble()] ++ tree.body.kids)...)) with { lo: tree.lo, hi: tree.hi })
+    fs => mk.placed-program(Program(tree.hashbang, List(body...)) with { lo: tree.lo, hi: tree.hi })
+      where body = [preamble() for x in [entry?] if x]
+                   ++ prologue(path, src)
+                   ++ [s2 for s in tree.body.kids for s2 in with-signatures(s, fs, src)]
+                   ++ [mk.made("$RefreshReg$(" ++ f.name ++ ", " ++ host.js-string(f.name) ++ ");") for f in fs if f.component]
+                   ++ epilogue(path, src)
+  }
+} where entry? = real-path(path) in options.entries
+
+fn preamble() -> Node = mk.made("import " ++ host.js-string(preamble-module) ++ ";")
+
+fn runtime-name(src: Text) -> Text = fresh("__RefreshRuntime", src)
+
+fn fresh(base: Text, src: Text) -> Text = match contains-text?(src, base) {
+  false => base
+  true => first n in 1.. if not contains-text?(src, base ++ int-text(n)): base ++ int-text(n)
+}
+
+# The module's id as the runtime knows it: the same each time it runs.
+fn module-id(path: Text) -> Text = host.js-string(path)
+
+fn prologue(path: Text, src: Text) -> [Node] =
+  [mk.made("import * as " ++ runtime-name(src) ++ " from " ++ host.js-string(runtime-module) ++ ";"),
+   mk.made("var " ++ fresh("__prevRefreshReg", src) ++ " = globalThis.$RefreshReg$, " ++ fresh("__prevRefreshSig", src) ++ " = globalThis.$RefreshSig$;"),
+   mk.made("globalThis.$RefreshReg$ = (type, id) => " ++ runtime-name(src) ++ ".register(type, " ++ module-id(path) ++ " + \" \" + id);"),
+   mk.made("globalThis.$RefreshSig$ = " ++ runtime-name(src) ++ ".createSignatureFunctionForTransform;")]
+
+fn epilogue(path: Text, src: Text) -> [Node] =
+  [mk.made("globalThis.$RefreshReg$ = " ++ fresh("__prevRefreshReg", src) ++ "; globalThis.$RefreshSig$ = " ++ fresh("__prevRefreshSig", src) ++ ";"),
+   mk.made("if (import.meta.hot) import.meta.hot.accept((next, prev) => { if (!prev) return; "
+           ++ "var why = " ++ runtime-name(src) ++ ".validateRefreshBoundaryAndEnqueueUpdate(" ++ module-id(path) ++ ", prev, next); "
+           ++ "if (why) import.meta.hot.invalidate(why); });")]
+
+# A statement, and for each function of it whose hooks are called, its signature: made before it,
+# called first in its body, and given the function, its key and its custom hooks after it.
+fn with-signatures(s: Node, fs: [Found], src: Text) -> [Node] = match [f for f in found-in(s, src) if len(f.hooks) > 0] {
+  [] => [s]
+  signed => [mk.made("var " ++ sig-name(f.name, src) ++ " = $RefreshSig$();") for f in signed]
+            ++ [signed-statement(s, signed, src)]
+            ++ [mk.made(sig-name(f.name, src) ++ "(" ++ f.name ++ ", " ++ host.js-string(signature-key(f, src)) ++ ", false, () => ["
+                        ++ join(custom-hooks(f), ", ") ++ "]);") for f in signed]
+}
+
+fn sig-name(name: Text, src: Text) -> Text = fresh("_s_" ++ name, src)
+
+fn signed-statement(s: Node, signed: [Found], src: Text) -> Node = match s {
+  FuncDecl(BindName(name) as b, params, body) => FuncDecl(b, params, signed-body(body, name, src)) with { lo: s.lo, hi: s.hi }
+  AsyncFuncDecl(BindName(name) as b, params, body) => AsyncFuncDecl(b, params, signed-body(body, name, src)) with { lo: s.lo, hi: s.hi }
+  ExportFunction(d) => ExportFunction(signed-statement(d, signed, src)) with { lo: s.lo, hi: s.hi }
+  ExportDefaultDecl(FuncExpr(BindName(name) as b, params, body) as f) =>
+    ExportDefaultDecl(FuncExpr(b, params, signed-body(body, name, src)) with { lo: f.lo, hi: f.hi }) with { lo: s.lo, hi: s.hi }
+  ConstDecl(List(ds...)) => ConstDecl(List([signed-declarator(d, src) for d in ds]...)) with { lo: s.lo, hi: s.hi }
+  LetDecl(List(ds...)) => LetDecl(List([signed-declarator(d, src) for d in ds]...)) with { lo: s.lo, hi: s.hi }
+  VarDecl(List(ds...)) => VarDecl(List([signed-declarator(d, src) for d in ds]...)) with { lo: s.lo, hi: s.hi }
+  ExportLexical(d) => ExportLexical(signed-statement(d, signed, src)) with { lo: s.lo, hi: s.hi }
+  ExportVar(d) => ExportVar(signed-statement(d, signed, src)) with { lo: s.lo, hi: s.hi }
+  _ => s
+}
+
+fn signed-declarator(d: Node, src: Text) -> Node = match d {
+  Declarator(BindName(name) as b, Arrow(params, body) as a) if len(hooks-in(body)) > 0 =>
+    Declarator(b, Arrow(params, signed-body(body, name, src)) with { lo: a.lo, hi: a.hi }) with { lo: d.lo, hi: d.hi }
+  Declarator(BindName(name) as b, FuncExpr(n, params, body) as f) if len(hooks-in(body)) > 0 =>
+    Declarator(b, FuncExpr(n, params, signed-body(body, name, src)) with { lo: f.lo, hi: f.hi }) with { lo: d.lo, hi: d.hi }
+  _ => d
+}
+
+# A body that calls its signature first. An arrow's expression body becomes a block returning it.
+fn signed-body(body: Node, name: Text, src: Text) -> Node = match body {
+  FuncBody(List(ss...)) => FuncBody(List(([call] ++ ss)...)) with { lo: body.lo, hi: body.hi }
+  ExprBody(e) => FuncBody(List(call, Return(e) with { lo: e.lo, hi: e.hi })) with { lo: body.lo, hi: body.hi }
+  _ => body
+} where call = mk.made(sig-name(name, src) ++ "();")

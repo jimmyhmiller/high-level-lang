@@ -1,0 +1,172 @@
+# A route file in development, as TanStack's plugin makes it for React with Vite (its code splitter's
+# HMR compiler plugins): an update of the file updates its route in the running router, and React
+# Fast Refresh (react.refresh) refreshes its components.
+#
+#   - A route component given as a function written in place, or a function named as no component
+#     is, is first given a constant of its own named as one (`TSRComponent`), which Fast Refresh
+#     registers.
+#   - The file tells Fast Refresh that its `Route` export is not a component, and exports one
+#     (`TSRFastRefreshAnchor`) so that it is still a refresh boundary.
+#   - At its end, TanStack's statement for its route: run again, the module hands its new route to
+#     the router, which keeps the route's place and its components' identities and takes the rest.
+rules tanstack.dev over bundle.js
+use bundle.js as js
+use bundle.made as mk
+use bundle.minhost as host
+use tanstack.split as split
+
+const component-keys: [Text] = ["component", "shellComponent", "pendingComponent", "errorComponent", "notFoundComponent"]
+
+fn hot-route(tree: Node, path: Text, src: Text) -> Node = match split.route-file?(real-path(path)) {
+  false => tree
+  true => mk.placed-program(Program(tree.hashbang, List(body...)) with { lo: tree.lo, hi: tree.hi })
+    where id = route-id(split.options.ids[real-path(path)] ?? ""),
+          body = [s2 for s in tree.body.kids for s2 in hoisted(s, src)]
+                 ++ [mk.made(ignored-exports(path)), mk.made("export function " ++ fresh("TSRFastRefreshAnchor", src) ++ "() { return null }"),
+                     mk.made(hmr-statement(id))]
+}
+
+fn route-id(id: Text) -> Text = match id {
+  "/__root" => "__root__"
+  _ => id
+}
+
+fn fresh(base: Text, src: Text) -> Text = match contains-text?(src, base) {
+  false => base
+  true => first n in 1.. if not contains-text?(src, base ++ int-text(n)): base ++ int-text(n)
+}
+
+# ---------------------------------------------------------------- components named
+
+# The route's statement, its components' values each a name of its own, declared before it.
+fn hoisted(s: Node, src: Text) -> [Node] = match [h for h in hoists-in(s, src)] {
+  [] => [s]
+  hs => [declared(h) for h in hs] ++ [renamed(s, hs, src)]
+}
+
+# A component value given a name: the name, the value, and its key.
+record Hoist { name: Text, key: Text, value: Node }
+
+fn hoists-in(s: Node, src: Text) -> [Hoist] =
+  [Hoist(name: fresh("TSR" ++ capitalized(key), src), key: key, value: value-of(p))
+   for o in options-in(s) for p in o.props.kids for key in key-of(p) if key in component-keys if needs-name?(value-of(p))]
+
+fn capitalized(key: Text) -> Text = text-of-bytes([upper(key[0])]) ++ key[1..len(key)]
+
+fn upper(b: Int) -> Int = if b >= 'a' and b <= 'z' then b - 32 else b
+
+fn needs-name?(v: Node) -> Bool = match v {
+  Arrow(...) | FuncExpr(...) | AsyncArrow(...) | AsyncFuncExpr(...) => true
+  Ident(name) => not (len(name) > 0 and name[0] >= 'A' and name[0] <= 'Z')
+  _ => false
+}
+
+fn declared(h: Hoist) -> Node = match mk.made("const " ++ h.name ++ " = 0;") {
+  ConstDecl(List(Declarator(b, _))) => ConstDecl(List(Declarator(b, h.value)))
+  _ => panic "tanstack.dev: a declaration made of a template is not one"
+}
+
+# The route's options object, in a statement declaring the route.
+fn options-in(s: Node) -> [Node] = match s {
+  ExportLexical(d) => options-in(d)
+  ConstDecl(List(ds...)) | LetDecl(List(ds...)) | VarDecl(List(ds...)) => [o for d in ds for o in route-options(d)]
+  _ => []
+}
+
+fn route-options(d: Node) -> [Node] = match d {
+  Declarator(_, CallExpr(CallExpr(Ident(c), _), Args(List(ObjectLit(_) as o, ...)))) if c == "createFileRoute" or c == "createRootRouteWithContext" => [o]
+  Declarator(_, CallExpr(Ident("createRootRoute"), Args(List(ObjectLit(_) as o, ...)))) => [o]
+  _ => []
+}
+
+fn key-of(p: Node) -> Text? = match p {
+  Prop(PropName(k), _) => some(k)
+  Prop(Str(raw), _) => some(unquote(raw))
+  Shorthand(Ident(k)) => some(k)
+  _ => none
+}
+
+fn value-of(p: Node) -> Node = match p {
+  Prop(_, v) => v
+  Shorthand(name) => name
+  _ => p
+}
+
+# The statement, each hoisted value replaced by its name.
+everywhere fn renamed(n: Node, hs: [Hoist], src: Text) -> Node = match n {
+  Prop(k, v) if any h in hs: h.value.lo == v.lo and h.value.hi == v.hi and (key-of(n) is some(named) and named == h.key) =>
+    Prop(k, mk.made-expression((first h in hs if h.value.lo == v.lo: h.name) ?? "")) with { lo: n.lo, hi: n.hi }
+  Shorthand(Ident(k) as v) if any h in hs: h.key == k and h.value.lo == v.lo =>
+    Prop(PropName(k), mk.made-expression((first h in hs if h.value.lo == v.lo: h.name) ?? "")) with { lo: n.lo, hi: n.hi }
+}
+
+# ---------------------------------------------------------------- what TanStack's plugin adds
+
+fn ignored-exports(path: Text) -> Text =
+  "if (import.meta.hot && typeof window !== 'undefined') {\n"
+  ++ "  import.meta.hot.data ??= {}\n"
+  ++ "  const tsrReactRefresh = window.__TSR_REACT_REFRESH__ ??= (() => {\n"
+  ++ "    const ignoredExportsById = new Map()\n"
+  ++ "    const previousGetIgnoredExports = window.__getReactRefreshIgnoredExports\n"
+  ++ "    window.__getReactRefreshIgnoredExports = (ctx) => {\n"
+  ++ "      const ignoredExports = previousGetIgnoredExports?.(ctx) ?? []\n"
+  ++ "      const moduleIgnored = ignoredExportsById.get(ctx.id) ?? []\n"
+  ++ "      return [...ignoredExports, ...moduleIgnored]\n"
+  ++ "    }\n"
+  ++ "    return { ignoredExportsById }\n"
+  ++ "  })()\n"
+  ++ "  tsrReactRefresh.ignoredExportsById.set(" ++ host.js-string(path) ++ ", ['Route'])\n"
+  ++ "}"
+
+# TanStack's statement (its router plugin's Vite adapter, with its `handleRouteUpdate`), for the
+# route `id`: React's components keep their identities across updates.
+fn hmr-statement(id: Text) -> Text =
+  "if (import.meta.hot) {\n"
+  ++ "  const hotData = import.meta.hot.data ??= {}\n"
+  ++ "  const handleRouteUpdate = " ++ handle-route-update ++ "\n"
+  ++ "  const initialRouteId = " ++ host.js-string(id) ++ " ?? hotData['tsr-route-id']\n"
+  ++ "  if (initialRouteId) {\n    hotData['tsr-route-id'] = initialRouteId\n  }\n"
+  ++ "  const existingRoute =\n    typeof window !== 'undefined' && initialRouteId\n"
+  ++ "      ? window.__TSR_ROUTER__?.routesById?.[initialRouteId]\n      : undefined\n"
+  ++ "  if (initialRouteId && existingRoute && existingRoute !== Route) {\n"
+  ++ "    handleRouteUpdate(initialRouteId, Route)\n    hotData['tsr-route-update-handled'] = Route\n  }\n"
+  ++ "  import.meta.hot.accept((newModule) => {\n"
+  ++ "    if (Route && newModule && newModule.Route) {\n"
+  ++ "      const routeId = hotData['tsr-route-id'] ?? " ++ host.js-string(id) ++ "\n"
+  ++ "      if (routeId) {\n        hotData['tsr-route-id'] = routeId\n      }\n"
+  ++ "      if (hotData['tsr-route-update-handled'] === newModule.Route) {\n"
+  ++ "        delete hotData['tsr-route-update-handled']\n        return\n      }\n"
+  ++ "      handleRouteUpdate(routeId, newModule.Route)\n    }\n  })\n}"
+
+const handle-route-update: Text = join([
+  "function handleRouteUpdate(routeId, newRoute) {",
+  "  const router = window.__TSR_ROUTER__;",
+  "  const oldRoute = router.routesById[routeId];",
+  "  if (!oldRoute) return;",
+  "  const generatedRouteOptionKeys = new Set([\"id\", \"path\", \"getParentRoute\"]);",
+  "  const generatedRouteOptions = {};",
+  "  generatedRouteOptionKeys.forEach((key) => {",
+  "    if (key in oldRoute.options) generatedRouteOptions[key] = oldRoute.options[key];",
+  "  });",
+  "  const preserveComponentIdentity = \"shellComponent\" in oldRoute.options === \"shellComponent\" in newRoute.options;",
+  "  const componentKeys = [\"component\",\"shellComponent\",\"pendingComponent\",\"errorComponent\",\"notFoundComponent\"];",
+  "  if (preserveComponentIdentity) componentKeys.forEach((key) => {",
+  "    if (key in oldRoute.options && key in newRoute.options) newRoute.options[key] = oldRoute.options[key];",
+  "  });",
+  "  const nextOptions = { ...newRoute.options, ...generatedRouteOptions };",
+  "  oldRoute.options = nextOptions;",
+  "  oldRoute.update(nextOptions);",
+  "  router._replaceRouteChunk(oldRoute, newRoute.lazyFn);",
+  "  router.setRoutes(router.buildRouteTree());",
+  "  syncHotRouteExport(oldRoute);",
+  "  router.resolvePathCache.clear();",
+  "  router._refreshRoute?.();",
+  "  function syncHotRouteExport(liveRoute) {",
+  "    newRoute.options = liveRoute.options;",
+  "    newRoute.parentRoute = liveRoute.parentRoute;",
+  "    newRoute._path = liveRoute._path;",
+  "    newRoute._id = liveRoute._id;",
+  "    newRoute._fullPath = liveRoute._fullPath;",
+  "    newRoute._to = liveRoute._to;",
+  "  }",
+  "}"], "\n")
