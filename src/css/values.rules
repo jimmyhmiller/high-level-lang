@@ -1,0 +1,240 @@
+# The values lightningcss (v1.33.0) parses CSS into, and how it writes them when minifying.
+#
+# One record, `V`, holds every kind of value: a token, a length, a color, a list, a function. Its
+# `kind` says which, and each module says what the kinds it makes hold in `num`, `text` and
+# `items`. Values compare as wholes (`==`), as lightningcss's derive(PartialEq) types do.
+#
+# Writing follows lightningcss's `ToCss` impls and cssparser's serializer: numbers as dtoa-short
+# writes a float (six significant digits) with the leading zero of a fraction dropped, dimensions
+# and percentages likewise, identifiers and strings escaped as cssparser escapes them.
+rules css.values
+
+boxed record V { kind: Text, num: F32, text: Text, items: [V] }
+
+fn v(kind: Text, num: F32, text: Text, items: [V]) -> V = V(kind: kind, num: num, text: text, items: items)
+fn word(kind: Text, text: Text) -> V = V(kind: kind, num: 0.0, text: text, items: [])
+fn number(kind: Text, num: F32) -> V = V(kind: kind, num: num, text: "", items: [])
+fn holder(kind: Text, items: [V]) -> V = V(kind: kind, num: 0.0, text: "", items: items)
+fn named(kind: Text, text: Text, items: [V]) -> V = V(kind: kind, num: 0.0, text: text, items: items)
+
+# A bare number, as a part of a value (a color's component, a ratio's term).
+fn n(x: F32) -> V = V(kind: "n", num: x, text: "", items: [])
+
+# ---------------------------------------------------------------- reading tokens
+
+# What a parser took, and the tokens after it.
+record Got { value: V, rest: [V] }
+
+fn got(value: V, rest: [V]) -> Got? = some(Got(value: value, rest: rest))
+
+fn space?(t: V) -> Bool = t.kind == "ws" or t.kind == "comment"
+
+# cssparser's `next()` skips space and comments.
+fn skip-space(ts: [V]) -> [V] = ts[len([t for t in ts while space?(t)])..len(ts)]
+
+fn next-of(ts: [V]) -> Got? = match skip-space(ts) {
+  [] => none
+  [t, rest...] => got(t, rest)
+}
+
+fn exhausted?(ts: [V]) -> Bool = len(skip-space(ts)) == 0
+
+fn significant(ts: [V]) -> [V] = [t for t in ts if not space?(t)]
+
+# The next token, when it is this identifier (as `expect_ident_matching`: ASCII case aside).
+fn ident-matching(ts: [V], name: Text) -> [V]? = match next-of(ts) {
+  some(g) if g.value.kind == "ident" and lower(g.value.text) == name => some(g.rest)
+  _ => none
+}
+
+fn delim-matching(ts: [V], d: Text) -> [V]? = match next-of(ts) {
+  some(g) if g.value.kind == "delim" and g.value.text == d => some(g.rest)
+  _ => none
+}
+
+fn kind-matching(ts: [V], kind: Text) -> [V]? = match next-of(ts) {
+  some(g) if g.value.kind == kind => some(g.rest)
+  _ => none
+}
+
+# Whether a token is a math function (`calc()`, `min()`, …), which lightningcss's `Calc` reads.
+fn math-function?(t: V) -> Bool = t.kind == "function" and lower(t.text) in math-functions
+
+const math-functions: [Text] = ["calc", "min", "max", "clamp", "round", "mod", "rem", "abs", "sign", "hypot", "sin", "cos",
+                                "tan", "asin", "acos", "atan", "atan2", "pow", "sqrt", "exp", "log"]
+
+# Whether a token is, or holds, a `var()` or `env()`, which no typed value is.
+fn has-var?(t: V) -> Bool = (t.kind == "function" and (lower(t.text) == "var" or lower(t.text) == "env"))
+  or (any x in t.items: has-var?(x))
+
+# ---------------------------------------------------------------- numbers
+
+fn f32-fract(x: F32) -> F32 = x - f32-trunc(x)
+
+# lightningcss's `CSSNumber::to_css`: dtoa-short's text, the zero before a fraction's point gone.
+fn number-text(x: F32) -> Text = match f32-short-text(x) {
+  t if x != 0.0 and f32-abs(x) < 1.0 and x < 0.0 => "-" ++ trim-zeros(trim-minus(t))
+  t if x != 0.0 and f32-abs(x) < 1.0 => trim-zeros(t)
+  t => t
+}
+
+fn trim-minus(t: Text) -> Text = match t { "-" ++ rest => rest  _ => t }
+fn trim-zeros(t: Text) -> Text = t[span-of(t, 0, "0")..len(t)]
+
+# cssparser's `write_numeric`: -0 as `-0`, a `+` where the token had one, an integer as an
+# integer, and a float's text with `.0` where it would read as an integer.
+fn numeric-text(value: F32, int: Int?, has-sign: Bool) -> Text = match int {
+  _ if value == 0.0 and f32-sign-negative?(value) => "-0"
+  some(i) => sign ++ int-text(i)
+  none => sign ++ float-numeric(value)
+} where sign = if has-sign and value >= 0.0 then "+" else ""
+
+fn float-numeric(value: F32) -> Text = match f32-short-text(value) {
+  t if f32-fract(value) == 0.0 and not contains-text?(t, ".") and not contains-text?(t, "e") => t ++ ".0"
+  t => t
+}
+
+# The integer a whole float is, as `v as i32` makes it.
+fn whole(x: F32) -> Int? = if f32-fract(x) == 0.0 then some(f32-to-i32(x)) else none
+
+# lightningcss's `serialize_dimension`: the number as a dimension token writes it, the zero before
+# a fraction's point gone.
+fn dimension-text(value: F32, unit: Text) -> Text = match numeric-text(value, whole(value), value < 0.0) ++ unit-text(unit) {
+  t if value != 0.0 and f32-abs(value) < 1.0 and value < 0.0 => match t { "-0" ++ rest => "-" ++ rest  _ => t }
+  t if value != 0.0 and f32-abs(value) < 1.0 => trim-zeros(t)
+  t => t
+}
+
+# A dimension's unit: escaped so `1e3` is not read back as a number.
+fn unit-text(unit: Text) -> Text = match unit {
+  "e" | "E" => "\\65 "
+  "e-" ++ rest | "E-" ++ rest => "\\65 " ++ name-text("-" ++ rest)
+  _ => identifier-text(unit)
+}
+
+# lightningcss's `Percentage::to_css` of a percentage whose unit value (a hundredth) is `p`.
+fn percentage-text(p: F32) -> Text = match numeric-text(v, whole(v), p < 0.0) ++ "%" {
+  t if p != 0.0 and f32-abs(p) < 0.01 and p < 0.0 => "-" ++ (match t { "-0" ++ rest => rest  _ => t })
+  t if p != 0.0 and f32-abs(p) < 0.01 => trim-zeros(t)
+  t => t
+} where v = p * 100.0
+
+# ---------------------------------------------------------------- names and strings
+
+# cssparser's `serialize_identifier`.
+fn identifier-text(value: Text) -> Text = match value {
+  "" => ""
+  "--" ++ rest => "--" ++ name-text(rest)
+  "-" => "\\-"
+  "-" ++ rest => "-" ++ leading-digit-escaped(rest)
+  _ => leading-digit-escaped(value)
+}
+
+fn leading-digit-escaped(value: Text) -> Text = match value {
+  "" => ""
+  _ if digit-byte?(value[0]) => hex-escape(value[0]) ++ name-text(value[1..len(value)])
+  _ => name-text(value)
+}
+
+# cssparser's `serialize_name`: bytes outside `[0-9A-Za-z_-]` and ASCII escaped, control bytes by
+# their hex code, NUL as U+FFFD.
+fn name-text(value: Text) -> Text = match span-of(value, 0, name-bytes) {
+  n if n == len(value) => value
+  _ => join([name-byte(value[i]) for i in 0..len(value)], "")
+}
+
+const name-bytes: Text = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
+
+fn name-byte(b: Int) -> Text = match b {
+  0 => "�"
+  _ if b >= 128 or has-byte?(name-bytes, b) => byte-text(b)
+  _ if (b >= 1 and b <= 31) or b == 127 => hex-escape(b)
+  _ => "\\" ++ byte-text(b)
+}
+
+fn hex-escape(b: Int) -> Text = "\\" ++ hex-digits(b) ++ " "
+
+fn hex-digits(b: Int) -> Text = match b {
+  _ if b > 15 => byte-text(hex-digit(b / 16)) ++ byte-text(hex-digit(b % 16))
+  _ => byte-text(hex-digit(b))
+}
+
+fn hex-digit(d: Int) -> Int = if d < 10 then 48 + d else 87 + d
+
+# cssparser's `serialize_string`: double quotes, `"` and `\` escaped, control bytes by hex.
+fn string-text(value: Text) -> Text = "\"" ++ string-body(value) ++ "\""
+
+fn string-body(value: Text) -> Text = match span-not-of(value, 0, string-special) {
+  n if n == len(value) => value
+  _ => join([string-byte(value[i]) for i in 0..len(value)], "")
+}
+
+const string-special: Text = "\"\\" ++ join([byte-text(c) for c in 0..32], "") ++ byte-text(127)
+
+fn string-byte(b: Int) -> Text = match b {
+  34 => "\\\""
+  92 => "\\\\"
+  0 => "�"
+  _ if (b >= 1 and b <= 31) or b == 127 => hex-escape(b)
+  _ => byte-text(b)
+}
+
+# cssparser's `serialize_unquoted_url`.
+fn unquoted-url-text(value: Text) -> Text = join([url-byte(value[i]) for i in 0..len(value)], "")
+
+fn url-byte(b: Int) -> Text = match b {
+  _ if b <= 32 or b == 127 => hex-escape(b)
+  40 | 41 | 34 | 39 | 92 => "\\" ++ byte-text(b)
+  _ => byte-text(b)
+}
+
+# ---------------------------------------------------------------- escapes
+
+# What an identifier's or a string's text means: cssparser's `consume_escape`. A backslash and one
+# to six hex digits (and one white space after them) are the code point they number, U+FFFD for
+# zero, a surrogate or one past Unicode; a backslash and anything else, that; NUL, U+FFFD; in a
+# string, a backslash before a line break is nothing.
+fn unescaped(raw: Text) -> Text = match index-of-any(raw, ["\\", byte-text(0)]) {
+  none => raw
+  some(at) => raw[0..at] ++ unescaped-from(raw, at)
+}
+
+fn unescaped-from(s: Text, i: Int) -> Text = match s[i] {
+  0 => "�" ++ unescaped(s[i + 1..len(s)])
+  _ if i + 1 >= len(s) => "�"
+  _ => match hex-run(s, i + 1) {
+    0 if s[i + 1] == 10 or s[i + 1] == 12 => unescaped(s[i + 2..len(s)])
+    0 if s[i + 1] == 13 and i + 2 < len(s) and s[i + 2] == 10 => unescaped(s[i + 3..len(s)])
+    0 if s[i + 1] == 13 => unescaped(s[i + 2..len(s)])
+    0 => s[i + 1..i + 1 + char-length(s, i + 1)] ++ unescaped(s[i + 1 + char-length(s, i + 1)..len(s)])
+    n => code-point-text(digits-number(s[i + 1..i + 1 + n], 16, 8) ?? 0) ++ unescaped(s[after..len(s)])
+      where after = escape-end(s, i + 1 + n)
+  }
+}
+
+fn escape-end(s: Text, at: Int) -> Int = match at {
+  _ if at >= len(s) => at
+  _ if s[at] == 13 and at + 1 < len(s) and s[at + 1] == 10 => at + 2
+  _ if s[at] == 32 or s[at] == 9 or s[at] == 10 or s[at] == 12 or s[at] == 13 => at + 1
+  _ => at
+}
+
+fn hex-run(s: Text, i: Int) -> Int = len([j for j in i..min(len(s), i + 6) while is-some(digit-value(s[j], 16))])
+
+fn char-length(s: Text, i: Int) -> Int = match s[i] {
+  c if c < 192 => 1
+  c if c < 224 => 2
+  c if c < 240 => 3
+  _ => 4
+}
+
+fn code-point-text(cp: Int) -> Text = match cp {
+  _ if cp == 0 or cp > 1114111 or (cp >= 55296 and cp <= 57343) => "�"
+  _ => text-of-points([cp])
+}
+
+# A string token's value: between its quotes, escapes undone.
+fn string-value(raw: Text) -> Text = unescaped(raw[1..len(raw) - 1])
+
+# ASCII letters made lowercase, as `eq_ignore_ascii_case` compares them.
+fn lower(t: Text) -> Text = ascii-lower(t)

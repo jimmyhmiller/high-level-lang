@@ -1,0 +1,121 @@
+# cssparser's tokens, made from what `css.sheet` read: what each token's text means (escapes undone,
+# numbers read as cssparser reads them), and how cssparser writes each one again. A token is a
+# `css.values.V`:
+#
+#   ident, at-keyword, hash, idhash, string, url, delim, match   text: the value (`~=` for a match)
+#   number, percentage    num: the value (a percentage's divided by 100), text: as written
+#   dimension             num: the value, text: the unit, items: [the number as written]
+#   ws, comment           text: as written (a comment without its markers)
+#   colon, comma, semicolon, cdo, cdc
+#   function              text: the name, items: the tokens inside
+#   parens, brackets, braces   items: the tokens inside
+rules css.tokens over css.sheet
+use css.values as cv
+
+fn tokens-of(nodes: [Node]) -> [cv.V] = [token(n) for n in nodes]
+
+fn token(n: Node) -> cv.V = match n {
+  Ws(t) => cv.word("ws", t)
+  Comment(t) => cv.word("comment", comment-body(t))
+  Str(t) => cv.word("string", cv.string-value(t))
+  Url(t) => cv.word("url", url-body(t))
+  Func(FuncName(f), List(args...)) => cv.named("function", cv.unescaped(f[0..len(f) - 1]), tokens-of(args))
+  Parens(List(items...)) => cv.holder("parens", tokens-of(items))
+  Brackets(List(items...)) => cv.holder("brackets", tokens-of(items))
+  Braces(List(items...)) | CustomBraces(List(items...)) => cv.holder("braces", tokens-of(items))
+  Dimension(t) => cv.v("dimension", css-number-of(t[0..at]), cv.unescaped(t[at..len(t)]), [cv.word("raw", t[0..at])])
+    where at = number-length(t)
+  Percentage(t) => cv.v("percentage", css-percent-of(t[0..len(t) - 1]), t, [])
+  Num(t) => cv.v("number", css-number-of(t), t, [])
+  Hash(t) => cv.word(if ident-start?(t[1..len(t)]) then "idhash" else "hash", cv.unescaped(t[1..len(t)]))
+  AtKeyword(t) => cv.word("at-keyword", cv.unescaped(t[1..len(t)]))
+  Ident(t) => cv.word("ident", cv.unescaped(t))
+  CustomName(t) => cv.word("ident", cv.unescaped(t))
+  Cdo(_) => cv.word("cdo", "")
+  Cdc(_) => cv.word("cdc", "")
+  Match(t) => cv.word("match", t)
+  Delim(t) => cv.word("delim", t)
+  Colon(_) => cv.word("colon", "")
+  Comma(_) => cv.word("comma", "")
+  Semi(_) => cv.word("semicolon", "")
+  _ => fail-build("lightningcss: a token of this kind is not implemented")
+}
+
+fn comment-body(t: Text) -> Text = match t {
+  "/*" ++ body ++ "*/" if len(t) >= 4 => body
+  "/*" ++ body => body
+}
+
+# `url(  x  )`: what is between the parentheses and the space around it, escapes undone.
+fn url-body(t: Text) -> Text = cv.unescaped(trim-bytes(t[4..len(t) - 1], " \t\n\r" ++ byte-text(12)))
+
+# How many bytes of a dimension's text are its number: `[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?`,
+# the exponent only where digits follow it.
+fn number-length(t: Text) -> Int = exponent-end(t, fraction-end(t, sign + span-of(t, sign, "0123456789")))
+  where sign = if len(t) > 0 and (t[0] == '+' or t[0] == '-') then 1 else 0
+
+fn fraction-end(t: Text, at: Int) -> Int = match at {
+  _ if at + 1 < len(t) and t[at] == '.' and digit-byte?(t[at + 1]) => at + 1 + span-of(t, at + 1, "0123456789")
+  _ => at
+}
+
+fn exponent-end(t: Text, at: Int) -> Int = match at {
+  _ if at < len(t) and (t[at] == 'e' or t[at] == 'E') => match exponent-sign(t, at + 1) {
+    s if s < len(t) and digit-byte?(t[s]) => s + span-of(t, s, "0123456789")
+    _ => at
+  }
+  _ => at
+}
+
+fn exponent-sign(t: Text, at: Int) -> Int = if at < len(t) and (t[at] == '+' or t[at] == '-') then at + 1 else at
+
+# cssparser's `is_ident_start` of what follows a `#`: an `#id` hash, or another.
+fn ident-start?(t: Text) -> Bool = match t {
+  "" => false
+  "-" ++ rest => rest != "" and (name-start?(rest) or rest[0] == '-')
+  _ => name-start?(t)
+}
+
+fn name-start?(t: Text) -> Bool = (t[0] >= 'a' and t[0] <= 'z') or (t[0] >= 'A' and t[0] <= 'Z') or t[0] == '_' or t[0] == 0
+  or t[0] >= 128 or (t[0] == 92 and len(t) > 1 and t[1] != 10 and t[1] != 13 and t[1] != 12)
+
+# ---------------------------------------------------------------- writing
+
+# cssparser's `Token::to_css`, as lightningcss's own `Token` writes a token when minifying: space as
+# one space, comments as nothing, numbers and dimensions as lightningcss writes numbers.
+fn token-text(t: cv.V) -> Text = match t.kind {
+  "ident" => cv.identifier-text(t.text)
+  "at-keyword" => "@" ++ cv.identifier-text(t.text)
+  "hash" => "#" ++ cv.name-text(t.text)
+  "idhash" => "#" ++ cv.identifier-text(t.text)
+  "string" => cv.string-text(t.text)
+  "url" => "url(" ++ cv.unquoted-url-text(t.text) ++ ")"
+  "delim" | "match" => t.text
+  "number" => cv.number-text(t.num)
+  "percentage" => cv.numeric-text(t.num * 100.0, int-value(t.text), has-sign?(t.text)) ++ "%"
+  "dimension" => cv.dimension-text(t.num, t.text)
+  "ws" => " "
+  "comment" => ""
+  "colon" => ":"
+  "comma" => ","
+  "semicolon" => ";"
+  "cdo" => "<!--"
+  "cdc" => "-->"
+  "function" => cv.identifier-text(t.text) ++ "(" ++ tokens-text(t.items) ++ ")"
+  "parens" => "(" ++ tokens-text(t.items) ++ ")"
+  "brackets" => "[" ++ tokens-text(t.items) ++ "]"
+  "braces" => "{" ++ tokens-text(t.items) ++ "}"
+  k => fail-build("lightningcss: writing a `" ++ k ++ "` token is not implemented")
+}
+
+fn tokens-text(ts: [cv.V]) -> Text = join([token-text(t) for t in ts], "")
+
+# A number token's `int_value`: the number, when it is written with neither a fraction nor an
+# exponent (`%` aside).
+fn int-value(raw: Text) -> Int? = match raw {
+  _ if contains-text?(raw, ".") or contains-text?(raw, "e") or contains-text?(raw, "E") => none
+  n ++ "%" => some(css-int-of(n))
+  _ => some(css-int-of(raw))
+}
+
+fn has-sign?(raw: Text) -> Bool = raw != "" and (raw[0] == '+' or raw[0] == '-')
