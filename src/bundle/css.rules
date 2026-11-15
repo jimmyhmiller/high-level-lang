@@ -7,8 +7,9 @@ use bundle.minhost as host
 use bundle.legal as legal
 use bundle.comments as cm
 
-# A file's place in the output, under the media queries of the imports that brought it in.
-record Placed { path: Text, media: [Node] }
+# A file's place in the output, under the media queries of the imports that brought it in; `entry`
+# when the build loads it itself (a module or the page imports it), not through another's `@import`.
+record Placed { path: Text, media: [Node], entry: Bool }
 
 # A copied file: where it came from, and where it went.
 record Asset { from: Text, to: Text }
@@ -17,6 +18,26 @@ record Asset { from: Text, to: Text }
 setting loaders: {Text:Text}
 setting public-path: Text = ""
 setting asset-directory: Text = ""
+
+# What a framework's plugins make of a stylesheet the build loads itself (Vite's transforms, which
+# do not see what an `@import` brings in), given whether the build is a production one: the first
+# hook's text that is some, else the file's own.
+setting load-hooks: [Fn(Text,Bool)->Text?] = []
+# How a framework finds what an `@import` names (Vite's CSS resolver), given whether the build is a
+# production one; esbuild's relative URL otherwise.
+setting resolve-hooks: [Fn(Text,Text,Bool)->Text?] = []
+setting production: Bool = true
+
+# A stylesheet's tree, as the build loads it.
+fn sheet-tree(path: Text, entry: Bool) -> Node = match entry {
+  true => match hooked(path) {
+    some(text) => css.parse(text, path)
+    none => tree-of(path)
+  }
+  false => tree-of(path)
+}
+
+fn hooked(path: Text) -> Text? = first h in load-hooks for text in h(path, production): text
 
 fn tree-of(path: Text) -> Node = css.parse(read-file(path), path)
 
@@ -79,16 +100,21 @@ fn css-spec(spec: Text) -> Text = match spec {
 }
 
 # Every file in the order its rules apply: a stylesheet after what it imports, those after theirs.
-fn visit(path: Text, media: [Node]) -> [Placed] = visit-in(real-path(path), media, [])
+fn visit(path: Text, media: [Node]) -> [Placed] = visit-in(real-path(path), media, [], true)
 
-fn visit-in(path: Text, media: [Node], ancestors: [Text]) -> [Placed] = match path in ancestors {
+fn visit-in(path: Text, media: [Node], ancestors: [Text], entry: Bool) -> [Placed] = match path in ancestors {
   true => []
-  false => [imported(path, media, imp, ancestors ++ [path])... for item in leading-imports(tree-of(path))
-            if let some(imp) = import-of(item) if not external-url?(imp.spec)] ++ [Placed(path: path, media: media)]
+  false => [imported(path, media, imp, ancestors ++ [path])... for item in leading-imports(sheet-tree(path, entry))
+            if let some(imp) = import-of(item) if not external-url?(imp.spec)] ++ [Placed(path: path, media: media, entry: entry)]
 }
 
 fn imported(path: Text, media: [Node], imp: Import, ancestors: [Text]) -> [Placed] =
-  visit-in(res.resolve(css-spec(imp.spec), path).path, inner-media(path, media, imp.media), ancestors)
+  visit-in(import-target(imp.spec, path), inner-media(path, media, imp.media), ancestors, false)
+
+fn import-target(spec: Text, importer: Text) -> Text = match resolve-hooks {
+  [] => res.resolve(css-spec(spec), importer).path
+  hooks => (first h in hooks for path in h(spec, importer, production): path) ?? fail-build(importer ++ ": could not resolve " ++ spec)
+}
 
 fn inner-media(path: Text, outer: [Node], inner: [Node]) -> [Node] = match inner, outer {
   [], _ => outer
@@ -98,7 +124,7 @@ fn inner-media(path: Text, outer: [Node], inner: [Node]) -> [Node] = match inner
 
 # Keep each stylesheet/media pair at its last occurrence. A later unconditional copy also
 # subsumes earlier conditional copies; different media conditions do not subsume one another.
-fn placement-key(p: Placed) -> Text = quote-text(p.path) ++ quote-text(css.render(AtRule(AtName("@media"), List(p.media...), AtSemi()), false))
+fn placement-key(p: Placed) -> Text = (if p.entry then "loaded " else "imported ") ++ quote-text(p.path) ++ quote-text(css.render(AtRule(AtName("@media"), List(p.media...), AtSemi()), false))
 
 fn order-of(entries: [Text]) -> [Placed] =
   [placements[i] for i in 0..len(placements) if (last-at[placement-key(placements[i])] ?? -1) == i
@@ -229,9 +255,9 @@ fn wrapped-in-media(items: [Node], media: [Node]) -> [Node] = match media {
   _ => [AtRule(AtName("@media"), list-of([Ws(" ")] ++ media ++ [Ws(" ")]), Block(List(items...)))]
 }
 
-fn body-items(path: Text) -> [Node] =
-  [x for x in items-of(tree-of(path)) if not (charset-rule?(x) or (any l in leading: l.lo == x.lo and l is AtRule(...)))]
-  where leading = leading-imports(tree-of(path))
+fn body-items(p: Placed) -> [Node] =
+  [x for x in items-of(sheet-tree(p.path, p.entry)) if not (charset-rule?(x) or (any l in leading: l.lo == x.lo and l is AtRule(...)))]
+  where leading = leading-imports(sheet-tree(p.path, p.entry))
 
 # What bundling stylesheets makes: the text, the legal comments' own file when they have one, and
 # the files its urls name, copied beside it.
@@ -241,18 +267,18 @@ record Bundled { text: Text, legal: Text, assets: [Asset] }
 fn bundle(entries: [Text], outfile: Text, minify: Bool, pretty: Bool, legal-mode: Text) -> Bundled =
   Bundled(text: head ++ css.render(sheet, pretty and not minify) ++ "\n" ++ placement.tail,
           legal: placement.file,
-          assets: [asset-of(u, out-dir) for p in order for x in body-items(p.path) for u in urls-in(x, p.path)
+          assets: [asset-of(u, out-dir) for p in order for x in body-items(p) for u in urls-in(x, p.path)
                    if loader-for(u) == "file"])
   where out-dir = dir-of(outfile),
         order = order-of(entries),
         items = [i for p in order
-                   for i in wrapped-in-media([without-notes(rewritten-urls(x, p.path, out-dir)) for x in body-items(p.path)], p.media)],
-        notes = [t for p in order for x in body-items(p.path) for t in notes-in(x)],
+                   for i in wrapped-in-media([without-notes(rewritten-urls(x, p.path, out-dir)) for x in body-items(p)], p.media)],
+        notes = [t for p in order for x in body-items(p) for t in notes-in(x)],
         sheet = match minify {
           true => minified(Sheet(List(items...)), false)
           false => Sheet(List(items...))
         },
-        charset = any p in order: any item in items-of(tree-of(p.path)): charset-rule?(item),
+        charset = any p in order: any item in items-of(sheet-tree(p.path, p.entry)): charset-rule?(item),
         head = match charset, minify {
           true, true => "@charset \"UTF-8\";"
           true, false => "@charset \"UTF-8\";\n"
