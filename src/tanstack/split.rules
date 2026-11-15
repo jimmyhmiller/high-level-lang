@@ -7,7 +7,10 @@
 # virtual module that only names a value of it:
 #
 #   - in the route file, each split option's value becomes an export of its own, and the option
-#     `lazyRouteComponent(() => import('route.tsx?tsr-split=component'), 'component')`;
+#     `lazyRouteComponent(() => import('route.tsx?tsr-split=component'), 'component')`. A name is
+#     exported as it is; a value that computes nothing as it is made (a function, an arrow, an
+#     object of them) is exported from a declaration after the route's; anything else is still
+#     computed where it was, assigned to its export there, so it runs when and as often as it did;
 #   - `route.tsx?tsr-split=component` is `export { <that export> as component } from 'route.tsx'`.
 #
 # Which statements load with the route and which with the component is then the bundler's own
@@ -16,6 +19,7 @@
 rules tanstack.split over bundle.js
 use bundle.js as js
 use bundle.minhost as host
+use bundle.evaluation as ev
 
 # What the plugin is told: the routes directory (absolute, no trailing `/`), the files in it it
 # leaves alone (those a name of whose path starts with `ignore`), the router's package, the groups of
@@ -104,7 +108,7 @@ fn splits-in(s: Node) -> [Split] = match s {
 
 fn declarator-splits(d: Node) -> [Split] = match d {
   Declarator(_, CallExpr(CallExpr(Ident("createFileRoute"), _), Args(List(ObjectLit(List(props...)), ...)))) =>
-    [x for p in props for x in prop-split(p, groupings-of(props))]
+    [x for p in props for x in prop-split(p, groupings-of(props), props)]
   _ => []
 }
 
@@ -147,10 +151,13 @@ fn value-of(p: Node) -> Node = match p {
 }
 
 # A property split: one TanStack splits (a key of a group, with a value that is not a constant).
-fn prop-split(p: Node, groups: [[Text]]) -> [Split] =
-  [Split(what: what, group: group-id(g), value: value-of(p))
+# Its group is named by the options of the group the route splits, so the module of the group says
+# what is there to say.
+fn prop-split(p: Node, groups: [[Text]], props: [Node]) -> [Split] =
+  [Split(what: what, group: group-id([k for k in g if k in present]), value: value-of(p))
    for key in key-of(p) for what in splittable(key) for g in groups if key in g
    if not constant?(value-of(p)) distinct key]
+  where present = [k for q in props for k in key-of(q) if is-some(splittable(k)) and not constant?(value-of(q))]
 
 fn constant?(v: Node) -> Bool = match v {
   True() | False() | Null() | Ident("undefined") => true
@@ -163,13 +170,17 @@ fn lead(splits: [Split], path: Text, src: Text) -> [Node] =
    for lazy in sort l in [s.what.lazy for s in splits distinct s.what.lazy] by l]
   ++ [made("const " ++ fresh-name(s.what.importer, src) ++ " = () => import(" ++ host.js-string(path ++ "?tsr-split=" ++ s.group) ++ ");")
       for s in splits]
+  ++ [made("export let " ++ exported-as(path, s.what.key) ++ ";") for s in splits if computes?(s.value)]
+
+# A value that computes something as it is made (a call, say): it is computed where it was.
+fn computes?(v: Node) -> Bool = not (v is Ident(_)) and not ev.inert(v)
 
 fn local(lazy: Text, src: Text) -> Text = fresh-name("$$" ++ lazy, src)
 
 # A statement of the file, its route's split options made lazy, and their values exported after it.
 fn with-exports(s: Node, splits: [Split], path: Text, src: Text) -> [Node] = match splits-in(s) {
   [] => [s]
-  mine => [made-lazy(s, src)] ++ [exported(x, path, src) for x in mine]
+  mine => [made-lazy(s, path, src)] ++ [exported(x, path, src) for x in mine if not computes?(x.value)]
 }
 
 # A split option's value, exported. A name is exported as it is, which adds no statement that
@@ -185,19 +196,29 @@ fn exported(x: Split, path: Text, src: Text) -> Node = match x.value {
   }
 }
 
-everywhere fn made-lazy(n: Node, src: Text) -> Node = match n {
+everywhere fn made-lazy(n: Node, path: Text, src: Text) -> Node = match n {
   Declarator(target, CallExpr(CallExpr(Ident("createFileRoute") as callee, id), Args(List(ObjectLit(List(props...)) as o, rest...))) as call) as d =>
     Declarator(target, CallExpr(CallExpr(callee, id), Args(List(([ObjectLit(List(kept...)) with { lo: o.lo, hi: o.hi }] ++ rest)...)))
                with { lo: call.lo, hi: call.hi }) with { lo: d.lo, hi: d.hi }
     where groups = groupings-of(props),
-          kept = [lazy-prop(p, groups, src) for p in props if not (key-of(p) is some(k) and k in options.delete)]
+          kept = [lazy-prop(p, groups, props, path, src) for p in props if not (key-of(p) is some(k) and k in options.delete)]
 }
 
 # A property, its value the lazy import of the module it was split into.
-fn lazy-prop(p: Node, groups: [[Text]], src: Text) -> Node = match prop-split(p, groups) {
+fn lazy-prop(p: Node, groups: [[Text]], props: [Node], path: Text, src: Text) -> Node = match prop-split(p, groups, props) {
+  [x] if computes?(x.value) => Prop(PropName(x.what.key), assigned(x, path, src)) with { lo: p.lo, hi: p.hi }
   [x] => Prop(PropName(x.what.key), lazy-call(x, src)) with { lo: p.lo, hi: p.hi }
   _ => p
 }
+
+# `(S = value, lazy(…))`: the value computed where it was, and given to its export.
+fn assigned(x: Split, path: Text, src: Text) -> Node =
+  match made("(" ++ exported-as(path, x.what.key) ++ " = 0, 0);") {
+    ExprStmt(Paren(Seq(Assignment(target, op, _), _) as seq) as paren) =>
+      Paren(Seq(Assignment(target, op, x.value) with { lo: seq.kids[0].lo, hi: seq.kids[0].hi }, lazy-call(x, src)) with { lo: seq.lo, hi: seq.hi })
+      with { lo: paren.lo, hi: paren.hi }
+    _ => panic "tanstack.split: an assignment made of a template is not one"
+  }
 
 fn lazy-call(x: Split, src: Text) -> Node = match made(local(x.what.lazy, src) ++ "(" ++ fresh-name(x.what.importer, src) ++ ", "
                                                       ++ host.js-string(x.what.key) ++ ");") {

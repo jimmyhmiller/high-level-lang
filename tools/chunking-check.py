@@ -58,7 +58,7 @@ def dependency_files(output, entry):
             continue
         seen.add(name)
         text = (output / name).read_text()
-        pending.extend(path[2:] for path in re.findall(r'from\s*["\'](\./[^"\']+)["\']', text))
+        pending.extend(path[2:] for path in re.findall(r'(?:from\s*|import\s*)["\'](\./[^"\']+)["\']', text))
     return seen
 
 

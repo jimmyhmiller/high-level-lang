@@ -12,6 +12,9 @@ use hl.graph as graph
 
 boxed record Chunk {
   id: Int,
+  # Where it comes in the order the program's modules are evaluated (see `evaluated-order`): the
+  # chunks a chunk imports are imported in this order.
+  first: Int,
   key: Text,
   root: Int,          # the module this chunk is the entry for, or -1 for a shared chunk
   roots: [Int],       # every root that needs it
@@ -89,7 +92,8 @@ fn merged-group(groups: [packing.Group], units: [fragments.Unit]) -> packing.Gro
 # would introduce a facade cycle and run consumers before its var-based definitions exist.
 fn finalized(roots: [Int], model: fragments.Model, groups: [packing.Group]) -> [Chunk] =
   [with-needs(c, by-key[c.key], model.edges, unit-homes, homes) for c in placed]
-  where own = {key-of([r]): true for r in roots},
+  where ranks = evaluated-order(roots),
+        own = {key-of([r]): true for r in roots},
         unit-groups = {id: g.key for g in groups for id in g.units},
         imported = {unit-groups[dep] ?? "": true for u in model.units for dep in model.edges[u.id]
                     if (unit-groups[dep] ?? "") != (unit-groups[u.id] ?? "")},
@@ -97,7 +101,7 @@ fn finalized(roots: [Int], model: fragments.Model, groups: [packing.Group]) -> [
         group-keys = [if key-of([r]) in detached then "entry:" ++ key-of([r]) else key-of([r]) for r in roots]
                      ++ [g.key for g in groups if not (g.key in own) or g.key in detached],
         by-key = {g.key: g for g in groups},
-        placed = [placed-group(i, group-keys[i], root-at(roots, i), model.units, by-key[group-keys[i]]) for i in 0..len(group-keys)],
+        placed = [placed-group(i, group-keys[i], root-at(roots, i), model.units, by-key[group-keys[i]], ranks) for i in 0..len(group-keys)],
         homes = {p: c.id for c in placed for p in keys(c.parts)},
         chunk-ids = {c.key: c.id for c in placed},
         unit-homes = {id: chunk-ids[g.key] ?? -1 for g in groups for id in g.units}
@@ -105,9 +109,9 @@ fn finalized(roots: [Int], model: fragments.Model, groups: [packing.Group]) -> [
 fn evaluation-needs(self: Int, group: packing.Group?, edges: [[Int]], homes: {Int:Int}) -> {Int:[Text]} =
   {home: [] for g in group for id in g.units for dep in edges[id] for home in homes[dep] if home != self}
 
-fn placed-group(id: Int, key: Text, root: Int, units: [fragments.Unit], group: packing.Group?) -> Chunk = match group {
-  none => Chunk(id: id, key: key, root: root, roots: [root], parts: {}, initializers: {}, needs: {})
-  some(g) => Chunk(id: id, key: key, root: root, roots: packing.roots(g, units),
+fn placed-group(id: Int, key: Text, root: Int, units: [fragments.Unit], group: packing.Group?, ranks: {Int:Int}) -> Chunk = match group {
+  none => Chunk(id: id, first: ranks[root] ?? 0, key: key, root: root, roots: [root], parts: {}, initializers: {}, needs: {})
+  some(g) => Chunk(id: id, first: first-run(g, units, ranks), key: key, root: root, roots: packing.roots(g, units),
                    parts: {p: true for at in g.units for p in units[at].parts},
                    initializers: {p: true for at in g.units if units[at].evaluation for p in units[at].parts}, needs: {})
 }
@@ -137,11 +141,39 @@ fn home-of(s: Int, homes: {Int:Int}) -> Int? = first m.db.declares(?p, s): homes
 fn import-names(names: [Text], from: Text) -> Node =
   Import(ImportNamed(List([ImportName(BindName(n)) for n in sort n in names by n]...)), Str(quote-text(from)), None())
 
+fn most-first(xs: [Int]) -> Int = fold low = 2147483647 for x in xs: min(low, x)
+
+# Where a chunk comes: where the first module whose initialization it runs does. What only defines
+# (a function another module's statements were placed with) runs nothing as the chunk loads, and
+# says nothing of when it should; a chunk of nothing else comes where its first module does.
+fn first-run(g: packing.Group, units: [fragments.Unit], ranks: {Int:Int}) -> Int =
+  match [ranks[mo] ?? 0 for at in g.units if units[at].evaluation for mo in units[at].modules] {
+    [] => most-first([ranks[mo] ?? 0 for at in g.units for mo in units[at].modules])
+    running => most-first(running)
+  }
+
+# Where each module comes as the program is evaluated: after the modules it imports, in the order it
+# imports them, from each root in turn (the entries, then what `import()` names). Only static
+# imports are followed: what a module loads with `import()` is evaluated later, and elsewhere.
+fn evaluated-order(roots: [Int]) -> {Int:Int} = {walk.order[i]: i for i in 0..len(walk.order)}
+  where walk = fold w = Walked(seen: {}, order: []) for r in roots: walked(r, w)
+
+record Walked { seen: {Int:Bool}, order: [Int] }
+
+fn walked(id: Int, w: Walked) -> Walked = match id in w.seen {
+  true => w
+  false => after with { order: after.order ++ [id] }
+    where after = fold x = w with { seen: w.seen ++ {id: true} } for d in fragments.static-deps(id): walked(d, x)
+}
+
 # What this chunk says at its top. A root imports every chunk it needs, for its effects if nothing
-# else; a shared chunk imports only what it reads.
-fn imports-of(ch: Chunk, all: [Chunk]) -> [Node] = [x for other in all if other.id != ch.id if let some(x) = import-from(ch, other)]
+# else; a shared chunk imports only what it reads. Chunks are imported in the order their modules
+# are evaluated, so that what runs as they load runs in the order it did.
+fn imports-of(ch: Chunk, all: [Chunk]) -> [Node] =
+  [x for other in sort o in all by o.first if other.id != ch.id if let some(x) = import-from(ch, other)]
 
 fn import-from(ch: Chunk, other: Chunk) -> Node? = match ch.needs[other.id] {
+  some([]) => some(ImportBare(Str(quote-text(placeholder(other.id))), None()))
   some(names) => some(import-names(names, placeholder(other.id)))
   none if ch.root >= 0 and ch.root in other.roots => some(ImportBare(Str(quote-text(placeholder(other.id))), None()))
   none => none
