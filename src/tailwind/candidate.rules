@@ -1,0 +1,439 @@
+# Tailwind's candidates (tailwindcss/src/candidate.ts): a class name read as its variants, the
+# utility it names (static, functional with a value, or an arbitrary property), a modifier after a
+# `/` and `!` for important. Which roots exist is the design system's: a name is cut at each `-`,
+# from the right, to find a root its utilities or variants have. Also the decoding of arbitrary
+# values (`_` is a space) and Tailwind's checks of their brackets.
+rules tailwind.candidate
+use tailwind.text as tx
+use tailwind.values as vp
+
+enum VariantKind { ArbitraryVariant, StaticVariant, FunctionalVariant, CompoundVariant }
+enum UtilityKind { StaticUtility, FunctionalUtility, ArbitraryUtility }
+
+# A named or arbitrary value or modifier (`red-500`, `[#fff]`, `(--x)` as `var(--x)`).
+record Named { arbitrary: Bool, value: Text }
+
+# A functional utility's value: a named one may be a fraction (`1/2`, with the modifier), an
+# arbitrary one may say its type (`[length:…]`).
+record UtilityValue { arbitrary: Bool, value: Text, data-type: Text?, fraction: Text? }
+
+boxed record Variant {
+  kind: VariantKind,
+  root: Text,
+  # An arbitrary variant's selector, and whether it starts with a combinator.
+  selector: Text,
+  relative: Bool,
+  value: Named?,
+  modifier: Named?,
+  # A compound variant's variant, the only item.
+  inner: [Variant]
+}
+
+record Candidate {
+  kind: UtilityKind,
+  root: Text,
+  # An arbitrary property's property and value.
+  property: Text,
+  arbitrary-value: Text,
+  value: UtilityValue?,
+  modifier: Named?,
+  variants: [Variant],
+  important: Bool,
+  raw: Text
+}
+
+# What the design system answers about names: which utilities and variants exist, and which
+# compounds a compound variant takes.
+record Names {
+  static-utilities: {Text:Bool},
+  functional-utilities: {Text:Bool},
+  # A variant's kind by name, and what it compounds with and as (bits: 1 at-rules, 2 style rules).
+  variant-kinds: {Text:VariantKind},
+  variant-names: {Text:Bool},
+  compounds-with: {Text:Int},
+  compounds: {Text:Int},
+  prefix: Text
+}
+
+fn static-variant(root: Text) -> Variant =
+  Variant(kind: StaticVariant, root: root, selector: "", relative: false, value: none, modifier: none, inner: [])
+
+# ---------------------------------------------------------------- candidates
+
+# Every way the class name reads, in Tailwind's order: as a static utility, then as each
+# functional root it can be cut into.
+fn parse(input: Text, names: Names) -> [Candidate] = match tx.segment(input, ':') {
+  parts if names.prefix != "" and (len(parts) == 1 or parts[0] != names.prefix) => []
+  parts => with-variants(input, names, if names.prefix != "" then parts[1..len(parts)] else parts)
+}
+
+fn with-variants(input: Text, names: Names, parts: [Text]) -> [Candidate] = match variants {
+  _ if any v in variants: is-none(v) => []
+  _ => based(input, names, [v for o in variants for v in o], importance.base, importance.important)
+} where variants = [parse-variant(parts[len(parts) - 2 - i], names) for i in 0..len(parts) - 1],
+        importance = important-of(last(parts))
+
+record Importance { base: Text, important: Bool }
+
+fn important-of(base: Text) -> Importance = match base {
+  b ++ "!" => Importance(base: b, important: true)
+  "!" ++ b => Importance(base: b, important: true)
+  _ => Importance(base: base, important: false)
+}
+
+fn based(input: Text, names: Names, variants: [Variant], base: Text, important: Bool) -> [Candidate] =
+  statics ++ (match tx.segment(base, '/') {
+    parts if len(parts) > 2 => []
+    [b] => functional(input, names, variants, important, b, none, none)
+    [b, m] => match parse-modifier(m) {
+      none => []
+      some(modifier) => functional(input, names, variants, important, b, some(m), some(modifier))
+    }
+  })
+  where statics = [Candidate(kind: StaticUtility, root: base, property: "", arbitrary-value: "", value: none, modifier: none,
+                             variants: variants, important: important, raw: input)
+                   for ok in [true] if base in names.static-utilities and not has-byte?(base, '[')]
+
+fn functional(input: Text, names: Names, variants: [Variant], important: Bool, base: Text, segment: Text?, modifier: Named?) -> [Candidate] = match base {
+  "[" ++ _ => arbitrary-property(input, variants, important, base, modifier)
+  _ ++ "]" => match index-of(base, "-[") {
+    none => []
+    some(at) if base[0..at] in names.functional-utilities => valued(input, variants, important, segment, modifier, [Root(root: base[0..at], value: some(base[at + 1..len(base)]))])
+    _ => []
+  }
+  _ ++ ")" => match index-of(base, "-(") {
+    none => []
+    some(at) if base[0..at] in names.functional-utilities => match var-shorthand(base[at + 2..len(base) - 1]) {
+      some(v) => valued(input, variants, important, segment, modifier, [Root(root: base[0..at], value: some(v))])
+      none => []
+    }
+    _ => []
+  }
+  _ => valued(input, variants, important, segment, modifier, roots(base, names.functional-utilities))
+}
+
+# `bg-(--x)` and `bg-(color:--x)`: the arbitrary value they stand for.
+fn var-shorthand(inner: Text) -> Text? = match tx.segment(inner, ':') {
+  [t, v] if starts-with(v, "--") and valid-arbitrary?(v) => some("[" ++ t ++ ":var(" ++ v ++ ")]")
+  [_, _] => none
+  _ if starts-with(inner, "--") and valid-arbitrary?(inner) => some("[var(" ++ inner ++ ")]")
+  _ => none
+}
+
+fn arbitrary-property(input: Text, variants: [Variant], important: Bool, base: Text, modifier: Named?) -> [Candidate] = match base {
+  _ if not ends-with(base, "]") => []
+  _ if len(base) < 2 or not (base[1] == 45 or (base[1] >= 97 and base[1] <= 122)) => []
+  _ => match index-of(inner, ":") {
+    some(at) if at > 0 and at < len(inner) - 1 => match decoded-valid(inner[at + 1..len(inner)]) {
+      some(v) => [Candidate(kind: ArbitraryUtility, root: "", property: inner[0..at], arbitrary-value: v, value: none,
+                            modifier: modifier, variants: variants, important: important, raw: input)]
+      none => []
+    }
+    _ => []
+  }
+} where inner = base[1..len(base) - 1]
+
+record Root { root: Text, value: Text? }
+
+# The candidates of each root, in order; an arbitrary value that does not close ends them all.
+fn valued(input: Text, variants: [Variant], important: Bool, segment: Text?, modifier: Named?, roots: [Root]) -> [Candidate] =
+  [c for r in roots while not unclosed?(r) for c in valued-root(input, variants, important, segment, modifier, r)]
+
+fn unclosed?(r: Root) -> Bool = match r.value {
+  some(v) => has-byte?(v, '[') and not ends-with(v, "]")
+  none => false
+}
+
+fn valued-root(input: Text, variants: [Variant], important: Bool, segment: Text?, modifier: Named?, r: Root) -> [Candidate] = match r.value {
+  none => [made(base, none)]
+  some(v) => match index-of(v, "[") {
+    some(at) => match decoded-valid(v[at + 1..len(v) - 1]) {
+      none => []
+      some(decoded) => match type-hint(decoded) {
+        some(hint) if hint == "" => []
+        some(hint) => checked-arbitrary(decoded[len(hint) + 1..len(decoded)], some(hint), base)
+        none => checked-arbitrary(decoded, none, base)
+      }
+    }
+    none if named-value?(v) => [made(base, some(UtilityValue(arbitrary: false, value: v, data-type: none, fraction: fraction)))]
+    none => []
+  }
+} where base = Made(input: input, root: r.root, variants: variants, important: important, modifier: modifier),
+        fraction = match segment, modifier {
+          some(m), some(Named(arbitrary: false, ...)) => some(v ++ "/" ++ m) where v = r.value ?? ""
+          _, _ => none
+        }
+
+record Made { input: Text, root: Text, variants: [Variant], important: Bool, modifier: Named? }
+
+fn made(m: Made, value: UtilityValue?) -> Candidate =
+  Candidate(kind: FunctionalUtility, root: m.root, property: "", arbitrary-value: "", value: value, modifier: m.modifier,
+            variants: m.variants, important: m.important, raw: m.input)
+
+fn checked-arbitrary(value: Text, hint: Text?, m: Made) -> [Candidate] = match value {
+  _ if value == "" or tx.js-trim(value) == "" => []
+  _ => [made(m, some(UtilityValue(arbitrary: true, value: value, data-type: hint, fraction: none)))]
+}
+
+# A type hint: lowercase letters and dashes before the first `:`.
+fn type-hint(value: Text) -> Text? = match span-of(value, 0, "abcdefghijklmnopqrstuvwxyz-") {
+  n if n < len(value) and value[n] == ':' => some(value[0..n])
+  _ => none
+}
+
+fn named-value?(v: Text) -> Bool = v != "" and span-of(v, 0, named-bytes) == len(v)
+
+const named-bytes: Text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.%-"
+
+fn parse-modifier(m: Text) -> Named? = match m {
+  "[" ++ inner ++ "]" => match decoded-valid(inner) {
+    some(v) if v != "" and tx.js-trim(v) != "" => some(Named(arbitrary: true, value: v))
+    _ => none
+  }
+  "(" ++ inner ++ ")" if starts-with(inner, "--") and valid-arbitrary?(inner) => some(Named(arbitrary: true, value: decode("var(" ++ inner ++ ")")))
+  "(" ++ _ ++ ")" => none
+  _ if named-value?(m) => some(Named(arbitrary: false, value: m))
+  _ => none
+}
+
+# Tailwind's `findRoots`: the whole name if it is a root, then each cut at a `-`, from the right,
+# whose left side is one; `@` alone as a root of a name that starts with it.
+fn roots(input: Text, exists: {Text:Bool}) -> [Root] =
+  (if input in exists then [Root(root: input, value: none)] else [])
+  ++ [Root(root: input[0..at], value: some(input[at + 1..len(input)])) for at in dash-cuts(input)
+      while not (input[0..at] in exists and at + 1 == len(input))
+      while not (input[0..at] == "@")
+      if input[0..at] in exists]
+  ++ (if starts-with(input, "@") and "@" in exists then [Root(root: "@", value: some(input[1..len(input)]))] else [])
+
+# Where a name has a `-` past its first byte, from the right.
+fn dash-cuts(input: Text) -> [Int] = reversed([i for i in 1..len(input) if input[i] == '-'])
+
+# ---------------------------------------------------------------- variants
+
+fn parse-variant(variant: Text, names: Names) -> Variant? = match variant {
+  "[" ++ inner ++ "]" => arbitrary-variant(variant, inner)
+  _ => match tx.segment(variant, '/') {
+    parts if len(parts) > 2 => none
+    [v] => named-variant(v, none, names)
+    [v, m] => named-variant(v, some(m), names)
+  }
+}
+
+fn arbitrary-variant(variant: Text, inner: Text) -> Variant? = match decoded-valid(inner) {
+  _ if variant[1] == '@' and has-byte?(variant, '&') => none
+  some(selector) if selector != "" and tx.js-trim(selector) != "" =>
+    some(Variant(kind: ArbitraryVariant, root: "", selector: arbitrary-selector(selector, relative), relative: relative,
+                 value: none, modifier: none, inner: []))
+    where relative = selector[0] == '>' or selector[0] == '+' or selector[0] == '~'
+  _ => none
+}
+
+fn arbitrary-selector(selector: Text, relative: Bool) -> Text = match selector {
+  _ if relative or selector[0] == '@' or has-byte?(selector, '&') => selector
+  _ => "&:is(" ++ selector ++ ")"
+}
+
+# The first root the name can be cut into that makes a variant; a functional value that is not one
+# tries the next root.
+fn named-variant(v: Text, modifier: Text?, names: Names) -> Variant? = match decisions {
+  [d, ...] => d.variant
+  [] => none
+} where decisions = [d for r in roots(v, names.variant-names) for kind in names.variant-kinds[r.root]
+                     for d in [variant-at(r, kind, modifier, names)] if d.done]
+
+# What a root makes: not done to try the next root; done, with no variant, for none at all.
+record Decision { done: Bool, variant: Variant? }
+
+fn decided(v: Variant?) -> Decision = Decision(done: true, variant: v)
+fn undecided() -> Decision = Decision(done: false, variant: none)
+
+fn variant-at(r: Root, kind: VariantKind, modifier: Text?, names: Names) -> Decision = match kind {
+  StaticVariant => decided(match r.value, modifier {
+    none, none => some(static-variant(r.root))
+    _, _ => none
+  })
+  FunctionalVariant => match modifier {
+    some(m) if is-none(parse-modifier(m)) => decided(none)
+    _ => functional-variant(r, first m in modifier for p in parse-modifier(m): p)
+  }
+  CompoundVariant => decided(compound-variant(r, modifier, names))
+}
+
+fn functional-variant(r: Root, modifier: Named?) -> Decision = match r.value {
+  none => decided(some(made-variant(r.root, none, modifier)))
+  some(v) if ends-with(v, "]") => match v {
+    "[" ++ inner ++ "]" => decided(match decoded-valid(inner) {
+      some(a) if a != "" and tx.js-trim(a) != "" => some(made-variant(r.root, some(Named(arbitrary: true, value: a)), modifier))
+      _ => none
+    })
+    _ => undecided()
+  }
+  some(v) if ends-with(v, ")") => match v {
+    "(" ++ inner ++ ")" => decided(match decoded-valid(inner) {
+      some(a) if a != "" and tx.js-trim(a) != "" and starts-with(a, "--") =>
+        some(made-variant(r.root, some(Named(arbitrary: true, value: "var(" ++ a ++ ")")), modifier))
+      _ => none
+    })
+    _ => undecided()
+  }
+  some(v) if named-value?(v) => decided(some(made-variant(r.root, some(Named(arbitrary: false, value: v)), modifier)))
+  _ => undecided()
+}
+
+fn made-variant(root: Text, value: Named?, modifier: Named?) -> Variant =
+  Variant(kind: FunctionalVariant, root: root, selector: "", relative: false, value: value, modifier: modifier, inner: [])
+
+fn compound-variant(r: Root, modifier: Text?, names: Names) -> Variant? = match r.value {
+  none => none
+  some(v) => match modifier {
+    some(m) if r.root == "not" or r.root == "has" or r.root == "in" => compound-of(r.root, v ++ "/" ++ m, none, names)
+    _ => compound-of(r.root, v, modifier, names)
+  }
+}
+
+fn compound-of(root: Text, inner: Text, modifier: Text?, names: Names) -> Variant? = match parse-variant(inner, names) {
+  some(sub) if compounds-with?(root, sub, names) => match modifier {
+    some(m) => first p in parse-modifier(m):
+      Variant(kind: CompoundVariant, root: root, selector: "", relative: false, value: none, modifier: some(p), inner: [sub])
+    none => some(Variant(kind: CompoundVariant, root: root, selector: "", relative: false, value: none, modifier: none, inner: [sub]))
+  }
+  _ => none
+}
+
+fn compounds-with?(parent: Text, child: Variant, names: Names) -> Bool = match names.variant-kinds[parent] {
+  some(CompoundVariant) => with-bits != 0 and child-bits != 0 and bit-and(with-bits, child-bits) != 0
+    where with-bits = names.compounds-with[parent] ?? 0,
+          child-bits = match child.kind {
+            ArbitraryVariant => compounds-for([child.selector])
+            _ => names.compounds[child.root] ?? 0
+          }
+  _ => false
+}
+
+# Tailwind's `compoundsForSelectors`: 1 for at-rules a variant may be nested under (`@media`,
+# `@supports`, `@container`), 2 for selectors that are not pseudo-elements; nothing for any other.
+fn compounds-for(selectors: [Text]) -> Int = match any s in selectors: never-compounds?(s) {
+  true => 0
+  false => bit-or(if any s in selectors: starts-with(s, "@") then 1 else 0, if any s in selectors: not starts-with(s, "@") then 2 else 0)
+}
+
+fn never-compounds?(s: Text) -> Bool = match s {
+  "@media" ++ _ | "@supports" ++ _ | "@container" ++ _ => false
+  "@" ++ _ => true
+  _ => contains-text?(s, "::")
+}
+
+# ---------------------------------------------------------------- arbitrary values
+
+# A value from between brackets, decoded, when its brackets are Tailwind's idea of balanced.
+fn decoded-valid(input: Text) -> Text? = match valid-arbitrary?(input) {
+  true => some(decode(input))
+  false => none
+}
+
+# Tailwind's `isValidArbitrary`: `(` and `[` closed by their own, a `}` closing nothing is allowed,
+# and no `;` outside them.
+fn valid-arbitrary?(input: Text) -> Bool = balanced-from(input, 0, [])
+
+fn balanced-from(s: Text, i: Int, closers: [Int]) -> Bool = match i {
+  _ if i >= len(s) => len(closers) == 0
+  _ => match s[i] {
+    92 => balanced-from(s, i + 2, closers)
+    34 | 39 => balanced-from(s, tx.string-end(s, i + 1, s[i]) + 1, closers)
+    40 => balanced-from(s, i + 1, closers ++ [41])
+    91 => balanced-from(s, i + 1, closers ++ [93])
+    41 | 93 | 125 if len(closers) == 0 => false
+    c if (c == 41 or c == 93 or c == 125) and c == last(closers) => balanced-from(s, i + 1, closers[0..len(closers) - 1])
+    125 => balanced-from(s, i + 1, closers)
+    41 | 93 => false
+    59 if len(closers) == 0 => false
+    _ => balanced-from(s, i + 1, closers)
+  }
+}
+
+# Tailwind's `decodeArbitraryValue`: `_` is a space (`\_` an underscore), but not in `url(…)` nor in
+# a variable's name; math gets spaces around its operators.
+fn decode(input: Text) -> Text = match index-of(input, "(") {
+  none => spaced-underscores(input, false)
+  _ => math-spaced(vp.css([decoded-node(n) for n in vp.parse(input)]))
+}
+
+fn decoded-node(n: vp.Value) -> vp.Value = match n.kind {
+  vp.Function if n.value == "url" or ends-with(n.value, "_url") => n with { value: spaced-underscores(n.value, false) }
+  vp.Function if n.value == "var" or ends-with(n.value, "_var") or n.value == "theme" or ends-with(n.value, "_theme") =>
+    n with { value: spaced-underscores(n.value, false),
+             nodes: [if i == 0 and n.nodes[i].kind == vp.Word then n.nodes[i] with { value: spaced-underscores(n.nodes[i].value, true) }
+                     else decoded-node(n.nodes[i]) for i in 0..len(n.nodes)] }
+  vp.Function => n with { value: spaced-underscores(n.value, false), nodes: [decoded-node(c) for c in n.nodes] }
+  _ => n with { value: spaced-underscores(n.value, false) }
+}
+
+# Between the underscores: a piece ending in a backslash escapes the underscore after it, which
+# stays (its backslash gone); any other is a space, unless underscores are kept.
+fn spaced-underscores(input: Text, keep: Bool) -> Text = match index-of(input, "_") {
+  none => input
+  _ => join([underscore-piece(pieces, i, keep) for i in 0..len(pieces)], "") where pieces = split(input, "_")
+}
+
+fn underscore-piece(pieces: [Text], i: Int, keep: Bool) -> Text = match pieces[i] {
+  p if i == len(pieces) - 1 => p
+  p ++ "\\" => p ++ "_"
+  p if keep => p ++ "_"
+  p => p ++ " "
+}
+
+# Tailwind's `addWhitespaceAroundMathOperators`.
+const math-functions: [Text] = ["calc", "min", "max", "clamp", "mod", "rem", "sin", "cos", "tan", "asin", "acos", "atan",
+  "atan2", "pow", "sqrt", "hypot", "log", "exp", "round"]
+
+fn has-math-fn?(input: Text) -> Bool = has-byte?(input, '(') and (any f in math-functions: contains-text?(input, f ++ "("))
+
+fn math-spaced(input: Text) -> Text = match any f in math-functions: contains-text?(input, f) {
+  false => input
+  true => (fold st = MathState(out: "", formattable: [], value-pos: -1, last-value-pos: -1) for i in 0..len(input): math-step(input, i, st)).out
+}
+
+# The output so far, whether each open parenthesis is math (innermost first), and where the
+# number or dimension being read, and the one before, last had a byte (-1: none).
+record MathState { out: Text, formattable: [Bool], value-pos: Int, last-value-pos: Int }
+
+fn math-step(input: Text, i: Int, st: MathState) -> MathState = emitted(input, i, positioned)
+  where c = input[i],
+        positioned = match c {
+          _ if digit-byte?(c) => st with { value-pos: i }
+          _ if st.value-pos != -1 and (c == '%' or (c >= 97 and c <= 122) or (c >= 65 and c <= 90)) => st with { value-pos: i }
+          _ => st with { last-value-pos: st.value-pos, value-pos: -1 }
+        }
+
+fn top-formattable(st: MathState) -> Bool = match st.formattable {
+  [f, ...] => f
+  [] => false
+}
+
+fn emitted(input: Text, i: Int, st: MathState) -> MathState = match input[i] {
+  40 => st with { out: st.out ++ "(", formattable: [opened] ++ st.formattable }
+    where fn-name = input[name-start(input, i)..i],
+          opened = (fn-name in math-functions) or (top-formattable(st) and fn-name == "")
+  41 => st with { out: st.out ++ ")", formattable: match st.formattable { [_, rest...] => rest [] => [] } }
+  44 if top-formattable(st) => st with { out: st.out ++ ", " }
+  32 if top-formattable(st) and ends-with(st.out, " ") => st
+  c if (c == 43 or c == 42 or c == 47 or c == 45) and top-formattable(st) => st with { out: st.out ++ operator(input, i, st) }
+  c => st with { out: st.out ++ byte-text(c) }
+}
+
+fn name-start(input: Text, i: Int) -> Int = i - span-back-of(input[0..i], "0123456789abcdefghijklmnopqrstuvwxyz")
+
+fn operator(input: Text, i: Int, st: MathState) -> Text = match prev {
+  _ if (prev == 101 or prev == 69) and prev-prev >= 48 and prev-prev <= 57 => op
+  43 | 42 | 47 | 45 => op
+  40 | 44 => op
+  _ if i > 0 and input[i - 1] == 32 => op ++ " "
+  _ if digit-byte?(prev) or digit-byte?(next) or prev == 41 or next == 40 or next == 43 or next == 42 or next == 47 or next == 45
+       or (st.last-value-pos != -1 and st.last-value-pos == i - 1) => " " ++ op ++ " "
+  _ => op
+} where trimmed = tx.js-trim-end(st.out),
+        prev = if len(trimmed) > 0 then trimmed[len(trimmed) - 1] else -1,
+        prev-prev = if len(trimmed) > 1 then trimmed[len(trimmed) - 2] else -1,
+        next = if i + 1 < len(input) then input[i + 1] else -1,
+        op = byte-text(input[i])
