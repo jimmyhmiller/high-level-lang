@@ -491,6 +491,14 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and " 0 differ" in out, "split-fuzz: "
       + (out.strip().splitlines()[-1] if code == 0 else out[-1800:]))
 
+print("== TanStack Start applications")
+if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmarks/tanstack-start/node_modules/@tanstack/react-start")):
+    code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "start-check.py"), ESB], 1200)
+    check(code == 0 and " 0 failed" in out, "a TanStack Start application, both builds: "
+          + (out.strip().splitlines()[-1] + " (its route tree, server functions with Vite's ids, run as Start's server runs it, in a browser)" if code == 0 else out[-1800:]))
+else:
+    check(False, "TanStack Start application: benchmarks/tanstack-start has no node_modules (npm ci --prefix benchmarks/tanstack-start --ignore-scripts)")
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "
