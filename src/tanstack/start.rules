@@ -54,7 +54,9 @@ fn default-entry(root: Text, name: Text) -> Text =
 const manifest-module: Text = "tanstack-start-manifest:v"
 const resolver-module: Text = "tanstack-start-server-fn-resolver"
 
-fn resolved(spec: Text, importer: Text) -> Text? = match spec {
+fn resolved(spec: Text, importer: Text) -> Text? = denied(spec, importer) ?? resolved-start(spec, importer)
+
+fn resolved-start(spec: Text, importer: Text) -> Text? = match spec {
   "#tanstack-router-entry" => some(build.entries.router)
   "#tanstack-start-entry" => some(build.entries.start)
   "virtual:tanstack-start-client-entry" => some(build.entries.client)
@@ -69,6 +71,7 @@ fn resolved(spec: Text, importer: Text) -> Text? = match spec {
 }
 
 fn loaded(path: Text) -> Text? = match path {
+  "tss-denied:" ++ _ => some(mock-text(path))
   # The browser's route tree is not the one on disk (see `client-tree`).
   _ if build.client and path == build.tree-path => some(client-tree(build.tree-config, build.generated))
   _ if path == manifest-module => some(match build.client {
@@ -303,6 +306,121 @@ fn built(o: api.Options, root: Text) -> [api.Written] = client-files ++ public +
         g = generated!(c),
         client-all = client-build(o, root, e, g, c),
         manifest-json = (first w in client-all if ends-with(w.path, "/.vite/manifest.json"): w.text) ?? fail-build("tanstack.start: the browser's build has no manifest"),
-        client-files = [w for w in client-all if not ends-with(w.path, "/.vite/manifest.json")],
+        client-files = protected([w for w in client-all if not ends-with(w.path, "/.vite/manifest.json")], root, true),
         public = api.public-written(path-normalize(root ++ "/public"), path-normalize(root ++ "/dist/client")),
-        server-files = server-build(o, root, e, g, c, manifest-text(chunks-of(manifest-json), g.manifest, root))
+        server-files = protected(server-build(o, root, e, g, c, manifest-text(chunks-of(manifest-json), g.manifest, root)), root, false)
+
+# ---------------------------------------------------------------- import protection
+
+# What Start keeps each side from importing (its import protection): in the browser, Start's server
+# entry (`@tanstack/react-start/server`) and the project's `*.server.*` files; on the server, its
+# `*.client.*` files; and on either, a file marked for the other side (by importing
+# `@tanstack/react-start/server-only` or `/client-only`). An import of one is a mock module that
+# throws if it is used; and if the mock is still in what the build writes (what Start's compiler
+# and tree shaking left reads it), the build fails, saying which import of which file it was.
+const denied-mark: Text = "__TSS_IMPORT_DENIED__"
+
+fn denied-specifier?(spec: Text) -> Bool =
+  build.client and spec in ["@tanstack/react-start/server", "@tanstack/solid-start/server", "@tanstack/vue-start/server"]
+
+# Why a file may not be imported on this side, if it may not.
+fn denied-file(file: Text) -> Text? = match file {
+  _ if contains-text?(file, "/node_modules/") or contains-text?(file, "?") => none
+  _ if build.client and contains-text?(path-base(file), ".server.") => some("Denied by file pattern: **/*.server.*")
+  _ if not build.client and contains-text?(path-base(file), ".client.") => some("Denied by file pattern: **/*.client.*")
+  _ if readable-file?(file) and marked?(read-file(file), if build.client then "server-only" else "client-only") =>
+    some("Denied by marker: module is restricted to the opposite environment")
+  _ => none
+}
+
+fn marked?(src: Text, side: Text) -> Bool =
+  any p in ["@tanstack/react-start/", "@tanstack/solid-start/", "@tanstack/vue-start/"]: contains-text?(src, "\"" ++ p ++ side ++ "\"") or contains-text?(src, "'" ++ p ++ side ++ "'")
+
+# An import of the project's (by a file of it, not a package's) that this side may not make: its
+# mock, `tss-denied:` with the file, the importer, the specifier and why, by `|`.
+fn denied(spec: Text, importer: Text) -> Text? = match contains-text?(importer, "/node_modules/") or starts-with(spec, "tss-denied:") {
+  true => none
+  false => match denied-specifier?(spec) {
+    true => some(denial-id(spec, importer, spec, "Denied by specifier pattern: " ++ spec))
+    false => match res.relative?(spec) or starts-with(spec, "/") {
+      true => match denied-file(file) {
+        some(why) => some(denial-id(file, importer, spec, why))
+        none => none
+      } where file = m.searched-for(m.import-request(match index-of(spec, "?") { some(at) => spec[0..at]  none => spec }), importer).path
+      false => none
+    }
+  }
+}
+
+fn denial-id(file: Text, importer: Text, spec: Text, why: Text) -> Text = "tss-denied:" ++ join([file, importer, spec, why], "|")
+
+record Denial { file: Text, importer: Text, spec: Text, why: Text }
+
+fn denied-of(id: Text) -> Denial = match split(id[len("tss-denied:")..len(id)], "|") {
+  [file, importer, spec, why] => Denial(file: file, importer: importer, spec: spec, why: why)
+  _ => fail-build("tanstack.start: an import protection mock without its import: " ++ id)
+}
+
+# The mock: each export the denied module has, made by one function, which throws if what it made
+# is used, and whose text says which import it stands for: it is in the output exactly when the
+# mock is used there.
+fn mock-text(id: Text) -> Text =
+  "function __tssDenied() {\n"
+  ++ "  const fail = () => { throw new Error(" ++ host.js-string("[import-protection] " ++ d.spec ++ " is not to be imported in the " ++ side-name()
+                                                                ++ " environment " ++ denied-mark ++ id ++ denied-end) ++ "); };\n"
+  ++ "  return new Proxy(function () {}, { get: fail, apply: fail, construct: fail });\n}\n"
+  ++ "export default __tssDenied();\n"
+  ++ join(["export const " ++ n ++ " = __tssDenied();\n" for n in exports-of(d.file) if n != "default"], "")
+  where d = denied-of(id)
+
+const denied-end: Text = "__TSS_IMPORT_DENIED_END__"
+
+fn side-name() -> Text = if build.client then "client" else "server"
+
+# The names a module exports, read from its tree.
+fn exports-of(file: Text) -> [Text] = match readable-file?(file) {
+  false => []
+  true => [n for s in m.parsed-of(file).tree.body.kids for n in exported-names(s) distinct n]
+}
+
+fn exported-names(s: Node) -> [Text] = match s {
+  ExportLexical(ConstDecl(List(ds...))) | ExportLexical(LetDecl(List(ds...))) | ExportVar(List(ds...)) =>
+    [d.kids[0].text for d in ds if d.kids[0] is BindName(_)]
+  ExportFunction(d) | ExportClass(d) => [d.kids[0].text]
+  ExportNamed(List(specs...)) | ExportFrom(List(specs...), _, _) => [exported-as(sp) for sp in specs]
+  ExportDefault(_) | ExportDefaultDecl(_) => ["default"]
+  _ => []
+}
+
+fn exported-as(sp: Node) -> Text = match sp {
+  ExportAs(_, out) => unquote-name(out.text)
+  _ => unquote-name(sp.text)
+}
+
+fn unquote-name(t: Text) -> Text = if starts-with(t, "\"") or starts-with(t, "'") then unquote(t) else t
+
+# A build's files, or the build fails, as Start's does, for each mock still in what it writes.
+fn protected(ws: [api.Written], root: Text, client: Bool) -> [api.Written] =
+  match [id for w in ws if ends-with(w.path, ".js") for at in occurrences(w.text, [denied-mark]) for id in [denial-at(w.text, at)] distinct id] {
+    [] => ws
+    ids => fail-build(join([violation(denied-of(id), root, client) for id in ids], "\n\n"))
+  }
+
+fn denial-at(text: Text, at: Int) -> Text = match index-of(text[start..len(text)], denied-end) {
+  some(n) => text[start..start + n]
+  none => ""
+} where start = at + len(denied-mark)
+
+fn violation(d: Denial, root: Text, client: Bool) -> Text =
+  "[import-protection] Import denied in " ++ (if client then "client" else "server") ++ " environment\n\n"
+  ++ "  " ++ d.why ++ "\n  Importer: " ++ relative(root, d.importer) ++ "\n  Import: " ++ host.js-string(d.spec)
+  ++ "\n  Resolved: " ++ (if starts-with(d.file, "/") then relative(root, d.file) else d.file) ++ "\n\n  Suggestions:\n"
+  ++ join(["    - " ++ x ++ "\n" for x in (match client {
+       true => ["Use createServerFn().handler(() => ...) to keep the logic on the server and call it from the client via an RPC bridge",
+                "Use createServerOnlyFn(() => ...) to mark it as server-only (it will throw if accidentally called from the client)",
+                "Use createIsomorphicFn().client(() => ...).server(() => ...) to provide separate client and server implementations",
+                "Move the server-only import out of this file into a separate .server.ts module that is not imported by any client code"]
+       false => ["Use createClientOnlyFn(() => ...) to mark it as client-only (it will throw if accidentally called from the server)",
+                 "Use createIsomorphicFn().client(() => ...).server(() => ...) to provide separate client and server implementations",
+                 "Move the client-only import out of this file into a separate .client.ts module that is not imported by any server code"]
+     })], "")

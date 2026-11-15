@@ -64,6 +64,35 @@ def main():
     last = (run.stdout + run.stderr).strip().splitlines()[-1] if (run.stdout + run.stderr).strip() else ""
     check(run.returncode == 0, "it runs as Start's server runs it, in a browser: " + last + ("" if run.returncode == 0 else "\n" + run.stdout[-1500:]))
 
+    # Import protection: a .server module the browser's code uses fails the build, as one only a
+    # server function's handler uses does not; a .client module the server's code uses fails it.
+    for case, edit, want in [
+        ("protect-ok", ('import { useState } from "react";', 'import { useState } from "react";\nimport { createServerFn } from "@tanstack/react-start";\n'
+                        'import { dbSecret } from "../db.server";\nconst fromDb = createServerFn({ method: "GET" }).handler(async () => dbSecret());'), None),
+        ("protect-client", ('<h1 data-testid="title">About</h1>', '<h1 data-testid="title">About {dbSecret()}</h1>'),
+         ["Import denied in client environment", "Denied by file pattern: **/*.server.*", "Importer: src/routes/about.tsx", 'Import: "../db.server"']),
+        ("protect-server", ('<h1 data-testid="title">About</h1>', '<h1 data-testid="title">About {clientOnly()}</h1>'),
+         ["Import denied in server environment", "Denied by file pattern: **/*.client.*", 'Import: "../browser.client"']),
+    ]:
+        d = os.path.join(OUT, case)
+        shutil.copytree(APP, d, symlinks=True, ignore=shutil.ignore_patterns("node_modules", "dist*", "START-SPEC.md"))
+        os.symlink(os.path.join(APP, "node_modules"), os.path.join(d, "node_modules"))
+        open(os.path.join(d, "src/db.server.ts"), "w").write('export function dbSecret() { return "DB_SECRET"; }\n')
+        open(os.path.join(d, "src/browser.client.ts"), "w").write("export function clientOnly() { return window.location.href; }\n")
+        about = os.path.join(d, "src/routes/about.tsx")
+        text = open(about).read()
+        if case != "protect-ok":
+            text = text.replace('import { useState } from "react";', 'import { useState } from "react";\nimport { dbSecret } from "../db.server";\nimport { clientOnly } from "../browser.client";')
+        open(about, "w").write(text.replace(*edit))
+        p = subprocess.run([ESB, "--tanstack-start"], cwd=d, capture_output=True, text=True, timeout=600)
+        said = p.stdout + p.stderr
+        if want is None:
+            leaked = any("DB_SECRET" in open(os.path.join(dp, f)).read() for dp, _, fs in os.walk(os.path.join(d, "dist/client")) for f in fs if f.endswith(".js"))
+            check(p.returncode == 0 and not leaked, "a .server module only a server function's handler uses builds, and is not in the browser's code")
+        else:
+            check(p.returncode != 0 and all(w in said for w in want) and not os.path.exists(os.path.join(d, "dist")),
+                  "import protection: " + want[0] + ", saying which import, and nothing written" + ("" if p.returncode != 0 else ": it built"))
+
     vite = os.path.join(APP, "node_modules/.bin/vite")
     if os.path.exists(vite):
         v = subprocess.run([vite, "build", "--outDir", os.path.join(OUT, "vite")], cwd=app, capture_output=True, text=True, timeout=300)
