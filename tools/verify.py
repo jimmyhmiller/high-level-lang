@@ -477,6 +477,17 @@ if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
 else:
     check(False, "route trees: benchmarks/tanstack-router has no node_modules (npm ci --prefix benchmarks/tanstack-router --ignore-scripts)")
 
+print("== TanStack Router applications")
+if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmarks/tanstack-router/node_modules/@tanstack/react-router")):
+    code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tanstack-check.py"), ESB], 900)
+    check(code == 0 and " 0 failed" in out, "a TanStack Router application from its page: "
+          + (out.strip().splitlines()[-1] + " (its route tree, its page, routes split, run in a browser, size against Vite's)" if code == 0 else out[-1800:]))
+else:
+    check(False, "TanStack Router application: benchmarks/tanstack-router has no node_modules (npm ci --prefix benchmarks/tanstack-router --ignore-scripts)")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "split-fuzz.py"), "100", "1", ESB], 900)
+check(code == 0 and " 0 differ" in out, "split-fuzz: "
+      + (out.strip().splitlines()[-1] if code == 0 else out[-1800:]))
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "
