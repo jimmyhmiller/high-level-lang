@@ -1,0 +1,273 @@
+# A TanStack Start application built as its Vite plugin builds it (`esb --tanstack-start[=DIR]`):
+# the route tree generated, with Start's footer; the browser's build (dist/client), the client
+# entry hydrating the page the server rendered; then the server's (dist/server/server.js, whose
+# default export's `fetch` answers requests), told which files the browser's build made for each
+# route (Start's manifest) and where each server function is (its resolver).
+#
+# Each build compiles Start's factories for its side (tanstack.start-compiler) before splitting
+# route files (tanstack.split): in both, components load lazily; the browser's route options lose
+# `ssr`, `server` and `headers`. The server leaves packages to Node but Start's own, which the
+# compiler and Start's modules (`#tanstack-start-…`) apply to.
+rules tanstack.start
+use bundle.api as api
+use bundle.modules as m
+use bundle.package as pkg
+use bundle.resolve as res
+use bundle.minhost as host
+use tanstack.split as split
+use tanstack.plugin as plugin
+use tanstack.config as cfg
+use tanstack.routes as routes
+use tanstack.start-compiler as compiler
+use vite.env as env
+use vite.compat as vite
+
+# The files a Start application is made of: its router (required), its Start options, and its two
+# entries, Start's own where the application has none.
+record Entries { router: Text, start: Text, client: Text, server: Text }
+
+# What a build of the application's is told: the project, its entries, which side it is, and for the
+# server, Start's manifest module.
+record Build { root: Text, entries: Entries, client: Bool, manifest: Text }
+
+setting build: Build
+
+fn entries-of(root: Text) -> Entries =
+  Entries(router: own(src, "router") ?? fail-build("Could not resolve entry for router entry: ./router in " ++ src),
+          start: own(src, "start") ?? default-entry(root, "start.ts"),
+          client: own(src, "client") ?? default-entry(root, "client.tsx"),
+          server: own(src, "server") ?? default-entry(root, "server.ts"))
+  where src = path-normalize(root ++ "/src")
+
+fn own(src: Text, name: Text) -> Text? =
+  first ext in [".ts", ".js", ".mts", ".mjs", ".tsx", ".jsx"] for f in [src ++ "/" ++ name ++ ext] if readable-file?(f): real-path(f)
+
+# Start's own entry, from @tanstack/react-start as the project's node_modules has it.
+fn default-entry(root: Text, name: Text) -> Text =
+  (first dir in path-ancestors(real-path(root)) for f in [dir ++ "/node_modules/@tanstack/react-start/dist/plugin/default-entry/" ++ name]
+   if readable-file?(f): f)
+  ?? fail-build("@tanstack/react-start is not installed where " ++ root ++ " can find it")
+
+# ---------------------------------------------------------------- what Start's modules are
+
+const manifest-module: Text = "tanstack-start-manifest:v"
+const resolver-module: Text = "tanstack-start-server-fn-resolver"
+
+fn resolved(spec: Text, importer: Text) -> Text? = match spec {
+  "#tanstack-router-entry" => some(build.entries.router)
+  "#tanstack-start-entry" => some(build.entries.start)
+  "virtual:tanstack-start-client-entry" => some(build.entries.client)
+  "virtual:tanstack-start-server-entry" => some(build.entries.server)
+  "tanstack-start-manifest:v" => some(manifest-module)
+  "#tanstack-start-server-fn-resolver" if not build.client => some(resolver-module)
+  _ if compiler.provider?(spec) => some(spec)
+  # The server leaves packages outside but Start's own.
+  _ if not build.client and (starts-with(spec, "@tanstack/start") or starts-with(spec, "@tanstack/react-start")) =>
+    some(m.searched-for(m.import-request(spec), importer).path)
+  _ => none
+}
+
+fn loaded(path: Text) -> Text? = match path {
+  _ if path == manifest-module => some(match build.client {
+    true => "export const tsrStartManifest = () => ({ routes: {} });\n"
+    false => build.manifest
+  })
+  _ if path == resolver-module => some(resolver-text(build.root))
+  _ if compiler.provider?(path) => some(read-file(compiler.base-file(path)))
+  _ => none
+}
+
+# ---------------------------------------------------------------- server functions
+
+# Each server function of the project's: what the server's resolver loads it by.
+record Provided { id: Text, handler: Text, file: Text }
+
+fn provided(root: Text) -> [Provided] =
+  sort p in [Provided(id: f.id, handler: f.handler, file: file)
+             for file in sources(path-normalize(root ++ "/src")) if contains-text?(read-file(file), "createServerFn")
+             for tree in [m.parsed-of(file).tree] for f in compiler.server-fns(tree, file, compiler.known-in(tree))] by p.id
+
+fn sources(dir: Text) -> [Text] =
+  [f for name in sort n in keys(listing) by n if not starts-with(name, ".") and name != "node_modules"
+   for f in (match listing[name] ?? 0 {
+     'd' => sources(dir ++ "/" ++ name)
+     'f' | 'l' if path-ext(name) in [".ts", ".tsx", ".js", ".jsx", ".mts", ".mjs"] => [real-path(dir ++ "/" ++ name)]
+     _ => []
+   })]
+  where listing = res.listing-of(dir)
+
+# Start's resolver (`#tanstack-start-server-fn-resolver`): each function's id, the export of its
+# module that is its handler, and that module, loaded once.
+fn resolver-text(root: Text) -> Text =
+  "const manifest = {\n" ++ join(["  " ++ host.js-string(p.id) ++ ": {\n    functionName: " ++ host.js-string(p.handler)
+                                  ++ ",\n    importer: () => import(" ++ host.js-string(p.file ++ compiler.provider-query) ++ ")\n  }"
+                                  for p in provided(root)], ",\n") ++ "\n}\n\n"
+  ++ "export async function getServerFnById(id, access) {\n"
+  ++ "  const serverFnInfo = manifest[id]\n"
+  ++ "  if (!serverFnInfo) {\n    throw new Error('Server function info not found for ' + id)\n  }\n"
+  ++ "  const fnModule = serverFnInfo.module ??= await serverFnInfo.importer()\n"
+  ++ "  if (!fnModule) {\n    throw new Error('Server function module not resolved for ' + id)\n  }\n"
+  ++ "  const action = fnModule[serverFnInfo.functionName]\n"
+  ++ "  if (!action) {\n    throw new Error('Server function module export not resolved for serverFn ID: ' + id)\n  }\n"
+  ++ "  return action\n}\n"
+
+# ---------------------------------------------------------------- the manifest
+
+# A chunk of the browser's build, as its `.vite/manifest.json` says it.
+record Chunk { key: Text, file: Text, entry: Bool, imports: [Text], css: [Text] }
+
+fn chunks-of(json: Text) -> [Chunk] = match pkg.parse(json, ".vite/manifest.json") {
+  pkg.Object(List(members...)) => [chunk-of(unquote(mb.key.text), mb.value) for mb in members]
+  _ => fail-build("tanstack.start: the browser build's manifest is not an object")
+}
+
+fn chunk-of(key: Text, v: pkg.Node) -> Chunk =
+  Chunk(key: key, file: res.text-member(v, "file") ?? "", entry: res.member(v, "isEntry") is some(pkg.True()),
+        imports: texts(res.member(v, "imports")), css: texts(res.member(v, "css")))
+
+fn texts(n: pkg.Node?) -> [Text] = match n {
+  some(pkg.Array(List(xs...))) => [unquote(x.text) for x in xs]
+  _ => []
+}
+
+fn asset(file: Text) -> Text = "/" ++ file
+
+# A chunk's static imports, all the way down, in the order a walk meets them.
+fn closure(chunks: [Chunk], key: Text) -> [Text] = [k for k in walked(chunks, [key], []) if k != key]
+
+fn walked(chunks: [Chunk], todo: [Text], seen: [Text]) -> [Text] = match todo {
+  [] => seen
+  [k, rest...] if k in seen => walked(chunks, rest, seen)
+  [k, rest...] => walked(chunks, rest ++ ((first c in chunks if c.key == k: c.imports) ?? []), seen ++ [k])
+}
+
+fn file-of(chunks: [Chunk], key: Text) -> Text = (first c in chunks if c.key == key: c.file) ?? ""
+
+fn preloads(chunks: [Chunk], key: Text) -> [Text] = [asset(file-of(chunks, k)) for k in [key] ++ closure(chunks, key)]
+
+fn styles(chunks: [Chunk], key: Text) -> [Text] =
+  [asset(f) for k in reversed(closure(chunks, key)) ++ [key] for c in chunks if c.key == k for f in c.css distinct f]
+
+# What one route loads, before what its ancestors load is taken out of it.
+record Assets { id: Text, file: Text, children: [Text], preloads: [Text], css: [Text], scripts: [Text] }
+
+fn route-assets(chunks: [Chunk], r: routes.RouteInfo, root: Text) -> Assets =
+  Assets(id: r.id, file: r.file, children: r.children,
+         preloads: [p for k in mine for p in preloads(chunks, k) distinct p] ++ entry-preloads,
+         css: [c for k in mine for c in styles(chunks, k) distinct c] ++ entry-css,
+         scripts: [asset(e.file) for e in entries if r.id == "__root__"])
+  where mine = [c.key for c in chunks if contains-text?(c.key, "?tsr-split=") and r.file != ""
+                and real-path(path-normalize(root ++ "/" ++ text-before(c.key, "?"))) == real-path(r.file)],
+        entries = [c for c in chunks if c.entry],
+        entry-preloads = [p for e in entries if r.id == "__root__" for p in preloads(chunks, e.key)],
+        entry-css = [c for e in entries if r.id == "__root__" for c in styles(chunks, e.key)]
+
+# Start's manifest module: what each route loads that its ancestors do not, as `tsrStartManifest`.
+fn manifest-text(chunks: [Chunk], info: [routes.RouteInfo], root: Text) -> Text =
+  "export const tsrStartManifest = () => ({ routes: {\n" ++ join([route-text(a) for a in deduped if non-empty?(a)], ",\n") ++ "\n} });\n"
+  where all = [route-assets(chunks, r, root) for r in info],
+        deduped = [without-ancestors(a, all) for a in all]
+
+fn non-empty?(a: Assets) -> Bool = len(a.preloads) + len(a.css) + len(a.scripts) > 0 or a.id == "__root__"
+
+# A route's assets without what an ancestor of it loads.
+fn without-ancestors(a: Assets, all: [Assets]) -> Assets =
+  a with { preloads: [p for p in a.preloads if not (p in above.preloads)], css: [c for c in a.css if not (c in above.css)],
+           scripts: [s for s in a.scripts if not (s in above.scripts)] }
+  where above = ancestors(a.id, all)
+
+fn ancestors(id: Text, all: [Assets]) -> Assets = match first p in all if id in p.children: p {
+  some(parent) => parent with { preloads: parent.preloads ++ up.preloads, css: parent.css ++ up.css, scripts: parent.scripts ++ up.scripts }
+    where up = ancestors(parent.id, all)
+  none => Assets(id: "", file: "", children: [], preloads: [], css: [], scripts: [])
+}
+
+fn route-text(a: Assets) -> Text =
+  "  " ++ host.js-string(a.id) ++ ": {\n    filePath: " ++ (if a.file == "" then "undefined" else host.js-string(a.file))
+  ++ ",\n    children: " ++ (match a.children { [] => "undefined"  cs => "[" ++ join([host.js-string(c) for c in cs], ", ") ++ "]" })
+  ++ (match a.preloads { [] => ""  ps => ",\n    preloads: [" ++ join([host.js-string(p) for p in ps], ", ") ++ "]" })
+  ++ (match a.css { [] => ""  cs => ",\n    css: [" ++ join(["{ link: { rel: \"stylesheet\", href: " ++ host.js-string(c) ++ " } }" for c in cs], ", ") ++ "]" })
+  ++ (match a.scripts { [] => ""  ss => ",\n    scripts: [" ++ join(["{ attrs: { type: \"module\", async: true, src: " ++ host.js-string(s) ++ " } }" for s in ss], ", ") ++ "]" })
+  ++ "\n  }"
+
+# ---------------------------------------------------------------- the two builds
+
+# Start's defines, each as `process.env.X` and as `import.meta.env.X`.
+fn start-defines() -> [api.DefineText] =
+  [api.DefineText(key: prefix ++ k, value: host.js-string(v)) for kv in [["TSS_SERVER_FN_BASE", "/_serverFn/"], ["TSS_ROUTER_BASEPATH", ""],
+     ["TSS_DEV_SERVER", "false"], ["TSS_DEV_SSR_STYLES_ENABLED", "true"], ["TSS_DEV_SSR_STYLES_BASEPATH", "/"],
+     ["TSS_INLINE_CSS_ENABLED", "false"], ["TSS_DISABLE_CSRF_MIDDLEWARE_WARNING", "false"]]
+   for k in [kv[0]] for v in [kv[1]] for prefix in ["process.env.", "import.meta.env."]]
+
+# The route tree's footer that Start's generator adds: the router's type registered with Start.
+fn footer(root: Text, c: cfg.Config, e: Entries) -> Text =
+  "import type { getRouter } from '" ++ tree-import(c.tree-path, e.router) ++ "'\n"
+  ++ (match own(path-normalize(root ++ "/src"), "start") {
+       some(start) => "import type { startInstance } from '" ++ tree-import(c.tree-path, start) ++ "'\n"
+       none => "import type { createStart } from '@tanstack/react-start'\n"
+     })
+  ++ "declare module '@tanstack/react-start' {\n  interface Register {\n    ssr: true\n    router: Awaited<ReturnType<typeof getRouter>>"
+  ++ (if is-some(own(path-normalize(root ++ "/src"), "start")) then "\n    config: Awaited<ReturnType<typeof startInstance.getOptions>>" else "")
+  ++ "\n  }\n}"
+
+fn tree-import(tree: Text, file: Text) -> Text = match relative(dir-of(tree), file) {
+  r if starts-with(r, ".") => r
+  r => "./" ++ r
+}
+
+fn relative(from: Text, to: Text) -> Text = join([".." for i in common..len(a)] ++ b[common..len(b)], "/")
+  where a = [s for s in split(real-path(from), "/") if s != ""], b = [s for s in split(real-path(to), "/") if s != ""],
+        common = len([i for i in 0..min(len(a), len(b)) while a[i] == b[i]])
+
+# The generator's configuration as Start gives it: its footer after the project's own.
+fn generator-config(root: Text, e: Entries) -> cfg.Config = c with { footer: [footer(root, c, e)] ++ c.footer, auto-code-splitting: true }
+  where c = cfg.read(root)
+
+# One build's options, from what the command line gave. The browser's is minified, as Vite's is.
+fn side-options(o: api.Options, root: Text, e: Entries, client: Bool) -> api.Options =
+  vite.compatible(envd with { defines: envd.defines ++ [d for d in start-defines() if not api.has-define?(envd, d.key)] })
+  where common = (if o.jsx.explicit then o else api.with-jsx-runtime(o, "automatic")) with { splitting: true, format: api.esm-format(), manifest: client, url-queries: true,
+                          on-resolve: o.on-resolve ++ [resolved, split.resolved], on-load: o.on-load ++ [loaded, split.loaded],
+                          transforms: o.transforms ++ [compiler.compiled, split.split-route],
+                          chunking: o.chunking with { fragments: true, already-loaded: true }, strict-execution-order: true,
+                          chunk-names: "assets/[name]-[hash]", public-path: "/assets/" },
+        base = match client {
+          true => common with { entry: e.client, entries: [e.client], outdir: out, asset-dir: out ++ "/assets", minify-identifiers: true, minify-syntax: true,
+                                entry-names: "assets/index-[hash]", conditions: some(["module", "browser", "production"]) }
+            where out = path-normalize(root ++ "/dist/client")
+          false => api.on-node(common) with { entry: e.server, entries: [e.server], outdir: out, asset-dir: out ++ "/assets",
+                                              entry-names: "[name]", packages-external: true, minify-identifiers: false, minify-syntax: false,
+                                              conditions: some(["module", "node", "production"]), url-assets: false }
+            where out = path-normalize(root ++ "/dist/server")
+        },
+        envd = env.with-env(base, root, "production", not client)
+
+# The route tree generated, as Start's generator writes it, and written where it changed.
+fn generated!(c: cfg.Config) -> routes.Generated = with routes.config = c { routes.written!(routes.generated-with(c)) }
+
+fn split-options(g: routes.Generated, delete: [Text]) -> split.Options =
+  split.Options(files: {real-path(f): true for f in g.routes}, ids: {real-path(g.routes[i]): g.ids[i] for i in 0..len(g.routes)},
+                package: "@tanstack/react-router", groupings: split.default-groupings(), delete: delete)
+
+fn client-build(o: api.Options, root: Text, e: Entries, g: routes.Generated) -> [api.Written] =
+  with split.options = split-options(g, ["ssr", "server", "headers"]), compiler.side = compiler.Side(client: true, root: real-path(root)),
+       build = Build(root: root, entries: e, client: true, manifest: "") {
+    api.files(side-options(o, root, e, true))
+  }
+
+fn server-build(o: api.Options, root: Text, e: Entries, g: routes.Generated, manifest: Text) -> [api.Written] =
+  with split.options = split-options(g, []), compiler.side = compiler.Side(client: false, root: real-path(root)),
+       build = Build(root: root, entries: e, client: false, manifest: manifest) {
+    api.files(side-options(o, root, e, false))
+  }
+
+# Both builds' files: the browser's (its manifest read, not written; the project's public/ beside
+# it), then the server's.
+fn built(o: api.Options, root: Text) -> [api.Written] = client-files ++ public ++ server-files
+  where e = entries-of(root),
+        g = generated!(generator-config(root, e)),
+        client-all = client-build(o, root, e, g),
+        manifest-json = (first w in client-all if ends-with(w.path, "/.vite/manifest.json"): w.text) ?? fail-build("tanstack.start: the browser's build has no manifest"),
+        client-files = [w for w in client-all if not ends-with(w.path, "/.vite/manifest.json")],
+        public = api.public-written(path-normalize(root ++ "/public"), path-normalize(root ++ "/dist/client")),
+        server-files = server-build(o, root, e, g, manifest-text(chunks-of(manifest-json), g.manifest, root))

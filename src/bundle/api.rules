@@ -68,8 +68,12 @@ boxed record Options {
   dev: Bool,
   # `--manifest`: what each entry and `import()` became, as Vite's `.vite/manifest.json` says it.
   manifest: Bool,
-  # Vite's import queries, `?url` and `?raw` (see `Loading.url-queries`).
+  # Vite's import queries, `?url` and `?raw` (see `Loading.url-queries`); and whether the files
+  # `?url` names are written (not by a build whose assets another build writes).
   url-queries: Bool,
+  url-assets: Bool,
+  # Where the files modules and stylesheets name are written, when not the output directory.
+  asset-dir: Text,
   outfile: Text,
   outdir: Text,
   outbase: Text,
@@ -154,7 +158,7 @@ fn paged(o: Options) -> Options = match o.entry {
 }
 
 fn options-new(entry: Text, outfile: Text) -> Options =
-  Options(entry: entry, entries: [entry], page: "", dev: false, manifest: false, url-queries: false, outfile: outfile, outdir: "", outbase: "", splitting: false,
+  Options(entry: entry, entries: [entry], page: "", dev: false, manifest: false, url-queries: false, url-assets: true, asset-dir: "", outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]", chunking: packing.options(),
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
@@ -448,7 +452,7 @@ fn delivered(o: Options, ws: [Written]) -> Void = match printing?(o) {
 fn files(options: Options) -> [Written] =
   with res.options = resolve-options(options), tsc.forced = options.tsconfig, ascii.braces = options.target >= 2015,
        cssb.loaders = loader-map(options), cssb.public-path = options.public-path,
-       cssb.asset-directory = (if options.outdir != "" then options.outdir else dir-of(options.outfile)) {
+       cssb.asset-directory = (if options.asset-dir != "" then options.asset-dir else if options.outdir != "" then options.outdir else dir-of(options.outfile)) {
     checked-files(built(printable(options with { chunking: packing.checked(options.chunking) })))
   }
 
@@ -540,6 +544,11 @@ fn assets-written(assets: [cssb.Asset]) -> [Written] = [Written(path: a.to, text
 # The files the program's modules stand for, copied beside it: what the file loader gives.
 fn module-assets(out-dir: Text) -> [cssb.Asset] =
   [cssb.asset-of(mo.path, out-dir) for mo in m.modules if mo.kind != m.External and m.loader-of(mo.path) == "file"]
+
+fn url-assets-of(o: Options, out-dir: Text) -> [Written] = match o.url-assets {
+  true => url-assets(out-dir)
+  false => []
+}
 
 # The files `?url` imports name, written as assets: a stylesheet bundled, with the files it names,
 # any other file as it is.
@@ -673,7 +682,7 @@ fn final-names(o: Options) -> sym.Table = match o.minify-identifiers {
 fn named-built(o: Options, f: Format) -> [Written] =
   beside(o.outfile ++ ".LEGAL.txt", notes.file) ++ js
   ++ [sheet-written(css-out, b)... for b in css]
-  ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile))) ++ url-assets(dir-of(o.outfile))
+  ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile))) ++ url-assets-of(o, dir-of(o.outfile))
   ++ analysis-written(o, [analyze.Output(path: o.outfile, kind: "js", text: text-written(js, o.outfile), base: len(head) + out0.base, marks: out0.marks, root: m.entry,
                                          imports: [], dynamic: [])]
                          ++ [analyze.Output(path: css-out, kind: "css", text: b.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for b in css],
@@ -850,8 +859,20 @@ fn chunk-programs(o: Options, all: [chunks.Chunk], selected: [[e.Unit]]) -> [Pri
 fn chunk-path-of(o: Options, c: chunks.Chunk, hash: Text, base: Text, static-roots: [Int]) -> Text = match c.root {
   r if r < 0 => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", "chunk", hash) ++ ".js"
   r if r in static-roots => entry-output-hashed(o, (first entry in o.entries if real-path(entry) == m.modules[r].path: entry) ?? m.modules[r].path, base, hash)
-  r => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(m.modules[r].path), hash) ++ ".js"
+  r => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", chunk-stem(m.modules[r].path), hash) ++ ".js"
 }
+
+# A file's name for its chunk: its stem, with what a virtual module's id may hold that a file name
+# should not (`tanstack-start-manifest:v`, a query) made `_`.
+fn chunk-stem(path: Text) -> Text =
+  text-of-bytes([match c { '/' | ':' | '?' | '*' | '"' | '<' | '>' | '|' | '=' | '&' => '_'  _ => c } for c in bytes-of(path-stem(text-before-query(path)))])
+
+fn text-before-query(path: Text) -> Text = match index-of(path, "?") {
+  some(at) => path[0..at]
+  none => path
+}
+
+fn bytes-of(t: Text) -> [Int] = [t[i] for i in 0..len(t)]
 
 fn split-built(options: Options) -> [Written] = match options.outdir, options.format.export-names {
   "", _ => panic "code splitting needs --outdir"
@@ -922,7 +943,7 @@ record RootStylesheet { root: Int, path: Text, bundle: cssb.Bundled }
 fn root-stylesheet(o: Options, root: Int, sheets: [Text]) -> RootStylesheet =
   RootStylesheet(root: root, path: path, bundle: cssb.bundle(sheets, path, o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments))
   where bundled = cssb.bundle(sheets, o.outdir ++ "/style.css", o.minify-syntax or o.minify-identifiers, o.pretty, o.legal-comments),
-        path = match root in m.entries and o.page == "" {
+        path = match root in m.entries and o.page == "" and not contains-text?(o.entry-names, "[hash]") {
           true => with-extension(entry-output(o, (first entry in o.entries if real-path(entry) == m.modules[root].path: entry)
                                                   ?? m.modules[root].path, base-dir(o)), ".css")
           false => o.outdir ++ "/" ++ chunks.pattern-path(o.chunk-names, "", path-stem(m.modules[root].path), host.content-hash(bundled.text)) ++ ".css"
@@ -934,7 +955,7 @@ fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> 
   ++ analysis-written(o, [chunk-analyzed(all, i, printed[i], holes[i], paths, text-written(js[i], paths[i])) for i in 0..len(all)]
                          ++ [analyze.Output(path: s.path, kind: "css", text: s.bundle.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for s in styles],
                       m.entries ++ an.linked.dynamic-roots)
-  ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir)) ++ url-assets(o.outdir)
+  ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir)) ++ url-assets-of(o, o.outdir)
   ++ page-written(o, all, paths, styles)
   ++ manifest-written(o, all, paths, styles)
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},

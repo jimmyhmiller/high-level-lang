@@ -1,0 +1,341 @@
+# TanStack Start's compiler, as its plugin runs it on each module of each build (its
+# start-compiler): calls of Start's factories made into what each side of the application runs.
+#
+#   - `const X = createServerFn(…)[.middleware(…)][.validator(v)].handler(fn)`: in the browser, the
+#     handler a call of the server (`createClientRpc(id)`, the validator taken out); on the server,
+#     a call of the function's own module (`createSsrRpc(id)`); and in that module, a file with
+#     `?tss-serverfn-split` that only the server's resolver loads, the function itself, its handler
+#     registered under its id (`createServerRpc`) and exported.
+#   - `createIsomorphicFn().server(a).client(b)`: the side's own function (or `() => {}`).
+#   - `createServerOnlyFn(fn)`, `createClientOnlyFn(fn)`: the function on its side, and on the other
+#     one that throws.
+#   - `createMiddleware(…)` in the browser: its `.validator(…)` and `.server(…)` taken out.
+#   - `<ClientOnly>` on the server: its children taken out.
+#
+# A factory is known by the import that names it (from @tanstack/react-start, start-client-core or
+# start-fn-stubs), as itself, under another name, or through a namespace. Then, as Start's compiler
+# does, what the module imported or declared that only what was taken out read goes too: so a
+# server-only module a handler imported is not imported in the browser at all.
+#
+# A function's id is the SHA-256 of `path--X_createServerFn_handler` (the path from the project's
+# root), so it is the one Vite's build gives it.
+rules tanstack.start-compiler over bundle.js
+use bundle.js as js
+use bundle.made as mk
+use bundle.minhost as host
+
+# Which side a build is, and the project's root (a real path) that ids are relative to.
+record Side { client: Bool, root: Text }
+
+setting side: Side
+
+const provider-query: Text = "?tss-serverfn-split"
+
+fn provider?(path: Text) -> Bool = ends-with(path, provider-query)
+
+fn base-file(path: Text) -> Text = text-before(path, "?")
+
+fn detected?(src: Text) -> Bool =
+  contains-text?(src, "createServerFn") or contains-text?(src, ".handler") or contains-text?(src, "createMiddleware")
+  or contains-text?(src, "createIsomorphicFn") or contains-text?(src, "createServerOnlyFn") or contains-text?(src, "createClientOnlyFn")
+  or (not side.client and contains-text?(src, "ClientOnly"))
+
+# ---------------------------------------------------------------- what the module imports
+
+const start-packages: [Text] = ["@tanstack/react-start", "@tanstack/solid-start", "@tanstack/vue-start", "@tanstack/start-client-core"]
+const stub-packages: [Text] = ["@tanstack/react-start", "@tanstack/solid-start", "@tanstack/vue-start", "@tanstack/start-client-core",
+                               "@tanstack/start-fn-stubs"]
+const router-packages: [Text] = ["@tanstack/react-router", "@tanstack/solid-router", "@tanstack/vue-router"]
+
+# What a factory a package exports is, on this side.
+fn kind-of(source: Text, name: Text) -> Text? = match name {
+  "createServerFn" if source in start-packages => some("root")
+  "createIsomorphicFn" if source in stub-packages => some("isomorphic")
+  "createServerOnlyFn" if source in stub-packages => some("server-only")
+  "createClientOnlyFn" if source in stub-packages => some("client-only")
+  "createMiddleware" if side.client and source in start-packages => some("middleware")
+  "ClientOnly" if not side.client and source in router-packages => some("client-only-jsx")
+  _ => none
+}
+
+record Known { names: {Text:Text}, spaces: {Text:Text} }
+
+fn known-in(tree: Node) -> Known =
+  Known(names: {local: k for s in tree.body.kids for i in imported(s) if not i.space for k in kind-of(i.source, i.name) for local in [i.local]},
+        spaces: {i.local: i.source for s in tree.body.kids for i in imported(s) if i.space})
+
+record Imported { source: Text, name: Text, local: Text, space: Bool }
+
+fn imported(s: Node) -> [Imported] = match s {
+  Import(clause, from, _) => [i with { source: unquote(from.text) } for i in clause-imports(clause)]
+  _ => []
+}
+
+fn clause-imports(c: Node) -> [Imported] = match c {
+  ImportNamed(List(specs...)) => [i for sp in specs for i in spec-imports(sp)]
+  ImportNamespace(BindName(local)) => [Imported(source: "", name: "*", local: local, space: true)]
+  ImportDefaultAnd(_, rest) => clause-imports(rest)
+  _ => []
+}
+
+fn spec-imports(sp: Node) -> [Imported] = match sp {
+  ImportName(BindName(n)) => [Imported(source: "", name: n, local: n, space: false)]
+  ImportAs(imported, BindName(local)) => [Imported(source: "", name: match imported { Str(raw) => unquote(raw)  _ => imported.text }, local: local, space: false)]
+  _ => []
+}
+
+# A call's factory, when the callee names one.
+fn factory(callee: Node, k: Known) -> Text? = match callee {
+  Ident(n) => k.names[n]
+  Member(Ident(ns), PropName(n)) => match k.spaces[ns] {
+    some(source) => kind-of(source, n)
+    none => none
+  }
+  _ => none
+}
+
+# ---------------------------------------------------------------- chains
+
+# `root(…).a(…).b(…)`: the factory call and each method called on what it made, in order.
+record Link { method: Text, args: [Node], call: Node, member: Node }
+record Chain { kind: Text, root: Node, links: [Link] }
+
+fn chain-of(n: Node, k: Known) -> Chain? = match n {
+  CallExpr(Member(inner, PropName(m)) as member, Args(List(args...))) => match chain-of(inner, k) {
+    some(c) => some(c with { links: c.links ++ [Link(method: m, args: args, call: n, member: member)] })
+    none => match factory(n.kids[0], k) {
+      some(kind) => some(Chain(kind: kind, root: n, links: []))
+      none => none
+    }
+  }
+  CallExpr(callee, _) => match factory(callee, k) {
+    some(kind) => some(Chain(kind: kind, root: n, links: []))
+    none => none
+  }
+  Paren(x) => chain-of(x, k)
+  _ => none
+}
+
+fn server-fn?(c: Chain) -> Bool = c.kind == "root" and (match c.links { [] => false  ls => ls[len(ls) - 1].method == "handler" })
+
+# The chain written again: its factory call, then each link kept, its arguments as given.
+fn rebuilt(c: Chain, links: [Link]) -> Node =
+  fold n = c.root for l in links: CallExpr(Member(n, l.member.kids[1]) with { lo: l.member.lo, hi: l.member.hi }, Args(List(l.args...))) with { lo: l.call.lo, hi: l.call.hi }
+
+fn argument-of(c: Chain, method: Text) -> Node? = last l in c.links if l.method == method for a in [l.args]: match a {
+  [x, ...] => x
+  [] => fail-build(method ++ "() must be called with an expression")
+}
+
+# ---------------------------------------------------------------- server functions
+
+# A server function of the module: the variable it is given to, the name of its handler's export
+# in its module, and its id.
+record ServerFn { name: Text, handler: Text, id: Text, at: Int }
+
+fn server-fns(tree: Node, path: Text, k: Known) -> [ServerFn] =
+  [ServerFn(name: d.name, handler: handler-names[i], id: sha256-hex(relative-path(path) ++ "--" ++ handler-names[i]), at: d.at)
+   for i in 0..len(declared) for d in [declared[i]]]
+  where declared = [d for s in tree.body.kids for d in declared-fns(s, k)],
+        handler-names = versions([d.name ++ "_createServerFn_handler" for d in declared])
+
+# Names, each taken one given the next version (`name_1`, `name_2`, …).
+fn versions(names: [Text]) -> [Text] {
+  let made: [Text] = fold taken = [] for n in names: taken ++ [versioned(n, taken)]
+  made
+}
+
+record Declared { name: Text, at: Int }
+
+fn declared-fns(s: Node, k: Known) -> [Declared] = match s {
+  ExportLexical(d) => declared-fns(d, k)
+  ConstDecl(List(ds...)) | LetDecl(List(ds...)) | VarDecl(List(ds...)) | ExportVar(List(ds...)) =>
+    [Declared(name: n, at: init.lo) for d in ds for x in [d] if x is Declarator(BindName(_), _)
+     for n in [d.kids[0].text] for init in [d.kids[1]] if chain-of(init, k) is some(c) and server-fn?(c)]
+  _ => []
+}
+
+# A name taken already gets the next version (`name_1`, `name_2`, …).
+fn versioned(name: Text, taken: [Text]) -> Text = match name in taken {
+  false => name
+  true => first n in 1.. if not ((name ++ "_" ++ int-text(n)) in taken): name ++ "_" ++ int-text(n)
+}
+
+fn relative-path(path: Text) -> Text = match starts-with(real-path(base-file(path)), side.root ++ "/") {
+  true => real-path(base-file(path))[len(side.root) + 1..len(real-path(base-file(path)))]
+  false => base-file(path)
+}
+
+# ---------------------------------------------------------------- the module compiled
+
+fn compiled(tree: Node, path: Text, src: Text) -> Node = match detected?(src) {
+  false => tree
+  true => match changed?(tree, k) {
+    false => tree
+    true => mk.placed-program(pruned(Program(tree.hashbang, List(body...)) with { lo: tree.lo, hi: tree.hi }, referenced(tree)))
+      where fns = server-fns(tree, path, k),
+            body = lead(fns, path, src) ++ [x for s in tree.body.kids for x in statement(s, fns, k, path, src)]
+                   ++ trail(fns, path)
+  }
+} where k = known-in(tree)
+
+# Whether anything here is Start's to compile.
+fn changed?(n: Node, k: Known) -> Bool = match chain-of(n, k) {
+  some(_) => true
+  none => any c in n.kids: changed?(c, k)
+}
+
+fn rpc-name(src: Text) -> Text = fresh(match side.client {
+  true => "createClientRpc"
+  false => "createSsrRpc"
+}, src)
+
+fn fresh(base: Text, src: Text) -> Text = match contains-text?(src, base) {
+  false => base
+  true => first n in 1.. if not contains-text?(src, base ++ int-text(n)): base ++ int-text(n)
+}
+
+# The imports the compiled module needs.
+fn lead(fns: [ServerFn], path: Text, src: Text) -> [Node] = match fns, side.client, provider?(path) {
+  [], _, _ => []
+  _, true, _ => [mk.made("import { createClientRpc as " ++ rpc-name(src) ++ " } from \"@tanstack/react-start/client-rpc\";")]
+  _, false, false => [mk.made("import { createSsrRpc as " ++ rpc-name(src) ++ " } from \"@tanstack/react-start/ssr-rpc\";")]
+  _, false, true => [mk.made("import { createServerRpc as " ++ fresh("createServerRpc", src) ++ " } from \"@tanstack/react-start/server-rpc\";")]
+}
+
+# In a provider module, each handler exported, and nothing else.
+fn trail(fns: [ServerFn], path: Text) -> [Node] = match provider?(path) and len(fns) > 0 {
+  true => [mk.made("export { " ++ join([f.handler for f in fns], ", ") ++ " };")]
+  false => []
+}
+
+fn statement(s: Node, fns: [ServerFn], k: Known, path: Text, src: Text) -> [Node] = match provider?(path) {
+  false => [expressions(s, fns, k, path, src)]
+  true => [registered(f, path, src) for f in fns if declares?(s, f, k)] ++ [x for x in unexported(expressions(s, fns, k, path, src))]
+}
+
+fn declares?(s: Node, f: ServerFn, k: Known) -> Bool = any d in declared-fns(s, k): d.at == f.at
+
+# `const X_createServerFn_handler = createServerRpc({ id, name, filename }, (opts) => X.__executeServer(opts));`
+fn registered(f: ServerFn, path: Text, src: Text) -> Node =
+  mk.made("const " ++ f.handler ++ " = " ++ fresh("createServerRpc", src) ++ "({ id: " ++ host.js-string(f.id) ++ ", name: " ++ host.js-string(f.name)
+          ++ ", filename: " ++ host.js-string(relative-path(path)) ++ " }, (opts) => " ++ f.name ++ ".__executeServer(opts));")
+
+# A provider module exports only its handlers: its own exports become plain declarations.
+fn unexported(s: Node) -> [Node] = match s {
+  ExportLexical(d) | ExportFunction(d) | ExportClass(d) => [d]
+  ExportVar(List(ds...)) => [VarDecl(List(ds...)) with { lo: s.lo, hi: s.hi }]
+  ExportNamed(_) | ExportFrom(...) | ExportAll(...) | ExportAllAs(...) => []
+  ExportDefaultDecl(d) if d.kids[0] is BindName(_) => [d]
+  _ => [s]
+}
+
+# Each factory call of a statement compiled, from its leaves up.
+everywhere fn expressions(n: Node, fns: [ServerFn], k: Known, path: Text, src: Text) -> Node = match n {
+  Declarator(BindName(x) as b, init) if chain-of(init, k) is some(c) and server-fn?(c) =>
+    Declarator(b, server-fn(deep-chain(c, fns, k, path, src), (first f in fns if f.name == x: f) ?? (panic "tanstack.start: {} has no id", x), path, src))
+      with { lo: n.lo, hi: n.hi }
+  CallExpr(...) if chain-of(n, k) is some(c) and c.kind != "root" => side-call(deep-chain(c, fns, k, path, src), n, fns, k, path, src)
+  CallExpr(...) if chain-of(n, k) is some(c) and server-fn?(c) =>
+    fail-build(path ++ ": createServerFn must be assigned to a variable, as `const name = createServerFn(…).handler(…)`")
+}
+
+# A chain whose factory's arguments and links' arguments are compiled too: what they hold may call
+# a factory of its own.
+fn deep-chain(c: Chain, fns: [ServerFn], k: Known, path: Text, src: Text) -> Chain =
+  c with { root: match c.root {
+             CallExpr(callee, Args(List(args...)) as a) =>
+               CallExpr(callee, Args(List([expressions(x, fns, k, path, src) for x in args]...)) with { lo: a.lo, hi: a.hi }) with { lo: c.root.lo, hi: c.root.hi }
+             other => other
+           },
+           links: [l with { args: [expressions(x, fns, k, path, src) for x in l.args] } for l in c.links] }
+
+fn server-fn(c: Chain, f: ServerFn, path: Text, src: Text) -> Node = match side.client, provider?(path) {
+  true, _ => rebuilt(c, with-handler([l for l in c.links if l.method != "validator"], [rpc(f, src)]))
+  false, false => rebuilt(c, with-handler(c.links, [rpc(f, src)]))
+  false, true => rebuilt(c, with-handler(c.links, [mk.made-expression(f.handler)] ++ handler-args(c)))
+}
+
+fn rpc(f: ServerFn, src: Text) -> Node = mk.made-expression(rpc-name(src) ++ "(" ++ host.js-string(f.id) ++ ")")
+
+fn handler-args(c: Chain) -> [Node] = match argument-of(c, "handler") {
+  some(fn) => [fn]
+  none => fail-build("createServerFn must be called with a \"handler\" property!")
+}
+
+# A chain's links, its last (the handler's) given these arguments.
+fn with-handler(links: [Link], args: [Node]) -> [Link] = [match i == len(links) - 1 { true => links[i] with { args: args }  false => links[i] } for i in 0..len(links)]
+
+# The other factories.
+fn side-call(c: Chain, n: Node, fns: [ServerFn], k: Known, path: Text, src: Text) -> Node = match c.kind {
+  "isomorphic" => match argument-of(c, if side.client then "client" else "server") {
+    some(fn) => fn
+    none => mk.made-expression("() => {}")
+  }
+  "server-only" if side.client => thrower("createServerOnlyFn() functions can only be called on the server!")
+  "client-only" if not side.client => thrower("createClientOnlyFn() functions can only be called on the client!")
+  "server-only" | "client-only" => match c.root {
+    CallExpr(_, Args(List(fn, ...))) => fn
+    _ => fail-build(path ++ ": " ++ (if c.kind == "server-only" then "createServerOnlyFn" else "createClientOnlyFn") ++ "() must be called with a function!")
+  }
+  "middleware" => rebuilt(c, [l for l in c.links if l.method != "validator" and l.method != "server"])
+  "client-only-jsx" => n
+  _ => n
+}
+
+fn thrower(message: Text) -> Node = mk.made-expression("() => { throw new Error(" ++ host.js-string(message) ++ "); }")
+
+# ---------------------------------------------------------------- what is left unread
+
+# The names the module reads.
+fn referenced(tree: Node) -> {Text:Int} = {x: 1 for x in reads-in(tree) distinct x}
+
+# A name an export names is read too: it is not the compiler's to take away.
+fn reads-in(n: Node) -> [Text] = match n {
+  Ident(x) => [x]
+  ExportName(PropName(x)) | ExportAs(PropName(x), _) => [x]
+  _ => [r for c in n.kids for r in reads-in(c)]
+}
+
+# A name the module read before and does not now is dead: its import goes, and a declaration of
+# the module's own of it, until no more go.
+fn pruned(tree: Node, before: {Text:Int}) -> Node = match [x for x in keys(before) if not (x in now)] {
+  [] => tree
+  dead => match any s in tree.body.kids: shrinks?(s, dead) {
+    false => tree
+    true => pruned(pruned-once(tree, dead), before)
+  }
+} where now = referenced(tree)
+
+fn shrinks?(s: Node, dead: [Text]) -> Bool = match without(s, dead) {
+  [] => true
+  kept => spec-count(kept) < spec-count([s])
+}
+
+fn spec-count(ss: [Node]) -> Int = sum s in ss: match s {
+  Import(ImportNamed(List(specs...)), _, _) => len(specs)
+  _ => 0
+}
+
+fn pruned-once(tree: Node, dead: [Text]) -> Node =
+  Program(tree.hashbang, List([x for s in tree.body.kids for x in without(s, dead)]...)) with { lo: tree.lo, hi: tree.hi }
+
+# A statement without what declares only dead names; a statement it leaves empty is gone.
+fn without(s: Node, dead: [Text]) -> [Node] = match s {
+  Import(ImportNamed(List(specs...)) as c, from, attrs) => match [sp for sp in specs if not (local-of(sp) in dead)] {
+    [] if len(specs) > 0 => []
+    kept if len(kept) == len(specs) => [s]
+    kept => [Import(ImportNamed(List(kept...)) with { lo: c.lo, hi: c.hi }, from, attrs) with { lo: s.lo, hi: s.hi }]
+  }
+  Import(ImportDefault(BindName(x)), _, _) | Import(ImportNamespace(BindName(x)), _, _) if x in dead => []
+  ConstDecl(List(Declarator(BindName(x), init))) | LetDecl(List(Declarator(BindName(x), init))) | VarDecl(List(Declarator(BindName(x), init)))
+    if x in dead => []
+  FuncDecl(BindName(x), ...) | AsyncFuncDecl(BindName(x), ...) | ClassDecl(BindName(x), ...) if x in dead => []
+  _ => [s]
+}
+
+fn local-of(sp: Node) -> Text = match sp {
+  ImportName(BindName(n)) => n
+  ImportAs(_, BindName(n)) => n
+  _ => ""
+}
