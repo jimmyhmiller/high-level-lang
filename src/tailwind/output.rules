@@ -312,17 +312,42 @@ fn with-property-fallbacks(nodes: [ast.Css], root: [ast.Css], universal: [ast.Cs
 
 # ---------------------------------------------------------------- nesting
 
-# Tailwind's `handleNesting`, as a walk that threads what it has made: the output, where the list
-# being filled is (how deep along the output's last nodes; -1 none, -2 a list nothing holds, whose
-# nodes Tailwind drops), the selectors and at-rules the walk is inside (a selector that can never
-# match is dead: what is under it goes, but for hoistable at-rules).
+# Tailwind's `handleNesting` walks the tree entering and leaving nodes and emits nodes into the
+# output's last nodes. Here the walk is a flat list of steps (a rule or at-rule entered, a node met,
+# a rule or at-rule left), folded once into placements: each node, and the path of rules and
+# at-rules (heads) it goes under, with how many of those heads it shares with the placement before
+# it. The output is then built from the placements by grouping.
+enum Step { Enter, Leave, Meet }
+record Token { step: Step, node: ast.Css, depth: Int }
+
+fn tokens(n: ast.Css, depth: Int) -> [Token] = match n.kind {
+  ast.StyleRule | ast.AtRule => [Token(step: Enter, node: n, depth: depth)] ++ [t for c in n.nodes for t in tokens(c, depth + 1)]
+    ++ [Token(step: Leave, node: n, depth: depth)]
+  ast.Decl | ast.Comment => [Token(step: Meet, node: n, depth: depth)]
+  _ => [t for c in n.nodes for t in tokens(c, depth + 1)]
+}
+
+# A head of a path: an at-rule (its name and parameters) or a rule (its selector).
+record Head { rule: Bool, name: Text, params: Text }
+
+# A placement: `leaf` under `path`, sharing `shared` heads with the placement before; no leaf for an
+# at-rule with nothing in it, which is its path's last head (so later nodes can go into it).
+record Place { path: [Head], shared: Int, leaf: ast.Css? }
+
 record Entry { selector: Text, dead: Bool }
-record AtEntry { name: Text, params: Text }
-record Nest { result: [ast.Css], open: Int, selectors: [Entry], at-rules: [AtEntry] }
+
+# The walk's state: the placements so far, the path of the list being filled (none closed; `open-gone`
+# a list nothing holds, whose nodes Tailwind drops), the selectors and at-rules it is inside, for
+# each rule and at-rule entered whether it was pushed on those (one that was not is left without
+# Tailwind's exit step), the path of the last placement, and the depth of a node whose insides are
+# skipped (-1 none).
+record Nest { fresh: [Place], prev: Place?, open: [Head]?, open-gone: Bool, selectors: [Entry], at-rules: [Head], pushed: [Bool], last: [Head], skip: Int }
 
 fn nesting-handled(nodes: [ast.Css]) -> [ast.Css] = match any n in nodes: has-scope?(n) {
   true => fail-build("tailwind: `@scope` in a stylesheet is not implemented")
-  false => (fold st = Nest(result: [], open: -1, selectors: [], at-rules: []) for n in nodes: entered(st, n)).result
+  false => built([p for s in walked for p in s.fresh], 0)
+    where walked = scan st = Nest(fresh: [], prev: none, open: none, open-gone: false, selectors: [], at-rules: [], pushed: [], last: [], skip: -1)
+      for t in [t for n in nodes for t in tokens(n, 0)]: stepped(st with { fresh: [] }, t)
 }
 
 fn has-scope?(n: ast.Css) -> Bool = match n.kind {
@@ -334,38 +359,43 @@ fn has-scope?(n: ast.Css) -> Bool = match n.kind {
 const hoistable: [Text] = ["@container", "@layer", "@media", "@page", "@scope", "@starting-style", "@supports", "@view-transition"]
 const droppable-if-empty: [Text] = ["@container", "@media", "@page", "@scope", "@starting-style", "@supports", "@view-transition"]
 
-fn dead?(st: Nest) -> Bool = match st.selectors {
-  [] => false
-  entries => last(entries).dead
+fn dead?(st: Nest) -> Bool = len(st.selectors) > 0 and last(st.selectors).dead
+
+fn closed(st: Nest) -> Nest = st with { open: none, open-gone: false }
+
+fn stepped(st: Nest, t: Token) -> Nest = match t.step {
+  _ if st.skip != -1 and t.depth > st.skip => st
+  Enter if t.node.kind == ast.StyleRule => rule-entered(closed(st), t)
+  Enter => at-rule-entered(closed(st), t)
+  Leave => left(st with { skip: if st.skip == t.depth then -1 else st.skip }, t)
+  Meet => if dead?(st) then st else emitted(st, t.node)
 }
 
-fn entered(st: Nest, n: ast.Css) -> Nest = match n.kind {
-  ast.StyleRule => rule-entered(st with { open: -1 }, n)
-  ast.AtRule => at-rule-entered(st with { open: -1 }, n)
-  ast.Decl | ast.Comment => if dead?(st) then st else emitted(st, n)
-  ast.Context | ast.AtRoot => fold s = st for c in n.nodes: entered(s, c)
+fn left(st: Nest, t: Token) -> Nest = match last(st.pushed) {
+  false => st with { pushed: st.pushed[0..len(st.pushed) - 1] }
+  true if t.node.kind == ast.StyleRule => closed(st) with { pushed: st.pushed[0..len(st.pushed) - 1], selectors: st.selectors[0..len(st.selectors) - 1] }
+  true => closed(st) with { pushed: st.pushed[0..len(st.pushed) - 1], at-rules: st.at-rules[0..len(st.at-rules) - 1] }
 }
 
-fn rule-entered(st: Nest, n: ast.Css) -> Nest = match st.selectors {
-  [] => inside-rule(st, n, Entry(selector: top-selector(n.head), dead: false))
-  entries if n.head == "&" => fold s = st for c in n.nodes: entered(s, c)
-  entries => match [nested-selector(s, last(entries).selector) for s in tx.segment(n.head, ',')] {
+fn pushed-rule(st: Nest, e: Entry) -> Nest = st with { selectors: st.selectors ++ [e], pushed: st.pushed ++ [true] }
+fn quiet(st: Nest) -> Nest = st with { pushed: st.pushed ++ [false] }
+
+fn rule-entered(st: Nest, t: Token) -> Nest = match st.selectors {
+  [] => inside-rule(st, t, Entry(selector: top-selector(t.node.head), dead: false))
+  entries if t.node.head == "&" => quiet(st)
+  entries => match [nested-selector(s, last(entries).selector) for s in tx.segment(t.node.head, ',')] {
     selectors => match [s for s in selectors if not never-matches?(sel.parse(s))] {
-      [] => children-walked(st with { selectors: st.selectors ++ [Entry(selector: join(selectors, ", "), dead: true)] }, n)
-      live => inside-rule(st, n, Entry(selector: join(live, ", "), dead: false))
+      [] => pushed-rule(st, Entry(selector: join(selectors, ", "), dead: true))
+      live => inside-rule(st, t, Entry(selector: join(live, ", "), dead: false))
     }
   }
 }
 
 # A rule with declarations of its own is emitted whole, its nested rules and all.
-fn inside-rule(st: Nest, n: ast.Css, e: Entry) -> Nest = match any c in n.nodes: c.kind == ast.Decl {
-  true => exited-rule(fold s = st with { selectors: st.selectors ++ [e] } for c in n.nodes: emitted(s, c))
-  false => children-walked(st with { selectors: st.selectors ++ [e] }, n)
+fn inside-rule(st: Nest, t: Token, e: Entry) -> Nest = match any c in t.node.nodes: c.kind == ast.Decl {
+  true => (fold s = pushed-rule(st, e) for c in t.node.nodes: emitted(s, c)) with { skip: t.depth }
+  false => pushed-rule(st, e)
 }
-
-fn children-walked(st: Nest, n: ast.Css) -> Nest = exited-rule(fold s = st for c in n.nodes: entered(s, c))
-
-fn exited-rule(st: Nest) -> Nest = st with { open: -1, selectors: st.selectors[0..len(st.selectors) - 1] }
 
 # A top-level selector's `&` is `:scope`.
 fn top-selector(s: Text) -> Text = match has-byte?(s, '&') {
@@ -390,88 +420,86 @@ fn amp-one(n: sel.Sel, by: Text) -> Replaced = match n.kind {
   }
 }
 
-fn at-rule-entered(st: Nest, n: ast.Css) -> Nest = match n {
-  _ if dead?(st) and n.head == "@layer" and len(n.nodes) == 0 =>
-    emitted(st with { selectors: [] }, n) with { selectors: st.selectors }
-  _ if dead?(st) and (len(n.nodes) == 0 or not (n.head in hoistable)) => st
-  _ if len(n.nodes) == 0 and not (n.head in droppable-if-empty) => emitted(st, n)
-  _ if n.head in hoistable => match fold s = st with { at-rules: st.at-rules ++ [AtEntry(name: n.head, params: n.params)] } for c in n.nodes: entered(s, c) {
-    s => s with { open: -1, at-rules: s.at-rules[0..len(s.at-rules) - 1] }
-  }
-  _ => emitted(st, n)
+fn at-rule-entered(st: Nest, t: Token) -> Nest = match t.node {
+  n if dead?(st) and n.head == "@layer" and len(n.nodes) == 0 =>
+    quiet((emitted(st with { selectors: [] }, n) with { selectors: st.selectors }) with { skip: t.depth })
+  n if dead?(st) and (len(n.nodes) == 0 or not (n.head in hoistable)) => quiet(st with { skip: t.depth })
+  n if len(n.nodes) == 0 and not (n.head in droppable-if-empty) => quiet(emitted(st, n) with { skip: t.depth })
+  n if n.head in hoistable => st with { at-rules: st.at-rules ++ [Head(rule: false, name: n.head, params: n.params)], pushed: st.pushed ++ [true] }
+  n => quiet(emitted(st, n) with { skip: t.depth })
 }
 
 # Tailwind's `emit`: into the list being filled; else at the top when outside every rule; else a
 # new rule for the selector (or the rule before, when it is the same selector), inside the at-rules
-# that are not already the last node's.
+# that are not already the last placement's.
 fn emitted(st: Nest, n: ast.Css) -> Nest = match st.open {
-  d if d == -2 => st
-  d if d >= 0 => st with { result: spine-append-unique(st.result, d, n) }
-  _ => match st.selectors, st.at-rules {
-    [], [] => match st.result {
-      [init..., prev] if prev.kind == ast.AtRule and n.kind == ast.AtRule and len(prev.nodes) == 0 and len(n.nodes) == 0
-                         and prev.head == n.head and prev.params == n.params => st
-      _ => st with { result: st.result ++ [n] }
+  _ if st.open-gone => st
+  some(path) => placed(st, Place(path: path, shared: len(path), leaf: some(n)), st.open)
+  none => match st.selectors, st.at-rules {
+    [], [] => match st.prev {
+      some(prev) if len(prev.path) == 1 and is-none(prev.leaf) and n.kind == ast.AtRule and len(n.nodes) == 0
+                     and not prev.path[0].rule and prev.path[0].name == n.head and prev.path[0].params == n.params and len(st.last) == 1 => st
+      _ => placed(st, Place(path: [], shared: 0, leaf: some(n)), none)
     }
-    _, _ => placed(st, n, matched-at-rules(st.result, st.at-rules, 0))
+    entries, ats => match matched-at-rules(st.last, ats, 0) {
+      offset if len(entries) > 0 and offset == len(ats) and len(st.last) > offset and st.last[offset].rule
+                 and st.last[offset].name == last(entries).selector =>
+        placed(st, Place(path: ats ++ [rule-head(last(entries).selector)], shared: offset + 1, leaf: some(n)), some(ats ++ [rule-head(last(entries).selector)]))
+      offset if len(entries) > 0 => placed(st, Place(path: ats ++ [rule-head(last(entries).selector)], shared: offset, leaf: some(n)),
+                                           some(ats ++ [rule-head(last(entries).selector)]))
+      offset if offset == len(ats) => placed(st, Place(path: ats, shared: offset, leaf: some(n)), none) with { open-gone: true }
+      offset => placed(st, Place(path: ats, shared: offset, leaf: some(n)), some(ats))
+    }
   }
 }
 
-# How many of the at-rules the walk is inside are already the output's last nodes, outermost first.
-fn matched-at-rules(nodes: [ast.Css], ats: [AtEntry], i: Int) -> Int = match i < len(ats) {
-  false => i
-  true => match nodes {
-    [init..., prev] if prev.kind == ast.AtRule and prev.head == ats[i].name and prev.params == ats[i].params =>
-      matched-at-rules(prev.nodes, ats, i + 1)
-    _ => i
-  }
+fn rule-head(selector: Text) -> Head = Head(rule: true, name: selector, params: "")
+
+# A placement made, the list it fills left open; an empty at-rule placed as a head of its own.
+fn placed(st: Nest, p: Place, open: [Head]?) -> Nest = match p.leaf {
+  some(n) if n.kind == ast.AtRule and len(n.nodes) == 0 =>
+    st with { fresh: st.fresh ++ [head-place], prev: some(head-place),
+              open: open, last: head-place.path } where head-place = p with { path: p.path ++ [Head(rule: false, name: n.head, params: n.params)], leaf: none }
+  _ => st with { fresh: st.fresh ++ [p], prev: some(p), open: open, last: p.path }
 }
 
-fn placed(st: Nest, n: ast.Css, offset: Int) -> Nest = match st.selectors {
-  [] => match wrapped([n], st.at-rules[offset..len(st.at-rules)]) {
-    roots if offset == len(st.at-rules) => st with { result: spine-append(st.result, offset, roots), open: -2 }
-    roots => st with { result: spine-append(st.result, offset, roots), open: offset + len(st.at-rules) - offset }
-  }
-  entries if offset == len(st.at-rules) and same-rule-last?(st.result, offset, last(entries).selector) =>
-    st with { result: spine-append-unique(st.result, offset + 1, n), open: offset + 1 }
-  entries => st with { result: spine-append(st.result, offset, wrapped([ast.rule(last(entries).selector, [n])], st.at-rules[offset..len(st.at-rules)])),
-                       open: offset + (len(st.at-rules) - offset) + 1 }
+# How many of the at-rules the walk is inside lead the last placement's path.
+fn matched-at-rules(last-path: [Head], ats: [Head], i: Int) -> Int = match i < len(ats) and i < len(last-path) {
+  true if not last-path[i].rule and last-path[i].name == ats[i].name and last-path[i].params == ats[i].params => matched-at-rules(last-path, ats, i + 1)
+  _ => i
 }
 
-fn wrapped(nodes: [ast.Css], ats: [AtEntry]) -> [ast.Css] = match ats {
-  [] => nodes
-  [outer, inner...] => [ast.at-rule(outer.name, outer.params, wrapped(nodes, inner))]
+# The output from the placements: at each depth, a placement starts a new node unless it shares
+# that depth's head with the one before it. Tailwind dedupes the declarations of the lists it
+# filled (an earlier one the same as a later goes); the top level is not one of them.
+fn built(places: [Place], depth: Int) -> [ast.Css] = match depth {
+  0 => made-children(places, depth)
+  _ => deduped(made-children(places, depth))
 }
 
-fn same-rule-last?(nodes: [ast.Css], depth: Int, selector: Text) -> Bool = match spine-last(nodes, depth) {
-  some(r) => r.kind == ast.StyleRule and r.head == selector
-  none => false
+fn made-children(places: [Place], depth: Int) -> [ast.Css] =
+  [n for g in groups for n in group-node(places[g.from..g.to], depth)]
+  where starts = [i for i in 0..len(places) if i == 0 or len(places[i].path) == depth or places[i].shared <= depth
+                  or len(places[i - 1].path) == depth],
+        groups = [Range(from: starts[k], to: if k + 1 < len(starts) then starts[k + 1] else len(places)) for k in 0..len(starts)]
+
+record Range { from: Int, to: Int }
+
+fn group-node(group: [Place], depth: Int) -> [ast.Css] = match group[0] {
+  p if len(p.path) == depth => [n for x in group for n in x.leaf]
+  p => [headed(p.path[depth], built([x for x in group if len(x.path) > depth + 1 or is-some(x.leaf)], depth + 1))]
 }
 
-fn spine-last(nodes: [ast.Css], depth: Int) -> ast.Css? = match nodes {
-  [] => none
-  [init..., l] if depth == 0 => some(l)
-  [init..., l] => spine-last(l.nodes, depth - 1)
+fn headed(h: Head, children: [ast.Css]) -> ast.Css = match h.rule {
+  true => ast.style-rule(h.name, children)
+  false => ast.at-rule(h.name, h.params, children)
 }
 
-fn spine-append(nodes: [ast.Css], depth: Int, more: [ast.Css]) -> [ast.Css] = match depth {
-  0 => nodes ++ more
-  _ => match nodes {
-    [init..., l] => init ++ [l with { nodes: spine-append(l.nodes, depth - 1, more) }]
-    [] => panic "tailwind: nothing to nest into"
-  }
-}
+fn deduped(nodes: [ast.Css]) -> [ast.Css] =
+  [nodes[i] for i in 0..len(nodes) if not (nodes[i].kind == ast.Decl and (any j in i + 1..len(nodes): same-decl?(nodes[i], nodes[j])))]
 
-# Tailwind dedupes the declarations of the lists it fills: an earlier one the same as a later one
-# (property, value and importance) goes. Doing it as each comes is the same; lists taken whole are
-# left alone.
-fn spine-append-unique(nodes: [ast.Css], depth: Int, n: ast.Css) -> [ast.Css] = match depth {
-  0 => [x for x in nodes if not (n.kind == ast.Decl and x.kind == ast.Decl and x.head == n.head and (x.value ?? "") == (n.value ?? "") and is-some(x.value) == is-some(n.value) and x.important == n.important)] ++ [n]
-  _ => match nodes {
-    [init..., l] => init ++ [l with { nodes: spine-append-unique(l.nodes, depth - 1, n) }]
-    [] => panic "tailwind: nothing to nest into"
-  }
-}
+fn same-decl?(a: ast.Css, b: ast.Css) -> Bool = b.kind == ast.Decl and a.head == b.head and a.important == b.important
+  and (a.value ?? "") == (b.value ?? "") and is-some(a.value) == is-some(b.value)
 
 # ---------------------------------------------------------------- substituting `&`
 
