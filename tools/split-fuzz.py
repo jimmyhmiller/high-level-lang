@@ -29,6 +29,7 @@ OUT = os.path.join(ROOT, "out/split-fuzz")
 
 ROUTER = """export function log(s) { (globalThis.__log ??= []).push(String(s)); }
 export const createFileRoute = (id) => (options) => { log("create " + id); return { id, options }; };
+export const createRootRoute = (options) => ({ id: "__root__", options });
 export const lazyRouteComponent = (importer, name) => (...a) => importer().then((m) => m[name](...a));
 export const lazyFn = (importer, name) => (...a) => importer().then((m) => m[name](...a));
 """
@@ -120,7 +121,8 @@ def program(rng, folder):
         "node_modules/@tanstack/react-router/package.json": '{"name":"@tanstack/react-router","type":"module","main":"index.js","sideEffects":false}',
         "node_modules/@tanstack/react-router/index.js": ROUTER,
         "shared.js": SHARED,
-        "tsr.config.json": json.dumps({"routesDirectory": "./routes"}),
+        "tsr.config.json": json.dumps({"routesDirectory": "./routes", "generatedRouteTree": "./routeTree.gen.js", "disableTypes": True}),
+        "routes/__root.js": 'import { createRootRoute } from "@tanstack/react-router";\nexport const Route = createRootRoute({});\n',
     }
     for k in range(n):
         files[f"routes/r{k}.js"] = route_file(rng, k)
