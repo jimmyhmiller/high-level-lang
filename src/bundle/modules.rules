@@ -156,7 +156,10 @@ boxed record Loading {
   # `--minify-syntax`: constants are written in where they are read (bundle.constants).
   inline-constants: Bool,
   # A development build: a stylesheet a module imports is a module that puts it in the page.
-  dev-styles: Bool
+  dev-styles: Bool,
+  # Vite's import queries: `x?url` is the URL of `x` as an asset of the build's (a stylesheet's
+  # bundled), `x?raw` its text.
+  url-queries: Bool
 }
 
 setting loading: Loading
@@ -475,7 +478,24 @@ fn resolve-import(spec: Text, importer: Text) -> res.Resolved = resolved-now(imp
 
 fn resolved-now(request: Request, importer: Text) -> res.Resolved = match hook-path(aliased(request.spec), importer) {
   some(p) => res.Resolved(path: p, side-effects: true)
-  none => searched-for(request, importer)
+  none => match url-query(request.spec) {
+    some(q) => res.Resolved(path: searched-for(request with { spec: text-before(request.spec, "?" ++ q) }, importer).path ++ "?" ++ q,
+                            side-effects: false)
+    none => searched-for(request, importer)
+  }
+}
+
+# The query of a specifier Vite reads (`?url`, `?raw`), when the build reads them.
+fn url-query(spec: Text) -> Text? = match loading.url-queries, spec {
+  true, _ ++ "?url" => some("url")
+  true, _ ++ "?raw" => some("raw")
+  _, _ => none
+}
+
+# A module that is a file's URL or text: the file.
+fn queried-file(path: Text) -> Text = match path {
+  base ++ "?url" | base ++ "?raw" => base
+  _ => path
 }
 
 # Where an import leads when no hook says: the project's paths, then the search.
@@ -490,6 +510,8 @@ fn searched-for(request: Request, importer: Text) -> res.Resolved = match config
 
 fn loader-of(path: Text) -> Text = match path {
   "json:" ++ _ => "json module"
+  _ ++ "?url" => "url"
+  _ ++ "?raw" => "text"
   _ => (first l in loading.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
 }
 
@@ -505,6 +527,7 @@ fn default-loader(path: Text) -> Text = match path {
 # A file's text as a module, by what its loader says it is.
 fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
   "file" => "export default " ++ host.js-string(cssb.file-url(path)) ++ ";"
+  "url" => "export default " ++ host.js-string(url-of(queried-file(path))) ++ ";"
   _ => module-text(text, path)
 }
 
@@ -516,8 +539,20 @@ fn source-of(path: Text) -> Text = match path {
 
 fn file-source(path: Text) -> Text = match path {
   "disabled:" ++ _ => "module.exports = {};"
-  _ => read-file(path)
+  _ => read-file(queried-file(path))
 }
+
+# The URL of a file the build writes as an asset: a stylesheet as it is bundled, any other file as
+# it is.
+fn url-of(file: Text) -> Text = match path-ext(file) {
+  ".css" => cssb.asset-prefix() ++ css-asset-name(file)
+  _ => cssb.file-url(file)
+}
+
+fn css-asset-name(file: Text) -> Text = path-stem(file) ++ "-" ++ host.content-hash(url-sheet(file).text) ++ ".css"
+
+# A stylesheet a `?url` names, bundled where it will be written.
+fn url-sheet(file: Text) -> cssb.Bundled = cssb.bundle([file], cssb.asset-directory ++ "/" ++ path-stem(file) ++ ".css", loading.inline-constants, false, "eof")
 
 # The specifier a statement imports from, or nothing.
 fn import-spec-of(s: Node) -> Text? = match s {
@@ -674,7 +709,7 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
   "dataurl" => "export default \"" ++ host.data-url-of(text, host.mime-of(path)) ++ "\";"
   "css" if loading.dev-styles => dev-style-module(path)
   "empty" | "css" => ""
-  "file" => panic "{}: the file loader's text is made by the linking stage", path
+  "file" | "url" => panic "{}: the {} loader's text is made by the linking stage", path, loader-of(path)
   other => panic "{}: no loader named {}", path, other
 }
 

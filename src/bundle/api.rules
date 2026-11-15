@@ -68,6 +68,8 @@ boxed record Options {
   dev: Bool,
   # `--manifest`: what each entry and `import()` became, as Vite's `.vite/manifest.json` says it.
   manifest: Bool,
+  # Vite's import queries, `?url` and `?raw` (see `Loading.url-queries`).
+  url-queries: Bool,
   outfile: Text,
   outdir: Text,
   outbase: Text,
@@ -139,12 +141,21 @@ fn keep-as-is(n: Node) -> Node = n
 # What `minify syntax` means unless a build says otherwise.
 fn default-optimize(n: Node) -> Node = fin.finished(minify.run(n), false)
 
+# Vite's assets: an image, a font, a medium a module or stylesheet names is a file the build writes
+# (the file loader), unless a loader is given for its extension.
+const vite-assets: [Text] = [".apng", ".png", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp", ".gif", ".svg", ".ico", ".webp", ".avif",
+  ".cur", ".jxl", ".mp4", ".webm", ".ogg", ".mp3", ".wav", ".flac", ".aac", ".opus", ".mov", ".m4a", ".vtt", ".woff", ".woff2",
+  ".eot", ".ttf", ".otf", ".webmanifest", ".pdf", ".txt"]
+
+fn with-vite-assets(o: Options) -> Options =
+  o with { url-queries: true, loaders: o.loaders ++ [m.TextPair(key: ext, value: "file") for ext in vite-assets if not (any l in o.loaders: l.key == ext)] }
+
 # A build of an HTML page (bundle.pages): its module scripts and stylesheets are the entries, split
 # into ES module chunks named, as Vite names them, under `assets/`.
 fn paged(o: Options) -> Options = match o.entry {
   page ++ ".html" => match pages.entries(pages.page-of(o.entry)) {
     [] => fail-build(o.entry ++ ": the page loads no module script or stylesheet of the project's to build")
-    entries => o with { page: o.entry, entry: entries[0], entries: entries, splitting: true, format: esm-format(),
+    entries => with-vite-assets(o) with { page: o.entry, entry: entries[0], entries: entries, splitting: true, format: esm-format(),
                         entry-names: "assets/[name]-[hash]", chunk-names: "assets/[name]-[hash]",
                         outdir: match o.outdir { "" => fail-build("a page is built to a directory: give --outdir")  d => d } }
   }
@@ -152,7 +163,7 @@ fn paged(o: Options) -> Options = match o.entry {
 }
 
 fn options-new(entry: Text, outfile: Text) -> Options =
-  Options(entry: entry, entries: [entry], page: "", dev: false, manifest: false, outfile: outfile, outdir: "", outbase: "", splitting: false,
+  Options(entry: entry, entries: [entry], page: "", dev: false, manifest: false, url-queries: false, outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]", chunking: packing.options(),
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
@@ -390,7 +401,7 @@ fn loading-of(o: Options, out-dir: Text) -> m.Loading =
             transforms: o.transforms, aliases: o.aliases, loaders: o.loaders, on-resolve: o.on-resolve,
             on-load: o.on-load, jsx-options: o.jsx, out-dir: out-dir,
             packages-external: o.packages-external, public-path: o.public-path, inline-constants: o.minify-syntax,
-            dev-styles: o.dev)
+            dev-styles: o.dev, url-queries: o.url-queries)
 
 fn linking-of(o: Options, entry-namespace: Bool, splitting: Bool, f: Format) -> an.Linking =
   an.Linking(entry-namespace: entry-namespace, tree-shaking: o.tree-shaking,
@@ -539,6 +550,18 @@ fn assets-written(assets: [cssb.Asset]) -> [Written] = [Written(path: a.to, text
 fn module-assets(out-dir: Text) -> [cssb.Asset] =
   [cssb.asset-of(mo.path, out-dir) for mo in m.modules if mo.kind != m.External and m.loader-of(mo.path) == "file"]
 
+# The files `?url` imports name, written as assets: a stylesheet bundled, with the files it names,
+# any other file as it is.
+fn url-assets(out-dir: Text) -> [Written] =
+  [w for mo in m.modules if mo.kind != m.External and m.loader-of(mo.path) == "url" for w in url-asset(m.queried-file(mo.path), out-dir) distinct w.path]
+
+fn url-asset(file: Text, out-dir: Text) -> [Written] = match path-ext(file) {
+  ".css" => [Written(path: dir-of(cssb.asset-of(file, out-dir).to) ++ "/" ++ m.css-asset-name(file), text: sheet.text, said: "")]
+            ++ assets-written(sheet.assets)
+    where sheet = m.url-sheet(file)
+  _ => assets-written([cssb.asset-of(file, out-dir)])
+}
+
 # One bundle, as the build's settings say how to load, link, emit and print it.
 fn one-built(options: Options) -> [Written] = match options.entry {
   _ ++ ".css" => css-built(options)
@@ -659,7 +682,7 @@ fn final-names(o: Options) -> sym.Table = match o.minify-identifiers {
 fn named-built(o: Options, f: Format) -> [Written] =
   beside(o.outfile ++ ".LEGAL.txt", notes.file) ++ js
   ++ [sheet-written(css-out, b)... for b in css]
-  ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile)))
+  ++ assets-written([a for b in css for a in b.assets] ++ module-assets(dir-of(o.outfile))) ++ url-assets(dir-of(o.outfile))
   ++ analysis-written(o, [analyze.Output(path: o.outfile, kind: "js", text: text-written(js, o.outfile), base: len(head) + out0.base, marks: out0.marks, root: m.entry,
                                          imports: [], dynamic: [])]
                          ++ [analyze.Output(path: css-out, kind: "css", text: b.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for b in css],
@@ -920,7 +943,7 @@ fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> 
   ++ analysis-written(o, [chunk-analyzed(all, i, printed[i], holes[i], paths, text-written(js[i], paths[i])) for i in 0..len(all)]
                          ++ [analyze.Output(path: s.path, kind: "css", text: s.bundle.text, base: 0, marks: [], root: -1, imports: [], dynamic: []) for s in styles],
                       m.entries ++ an.linked.dynamic-roots)
-  ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
+  ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir)) ++ url-assets(o.outdir)
   ++ page-written(o, all, paths, styles)
   ++ manifest-written(o, all, paths, styles)
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
