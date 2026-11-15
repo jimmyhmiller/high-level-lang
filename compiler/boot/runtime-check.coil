@@ -167,6 +167,75 @@
       (rt/scratch-dispose! scratch)))
   0)
 
+;;; Settings copy short-lived values, share retained answers, and keep only the regions of the
+;;; parts they actually share. Releasing the original owners must leave the setting readable.
+(defn setting-copy-check [] (-> void)
+  (rt/reclaim!)
+  (let [v (rt/var-region-open!)
+        (mut xs) (ArrayList::new [i64] (rt/value-allocator))]
+    (push! (mut xs) 41)
+    (rt/answer-region-close! v)
+    (let [parent (rt/answer-region-open! "test parent")
+          (mut ys) (ArrayList::new [i64] (rt/value-allocator))]
+      (push! (mut ys) 42)
+      (let [setting (rt/setting-region-open! "test setting")]
+        (rt/own-begin!)
+        (let [x (rt/ints-own-in (rt/setting-copy-from) xs)
+              y (rt/ints-own-in (rt/setting-copy-from) ys)]
+          (rt/own-end!)
+          (rt/answer-region-close! setting)
+          (rt/answer-region-close! parent)
+          (when (or (= (rt/list-storage x) (rt/list-storage xs))
+                    (= (rt/list-storage y) (rt/list-storage ys)))
+            (panic "a setting shared a var's or parent's storage"))
+          (rt/var-region-release! v)
+          (rt/region-release-id! parent)
+          (rt/regions-safe-point!)
+          (when (or (!= (get x 0) 41) (!= (get y 0) 42))
+            (panic "a setting lost a copied value"))
+          (rt/region-release-id! setting)))))
+  (let [answer (rt/answer-region-open! "test answer")
+        (mut xs) (ArrayList::new [i64] (rt/value-allocator))]
+    (push! (mut xs) 43)
+    (rt/answer-region-close! answer)
+    (let [setting (rt/setting-region-open! "test sharing")]
+      (rt/own-begin!)
+      (let [x (rt/ints-own-in (rt/setting-copy-from) xs)]
+        (rt/own-end!)
+        (rt/answer-region-close! setting)
+        (when (!= (rt/list-storage x) (rt/list-storage xs)) (panic "an answer was copied instead of shared"))
+        (rt/region-release-id! answer)
+        (rt/regions-safe-point!)
+        (when (!= (get x 0) 43) (panic "a setting did not hold its shared answer"))
+        (let [address (rt/list-storage x)]
+          (rt/region-release-id! setting)
+          (rt/regions-safe-point!)
+          (when (!= (rt/region-at address) 0) (panic "a released chunk stayed indexed"))))))
+  0)
+
+;;; Context keys retain the whole argument and unambiguously delimit arbitrary context names.
+(defn context-key-check [] (-> void)
+  (let [outside (rt/context-text-key "client\x01;value")]
+    (rt/context-enter! "client")
+    (let [inside (rt/context-text-key "value")
+          low (rt/context-int-key 7)
+          high (rt/context-int-key 288230376151711751)]
+      (when (= outside inside) (panic "a context key collided with an outside key"))
+      (when (= low high) (panic "a context key discarded an integer's high bits"))
+      (when (= (rt/context-int-key -1) (rt/context-int-key 288230376151711743))
+        (panic "a negative context key collided"))
+      (rt/context-leave!)
+      (rt/context-enter! "client")
+      (when (!= low (rt/context-int-key 7)) (panic "a context key changed on reentry"))
+      (rt/context-leave!)))
+  (rt/context-enter! "a")
+  (let [one (rt/context-text-key "b\x01;c")]
+    (rt/context-leave!)
+    (rt/context-enter! "a\x01;b")
+    (when (= one (rt/context-text-key "c")) (panic "context names and arguments were not delimited"))
+    (rt/context-leave!))
+  0)
+
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (when (> argc 1)
     (let [scratch (rt/scratch-enter!)
@@ -178,6 +247,7 @@
       (rt/scratch-dispose! scratch)
       ;; With HL_REGION_CHECK=1 this must fault, never print a stale value.
       (println "released value: {}" (get bytes 0))))
+  (context-key-check)
   (lookup-check)
   (scratch-check)
   (memo-map-check)
@@ -187,6 +257,7 @@
   (int-seen-check)
   (scratch-copy-check)
   (when (or (tracking-a) (tracking-b)) (panic "tracking started before it was enabled"))
+  (setting-copy-check)
   (rt/dep-track!)
   (when (not (and (tracking-a) (tracking-b))) (panic "tracking switch is not shared"))
   (println "generic runtime checks passed")

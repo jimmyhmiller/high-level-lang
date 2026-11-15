@@ -11,7 +11,7 @@
 # regions alive, and their bytes), and its memory over the five builds to each, the middle reading. The regions must hold no more than
 # they did after build WARM, give or take 2%; the process's memory (its footprint on macOS, its
 # resident set elsewhere) may grow by at most 3% or 4 MB.
-#   usage: memory-check.py ESB [APP...] [--edits=N] [--warm=N]   (APP: zod, rx, datefns, three, …, manyzod: twelve zods)
+#   usage: memory-check.py ESB [APP...] [--edits=N] [--warm=N] [--case=statements|exports|hot-updates]   (APP: zod, rx, datefns, three, …, manyzod: twelve zods)
 import json, os, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guard
@@ -19,6 +19,9 @@ import guard
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 EDITS = next((int(a.split("=")[1]) for a in sys.argv[1:] if a.startswith("--edits=")), 200)
 WARM = next((int(a.split("=")[1]) for a in sys.argv[1:] if a.startswith("--warm=")), 20)
+CASE = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--case=")), None)
+if CASE not in (None, "statements", "exports", "hot-updates"):
+    sys.exit("--case must be statements, exports, or hot-updates")
 ESB, = guard.in_tests(args[:1])
 APPS = args[1:] or ["zod"]
 TESTS = os.getcwd()
@@ -94,7 +97,7 @@ def session(entry, rel, change, flags):
                 # The regions as the build's end left them, after what nothing held was let go.
                 held[builds] = (int(r.group(1)), int(r.group(2)) * 1024)
                 # The process's memory over the five builds that end at WARM and the five last.
-                if WARM - 4 <= builds <= WARM or builds > EDITS - 4:
+                if WARM - 4 <= builds <= WARM or builds > EDITS - 4 or (os.environ.get("MEMORY_PROFILE") and builds % 20 == 0):
                     # Once what the build was doing has settled (it may still be giving memory back).
                     time.sleep(0.3)
                     seen[builds] = resident(p.pid)
@@ -104,9 +107,16 @@ def session(entry, rel, change, flags):
     finally:
         os.killpg(p.pid, 9); p.wait()
         write(rel, original)
+        profile = os.environ.get("MEMORY_PROFILE")
+        if profile:
+            os.makedirs(profile, exist_ok=True)
+            with open(os.path.join(profile, f"{p.pid}-watch.log"), "w") as file:
+                file.write("".join(said))
+            with open(os.path.join(profile, f"{p.pid}-measurements.json"), "w") as file:
+                json.dump({"held": held, "footprint": seen}, file, indent=2)
     if builds <= EDITS or WARM not in held:
         sys.exit("the watcher stopped early:\n" + "".join(said)[-2000:])
-    early = [v for b, v in seen.items() if b <= WARM and v is not None]
+    early = [v for b, v in seen.items() if WARM - 4 <= b <= WARM and v is not None]
     late = [v for b, v in seen.items() if b > EDITS - 4 and v is not None]
     middle = lambda xs: sorted(xs)[len(xs) // 2] if xs else None
     return held[WARM], held[EDITS + 1], middle(early), middle(late)
@@ -128,6 +138,7 @@ for app in APPS:
         ("hot updates", module, lambda text, i: f'console.log("memory edit {i}");\n' + text, ["--hmr"]),
     ]
     for name, rel, change, flags in sessions:
+        if CASE is not None and name.replace(" ", "-") != CASE: continue
         (n0, b0), (n1, b1), r0, r1 = session(entry, rel, change, flags)
         check(b1 <= b0 * 1.02 + 2**20,
               f"{name}: regions {n0} → {n1}, holding {MB(b0)} → {MB(b1)}")

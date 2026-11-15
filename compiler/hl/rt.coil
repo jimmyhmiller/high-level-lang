@@ -311,7 +311,10 @@
    (space bool)
    (stretches (ArrayList i64))
    (space-at i64)
-   (space-end i64)])
+   (space-end i64)
+   ;; A setting's value's (see `setting-region-open!`): another setting's value copies what it
+   ;; has of it rather than holding it, so no setting's region holds another's.
+   (setting bool)])
 
 ;;; Where one thread allocates in one region: the free bytes of its current chunk, `at` up to
 ;;; `end`; the start of the last allocation, which can grow or be taken back in place; and the size
@@ -337,6 +340,7 @@
               :shared 0
               :label ""
               :space false
+              :setting false
               :stretches (ArrayList::new [i64] (malloc-allocator))
               :space-at 0
               :space-end 0))
@@ -393,7 +397,9 @@
       (spin-unlock! (field r lock))
       (store! (primitive/cast (ptr i64) p) before)
       (store! (primitive/cast (ptr i64) (+ p 8)) size))
-    (unless (.lasting r) (atomic/add (field (region-queue) bytes-made) size))
+    (unless (.lasting r)
+      (atomic/add (field (region-queue) bytes-made) size)
+      (chunk-index-add! p size r))
     (+ p (chunk-header-bytes))))
 
 (defn cursor-allocate :inline (Always) [(c (ptr Cursor)) (bytes i64) (align i64)] (-> (ptr i8))
@@ -526,6 +532,11 @@
 ;;; A thread's stack of regions: where its values go is the allocator on top, into `region`. The
 ;;; stack holds each entered region with its allocator's state and whether that is a shared cursor.
 (defstruct ThreadRegions [(top (dyn Allocator)) (region (ptr Region)) (stack (ArrayList i64)) (scratch i64)
+                          ;; The regions of the `var`s this thread holds values in (see
+                          ;; `var-region-open!`); and, while a setting's value is copied, the
+                          ;; regions it copies from (see `setting-region-open!`).
+                          (vars (ArrayList i64))
+                          (copy-from (ArrayList i64))
                           ;; How many computations working apart (see `apart-enter!`) enclose what this
                           ;; thread does now: what it is handed may be let go when they answer.
                           (apart i64)
@@ -575,6 +586,8 @@
     (store! t (ThreadRegions :top (primitive/make-dyn Allocator c)
                              :region r
                              :stack (ArrayList::new [i64] (malloc-allocator)) :scratch 0 :apart 0
+                             :vars (ArrayList::new [i64] (malloc-allocator))
+                             :copy-from (ArrayList::new [i64] (malloc-allocator))
                              :kept-last "" :in-job 0 :settings-view 0 :item 0 :name-notes 0
                              :help-seq 0 :help-took (ArrayList::new [i64] (malloc-allocator))))
     (push! (mut (.stack t)) (primitive/cast i64 r))
@@ -708,6 +721,11 @@
 
 ;;; Whether the byte at `p` is in scratch region `r`; in any scratch region at all, for `r` 0.
 (defn scratch-holds? [(r (ptr Region)) (p i64)] (-> bool)
+  (if (= (primitive/cast i64 r) 1)
+      (copy-from-holds? p)
+      (scratch-only-holds? r p)))
+
+(defn scratch-only-holds? [(r (ptr Region)) (p i64)] (-> bool)
   (and (scratch-space-holds? p)
        (or (= (primitive/cast i64 r) 0)
            (let [(mut found) false
@@ -1169,6 +1187,11 @@
                   size (load (primitive/cast (ptr i64) (+ at 8)))]
               (push! (mut ranges) at)
               (push! (mut ranges) (+ at size))
+              ;; Checking, with HL_REGION_GONE set: each chunk let go and what made its region,
+              ;; so an address a stale read faults on names the region that held it.
+              (when (and (region-check?) (env-on? "HL_REGION_GONE"))
+                (eprintln "[region gone] {} {} {}" at (+ at size) (.label r)))
+              (unless (.lasting r) (chunk-index-remove! at size))
               (chunk-let-go! at size)
               (set! at before))))
         (set! (.bytes-let-go q) (+ (.bytes-let-go q) (.bytes r)))
@@ -1365,6 +1388,157 @@
         (region-ref! cur (primitive/cast (ptr Region) r))
         (region-release-id! r))))
   0)
+
+;;; A `var`'s region (see `escape-assign` in the rules compiler), which this thread knows of while
+;;; the var holds it: a setting given part of the var's value copies that part (see
+;;; `setting-region-open!`), since the var lets its region go when it is given another.
+(defn var-region-open! [] (-> i64)
+  (let [r (answer-region-open! "var")]
+    (when (!= r 0) (push! (mut (.vars (thread-regions))) r))
+    r))
+
+(defn var-region-forget! [(r i64)] (-> void)
+  (when (!= r 0)
+    (let [t (thread-regions)
+          (mut at) -1]
+      (for i (range 0 (len (.vars t))) (when (= (get (.vars t) i) r) (set! at i)))
+      (when (< at 0) (panic "a var's region was let go that this thread does not know"))
+      (set! (mut (.vars t)) at (get (.vars t) (- (len (.vars t)) 1)))
+      (pop! (mut (.vars t)))))
+  0)
+
+;;; The var given another value lets its region go.
+(defn var-region-release! [(r i64)] (-> void)
+  (var-region-forget! r)
+  (region-release-id! r)
+  0)
+
+;;; The var's block ended: its region taken over (`region-adopt-id!`).
+(defn var-region-adopt! [(r i64)] (-> void)
+  (var-region-forget! r)
+  (region-adopt-id! r)
+  0)
+
+;;; Which region of those that can be let go each chunk is in, by address: what a copy that shares
+;;; part of a value asks, so what it is copied into holds the region that part lies in (see
+;;; `copy-from-holds?`). Each chunk is listed under every 4 KB page it covers: `pages` has each
+;;; page's first entry, and an entry its chunk's start, end and region and the page's next entry.
+;;; A chunk is listed as it is added (`chunk-add-own!`) and taken off as its region is let go.
+(defstruct ChunkIndex
+  [(ready i64) (lock i64) (pages (HashMap i64 i64))
+   (starts (ArrayList i64)) (ends (ArrayList i64)) (regions (ArrayList i64)) (nexts (ArrayList i64))
+   (free (ArrayList i64))])
+
+(defn chunk-index [] (-> (ptr ChunkIndex))
+  (let [c (primitive/alloc-static ChunkIndex)]
+    (when (once-mine? (field c ready))
+      (set! (.pages c) (HashMap::new [i64 i64] (malloc-allocator) (i64-keyops)))
+      (set! (.starts c) (ArrayList::new [i64] (malloc-allocator)))
+      (set! (.ends c) (ArrayList::new [i64] (malloc-allocator)))
+      (set! (.regions c) (ArrayList::new [i64] (malloc-allocator)))
+      (set! (.nexts c) (ArrayList::new [i64] (malloc-allocator)))
+      (set! (.free c) (ArrayList::new [i64] (malloc-allocator)))
+      (once-made! (field c ready)))
+    c))
+
+(defn chunk-index-page :inline (Always) [(p i64)] (-> i64) (>> p 12))
+
+(defn chunk-index-add! [(at i64) (size i64) (r (ptr Region))] (-> void)
+  (let [c (chunk-index)]
+    (spin-lock! (field c lock))
+    (for page (range (chunk-index-page at) (+ (chunk-index-page (- (+ at size) 1)) 1))
+      (let [next (match (get (.pages c) page) (Some [e] e) (None [] -1))
+            e (match (pop! (mut (.free c)))
+                (Some [e] e)
+                (None [] (let [n (len (.starts c))]
+                           (push! (mut (.starts c)) 0)
+                           (push! (mut (.ends c)) 0)
+                           (push! (mut (.regions c)) 0)
+                           (push! (mut (.nexts c)) 0)
+                           n)))]
+        (set! (mut (.starts c)) e at)
+        (set! (mut (.ends c)) e (+ at size))
+        (set! (mut (.regions c)) e (primitive/cast i64 r))
+        (set! (mut (.nexts c)) e next)
+        (set! (mut (.pages c)) page e)))
+    (spin-unlock! (field c lock)))
+  0)
+
+(defn chunk-index-remove! [(at i64) (size i64)] (-> void)
+  (let [c (chunk-index)]
+    (spin-lock! (field c lock))
+    (for page (range (chunk-index-page at) (+ (chunk-index-page (- (+ at size) 1)) 1))
+      (let [(mut before) -1
+            (mut e) (match (get (.pages c) page) (Some [e] e) (None [] -1))]
+        (while (and (>= e 0) (!= (get (.starts c) e) at))
+          (set! before e)
+          (set! e (get (.nexts c) e)))
+        (when (< e 0) (panic "a chunk let go was never listed"))
+        (let [next (get (.nexts c) e)]
+          (cond (>= before 0) (set! (mut (.nexts c)) before next)
+                (>= next 0) (set! (mut (.pages c)) page next)
+                :else (HashMap::remove! (mut (.pages c)) page)))
+        (push! (mut (.free c)) e)))
+    (spin-unlock! (field c lock)))
+  0)
+
+;;; The region that can be let go whose memory `p` lies in; 0 for any other memory (a lasting
+;;; region's, a kept text's, the program's own).
+(defn region-at [(p i64)] (-> i64)
+  (let [c (chunk-index)]
+    (spin-lock! (field c lock))
+    (let [(mut e) (match (get (.pages c) (chunk-index-page p)) (Some [e] e) (None [] -1))
+          (mut found) 0]
+      (while (>= e 0)
+        (if (and (>= p (get (.starts c) e)) (< p (get (.ends c) e)))
+            (do (set! found (get (.regions c) e)) (set! e -1))
+            (set! e (get (.nexts c) e))))
+      (spin-unlock! (field c lock))
+      found)))
+
+;;; While a setting's value is copied (see `setting-region-open!`): whether the part at `p` is
+;;; copied, as it lies in a region that may be let go while the setting holds it (one on this
+;;; thread's stack, a var's, another setting's); else it is shared, and the region the value is
+;;; copied into holds the region it lies in, if any.
+(defn copy-from-holds? [(p i64)] (-> bool)
+  (let [r (region-at p)]
+    (cond (= r 0) false
+          (.setting (primitive/cast (ptr Region) r)) true
+          :else
+            (let [t (thread-regions)
+                  (mut found) false]
+              (for f (.copy-from t) (when (= f r) (set! found true)))
+              (unless found (region-ref! (region-current) (primitive/cast (ptr Region) r)))
+              found))))
+
+;;; The `from` of a copy of a setting's value (see `own-in-code` in the rules compiler): the regions
+;;; `setting-region-open!` named, in place of a scratch region.
+(defn setting-copy-from [] (-> (ptr Region))
+  (primitive/cast (ptr Region) 1))
+
+;;; The region a setting's value is made in, while the run reclaims memory, entered: the setting
+;;; holds it until it is given another. The value is made before, where values went then, and
+;;; copied into it (`setting-copy-from`) as far as it lies in regions that may be let go while the
+;;; setting holds it: those on this thread's stack (a loop's turn, an answer being made), its vars',
+;;; and other settings' values. What it shares lies in regions the new one holds (an answer's, a
+;;; relation's), as any region holds those it has values of; so no setting's region holds
+;;; another's, or a loop's turn, which hold it as they read the setting.
+(defn setting-region-open! [(label (slice u8))] (-> i64)
+  (if (reclaiming?)
+      (let [t (thread-regions)
+            r (region-new)
+            n (/ (len (.stack t)) 3)]
+        (set! (.label r) label)
+        (set! (.setting r) true)
+        (when (region-labels?) (regions-live-add! r))
+        (clear! (mut (.copy-from t)))
+        (for i (range 0 n)
+          (let [from (primitive/cast (ptr Region) (get (.stack t) (* i 3)))]
+            (unless (.lasting from) (push! (mut (.copy-from t)) (primitive/cast i64 from)))))
+        (for v (.vars t) (push! (mut (.copy-from t)) v))
+        (region-enter! r)
+        (primitive/cast i64 r))
+      0))
 
 ;;; A text's own copy, in the region values go to now.
 (defn text-copy [(s (slice u8))] (-> (slice u8))
@@ -3848,6 +4022,8 @@
   (= (atomic/read (field (names-record) on)) 1))
 
 ;;; Which element of a map this thread works on from here.
+(defn item-current :inline (Always) [] (-> i64) (.item (thread-regions)))
+
 (defn item-begin! :inline (Always) [(i i64)] (-> void)
   (set! (.item (thread-regions)) i)
   0)
@@ -3884,6 +4060,8 @@
       (push! (mut by-item) (ArrayList::new [(slice u8)] (malloc-allocator))))
     (for slot (range 0 (len (.notes r)))
       (for note (get (.notes r) slot)
+        (when (or (< (.item note) 0) (>= (.item note) count))
+          (panic "a recorded name has no item in its stage: {} of {}" (.item note) count))
         (push! (elem (mut by-item) (.item note)) (.name note)))
       (clear! (elem (mut (.notes r)) slot)))
     (for i (range 0 count)
@@ -9647,6 +9825,112 @@
   0)
 
 ;; ---------------------------------------------------------------- forgetting, while nothing is tracked
+
+;; ---------------------------------------------------------------- contexts
+
+;;; The contexts a program builds in side by side (`contexts` in the pipeline language): a
+;;; framework's browser build and server build. One is entered by giving the setting that names it;
+;;; while it is, each setting a context has of its own holds that context's value, binding count and
+;;; last value (what its next binding is compared with), each context's kept apart (`slots`, by
+;;; context), so going back to a context finds its settings as it left them, and an answer that reads
+;;; none of them is the same in every context. Context 0 is none: a build outside any context.
+(defstruct ContextOwn
+  [(name (slice u8))
+   ;; The setting's state taken out, as a block of its own (panics if it is given just now); and a
+   ;; block put back (0: a context that never gave it: unbound, nothing held).
+   (save (fnptr (cc/C) [] (ptr u8)))
+   (load (fnptr (cc/C) [(ptr u8)] void))
+   (slots (ArrayList i64))])
+
+(defstruct ContextsState
+  [(ready bool)
+   (current i64)
+   (names (ArrayList (slice u8)))
+   (stack (ArrayList i64))
+   (owns (ArrayList ContextOwn))])
+
+(defn contexts [] (-> (ptr ContextsState))
+  (let [c (primitive/alloc-static ContextsState)]
+    (unless (.ready c)
+      (init-lock!)
+      (unless (.ready c)
+        (set! (.names c) (ArrayList::new [(slice u8)] (malloc-allocator)))
+        (push! (mut (.names c)) "")
+        (set! (.stack c) (ArrayList::new [i64] (malloc-allocator)))
+        (set! (.owns c) (ArrayList::new [ContextOwn] (malloc-allocator)))
+        (set! (.ready c) true))
+      (init-unlock!))
+    c))
+
+(defn context-active? [] (-> bool) (> (.current (contexts)) 0))
+
+(defn context-index [(name (slice u8))] (-> i64)
+  (let [c (contexts)
+        (mut at) -1]
+    (for i (range 0 (len (.names c))) (when (= (get (.names c) i) name) (set! at i)))
+    (when (< at 0)
+      (set! at (len (.names c)))
+      (when (>= at 64) (panic "more than 63 contexts: {}" name))
+      (push! (mut (.names c)) (own-text name)))
+    at))
+
+;;; A context's own setting given while a context is entered: from now on it is swapped as contexts
+;;; change. Named once; a second module's helpers for the same setting are the same.
+(defn context-own-give! [(name (slice u8))
+                         (save (fnptr (cc/C) [] (ptr u8)))
+                         (load (fnptr (cc/C) [(ptr u8)] void))] (-> void)
+  (let [c (contexts)]
+    (when (and (> (.current c) 0) (not (in-job?)))
+      (let [(mut known) false]
+        (for o (.owns c) (when (= (.name o) name) (set! known true)))
+        (unless known
+          (let [(mut slots) (ArrayList::new [i64] (malloc-allocator))]
+            (for i (range 0 64) (push! (mut slots) 0))
+            (push! (mut (.owns c)) (ContextOwn :name (own-text name) :save save :load load :slots slots)))))))
+  0)
+
+(defn context-swap! [(from i64) (to i64)] (-> void)
+  (let [c (contexts)]
+    (for i (range 0 (len (.owns c)))
+      (let [o (get (.owns c) i)
+            out (primitive/call-ptr (.save o))
+            back (get (.slots o) to)]
+        (set! (mut (.slots (elem (mut (.owns c)) i))) from (primitive/cast i64 out))
+        (primitive/call-ptr (.load o) (primitive/cast (ptr u8) back))
+        (when (!= back 0) (primitive/free (primitive/cast (ptr i8) back)))
+        (set! (mut (.slots (elem (mut (.owns c)) i))) to 0))))
+  0)
+
+;;; The setting naming the context was given `name`: its own settings as that context left them.
+(defn context-enter! [(name (slice u8))] (-> void)
+  (when (in-job?) (panic "a context is entered by the program's own thread, not a job's: {}" name))
+  (let [c (contexts)
+        to (if (= (len name) 0) 0 (context-index name))]
+    (push! (mut (.stack c)) (.current c))
+    (when (!= to (.current c)) (context-swap! (.current c) to))
+    (set! (.current c) to))
+  0)
+
+;;; And its binding ended: back to the context it was given in.
+(defn context-leave! [] (-> void)
+  (let [c (contexts)
+        back (match (pop! (mut (.stack c))) (Some [b] b) (None [] (panic "a context left that was never entered")))]
+    (when (!= back (.current c)) (context-swap! (.current c) back))
+    (set! (.current c) back))
+  0)
+
+;;; A context's own answer's key: its key and the context it is made in (none: the key itself).
+(defn context-int-key [(k i64)] (-> (slice u8))
+  (context-text-key (num-text k)))
+
+;;; Length-prefixed fields distinguish every context and key, including the context outside any
+;;; named one. The complete integer is encoded too: reserving low bits would lose its high bits.
+(defn context-text-key [(k (slice u8))] (-> (slice u8))
+  (let [c (contexts)
+        (mut b) (key-buf-new)]
+    (key-text! (mut b) (get (.names c) (.current c)))
+    (key-text! (mut b) k)
+    (key-done! (mut b))))
 
 ;;; While dependencies are not tracked, a setting given a new value has each kept answer that reads
 ;;; it start over: each memo says, when its store is made, which settings it reads (as the compiler

@@ -195,7 +195,7 @@ until the build ends: the bundler took about 30 s and 8–9.8 GB. With the artif
 (cd tests && npm install --ignore-scripts && node node_modules/esbuild/install.js)
 git clone --depth 1 https://github.com/tc39/test262-parser-tests tests/test262
 
-python3 tools/guard.py 9500 500 tools/build-tools.sh -O3      # out/bin/{esb,jsparse,spec}
+python3 tools/guard.py 9500 500 tools/build-tools.sh --release # out/bin/{esb,jsparse,spec}; LLVM, optimized, no DWARF
 out/bin/esb tests/apps/named.js --minify --outfile=out/app.js  # command line, esbuild style
 python3 tools/verify.py out/bin/esb out/bin/jsparse           # every claim below
 npm ci --prefix benchmarks/heldout --ignore-scripts            # libraries it was never tuned on
@@ -1397,6 +1397,30 @@ a module, to the entry, a new file, a `package.json`, and a write that changes n
 dispose data, and that all 15 test apps run the same in the development format as bundled.
 A build error in `--watch` still ends the process. Split builds can be watched and cached;
 HMR remains a single-entry development format.
+
+A program that builds several environments can declare contexts in its pipeline:
+
+```
+contexts by bundle.api/context shared bundle.modules/parsing bundle.tsconfig/forced react.refresh/options end
+```
+
+TanStack Start enters `client` and `server` contexts around their respective builds. Settings
+without defaults belong to each context unless declared shared. The compiler follows setting
+reads through the whole call graph, including recursion: only answers that read context-specific
+settings receive context-specific keys. Returning to a context restores its settings, so the two
+builds retain their own answers without invalidating shared parsing. Disk caches retain answers
+from outside named contexts; named-context settings and answers are rebuilt after a restart.
+
+The file's base analysis and its side transforms are separate operations: `parsed-of` produces
+the scopes as written; `sided` takes that base and applies defines and constants. A transform that
+changes the tree requires analysis of that changed tree. This separation also applies to plain
+function calls; the pipeline strategy independently decides which results it retains.
+
+Settings kept between turns copy values from the current stack, vars and other settings. Shared
+parts retain only their actual owning regions, located through a chunk-address index. Text-keyed
+transformed parses are evicted after builds stop asking for them. `tools/context-check.py` checks
+context keys and setting isolation with and without dependency tracking; `tools/start-memory-check.py`
+checks live regions over sixty distinct route edits in a two-context development build.
 
 ## Application acceptance and larger graphs
 

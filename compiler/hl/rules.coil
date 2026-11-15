@@ -71,7 +71,9 @@
    (ty (slice u8))
    (assignable bool)
    (task bool)
-   (attr i64)])  ; an attribute: 1 inherited, 2 an input, 3 collected, 4 given;
+   (attr i64)    ; an attribute: 1 inherited, 2 an input, 3 collected, 4 given;
+   ;; A setting with a value of its own, wherever nothing gave it another (`setting x: T = v`).
+   (root bool)])
 
 ; else 0
 (defstruct RelDef [(name (slice u8)) (arity i64)])
@@ -143,6 +145,10 @@
    ;; what, to know what a setting given again changes.
    (keeps (ArrayList (slice u8)))
    (default-keeps (ArrayList (slice u8)))
+   ;; The program's contexts (`contexts by S shared …` in the pipeline): the setting naming the
+   ;; context, `module.name` ("" when there are none), and the settings every context gives alike.
+   (context-by (slice u8))
+   (context-shared (ArrayList (slice u8)))
    (made (ArrayList (slice u8)))
    ;; The functions some strategy has work apart (`apart` in the pipeline language), as
    ;; `module/function`: each one's place is its number, by which a run's strategy turns it on.
@@ -621,6 +627,10 @@
                              :fns hooks)))))))
           (for m made (push! (mut (.made k)) m))
           (for s (pl/sizes-of tree) (push! (mut (.sizes k)) s))
+          (let [cx (pl/contexts-of tree)]
+            (when (> (len (.by cx)) 0)
+              (set! (.context-by k) (.by cx))
+              (for o (.shared cx) (push! (mut (.context-shared k)) o))))
           (let [stages (pl/stages-of tree)]
             (when (> (len stages) 0)
               (when (> (len (.stages k)) 0)
@@ -1806,7 +1816,8 @@
              :ty ty
              :assignable false
              :task false
-             :attr 5))))
+             :attr 5
+             :root (setting-root? d)))))
 
 (defn bound-field [(name (slice u8))] (-> (slice u8))
   (cat name "--bound"))
@@ -1870,7 +1881,8 @@
              :ty ty
              :assignable assignable
              :task task
-             :attr attr))))
+             :attr attr
+             :root false))))
 
 ;;; Where a global lives: once per program, or once per worker slot for `task state` and contexts.
 ;;; A function runs on one thread from start to end, so inside one the slot is looked up once.
@@ -4534,21 +4546,23 @@
                             [(next i64)
                              (xs (ArrayList ~ct))
                              (out (ArrayList (Option ~cr)))
-                             (f (fnptr (cc/C) [~ct] ~cr))]))
+                             (f (fnptr (cc/C) [~ct] ~cr)) (item i64)]))
                   (push! (mut (.aux k))
                          `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
                             (let [j (cast (ptr ~(sym job)) arg)
                                   f (.f j)
                                   xs (.xs j)
                                   (mut out) (.out j)
-                                  (mut go) true]
+                                  (mut go) true
+                                  saved-item (rt/item-current)]
+                              (rt/item-begin! (.item j))
                               (while go
                                 (let [i (atomic/add (cast (ptr i64) j) 1)]
                                   (if (< i (len xs))
                                       (do
-                                        (rt/item-begin! i)
                                         (set! (mut out) i (Some (f (get xs i)))))
                                       (set! go false))))
+                              (rt/item-begin! saved-item)
                               arg)))
                   (Some (te `(let [~(sym xs-v) ~(.code xs)
                                    (mut ~(sym out-v))
@@ -4561,7 +4575,7 @@
                                          :next 0
                                          :xs ~(sym xs-v)
                                          :out ~(sym out-v)
-                                         :f ~(.code f))]
+                                         :f ~(.code f) :item (rt/item-current))]
                                  (rt/run-map-workers (fnptr-of ~(sym body))
                                                  (cast (ptr i8)
                                                        (mut ~(sym job-v)))
@@ -5661,7 +5675,7 @@
                  (reserve! (mut ~(sym out-v)) (len ~(sym items)))
                  (for _ ~(sym items) (push! (mut ~(sym out-v)) (None [~cr])))
                  (let [(mut ~(sym job-v))
-                         (~(sym job) :next 0 :xs ~(sym items) :out ~(sym out-v) ~@same-inits)]
+                         (~(sym job) :next 0 :xs ~(sym items) :out ~(sym out-v) :item (rt/item-current) ~@same-inits)]
                    (if (< (len ~(sym items)) ~(.least (.stage sc)))
                        (do (~(sym body) (cast (ptr i8) (mut ~(sym job-v)))) 0)
                        (do
@@ -5715,22 +5729,26 @@
         (unless single (push! (mut (.aux k)) `(defstruct ~(sym tuple) [~@fields])))
         (push! (mut (.aux k))
                `(defstruct ~(sym job)
-                  [(next i64) (xs (ArrayList ~ct)) (out (ArrayList (Option ~cr))) ~@same-fields]))
+                  [(next i64) (xs (ArrayList ~ct)) (out (ArrayList (Option ~cr))) (item i64) ~@same-fields]))
         (push! (mut (.aux k))
                `(defn ~(sym body) [(arg (ptr i8))] (-> (ptr i8))
                   (let [j (cast (ptr ~(sym job)) arg)
                         xs (.xs j)
                         (mut out) (.out j)
-                        (mut go) true]
+                        (mut go) true
+                        saved-item (rt/item-current)]
                     (while go
                       (let [from (atomic/add (cast (ptr i64) j) ~step)
                             to (if (< (+ from ~step) (len xs)) (+ from ~step) (len xs))]
                         (if (< from (len xs))
                             (for i (range from to)
-                              (rt/item-begin! i)
+                              ;; Only the naming stage owns the recorded item number. A nested
+                              ;; stage must preserve the item whose names it is helping discover.
+                              ~(if naming `(rt/item-begin! i) `(rt/item-begin! (.item j)))
                               (let [t (get xs i)]
                                 (set! (mut out) i (Some ~call))))
                             (set! go false))))
+                    (rt/item-begin! saved-item)
                     arg)))
         (te `(let [(mut ~(sym items)) (ArrayList::new [~ct] (rt/tree-allocator))]
                ~fill
@@ -6459,11 +6477,20 @@
                            (changed Code)] (-> Code)
   (let [helper (cat4 "setting-give--" (rt/replace-all module "." "_") "--" name)
         t (coil-type (mut k) ty)
-        field `(~(primitive/code-symbol "." name) ~storage)]
+        field `(~(primitive/code-symbol "." name) ~storage)
+        qname (cat3 module "." name)
+        own (context-own-setting? (mut k) qname)]
     (unless (has-text? (.sames k) helper)
       (push! (mut (.sames k)) helper)
+      (when own (context-slot-helpers! (mut k) module name t storage))
       (push! (mut (.aux k))
              `(defn ~(sym helper) [(given ~t) (made-in i64) (saved ~t)] (-> i64)
+                ~(if own
+                     (let [tag (cat3 (rt/replace-all module "." "_") "--" name)]
+                       `(rt/context-own-give! ~qname
+                                              (fnptr-of ~(sym (cat "context-save--" tag)))
+                                              (fnptr-of ~(sym (cat "context-load--" tag)))))
+                     `0)
                 (set! ~field given)
                 (set! (~(primitive/code-symbol "." (region-field name)) ~storage) made-in)
                 (set! (~(primitive/code-symbol "." (dirty-field name)) ~storage) 1)
@@ -6473,6 +6500,45 @@
                 (set! (~(primitive/code-symbol "." (held-field name)) ~storage) 1)
                 0)))
     (sym helper)))
+
+;;; A context's own setting kept apart for each context (see `contexts` in hl.rt): its state taken
+;;; out as a block of its own, and put back; a context that never gave it starts unbound, with
+;;; nothing held (the value it had is the other context's, held by that context's block).
+(defn context-slot-helpers! [(k (mut Comp)) (module (slice u8)) (name (slice u8)) (t Code) (storage Code)] (-> void)
+  (let [tag (cat3 (rt/replace-all module "." "_") "--" name)
+        slot (sym (cat "ContextSlot--" tag))
+        value (primitive/code-symbol "." name)
+        region (primitive/code-symbol "." (region-field name))
+        dirty (primitive/code-symbol "." (dirty-field name))
+        bound (primitive/code-symbol "." (bound-field name))
+        held (primitive/code-symbol "." (held-field name))]
+    (push! (mut (.aux k))
+           `(defstruct ~slot [(value ~t) (region i64) (dirty i64) (bound i64) (held i64)]))
+    (push! (mut (.aux k))
+           `(defn ~(sym (cat "context-save--" tag)) [] (-> (ptr u8))
+              (let [st ~storage]
+                (when (> (~bound st) 0)
+                  (panic "{} is a context's own setting, given across a change of context" ~(cat3 module "." name)))
+                (primitive/cast (ptr u8)
+                                (box! (malloc-allocator) ~slot
+                                      (~slot :value (~value st) :region (~region st) :dirty (~dirty st)
+                                             :bound (~bound st) :held (~held st)))))))
+    (push! (mut (.aux k))
+           `(defn ~(sym (cat "context-load--" tag)) [(raw (ptr u8))] (-> void)
+              (let [st ~storage]
+                (if (= (primitive/cast i64 raw) 0)
+                    (do (set! (~region st) 0)
+                        (set! (~dirty st) 1)
+                        (set! (~bound st) 0)
+                        (set! (~held st) 0))
+                    (let [p (primitive/cast (ptr ~slot) raw)]
+                      (set! (~value st) (.value p))
+                      (set! (~region st) (.region p))
+                      (set! (~dirty st) (.dirty p))
+                      (set! (~bound st) (.bound p))
+                      (set! (~held st) (.held p))))
+                0)))
+    0))
 
 ;;; And what it does as it ends: back to what an outer binding gave the setting, telling what read it
 ;;; (`changed`), with that value's region held again and this one's let go; or, with none, its own
@@ -7710,20 +7776,31 @@
                                           given (fresh (mut k) "given")]
                                       (push! (mut saves) (sym saved-region))
                                       (push! (mut saves) region-at)
-                                      ;; The value made in a region of its own (while the run
-                                      ;; reclaims memory), which the setting holds from now on;
-                                      ;; what giving it does after is the setting's helper's, made
-                                      ;; once in the module, not at every `with`.
+                                      ;; The value made, then its own copy in a region of its own
+                                      ;; (while the run reclaims memory), which the setting holds
+                                      ;; from now on (see `rt/setting-region-open!`); what giving
+                                      ;; it does after is the setting's helper's, made once in the
+                                      ;; module, not at every `with`.
                                       (push! (mut sets)
-                                             `(let [~(sym made-in) (rt/answer-region-open! ~(cat "with " name))
+                                             `(let [~(sym (cat given "-made")) ~(.code v)
+                                                    ~(sym made-in) (rt/setting-region-open! ~(cat "with " name))
                                                     ;; Given by a computation working apart, the
                                                     ;; setting's own: the next is compared with it.
-                                                    ~(sym given) ~(lasting-code (mut k) (.ty x) (.code v))]
+                                                    ~(sym given) ~(lasting-code (mut k) (.ty x) (sym (cat given "-made")) (sym made-in))]
                                                 (rt/answer-region-close! ~(sym made-in))
                                                 (~(setting-give-helper (mut k) module name (.ty x) storage changed-in)
                                                    ~(sym given)
                                                    ~(sym made-in)
                                                    ~(sym saved))))
+                                      ;; The setting naming the context: given, its context is entered;
+                                      ;; its binding ending, left (see `contexts` in hl.rt).
+                                      ;; A `with` of its own: the others' values are taken before
+                                      ;; any is given, and would be the context before's.
+                                      (when (= (cat3 module "." name) (.context-by k))
+                                        (when (> (len (list-kids (kid s 0))) 1)
+                                          (die (mut k) init "the setting naming the context is given by a `with` of its own, around what the context gives"))
+                                        (push! (mut sets) `(rt/context-enter! ~field))
+                                        (push! (mut leaves) `(rt/context-leave!)))
                                       (push! (mut restores)
                                              `(~(setting-restore-helper (mut k) module name (.ty x) storage changed-out)
                                                  ~(sym saved)
@@ -7881,10 +7958,10 @@
         (unless (has-text? (.escaped k) (.sym l)) (push! (mut (.escaped k)) (.sym l)))
         `(let [~(sym given) ~(.code v)]
            (if (rt/iterating-since? ~(sym mark))
-               (let [~(sym made-in) (rt/answer-region-open! ~"var")
+               (let [~(sym made-in) (rt/var-region-open!)
                      copied ~(own-code (mut k) (.ty l) (sym given))]
                  (rt/answer-region-close! ~(sym made-in))
-                 (rt/region-release-id! ~region)
+                 (rt/var-region-release! ~region)
                  (set! ~region ~(sym made-in))
                  (set! ~(sym (.sym l)) copied))
                (set! ~(sym (.sym l)) ~(sym given)))
@@ -7902,7 +7979,7 @@
   (let [(mut out) (primitive/code-list-new)]
     (for l (.locals k)
       (when (has-text? (.escaped k) (.sym l))
-        (push! (mut out) `(rt/region-adopt-id! ~(sym (cat (.sym l) "--region"))))))
+        (push! (mut out) `(rt/var-region-adopt! ~(sym (cat (.sym l) "--region"))))))
     out))
 
 ;;; `xs ++= e`: a list literal's items, or a comprehension's, go straight into `xs`, with no list
@@ -8202,10 +8279,11 @@
                                                         (held-field (.name (.x sp)))) ~storage)]
                         (te `(let [~(sym old) ~(.code p)
                                    given (or (> ~bound 0) (> ~held 0))
-                                   ;; Made in a region of its own, which the setting holds from
-                                   ;; now on in place of the one it held.
-                                   made-in (rt/answer-region-open! ~(cat "set " (.name (.x sp))))
-                                   value ~(lasting-code (mut k) (.ty (.x sp)) (.code v))
+                                   ;; Made, then its own copy in a region of its own, which the
+                                   ;; setting holds from now on in place of the one it held.
+                                   value-made ~(.code v)
+                                   made-in (rt/setting-region-open! ~(cat "set " (.name (.x sp))))
+                                   value ~(lasting-code (mut k) (.ty (.x sp)) `value-made `made-in)
                                    closed (rt/answer-region-close! made-in)]
                                (set! ~(.code p) value)
                                (rt/region-release-id! (~(primitive/code-symbol "."
@@ -8337,7 +8415,7 @@
                       (set! adopting true)
                       (push! (mut binds) `(mut ~(sym region)))
                       (push! (mut binds) `0)
-                      (push! (mut adopts) `(rt/region-adopt-id! ~(sym region))))))
+                      (push! (mut adopts) `(rt/var-region-adopt! ~(sym region))))))
                 (push! (mut forms)
                        (cond (not adopting) `(let [~@binds] ~(.code rest))
                              (= (.ty rest) "Never") `(let [~@binds] ~(.code rest))
@@ -8451,7 +8529,7 @@
                   (let [entered (rt/now-ns)
                         key ~(memo-key-code (mut k) f)
                         text
-                          ~(if (= (memo-key-type f) "Int")
+                          ~(if (= (memo-key-type (mut k) f) "Int")
                                `(rt/num-text key)
                                `key)
                         before (rt/audit-overhead-now)
@@ -8556,20 +8634,28 @@
                   (~(sym working) ~@args))))
     0))
 
-;;; A value that must outlive a computation working apart: while one is open on this thread, its
-;;; own copy in the thread's lasting storage; else the value itself.
-(defn lasting-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
+;;; A value a setting is given, which it holds after what gave it is gone: while a computation
+;;; working apart is open on this thread, its own copy in the thread's lasting storage; while the
+;;; run reclaims memory, its own copy, in the region made for it (`made-in`, entered now), of what
+;;; lies in regions that may be let go while the setting holds it (a loop's turn, a var's, another
+;;; setting's; see `rt/setting-region-open!`), sharing the rest; else the value itself.
+(defn lasting-code [(k (mut Comp)) (t (slice u8)) (v Code) (made-in Code)] (-> Code)
   (if (own-in-plain? t)
       v
       `(let [lasting-given ~v]
-         (if (rt/apart-open?)
-             (let [lasting-open (rt/lasting-enter!)
-                   lasting-began (rt/own-begin!)
-                   lasting-own ~(own-in-code (mut k) t `lasting-given `(rt/any-scratch))]
-               (rt/own-end!)
-               (rt/lasting-leave! lasting-open)
-               lasting-own)
-             lasting-given))))
+         (cond (rt/apart-open?)
+                 (let [lasting-open (rt/lasting-enter!)
+                       lasting-began (rt/own-begin!)
+                       lasting-own ~(own-in-code (mut k) t `lasting-given `(rt/any-scratch))]
+                   (rt/own-end!)
+                   (rt/lasting-leave! lasting-open)
+                   lasting-own)
+               (!= ~made-in 0)
+                 (let [setting-began (rt/own-begin!)
+                       setting-own ~(own-in-code (mut k) t `lasting-given `(rt/setting-copy-from))]
+                   (rt/own-end!)
+                   setting-own)
+               :else lasting-given))))
 
 (defn compile-fn-as [(k (mut Comp)) (d g/Node) (coil-name (slice u8))] (-> Code)
   (let [name (.text (kid d 0))
@@ -9868,12 +9954,15 @@
 ;;; arguments' text joined.
 ;;; Whether a memo's key is its one argument, a number or text: an answer's node then says, by its
 ;;; text, all the answer is made from, and it can be made again from that alone.
-(defn key-is-argument? [(f Func)] (-> bool)
+(defn key-is-argument? [(k (mut Comp)) (f Func)] (-> bool)
   (and (= (len (.params f)) 1)
        (or (= (.ty (get (.params f) 0)) "Int")
            (= (.ty (get (.params f) 0)) "Text"))))
 
-(defn memo-key-type [(f Func)] (-> (slice u8))
+(defn memo-key-type [(k (mut Comp)) (f Func)] (-> (slice u8))
+  (if (contextual? (mut k) (.name f)) "Text" (plain-memo-key-type f)))
+
+(defn plain-memo-key-type [(f Func)] (-> (slice u8))
   (if (and (= (len (.params f)) 1)
            (or (= (.ty (get (.params f) 0)) "Int")
                (= (.ty (get (.params f) 0)) "Text")))
@@ -9885,7 +9974,42 @@
   (sym (cat "memo-arg-" (rt/num-text i))))
 
 (defn memo-key-code [(k (mut Comp)) (f Func)] (-> Code)
-  (if (!= (memo-key-type f) "Text")
+  (let [plain (plain-memo-key-code (mut k) f)]
+    (if (contextual? (mut k) (.name f))
+        (if (= (plain-memo-key-type f) "Int")
+            `(rt/context-int-key ~plain)
+            `(rt/context-text-key ~plain))
+        plain)))
+
+;;; Whether a kept function's answers are each context's own (`contexts` in the pipeline): it reads,
+;;; as the compiler works out, the setting naming the context or one each context has of its own.
+;;; Its key then says the context it was made in (see `rt/context-int-key`).
+(defn contextual? [(k (mut Comp)) (name (slice u8))] (-> bool)
+  (and (> (len (.context-by k)) 0)
+       (let [(mut hit) false]
+         (for r (pl/reads-of (mut (.checker k)) (.self k) name)
+           (when (or (= r (.context-by k)) (context-own-setting? (mut k) r)) (set! hit true)))
+         hit)))
+
+;;; Whether a setting (`module.name`) is each context's own: one a build must give (no value of its
+;;; own), not the one naming the context, and not one the pipeline says every context gives alike.
+(defn context-own-setting? [(k (mut Comp)) (q (slice u8))] (-> bool)
+  (and (> (len (.context-by k)) 0)
+       (!= q (.context-by k))
+       (not (has-text? (.context-shared k) q))
+       (match (rt/last-index-of q ".")
+         (Some [cut]
+               (let [module (subslice q 0 cut)
+                     name (subslice q (+ cut 1) (len q))
+                     at (mod-index (mut k) module)]
+                 (and (>= at 0)
+                      (match (find-global (mod-at (mut k) module) name)
+                        (Some [x] (and (= (.attr x) 5) (not (.root x))))
+                        (None [] false)))))
+         (None [] false))))
+
+(defn plain-memo-key-code [(k (mut Comp)) (f Func)] (-> Code)
+  (if (!= (plain-memo-key-type f) "Text")
       (memo-arg 0)
       (if (and (= (len (.params f)) 1) (= (.ty (get (.params f) 0)) "Text"))
           (memo-arg 0)
@@ -9937,12 +10061,12 @@
                                                                          (.name fd)) ~(sym x)))))
                       `(let [~(sym x) ~v] ~@writes 0))))))
 
-(defn memo-map-type [(f Func)] (-> (slice u8))
-  (cat4 "{" (memo-key-type f) ":" (cat (.ret f) "}")))
+(defn memo-map-type [(k (mut Comp)) (f Func)] (-> (slice u8))
+  (cat4 "{" (memo-key-type (mut k) f) ":" (cat (.ret f) "}")))
 
 ;;; Who is computing an answer: the worker's slot plus one.
-(defn memo-busy-type [(f Func)] (-> (slice u8))
-  (cat3 "{" (memo-key-type f) ":Int}"))
+(defn memo-busy-type [(k (mut Comp)) (f Func)] (-> (slice u8))
+  (cat3 "{" (memo-key-type (mut k) f) ":Int}"))
 
 (defn memo-near [(name (slice u8))] (-> (slice u8))
   (cat "memo-near--" name))
@@ -9952,11 +10076,11 @@
 
 ;;; The task struct's fields for a memo: its near table and the generation that table is of.
 (defn memo-storage-type [(k (mut Comp)) (f Func)] (-> Code)
-  `(rt/MemoMap ~(coil-type (mut k) (memo-key-type f)) ~(coil-type (mut k) (.ret f))))
+  `(rt/MemoMap ~(coil-type (mut k) (memo-key-type (mut k) f)) ~(coil-type (mut k) (.ret f))))
 
 (defn memo-storage-new [(k (mut Comp)) (f Func)] (-> Code)
-  `(rt/MemoMap::new [~(coil-type (mut k) (memo-key-type f)) ~(coil-type (mut k) (.ret f))]
-                    ~(if (= (memo-key-type f) "Int") `(i64-keyops) `(rt/memo-keyops))))
+  `(rt/MemoMap::new [~(coil-type (mut k) (memo-key-type (mut k) f)) ~(coil-type (mut k) (.ret f))]
+                    ~(if (= (memo-key-type (mut k) f) "Int") `(i64-keyops) `(rt/memo-keyops))))
 
 (defn memo-new-map [(k (mut Comp)) (d g/Node)] (-> Code)
   (memo-storage-new (mut k) (memo-check! (mut k) d)))
@@ -9980,7 +10104,7 @@
   (cat "memo-near-regions--" name))
 
 (defn memo-key-int-type [(k (mut Comp)) (d g/Node)] (-> (slice u8))
-  (cat3 "{" (memo-key-type (memo-check! (mut k) d)) ":Int}"))
+  (cat3 "{" (memo-key-type (mut k) (memo-check! (mut k) d)) ":Int}"))
 
 (defn memo-near-regions-field [(k (mut Comp)) (d g/Node)] (-> Code)
   `(~(sym (memo-near-regions (.text (kid d 0)))) ~(coil-type (mut k) (memo-key-int-type (mut k) d))))
@@ -10446,8 +10570,8 @@
         fault-slow (sym (cat "memo-fault-slow--" name))
         force (sym (cat "memo-force--" name))
         qname (cat3 (.self k) "." name)
-        keyty (coil-type (mut k) (memo-key-type f))
-        int-key (= (memo-key-type f) "Int")
+        keyty (coil-type (mut k) (memo-key-type (mut k) f))
+        int-key (= (memo-key-type (mut k) f) "Int")
         tree (tree-keyed? (mut k) f)
         key-text (if int-key `(rt/num-text key) `key)
         number (kept-number (mut k) name)
@@ -10460,7 +10584,10 @@
               `false)
         ;; Whether the answer for `key` is saved, as the run's `store … by` says.
         stored
-          (if (>= number 0) `(~(sym (cat "memo-stored?--" name)) s key) `true)
+          (let [policy (if (>= number 0) `(~(sym (cat "memo-stored?--" name)) s key) `true)]
+            (if (contextual? (mut k) name)
+                `(and (= (get (rt/memo-key-parts key) 0) "") ~policy)
+                policy))
         (mut puts) (primitive/code-list-new)
         (mut binds) (primitive/code-list-new)
         (mut inits) (primitive/code-list-new)]
@@ -10521,6 +10648,9 @@
            (let [last-saved
                    (and (.has-last s)
                         ~disk
+                        ~(if (contextual? (mut k) name)
+                             `(= (get (rt/memo-key-parts (.last-key s)) 0) "")
+                             `true)
                         ~(if tree `false `true)
                         (match (get (.table (.main s)) (.last-key s))
                           (Some [_]
@@ -10556,7 +10686,7 @@
                        (push! (mut (.pending s)) id)
                        (push! (mut (.pending s)) at))))
                 `(do
-                   ~(if (key-is-argument? f) `(rt/memo-keyed-by-argument! ~qname) `0)
+                   ~(if (key-is-argument? (mut k) f) `(rt/memo-keyed-by-argument! ~qname) `0)
                    (for _ (range 0 n)
                    (let [key ~(if int-key `(rt/take-int r) `(rt/take-text r))
                          id (rt/take-int r)
@@ -10797,6 +10927,8 @@
                             (rt/region-leave!)
                             (rt/reader-return! r)))))))))
     (for d decls
+      ;; Contextual stores persist their outside-context answers too. Named-context answers are
+      ;; filtered by memo-save: their settings have not been entered in the new run yet.
       (when (= (.kind d) (g/KMemoFn))
         (push! (mut puts) `(rt/put-part! w ~(cat3 name "." (.text (kid d 0)))))
         (push! (mut puts)
@@ -11162,7 +11294,7 @@
 (defn compile-memo! [(k (mut Comp)) (d g/Node) (out (mut str/StrBuf))] (-> void)
   (let [f (memo-check! (mut k) d)
         name (.text (kid d 0))
-        mt (memo-map-type f)
+        mt (memo-map-type (mut k) f)
         store (sym (cat "MemoStore--" name))
         store-fn (sym (cat "memo-store--" name))
         whole-fn (sym (cat "memo-whole--" name))
@@ -11184,7 +11316,7 @@
         near-rev (primitive/code-symbol "." (memo-near-rev name))
         near-regions (primitive/code-symbol "." (memo-near-regions name))
         qname (cat3 (.self k) "." name)
-        key-text (if (= (memo-key-type f) "Int") `(rt/num-text key) `key)
+        key-text (if (= (memo-key-type (mut k) f) "Int") `(rt/num-text key) `key)
         (mut params) (primitive/code-list-new)
         (mut args) (primitive/code-list-new)
         (mut arg-fields) (primitive/code-list-new)
@@ -11218,7 +11350,7 @@
            `(defstruct ~part
               [(lock i64)
                (table ~(memo-storage-type (mut k) f))
-               (busy ~(coil-type (mut k) (memo-busy-type f)))]))
+               (busy ~(coil-type (mut k) (memo-busy-type (mut k) f)))]))
     (emit! (mut out)
            `(defstruct ~store
               [(lock i64)
@@ -11232,32 +11364,32 @@
                (fronted i64)
                ;; Whether its answers are to be forgotten before the next is looked for.
                (stale i64)
-               (args (HashMap ~(coil-type (mut k) (memo-key-type f)) ~args-ty))
-               (node-ids (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
+               (args (HashMap ~(coil-type (mut k) (memo-key-type (mut k) f)) ~args-ty))
+               (node-ids (HashMap ~(coil-type (mut k) (memo-key-type (mut k) f)) i64))
                ;; Answers the cache holds that this run has not read, by where their data is;
                ;; answers new since the last save; and, for a memo whose keys hold trees, the nodes
                ;; and data of answers whose keys are not made yet.
-               (lazy (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
-               (dirty (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
+               (lazy (HashMap ~(coil-type (mut k) (memo-key-type (mut k) f)) i64))
+               (dirty (HashMap ~(coil-type (mut k) (memo-key-type (mut k) f)) i64))
                (pending (ArrayList i64))
                ;; When each answer was last asked for, by `clock`: what an eviction bound lets go first.
-               (uses ~(coil-type (mut k) (cat3 "{" (memo-key-type f) ":Int}")))
+               (uses ~(coil-type (mut k) (cat3 "{" (memo-key-type (mut k) f) ":Int}")))
                (clock i64)
                ;; The arguments of the last answer made, for an `update by` function to make the next
                ;; from (see `memo-last--`).
-               (last-key ~(coil-type (mut k) (memo-key-type f)))
+               (last-key ~(coil-type (mut k) (memo-key-type (mut k) f)))
                (has-last bool)
                ;; While the run reclaims memory: the region each answer was made in, which the
                ;; table holds; and the region its keys' arguments are copied into, which lasts as
                ;; long as the store, as its keys do.
-               (regions (HashMap ~(coil-type (mut k) (memo-key-type f)) i64))
+               (regions (HashMap ~(coil-type (mut k) (memo-key-type (mut k) f)) i64))
                (keys-region i64)]))
     (emit! (mut out)
            `(defstruct ~(sym (cat "MemoOwned--" name)) [(args ~args-ty)]))
     ;; A key's arguments, the store's own: copied into the store's region the first time the key is
     ;; computed, so an answer made from them points at nothing its caller made.
     (emit! (mut out)
-           `(defn ~(sym (cat "memo-own--" name)) [(s (ptr ~store)) (key ~(coil-type (mut k) (memo-key-type f))) ~@params]
+           `(defn ~(sym (cat "memo-own--" name)) [(s (ptr ~store)) (key ~(coil-type (mut k) (memo-key-type (mut k) f))) ~@params]
               (-> ~(sym (cat "MemoOwned--" name)))
               (let [word (cast (ptr i64) s)]
                 (rt/spin-lock! word)
@@ -11318,7 +11450,7 @@
                     prepared (~(sym (cat "memo-prepare--" name)) s)
                     text (rt/dep-memo-key id)
                     key
-                      ~(if (= (memo-key-type f) "Int")
+                      ~(if (= (memo-key-type (mut k) f) "Int")
                            `(rt/parse-int text)
                            `text)
                     unread
@@ -11364,8 +11496,12 @@
                           ;; An answer not saved, of an earlier run (see `dep-earlier-current?`): its
                           ;; key is its one argument, so it is made again from that.
                           (None []
-                                ~(if (key-is-argument? f)
-                                     `(do (~entry key) 0)
+                                ~(if (key-is-argument? (mut k) f)
+                                     `(do (~entry ~(if (contextual? (mut k) (.name f))
+                                                      (if (= (plain-memo-key-type f) "Int")
+                                                          `(rt/parse-int (get (rt/memo-key-parts key) 1))
+                                                          `(get (rt/memo-key-parts key) 1))
+                                                      `key)) 0)
                                      `(panic "memo fn {} has no arguments for {}"
                                              ~name
                                              text))))))))))
@@ -11387,11 +11523,11 @@
                   (for key (.regions s)
                     (match (get (.regions s) key) (Some [r] (rt/region-release-id! r)) (None [] 0)))
                   (free! (mut (.regions s)))
-                  (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type f)))
+                  (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                   (free! (mut (.table (.main s))))
                   (set! (.table (.main s)) ~(memo-storage-new (mut k) f))
                   (free! (mut (.busy (.main s))))
-                  (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type f)))
+                  (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                   ;; The many parts' answers go with the rest, not into the one first.
                   (when (!= (atomic/read (field s fronted)) 0)
                     (for h (.fronts s)
@@ -11399,7 +11535,7 @@
                       (free! (mut (.table h)))
                       (set! (.table h) ~(memo-storage-new (mut k) f))
                       (free! (mut (.busy h)))
-                      (set! (.busy h) ~(runtime-map (mut k) (memo-busy-type f)))
+                      (set! (.busy h) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                       (rt/spin-unlock! (cast (ptr i64) h)))
                     (atomic/store (field s fronted) 0))
                   (set! (.gen s) (rt/next-pass!))
@@ -11409,7 +11545,7 @@
     ;; The part of the many that holds `key`'s answer: picked by bits of its hash the part's own
     ;; table does not place it by.
     (emit! (mut out)
-           `(defn ~front-fn [(s (ptr ~store)) (key ~(coil-type (mut k) (memo-key-type f)))] (-> (ptr ~part))
+           `(defn ~front-fn [(s (ptr ~store)) (key ~(coil-type (mut k) (memo-key-type (mut k) f)))] (-> (ptr ~part))
               (when (rt/once-mine? (field s fronts-made))
                 (let [(mut all) (ArrayList::new [(ptr ~part)] (malloc-allocator))]
                   (for _ (range 0 (rt/memo-parts))
@@ -11417,12 +11553,12 @@
                       (store! h
                               (~part :lock 0
                                      :table ~(memo-storage-new (mut k) f)
-                                     :busy ~(runtime-map (mut k) (memo-busy-type f))))
+                                     :busy ~(runtime-map (mut k) (memo-busy-type (mut k) f))))
                       (push! (mut all) h)))
                   (set! (.fronts s) all))
                 (rt/once-made! (field s fronts-made)))
               (get (.fronts s)
-                   (rt/memo-part-of ~(if (= (memo-key-type f) "Int")
+                   (rt/memo-part-of ~(if (= (memo-key-type (mut k) f) "Int")
                                          `(rt/memo-hash key)
                                          `(rt/text-hash key))))))
     ;; The many parts' answers put into the one, and the many left empty: before anything reads the
@@ -11442,7 +11578,7 @@
                       (free! (mut (.table h)))
                       (set! (.table h) ~(memo-storage-new (mut k) f))
                       (free! (mut (.busy h)))
-                      (set! (.busy h) ~(runtime-map (mut k) (memo-busy-type f)))
+                      (set! (.busy h) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                       (rt/spin-unlock! (cast (ptr i64) h)))
                     (atomic/store (field s fronted) 0))
                   (rt/spin-unlock! word)))
@@ -11461,7 +11597,7 @@
                   (unless (.ready s)
                     (set! (.table (.main s)) ~(memo-storage-new (mut k) f))
                     (set! (.args s)
-                          ~(if (= (memo-key-type f) "Int")
+                          ~(if (= (memo-key-type (mut k) f) "Int")
                                `(HashMap::new [i64 ~args-ty]
                                               (malloc-allocator)
                                               (i64-keyops))
@@ -11469,26 +11605,26 @@
                                               (malloc-allocator)
                                               (rt/memo-keyops))))
                     (set! (.node-ids s)
-                          ~(if (= (memo-key-type f) "Int")
+                          ~(if (= (memo-key-type (mut k) f) "Int")
                                `(HashMap::new [i64 i64]
                                               (malloc-allocator)
                                               (i64-keyops))
                                `(HashMap::new [(slice u8) i64]
                                               (malloc-allocator)
                                               (rt/memo-keyops))))
-                    (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type f)))
+                    (set! (.busy (.main s)) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                     (set! (.lazy s)
                           ~(runtime-map (mut k)
-                                    (cat3 "{" (memo-key-type f) ":Int}")))
+                                    (cat3 "{" (memo-key-type (mut k) f) ":Int}")))
                     (set! (.dirty s)
                           ~(runtime-map (mut k)
-                                    (cat3 "{" (memo-key-type f) ":Int}")))
+                                    (cat3 "{" (memo-key-type (mut k) f) ":Int}")))
                     (set! (.pending s)
                           (ArrayList::new [i64] (malloc-allocator)))
                     (set! (.uses s)
                           ~(runtime-map (mut k)
-                                    (cat3 "{" (memo-key-type f) ":Int}")))
-                    (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type f)))
+                                    (cat3 "{" (memo-key-type (mut k) f) ":Int}")))
+                    (set! (.regions s) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                     (set! (.keys-region s) 0)
                     (set! (.gen s) (rt/next-pass!))
                     (set! (.ready s) true))
@@ -11519,7 +11655,7 @@
           (emit! (mut out)
                  `(defn ~(sym (cat "memo-stored?--" name)) [(s (ptr ~store))
                                                             (key ~(coil-type (mut k)
-                                                                             (memo-key-type f)))]
+                                                                             (memo-key-type (mut k) f)))]
                     (-> bool)
                     (let [by (rt/kept-store-by ~number)]
                       (if (< by 0)
@@ -11539,7 +11675,7 @@
            `(defn ~(sym (cat "memo-evict--" name)) [(s (ptr ~store)) (keep i64)]
               (-> void)
               (let [(mut keys)
-                      (ArrayList::new [~(coil-type (mut k) (memo-key-type f))]
+                      (ArrayList::new [~(coil-type (mut k) (memo-key-type (mut k) f))]
                                       (malloc-allocator))
                     (mut stamps) (ArrayList::new [i64] (malloc-allocator))]
                 (for key (.table (.main s))
@@ -11589,7 +11725,7 @@
                             word (cast (ptr i64) s)
                             (mut drop)
                               (ArrayList::new [~(coil-type (mut k)
-                                                           (memo-key-type f))]
+                                                           (memo-key-type (mut k) f))]
                                               (malloc-allocator))]
                         (rt/spin-lock! word)
                         (let [kept (len (.table (.main s)))]
@@ -11670,7 +11806,7 @@
                   (free! (mut (~near t)))
                   (set! (~near t) ~(memo-storage-new (mut k) f))
                   (free! (mut (~near-regions t)))
-                  (set! (~near-regions t) ~(runtime-map (mut k) (memo-busy-type f)))
+                  (set! (~near-regions t) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                   (set! (~near-gen t) (.gen s)))
                 (when tracking
                   (let [rev (rt/dep-revision)]
@@ -11678,7 +11814,7 @@
                       (free! (mut (~near t)))
                       (set! (~near t) ~(memo-storage-new (mut k) f))
                       (free! (mut (~near-regions t)))
-                      (set! (~near-regions t) ~(runtime-map (mut k) (memo-busy-type f)))
+                      (set! (~near-regions t) ~(runtime-map (mut k) (memo-busy-type (mut k) f)))
                       (set! (~near-rev t) rev))))
                 (match (get (~near t) key)
                   (Some [v]
@@ -11945,7 +12081,7 @@
                                                     (when (= (atomic/read (field s fronted)) 0)
                                                       (atomic/store (field s fronted) 1))
                                                     (do
-                                                      ~(if (= (memo-key-type f) "Text")
+                                                      ~(if (= (memo-key-type (mut k) f) "Text")
                                                            `(rt/last-key-set! (field s last-key) key)
                                                            `(set! (.last-key s) key))
                                                       (set! (.has-last s) true)))
@@ -12126,6 +12262,8 @@
             :attrs-from ""
             :keeps (text-list)
             :default-keeps (text-list)
+            :context-by ""
+            :context-shared (text-list)
             :made (text-list)
             :aparts (text-list)
             :lastings (text-list)

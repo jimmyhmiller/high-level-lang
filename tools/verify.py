@@ -429,6 +429,11 @@ for app in ["three", "all"]:
         if any(o != outs[0] for o in outs): size_bad.append(f"{app} {' '.join(flags)}")
 check(not size_bad, f"the sizes work is cut by change nothing a build makes: 2 apps, plain and minified, three settings{': ' + ', '.join(size_bad) if size_bad else ''}")
 
+print("== generic pipeline contexts")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "context-check.py")], 600)
+check(code == 0 and out.count("ok   generic context") == 6,
+      "context keys and setting isolation, tracked, untracked and no memoization: " + ("6 checks" if code == 0 else out[-1800:]))
+
 print("== paired client/server builds")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "boundary-check.py"), SPEC], 300)
 check(code == 0 and out.strip().endswith("all checks passed"), "paired builds: "
@@ -499,6 +504,9 @@ if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
     code, out = sh(["node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "start-dev-check.mjs"), ESB], 300)
     check(code == 0 and " 0 failed" in out, "a TanStack Start application in development: "
           + (out.strip().splitlines()[-1] + " (rendered by the server, routes and components updated in place, server code run as edited, stylesheets reloaded, a route added)" if code == 0 else out[-1800:]))
+    code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "start-memory-check.py"), ESB], 300)
+    check(code == 0 and "Start memory check passed" in out, "Start retains bounded regions across distinct edits: "
+          + (out.strip().splitlines()[-1] if code == 0 else out[-1800:]))
 else:
     check(False, "TanStack Start application: benchmarks/tanstack-start has no node_modules (npm ci --prefix benchmarks/tanstack-start --ignore-scripts)")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tanstack-examples-check.py"), ESB], 2400)

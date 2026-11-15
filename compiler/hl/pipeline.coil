@@ -33,6 +33,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
 (import "coil.slice" :use [subslice])
 (import "coil.meta" :as meta)
 (import "hl.rt" :as rt)
@@ -278,7 +279,14 @@
    (made (ArrayList (slice u8)))
    ;; Every function the program names as a value (see `values-of`), once it has looked.
    (values (ArrayList Value))
-   (values-known bool)])
+   (values-known bool)
+   ;; What each function calls, `module/name` to `module/name`s, met as the walk meets the calls: a
+   ;; function's effect worked out while a function it calls was still being worked out (a cycle)
+   ;; lacks what that one reads, so what a function reads is the union over all it reaches
+   ;; (`reads-of`).
+   (calls (HashMap (slice u8) (ArrayList (slice u8))))
+   ;; Where each function's effect is in `memo`, by `module/name`.
+   (memo-ids (HashMap (slice u8) i64))])
 
 (defn checker-new [(entries (ArrayList dsl/Entry))] (-> Checker)
   (Checker
@@ -290,12 +298,34 @@
     :depends (texts)
     :made (texts)
     :values (ArrayList::new [Value] (rt/value-allocator))
-    :values-known false))
+    :values-known false
+    :calls (HashMap::new [(slice u8) (ArrayList (slice u8))] (rt/value-allocator) (rt/text-keyops))
+    :memo-ids (HashMap::new [(slice u8) i64] (rt/value-allocator) (rt/text-keyops))))
 
-;;; The settings `module/name` reads, through everything it calls.
+;;; The settings `module/name` reads, through everything it calls: each function's own reads (an
+;;; effect always holds the reads of its own code), over every function it reaches.
 (defn reads-of [(c (mut Checker)) (module (slice u8)) (name (slice u8))]
   (-> (ArrayList (slice u8)))
-  (.reads (fun-effect (mut c) module name)))
+  (fun-effect (mut c) module name)
+  (let [(mut out) (texts)
+        (mut seen) (texts)
+        (mut todo) (texts)]
+    (push! (mut todo) (dsl/join3 module "/" name))
+    (while (> (len todo) 0)
+      (let [key (match (pop! (mut todo)) (Some [x] x) (None [] ""))]
+        (unless (has? seen key)
+          (push! (mut seen) key)
+          (match (memo-at (mut c) key)
+            (Some [e] (for r (.reads e) (add-unique! (mut out) r)))
+            (None [] 0))
+          (match (get (.calls c) key)
+            (Some [cs] (for x cs (unless (has? seen x) (push! (mut todo) x))))
+            (None [] 0)))))
+    out))
+
+(defn memo-at [(c (mut Checker)) (key (slice u8))] (-> (Option Effect))
+  (let [at (memo-index (mut c) key)]
+    (if (>= at 0) (Some (get (.memo c) at)) (None))))
 
 ;;; The files read to know it.
 (defn checker-depends [(c (mut Checker))] (-> (ArrayList (slice u8)))
@@ -543,7 +573,7 @@
                                f
                                locals
                                (mut out)
-                               (fun-effect (mut c) (.name info) (.text e))
+                               (read-fun-effect (mut c) (.name info) (.text e))
                                args
                                where))
             (None [] 0)))))
@@ -577,7 +607,7 @@
                                                f
                                                locals
                                                (mut out)
-                                               (fun-effect (mut c)
+                                               (read-fun-effect (mut c)
                                                            (.name info)
                                                            name)
                                                args
@@ -615,7 +645,7 @@
                                                             f
                                                             locals
                                                             (mut out)
-                                                            (fun-effect (mut c)
+                                                            (read-fun-effect (mut c)
                                                                         m
                                                                         fname)
                                                             args
@@ -830,13 +860,23 @@
     (_ (for k (.kids n) (locals! k (mut out) in-pattern)))))
 
 (defn memo-index [(c (mut Checker)) (key (slice u8))] (-> i64)
-  (let [(mut at) -1]
-    (for i (range 0 (len (.memo-keys c)))
-      (when (= (get (.memo-keys c) i) key) (set! at i)))
-    at))
+  (match (get (.memo-ids c) key) (Some [i] i) (None [] -1)))
 
 ;;; What a function, and all it calls, writes. A call back into a function still being worked out
 ;;; adds nothing: its effects are being gathered already.
+;;; A statically known call propagates reads. A dynamically chosen function value contributes
+;;; writes only (`value-call!`), so querying its effect must not add a read edge to its caller.
+(defn read-fun-effect [(c (mut Checker)) (module (slice u8)) (name (slice u8))] (-> Effect)
+  (let [key (dsl/join3 module "/" name)]
+    ;; The call met: from the function being worked out, if any.
+    (when (> (len (.visiting c)) 0)
+      (let [from (get (.visiting c) (- (len (.visiting c)) 1))
+            (mut cs) (match (get (.calls c) from) (Some [x] x) (None [] (texts)))]
+        (unless (has? cs key)
+          (push! (mut cs) key)
+          (set! (mut (.calls c)) from cs))))
+    (fun-effect (mut c) module name)))
+
 (defn fun-effect [(c (mut Checker)) (module (slice u8)) (name (slice u8))]
   (-> Effect)
   (let [key (dsl/join3 module "/" name)
@@ -857,6 +897,8 @@
                     (None []
                           (push! (mut (.hooks out))
                                  (dsl/join2 "no function named " key)))))
+              (pop! (mut (.visiting c)))
+              (set! (mut (.memo-ids c)) key (len (.memo c)))
               (push! (mut (.memo-keys c)) key)
               (push! (mut (.memo c)) out)
               ;; What a stage makes is only read by the stages after it: of it, they see what it
@@ -1654,6 +1696,25 @@
 
 ;;; The sizes a pipeline file gives (`size module/name N`): each name, and its number as written.
 (defstruct Size [(name (slice u8)) (value (slice u8))])
+
+;;; The pipeline's contexts (see `Contexts` in the grammar): the setting that names the context, as
+;;; `module.name`, and the settings every context gives alike; none when it declares none.
+(defstruct Contexts [(by (slice u8)) (shared (ArrayList (slice u8)))])
+
+(defn contexts-of [(tree g/Node)] (-> Contexts)
+  (let [(mut out) (Contexts :by "" :shared (texts))]
+    (for d (.kids (kid-of tree 6))
+      (when (> (len (.by out)) 0)
+        (dsl/fail-at "pipeline" 1 1 "a pipeline declares its contexts once"))
+      (set! (.by out) (setting-name (.text (kid-of d 0))))
+      (for x (.kids (kid-of d 1)) (push! (mut (.shared out)) (setting-name (.text x)))))
+    out))
+
+;;; A setting as a pipeline names it, `module/name`, as the rules compiler names it, `module.name`.
+(defn setting-name [(t (slice u8))] (-> (slice u8))
+  (match (rt/last-index-of t "/")
+    (Some [i] (dsl/join3 (subslice t 0 i) "." (subslice t (+ i 1) (len t))))
+    (None [] t)))
 
 (defn sizes-of [(tree g/Node)] (-> (ArrayList Size))
   (let [(mut out) (ArrayList::new [Size] (rt/value-allocator))]

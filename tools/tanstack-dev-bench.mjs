@@ -24,6 +24,20 @@ const apps = {
            vite: (port) => ['node_modules/.bin/vite', ['dev', '--port', String(port), '--strictPort']] },
 };
 
+for (const [name, text, selector, exact] of [
+  ['start-bare', 'Hello world!', 'h1', true],
+  ['start-counter', 'Add 1 to', 'button', false],
+  ['start-material-ui', 'Hello world!', 'h1', true],
+  ['start-streaming-data-from-server-functions', 'Typed Readable Stream', 'h1', true],
+]) {
+  apps[name] = { fixture: `benchmarks/tanstack-examples/${name}`, file: 'src/routes/index.tsx',
+    text, selector, exact, ours: apps.start.ours, vite: apps.start.vite };
+}
+const selected = process.env.BENCH_APPS === 'all' ? Object.keys(apps) : (process.env.BENCH_APPS ?? 'router,start').split(',');
+for (const name of selected) if (!apps[name]) throw new Error(`unknown benchmark app ${name}`);
+const target = (page, a) => a.id ? page.getByTestId(a.id) : page.locator(a.selector);
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 function copy(name, fixture) {
   const d = join(work, name);
   rmSync(d, { recursive: true, force: true });
@@ -70,7 +84,7 @@ async function round(browser, app, tool) {
       if (performance.now() - began > 60000) throw new Error(`${tool} did not answer:\n${log}`);
       try { await page.goto(`http://localhost:${p}/`, { timeout: 5000 }); break; } catch { await new Promise((r) => setTimeout(r, 20)); }
     }
-    await page.getByTestId(a.id).filter({ hasText: a.text }).first().waitFor({ timeout: 30000 });
+    await target(page, a).filter({ hasText: a.text }).first().waitFor({ timeout: 30000 });
     await page.waitForFunction(() => self.$_TSR === undefined || self.$_TSR.hydrated, null, { timeout: 10000 }).catch(() => {});
     const first = performance.now() - began;
     await page.waitForTimeout(500);
@@ -82,7 +96,7 @@ async function round(browser, app, tool) {
       await page.evaluate(() => { window.__kept = true; });
       const t = performance.now();
       writeFileSync(path, original.replace(a.text, text));
-      await page.getByTestId(a.id).filter({ hasText: new RegExp(`^${text}$`) }).first().waitFor({ timeout: 20000 });
+      await target(page, a).filter({ hasText: a.exact === false ? text : new RegExp(`^${escapeRegex(text)}$`) }).first().waitFor({ timeout: 20000 });
       updates.push(performance.now() - t);
       if (!(await page.evaluate(() => window.__kept === true))) errors.push(`edit ${i} reloaded the page`);
       await page.waitForTimeout(300);
@@ -101,8 +115,8 @@ const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.
 const browser = await chromium.launch({ executablePath: process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
 const results = {};
 for (let r = 0; r < rounds; r++) {
-  for (const app of Object.keys(apps)) {
-    for (const tool of ['ours', 'vite']) {
+  for (const app of selected) {
+    for (const tool of (r % 2 ? ['vite', 'ours'] : ['ours', 'vite'])) {
       const res = await round(browser, app, tool);
       (results[`${app} ${tool}`] ??= []).push(res);
     }
@@ -110,9 +124,14 @@ for (let r = 0; r < rounds; r++) {
 }
 await browser.close();
 console.log(`TanStack apps in development (${rounds} rounds of a fresh server, ${edits} edits each, interleaved; load ${(await import('node:os')).loadavg()[0].toFixed(1)})`);
-console.log('                 first page ms   edit shown ms (median, worst)   peak MB   after edits MB   problems');
+console.log('                 first page ms   edit shown ms (median, worst)   peak MiB   after edits MiB   problems');
 for (const [key, rs] of Object.entries(results)) {
   const ups = rs.flatMap((x) => x.updates);
   console.log(`  ${key.padEnd(14)} ${median(rs.map((x) => x.first)).toFixed(0).padStart(10)}   ${median(ups).toFixed(0).padStart(14)} ${Math.max(...ups).toFixed(0).padStart(8)}`
     + `   ${median(rs.map((x) => x.peak)).toFixed(0).padStart(11)} ${median(rs.map((x) => x.after)).toFixed(0).padStart(12)}   ${rs.flatMap((x) => x.errors).join('; ') || 'none'}`);
 }
+
+if (process.env.BENCH_RESULTS) writeFileSync(process.env.BENCH_RESULTS, JSON.stringify({
+  measuredAt: new Date().toISOString(), rounds, edits, memoryUnit: 'MiB', loadEnd: (await import('node:os')).loadavg(), results,
+}, null, 2));
+if (Object.values(results).flat().some((r) => r.errors.length)) process.exitCode = 1;
