@@ -191,7 +191,7 @@ for entry in ["main", "eq", "rx", "zod3", "zod4", "immer"]:
         ra, rb = sh(["node", a], 30), sh(["node", b], 30)
         size = f"{os.path.getsize(a)} vs {os.path.getsize(b)} bytes" if "--minify" in flags else f"{len(ra[1])} bytes of output"
         check(code == 0 and ra[0] == 0 and ra[1] and ra[1] == rb[1], f"{' '.join([entry] + flags)}: same output as esbuild's; {size}")
-all_ts = subprocess.run("find node_modules -name '*.ts' -o -name '*.tsx' -o -name '*.mts' -o -name '*.cts'", shell=True, capture_output=True, text=True).stdout.split()
+all_ts = subprocess.run("find node_modules/ -name '*.ts' -o -name '*.tsx' -o -name '*.mts' -o -name '*.cts'", shell=True, capture_output=True, text=True).stdout.split()
 source = [f for f in all_ts if not re.search(r"\.d\.[mc]?ts$", f)]
 declarations = [f for f in all_ts if re.search(r"\.d\.[mc]?ts$", f)]
 for name, files in [("sources", source), ("declarations", declarations)]:
