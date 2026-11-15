@@ -817,6 +817,60 @@ actions (`"use server"` is an error), routing or paired-build watch/HMR. One bro
 emitted for all boundaries; paired builds do not combine with code splitting yet. It is a build
 graph check, not a sandbox for runtime filesystem/network access or nonliteral dynamic imports.
 
+## TanStack Router and Start
+
+A project written for Vite with TanStack Router or TanStack Start builds here without Vite:
+
+```sh
+esb index.html --outdir=dist --tanstack-router            # a Router app, as `vite build` makes it
+esb index.html --hmr --serve=3000 --tanstack-router        # ... and as `vite dev` serves it
+esb --tanstack-start                                       # a Start app: dist/client, dist/server/server.js
+```
+
+Each part of what TanStack's and Vite's plugins do is a language's here (`src/tanstack`, `src/vite`,
+`src/react`):
+
+- **The route tree.** TanStack's generator, in `.rules`: file names to route nodes, the tree placed,
+  `routeTree.gen.ts` written as its templates write it and then formatted as Prettier formats it —
+  `hl.doc` is Prettier's document algebra and printer, and `tanstack.pretty` builds the documents
+  Prettier's printers build for the shapes the tree has (assignment layouts, member chains, call
+  arguments, unions). `tools/router-gen-check.py` compares it with TanStack's generator over random
+  projects: over 7,000, nothing differs. Start's footer and its browser tree (no types, server-only
+  routes left out) are configurations of the same generator.
+- **Code splitting.** A route option split (`component`, …) becomes an export of the route file and,
+  in its place, a lazy import of `file?tsr-split=component`, a module that only re-exports it.
+  Which statements load with the route and which with the component is the bundler's own placement
+  of statements (`--fragments`); TanStack's plugin makes a third module of what both read so it is
+  not made twice, which placement does by itself. `--chunk-already-loaded` gives a dynamic root
+  nothing sure to be loaded before it runs (Rollup's rule). `tools/split-fuzz.py` runs random route
+  files with Node, unsplit and split: they print the same.
+- **The page.** `index.html` is a grammar (`bundle.markup`); its module scripts are the entries and
+  it is written again loading the entry chunk, preloading what that imports, linking its
+  stylesheets. `--manifest` writes Vite's `.vite/manifest.json`. Vite's `import.meta.env` (`.env`
+  files, `VITE_` variables), `?url`, `?raw`, assets and `import.meta.glob` come with it.
+- **Development.** React Fast Refresh (`react.refresh`): components registered with React's refresh
+  runtime, hooks as signatures, a module of components accepting its updates. A route file gets
+  TanStack's route update statement, so an edit updates the route in the running router. Stylesheets
+  are `<style>`s that take their updates; the server answers an app's routes with the page.
+  `tools/router-dev-check.mjs` edits a running app's files in a browser and checks state is kept.
+- **Start.** Two builds, the browser's then the server's, with Start's compiler before splitting
+  (`tanstack.start-compiler`): `createServerFn` is an RPC in the browser, a call of the function's own
+  module on the server, and in that module (`?tss-serverfn-split`) the handler registered under its
+  id — SHA-256 of `path--name`, so the ids are Vite's; `createIsomorphicFn`, `createServerOnlyFn`,
+  `createClientOnlyFn`, `createMiddleware` and `<ClientOnly>` as Start compiles them, and what only
+  the code taken out read goes, so server-only modules never reach the browser. Start's manifest is
+  made from the browser build's manifest; its server function resolver from the project's files.
+  Import protection fails the build when a `.server` module (or a marked one) is still read in the
+  browser's output. `tools/start-check.py` builds the reference app and runs it as Start's server
+  runs it, in a browser.
+
+Sizes against Vite 8 (`benchmarks/tanstack-router`, `benchmarks/tanstack-start`, minified browser
+JavaScript): Router 282.0 KB against 272.6 KB, Start 341.6 KB against 318.7 KB; esbuild's own bundle of
+the Router app is 275.7 KB, so most of the difference is the minifier. Not yet: Start in development
+(server rendering run in Node with updates), Start's `<Hydrate>`, a Start factory re-exported
+through a project's own file (recognised only when imported from Start's packages), a stylesheet's
+`url()` files and `?url` stylesheets in development.
+
 ## Results
 
 `tools/verify.py` checks all of this in one run.
