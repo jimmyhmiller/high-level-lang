@@ -6,8 +6,9 @@
 #                makes answers it never made before (new keys, new trees)
 #   exports      the entry exports a new name each time (ES module output), so linking's facts
 #                change and its database is brought up to date from the last one (`update by`)
+#   hot updates  the statements edits with --hmr: each build's development state, kept for the next
 # After build WARM and after the last, it reads what the watcher's regions hold (HL_REGION_TRACE:
-# regions alive, and their bytes), and its memory at its lowest over the five builds to each. The regions must hold no more than
+# regions alive, and their bytes), and its memory over the five builds to each, the middle reading. The regions must hold no more than
 # they did after build WARM, give or take 2%; the process's memory (its footprint on macOS, its
 # resident set elsewhere) may grow by at most 3% or 4 MB.
 #   usage: memory-check.py ESB [APP...] [--edits=N] [--warm=N]   (APP: zod, rx, datefns, three, …, manyzod: twelve zods)
@@ -73,7 +74,10 @@ def prepare(app):
 
 def session(entry, rel, change, flags):
     """A watcher through EDITS edits of `rel` (each `change(original, i)`): what its regions held and
-    its memory at its lowest over the five builds to WARM and over the last five."""
+    its memory over the five builds to WARM and over the last five, the middle reading of each: one
+    reading may be high (malloc gives back what is freed when it will) or low (the first after a
+    run of builds with no pause between them, before what they made has settled), and a leak
+    raises them all."""
     original = open(os.path.join(WORK, rel)).read()
     env = dict(os.environ, HL_REGION_TRACE="1")
     p = subprocess.Popen([ESB, entry, "--watch", "--no-cache", "--watch-interval=5", "--outfile=out/out.js"] + flags,
@@ -89,9 +93,7 @@ def session(entry, rel, change, flags):
             if r:
                 # The regions as the build's end left them, after what nothing held was let go.
                 held[builds] = (int(r.group(1)), int(r.group(2)) * 1024)
-                # The process's memory over the five builds that end at WARM and the five last:
-                # malloc gives back what is freed when it will, so one reading may be high, and a
-                # leak raises them all.
+                # The process's memory over the five builds that end at WARM and the five last.
                 if WARM - 4 <= builds <= WARM or builds > EDITS - 4:
                     time.sleep(0.05)
                     seen[builds] = resident(p.pid)
@@ -105,7 +107,8 @@ def session(entry, rel, change, flags):
         sys.exit("the watcher stopped early:\n" + "".join(said)[-2000:])
     early = [v for b, v in seen.items() if b <= WARM and v is not None]
     late = [v for b, v in seen.items() if b > EDITS - 4 and v is not None]
-    return held[WARM], held[EDITS + 1], (min(early) if early else None), (min(late) if late else None)
+    middle = lambda xs: sorted(xs)[len(xs) // 2] if xs else None
+    return held[WARM], held[EDITS + 1], middle(early), middle(late)
 
 def check(ok, what):
     global failures
@@ -119,6 +122,9 @@ for app in APPS:
     sessions = [
         ("statements", module, lambda text, i: f'console.log("memory edit {i}");\n' + text, []),
         ("exports", entry, lambda text, i: text + f"\nexport const memory_edit_{i} = {i};\n", ["--format=esm"]),
+        # Hot module replacement: what each build keeps for the next (its development state, copied
+        # out of the build's region) and sends must not stay behind either.
+        ("hot updates", module, lambda text, i: f'console.log("memory edit {i}");\n' + text, ["--hmr"]),
     ]
     for name, rel, change, flags in sessions:
         (n0, b0), (n1, b1), r0, r1 = session(entry, rel, change, flags)

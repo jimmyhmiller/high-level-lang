@@ -10,6 +10,7 @@
         [malloc-allocator overflow-arena-allocator box! Allocator AllocRequest alloc
          reallocate free create unwrap-ptr oom-at])
 (import "coil.mem" :as mem)
+(import "coil.math" :use [max min])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.slice" :use [subslice])
 (import "coil.hashmap" :use [HashMap MapIter KeyOps Entry i64-keyops bytewise-hash])
@@ -1396,6 +1397,65 @@
         (Some [m] (do (mem/copy [u8] (data m) (data s) (len s)) m))
         (None [] (panic "no memory to keep a text")))))
 
+;;; Where a writer's and a reader's own tables go (their bytes, the table of objects it has met, a
+;;; reader's arena): on malloc up to a megabyte, and past it pages of their own, given back to the
+;;; system when let go. They grow to sizes what is written decides, so a big block freed on malloc
+;;; is seldom the size the next one wants, and Darwin's malloc keeps it resident: a watcher that
+;;; copies what it keeps from each build (and saves the cache) kept a few more such blocks each
+;;; time. A block is pages exactly when it is more than the threshold; a resize in place never
+;;; crosses it, or changes the pages a block has, so it is freed as what it is.
+(defstruct BigAllocator [(unused i64)])
+
+(defn big-threshold :inline (Always) [] (-> i64) 1048576)
+
+(defn big-paged? [(bytes i64)] (-> bool) (> bytes (big-threshold)))
+
+(defn big-new [(bytes i64)] (-> (Option (ptr i8)))
+  (if (big-paged? bytes)
+      (let [p (pages-new bytes)]
+        (if (= (primitive/cast i64 p) 0) (None) (Some p)))
+      (let [p (malloc (primitive/cast isize bytes))]
+        (if (= (primitive/cast i64 p) 0) (None) (Some p)))))
+
+(defn big-let-go! [(memory (ptr i8)) (bytes i64)] (-> i64)
+  (if (big-paged? bytes)
+      (do (munmap memory (primitive/cast isize (chunk-pages bytes))) 0)
+      (do (primitive/free memory) 0)))
+
+(impl Allocator BigAllocator
+  (allocate [(self (ptr BigAllocator)) (request (ref AllocRequest))]
+            (-> (Option (ptr i8)))
+            (if (> (load (field request align)) 16)
+                (None)
+                (big-new (max 1 (load (field request bytes))))))
+  (resize [(self (ptr BigAllocator)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))]
+          (-> bool)
+          (let [o (load (field old bytes))
+                n (load (field new bytes))]
+            (and (<= n o)
+                 (= (big-paged? o) (big-paged? n))
+                 (or (not (big-paged? o)) (= (chunk-pages o) (chunk-pages n))))))
+  (remap [(self (ptr BigAllocator)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))]
+         (-> (Option (ptr i8)))
+         (let [o (load (field old bytes))
+               n (load (field new bytes))]
+           (cond (> (load (field new align)) 16) (None)
+                 (and (not (big-paged? o)) (not (big-paged? n)))
+                   (let [p (realloc memory (primitive/cast isize (max 1 n)))]
+                     (if (= (primitive/cast i64 p) 0) (None) (Some p)))
+                 :else
+                   (match (big-new (max 1 n))
+                     (Some [p] (do (mem/copy [u8] (primitive/cast (ptr u8) p) (primitive/cast (ptr u8) memory) (min o n))
+                                   (big-let-go! memory o)
+                                   (Some p)))
+                     (None [] (None))))))
+  (deallocate [(self (ptr BigAllocator)) (memory (ptr i8)) (request (ref AllocRequest))]
+              (-> i64)
+              (big-let-go! memory (load (field request bytes)))))
+
+(defn big-allocator [] (-> (dyn Allocator))
+  (primitive/make-dyn Allocator (primitive/alloc-static BigAllocator)))
+
 ;;; A writer for copying one value: written, then read back where values go now (see `own-code` in
 ;;; the rules compiler), so the copy points at nothing the original did.
 (defn copy-writer-new [] (-> (ptr Writer))
@@ -1406,21 +1466,21 @@
 (defn copy-writer-value [] (-> Writer)
   (Writer
     :mem
-      (match (alloc [u8] (malloc-allocator) 256)
+      (match (alloc [u8] (big-allocator) 256)
         (Some [m] m)
         (None [] (panic "no memory to copy a value")))
     :pos 0
     :base 0
     :objects false
-    :keys (ArrayList::new [i64] (malloc-allocator))
-    :ids (ArrayList::new [i64] (malloc-allocator))
+    :keys (ArrayList::new [i64] (big-allocator))
+    :ids (ArrayList::new [i64] (big-allocator))
     :mask -1
     :filled 0
-    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))
+    :shared (HashMap::new [(slice u8) i64] (big-allocator) (text-keyops))
     :next-id 0
-    :defined (ArrayList::new [i64] (malloc-allocator))
-    :open (ArrayList::new [i64] (malloc-allocator))
-    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))))
+    :defined (ArrayList::new [i64] (big-allocator))
+    :open (ArrayList::new [i64] (big-allocator))
+    :modules (HashMap::new [(slice u8) i64] (big-allocator) (text-keyops))))
 
 ;;; What a copy writer wrote, as a reader of its bytes copied where values go now; the writer let go.
 (defn copy-reader [(w (ptr Writer))] (-> (ptr Reader))
@@ -1445,7 +1505,7 @@
   0)
 
 (defn writer-free! [(w (ptr Writer))] (-> void)
-  (free [u8] (malloc-allocator) (.mem w))
+  (free [u8] (big-allocator) (.mem w))
   (free! (mut (.keys w)))
   (free! (mut (.ids w)))
   (free! (mut (.shared w)))
@@ -1501,6 +1561,7 @@
     (.on c)))
 
 (extern malloc :cc (cc/C) [isize] (-> (ptr i8)))
+(extern realloc :cc (cc/C) [(ptr i8) isize] (-> (ptr i8)))
 
 ;;; hygiene: the platform's flag enters this module's namespace on purpose.
 (defn gen-map-anon-private [] (-> Code)
@@ -7704,14 +7765,16 @@
 ;;; IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE |
 ;;; IN_DELETE_SELF | IN_MOVE_SELF
 (defn inotify-watch! [(w (ptr Watch)) (path (slice u8))] (-> bool)
-  (let [wd
+  (let [c (str/to-cstr (malloc-allocator) path)
+        wd
           (primitive/call-ptr (primitive/cast (fnptr (cc/C)
                                                      [i32 (ptr i8) u32]
                                                      i32)
                                               (inotify-add-fn))
                               (.kq w)
-                              (str/to-cstr (malloc-allocator) path)
+                              c
                               (: 4046 u32))]
+    (primitive/free (primitive/cast (ptr i8) c))
     (if (< wd (: 0 i32))
         false
         (do
@@ -7721,7 +7784,9 @@
 
 (defn kqueue-watch! [(w (ptr Watch)) (path (slice u8))] (-> bool)
   ;; O_EVTONLY: open only to be told of events, which does not keep a volume busy.
-  (let [fd (os/open (str/to-cstr (malloc-allocator) path) (: 32768 i32) 0)]
+  (let [c (str/to-cstr (malloc-allocator) path)
+        fd (os/open c (: 32768 i32) 0)]
+    (primitive/free (primitive/cast (ptr i8) c))
     (if (< fd (: 0 i32))
         false
         (let [event (primitive/alloc-stack (array u8 32))
@@ -7871,7 +7936,21 @@
    (port i64)
    (listener TcpListener)
    (clients (ArrayList TcpConnection))
-   (thread Thread)])
+   (thread Thread)
+   ;; Whether pages and files asked for wait (1) until what is served is written: a development
+   ;; server holds them until its first build is, so a browser that comes early is not given a
+   ;; page whose script is not there yet.
+   (held i64)])
+
+;;; What is served is not written yet: pages and files asked for wait for `served-written!`.
+(defn serve-hold! [] (-> void)
+  (atomic/store (field (server) held) 1)
+  0)
+
+;;; What is served is written: pages and files asked for are answered.
+(defn served-written! [] (-> void)
+  (atomic/store (field (server) held) 0)
+  0)
 
 (defn server [] (-> (ptr Server))
   (primitive/alloc-static Server))
@@ -8019,7 +8098,9 @@
             ;; A path naming no file, whose last part has no extension, is a page of the app the
             ;; page is (a single-page app's route): it is answered with the page, as Vite's server
             ;; answers it.
-            (let [file (join (.dir s) (if (= path "/") "/index.html" path))
+            (let [file (do (while (= (atomic/read (field s held)) 1)
+                             (sleep (Duration :sec 0 :nsec 10000000)))
+                           (join (.dir s) (if (= path "/") "/index.html" path)))
                   last-part (subslice path (+ (match (last-index-of path "/") (Some [i] i) (None [] -1)) 1) (len path))]
               (cond (file-exists-raw? file)
                       (respond! c
@@ -8037,27 +8118,30 @@
 
 ;;; An event to every client listening at the configured event path; one that has gone is dropped.
 (defn broadcast! [(event (slice u8)) (text (slice u8))] (-> void)
-  (let [s (server)
-        (mut b) (str/StrBuf::new (malloc-allocator))]
-    (push-str! (mut b) "event: ")
-    (push-str! (mut b) event)
-    (push-str! (mut b) "\n")
-    (for l (split text "\n")
-      (push-str! (mut b) "data: ")
-      (push-str! (mut b) l)
-      (push-str! (mut b) "\n"))
-    (push-str! (mut b) "\n")
-    (let [message (finish! (mut b))
-          (mut kept) (ArrayList::new [TcpConnection] (malloc-allocator))]
-      (when (.ready s)
-        (spin-lock! (cast (ptr i64) s))
-        (for c (.clients s)
-          (if (send-all! c message)
-              (push! (mut kept) c)
-              (close-connection! c)))
-        (set! (.clients s) kept)
-        (spin-unlock! (cast (ptr i64) s)))
-      0)))
+  (let [s (server)]
+    ;; Nothing is served (a watcher with no --serve): there is no one to send it to.
+    (when (.ready s)
+      (let [(mut b) (str/StrBuf::new (malloc-allocator))]
+        (push-str! (mut b) "event: ")
+        (push-str! (mut b) event)
+        (push-str! (mut b) "\n")
+        (for l (split text "\n")
+          (push-str! (mut b) "data: ")
+          (push-str! (mut b) l)
+          (push-str! (mut b) "\n"))
+        (push-str! (mut b) "\n")
+        (let [message (finish! (mut b))
+              (mut kept) (ArrayList::new [TcpConnection] (malloc-allocator))]
+          (spin-lock! (cast (ptr i64) s))
+          (for c (.clients s)
+            (if (send-all! c message)
+                (push! (mut kept) c)
+                (close-connection! c)))
+          (free! (mut (.clients s)))
+          (set! (.clients s) kept)
+          (spin-unlock! (cast (ptr i64) s))
+          (free [u8] (malloc-allocator) message))))
+    0))
 
 ;;; How many clients listen at the configured event path.
 (defn listeners [] (-> i64)
@@ -8124,21 +8208,21 @@
 (defn writer-new [(objects bool)] (-> Writer)
   (Writer
     :mem
-      (match (alloc [u8] (malloc-allocator) 1048576)
+      (match (alloc [u8] (big-allocator) 1048576)
         (Some [m] m)
         (None [] (panic "no memory to write the cache")))
     :pos 0
     :base 0
     :objects objects
-    :keys (ArrayList::new [i64] (malloc-allocator))
-    :ids (ArrayList::new [i64] (malloc-allocator))
+    :keys (ArrayList::new [i64] (big-allocator))
+    :ids (ArrayList::new [i64] (big-allocator))
     :mask -1
     :filled 0
-    :shared (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))
+    :shared (HashMap::new [(slice u8) i64] (big-allocator) (text-keyops))
     :next-id 0
-    :defined (ArrayList::new [i64] (malloc-allocator))
-    :open (ArrayList::new [i64] (malloc-allocator))
-    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))))
+    :defined (ArrayList::new [i64] (big-allocator))
+    :open (ArrayList::new [i64] (big-allocator))
+    :modules (HashMap::new [(slice u8) i64] (big-allocator) (text-keyops))))
 
 ;;; A buffer to write the next part in, at `base`, keeping what objects are known.
 (defn writer-restart! [(w (ptr Writer)) (base i64)] (-> void)
@@ -8154,12 +8238,12 @@
     :bytes bytes
     :at 0
     :objects objects
-    :returns (ArrayList::new [i64] (malloc-allocator))
-    :offsets (ArrayList::new [i64] (malloc-allocator))
-    :values (ArrayList::new [i64] (malloc-allocator))
-    :arena (ArrayList::new [u8] (malloc-allocator))
-    :frames (ArrayList::new [i64] (malloc-allocator))
-    :modules (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops))))
+    :returns (ArrayList::new [i64] (big-allocator))
+    :offsets (ArrayList::new [i64] (big-allocator))
+    :values (ArrayList::new [i64] (big-allocator))
+    :arena (ArrayList::new [u8] (big-allocator))
+    :frames (ArrayList::new [i64] (big-allocator))
+    :modules (HashMap::new [(slice u8) i64] (big-allocator) (text-keyops))))
 
 (defn written-bytes [(w (ptr Writer))] (-> (slice u8))
   (subslice (.mem w) 0 (.pos w)))
@@ -8171,11 +8255,10 @@
 ;;; Room for `n` more bytes.
 (defn put-room! [(w (ptr Writer)) (n i64)] (-> void)
   (when (> (+ (.pos w) n) (len (.mem w)))
-    (let [want (+ (* 2 (len (.mem w))) n 65536)]
-      (set! (.mem w)
-            (match (reallocate [u8] (malloc-allocator) (.mem w) want)
-              (Some [m] m)
-              (None [] (panic "no memory to write the cache"))))))
+    (set! (.mem w)
+          (match (reallocate [u8] (big-allocator) (.mem w) (+ (* 2 (len (.mem w))) n 65536))
+            (Some [m] m)
+            (None [] (panic "no memory to write the cache")))))
   0)
 
 (defn put-byte! [(w (ptr Writer)) (b i64)] (-> void)
@@ -8299,8 +8382,8 @@
   (let [old-keys (.keys w)
         old-ids (.ids w)
         cap (if (< (.mask w) 1023) 1024 (* (+ (.mask w) 1) 2))
-        (mut keys) (ArrayList::new [i64] (malloc-allocator))
-        (mut ids) (ArrayList::new [i64] (malloc-allocator))]
+        (mut keys) (ArrayList::new [i64] (big-allocator))
+        (mut ids) (ArrayList::new [i64] (big-allocator))]
     (ArrayList::extend-zeroed! (mut keys) (* cap 3))
     (ArrayList::extend-zeroed! (mut ids) cap)
     (for j (range 0 (len old-ids))
@@ -8355,8 +8438,8 @@
       (let [cap (+ (.mask w) 1)
             old-keys (.keys w)
             old-ids (.ids w)
-            (mut keys) (ArrayList::new [i64] (malloc-allocator))
-            (mut ids) (ArrayList::new [i64] (malloc-allocator))
+            (mut keys) (ArrayList::new [i64] (big-allocator))
+            (mut ids) (ArrayList::new [i64] (big-allocator))
             (mut filled) 0]
         (ArrayList::extend-zeroed! (mut keys) (* cap 3))
         (ArrayList::extend-zeroed! (mut ids) cap)
@@ -9253,7 +9336,7 @@
       (for v defined (put-varint! w v))
       (put-raw! w (written-bytes (field x w)))
       (put-word! w index-at)
-      (free [u8] (malloc-allocator) (.mem (field x w)))
+      (free [u8] (big-allocator) (.mem (field x w)))
       (let [body (written-bytes w)
             f (primitive/alloc-static FrameWriter)]
         (set! (.w f) (writer-new false))
@@ -9316,7 +9399,7 @@
         (match (fs/rename-file (malloc-allocator) tmp to)
           (Ok [_] 0)
           (Err [_] (panic "cannot move {} to {}" tmp to))))
-      (free [u8] (malloc-allocator) (.mem w))))
+      (free [u8] (big-allocator) (.mem w))))
   (cache-kept! d)
   0)
 

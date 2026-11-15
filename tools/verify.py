@@ -554,11 +554,12 @@ fails = [l.strip() for l in out.splitlines() if l.strip().startswith("FAIL")]
 check(code == 0 and out.strip().endswith("all mechanisms check out"),
       f"mechanisms: {len([l for l in out.splitlines() if l.strip().startswith('ok')])} checks" + (f"; {fails[0]}" if fails else ""))
 
-# Memory while watching: through fifty edits that each make answers never made before, and fifty
-# that each change what linking derives, what the watcher holds stays what it held at build 20.
-code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory-check.py"), ESB, "zod",
+# Memory while watching, on zod and on three (a big module, whose copies and tables are big): through
+# fifty edits that each make answers never made before, fifty that each change what linking derives,
+# and fifty with hot module replacement, what the watcher holds stays what it held at build 20.
+code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory-check.py"), ESB, "zod", "three",
                                        "--edits=50", "--warm=20"],
-                                      8000, 600, quiet=True)
+                                      8000, 1800, quiet=True)
 fails = [l.strip() for l in out.splitlines() if l.strip().startswith("FAIL")]
 check(code == 0 and out.strip().endswith("memory holds steady"),
       f"memory while watching: {len([l for l in out.splitlines() if l.strip().startswith('ok')])} checks" + (f"; {fails[0]}" if fails else ""))
