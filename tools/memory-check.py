@@ -95,7 +95,8 @@ def session(entry, rel, change, flags):
                 held[builds] = (int(r.group(1)), int(r.group(2)) * 1024)
                 # The process's memory over the five builds that end at WARM and the five last.
                 if WARM - 4 <= builds <= WARM or builds > EDITS - 4:
-                    time.sleep(0.05)
+                    # Once what the build was doing has settled (it may still be giving memory back).
+                    time.sleep(0.3)
                     seen[builds] = resident(p.pid)
                 if builds > EDITS: break
                 write(rel, change(original, builds))

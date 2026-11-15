@@ -501,6 +501,9 @@ if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
           + (out.strip().splitlines()[-1] + " (rendered by the server, routes and components updated in place, server code run as edited, stylesheets reloaded, a route added)" if code == 0 else out[-1800:]))
 else:
     check(False, "TanStack Start application: benchmarks/tanstack-start has no node_modules (npm ci --prefix benchmarks/tanstack-start --ignore-scripts)")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tanstack-examples-check.py"), ESB], 2400)
+check(code == 0 and " 0 failed" in out, "TanStack's own examples, against Vite's builds of them: "
+      + (out.strip().splitlines()[-1] + " (benchmarks/tanstack-examples: every route, in Chrome)" if code == 0 else out[-1800:]))
 
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)

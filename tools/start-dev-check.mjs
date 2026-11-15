@@ -45,6 +45,9 @@ const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(String(e)));
 page.on('console', (m) => { if (m.type() === 'error' && !m.text().startsWith('Failed to load resource')) errors.push(m.text()); });
+// A file the page asks for and does not get is an error too (the console's own line for it is not);
+// a page's own status is the server's answer, checked where it matters.
+page.on('response', (r) => { if (r.status() >= 400 && !r.request().isNavigationRequest() && !r.url().endsWith('/favicon.ico')) errors.push(`${r.status()} ${new URL(r.url()).pathname}`); });
 
 async function text(id, want, ms = 8000) {
   const deadline = Date.now() + ms;

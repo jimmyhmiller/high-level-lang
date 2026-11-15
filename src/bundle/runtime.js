@@ -30,6 +30,10 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
   if (typeof require !== "undefined") return require.apply(this, arguments);
   throw Error('Dynamic require of "' + x + '" is not supported');
 });
+// What loads an outside module for ES module output that Node runs: Node's own `require`, for the
+// chunk at `url` (its `import.meta.url`), as the bundled CommonJS that requires a package Node loads
+// would have it. Made when called: the runtime is also a script's, where there is no `process`.
+var __nodeRequire = (url) => process.getBuiltinModule("module").createRequire(url);
 var __objRest = (source, exclude) => {
   var target = {};
   for (var prop in source)
