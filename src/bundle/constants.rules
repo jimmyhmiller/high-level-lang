@@ -22,12 +22,60 @@ quote exp at 1 0 0 ;
 # a value a branch can be decided by, so code may be gone), or none if it has none.
 record Inlined { tree: Node, decided: Bool }
 
+# What a file's imports name that is known to be a constant of the file it comes from (as esbuild
+# writes them in across modules; see bundle.modules' `imported-constants`): each imported name's
+# value, by where the import binds it; and for an `import * as ns`, by where it binds `ns`, the
+# values of the names read off it (`ns.x`).
+record Imported { names: {Int:Node}, spaces: {Int:{Text:Node}} }
+
+fn no-imports() -> Imported = Imported(names: {}, spaces: {})
+
 # `top`: the program's statements as written, before its top level became one `var` a declarator
 # (which says which of them were `const`s); `b`: which symbol each name leaf is; `dynamic`: whether
-# the file has `with` or a direct `eval`.
-fn inlined(tree: Node, top: [Node], b: {Int:Int}, dynamic: Bool) -> Inlined? = match dynamic {
+# the file has `with` or a direct `eval`; `imported`: what its imports are known to be.
+fn inlined(tree: Node, top: [Node], b: {Int:Int}, dynamic: Bool, imported: Imported) -> Inlined? = match dynamic {
   true => none
-  false => written(tree, b, [seen(c) for c in leading(as-defined(top, tree), b, {})], [seen-in(s, b) for s in tree.body.kids])
+  false => written(tree, b, [seen(c) for c in leading(as-defined(top, tree), b, {})] ++ imported-seen(imported, b),
+                   [seen-in(s, b) for s in tree.body.kids],
+                   {s: names for lo in keys(imported.spaces) for s in b[lo] for names in imported.spaces[lo]})
+}
+
+fn imported-seen(imported: Imported, b: {Int:Int}) -> [Seen] =
+  [Seen(symbol: s, value: v, assigned: false) for lo in keys(imported.names) for s in b[lo] for v in imported.names[lo]]
+
+# The constants a file exports, by the names it exports them as: its leading constants at the top
+# level, as `inlined` finds them, that nothing assigns to, exported where declared or by name.
+fn exported(tree: Node, top: [Node], b: {Int:Int}, dynamic: Bool) -> {Text:Node} = match dynamic {
+  true => {}
+  false => {e.name: v for s in top for e in exports-in(s, b, by-name) for v in values[e.symbol]}
+    where by-name = {d.target.text: sym for s in top for d in top-consts(s) if d.target is BindName(_) for sym in b[d.target.lo]},
+          assigned-to = {x.symbol: true for s in tree.body.kids for x in seen-in(s, b) if x.assigned},
+          values = {c.symbol: c.value for c in leading(as-defined(top, tree), b, {}) if not (c.symbol in assigned-to)}
+}
+
+# A name a statement exports, and the symbol it is.
+record Export { name: Text, symbol: Int }
+
+# `by-name`: the symbols of the top level's `const`s, by name, which `export { … }` names them by.
+fn exports-in(s: Node, b: {Int:Int}, by-name: {Text:Int}) -> [Export] = match s {
+  ExportLexical(ConstDecl(List(ds...))) => [Export(name: d.target.text, symbol: sym) for d in ds if d.target is BindName(_) for sym in b[d.target.lo]]
+  ExportNamed(List(specs...)) => [Export(name: exported-name(x), symbol: sym) for x in specs for sym in by-name[name-text(x.local)]]
+  _ => []
+}
+
+fn top-consts(s: Node) -> [Node] = match s {
+  ConstDecl(List(ds...)) | ExportLexical(ConstDecl(List(ds...))) => ds
+  _ => []
+}
+
+fn exported-name(x: Node) -> Text = match x {
+  ExportAs(_, name) => name-text(name)
+  _ => name-text(x.local)
+}
+
+fn name-text(n: Node) -> Text = match n {
+  Str(raw) => unquote(raw)
+  _ => n.text
 }
 
 # What one walk of the tree finds: a constant at the start of a list, or a symbol assigned to.
@@ -41,19 +89,24 @@ fn assigned(symbols: [Int]) -> [Seen] = [Seen(symbol: s, value: None(), assigned
 # statements of the program that read or declare one are made again, and folded where a value can
 # decide a branch: with constants at the top level, those that name one; else those holding one,
 # as a constant inside a statement is read only there. `within`: what each statement holds.
-fn written(tree: Node, b: {Int:Int}, top: [Seen], within: [[Seen]]) -> Inlined? = match known {
-  _ if len(known) == 0 => none
+fn written(tree: Node, b: {Int:Int}, top: [Seen], within: [[Seen]], spaces: {Int:{Text:Node}}) -> Inlined? = match known {
+  _ if len(known) == 0 and len(read-spaces) == 0 => none
   _ => some(Inlined(tree: Program(tree.hashbang, List(stmts...)) with { lo: tree.lo, hi: tree.hi }, decided: deciding))
-    where deciding = any x in found: not x.assigned and deciding?(x.value),
+    where deciding = (any x in found: not x.assigned and deciding?(x.value)) or (any s in keys(read-spaces): any v in values-of(read-spaces[s] ?? {}): deciding?(v)),
+          named = known ++ {s: None() for s in keys(read-spaces)},
           stmts = [match touched {
-                     true => folded(written-in(ss[i], b, known), deciding)
+                     true => folded(written-in(ss[i], b, known, read-spaces), deciding)
                      false => ss[i]
                    } for i in 0..len(ss)
-                   for touched in [(any x in within[i]: x.symbol in known) or (len(top) > 0 and mentions?(ss[i], b, known))]]
+                   for touched in [(any x in within[i]: x.symbol in known) or (len(top) > 0 and mentions?(ss[i], b, named))]]
 } where ss = tree.body.kids,
         found = top ++ [x for w in within for x in w],
         written-to = {x.symbol: true for x in found if x.assigned},
-        known = {x.symbol: x.value for x in found if not x.assigned and not (x.symbol in written-to)}
+        known = {x.symbol: x.value for x in found if not x.assigned and not (x.symbol in written-to)},
+        # A namespace written through (which throws) is left as it is.
+        read-spaces = {s: names for s in keys(spaces) if not (s in written-to) for names in spaces[s]}
+
+fn values-of(m: {Text:Node}) -> [Node] = [v for k in keys(m) for v in m[k]]
 
 fn folded(s: Node, deciding: Bool) -> Node = match deciding {
   true => dce.run(s)
@@ -97,6 +150,7 @@ everywhere fn seen-in(n: Node, b: {Int:Int}) -> [Seen] = match n {
   PreInc(t) | PreDec(t) | PostInc(t) | PostDec(t) => assigned(names-in(t, b))
   ForIn(left, right, body) => assigned(names-in(left, b)) ++ seen-in(right, b) ++ seen-in(body, b)
   ForOf(_, left, right, body) => assigned(names-in(left, b)) ++ seen-in(right, b) ++ seen-in(body, b)
+  Delete(t) => assigned(names-in(t, b))
 }
 
 # The constants at the start of a list, `before` those already found in it.
@@ -119,7 +173,7 @@ record Run { found: [Constant], whole: Bool }
 
 fn declarators(ds: [Node], b: {Int:Int}, before: {Int:Node}) -> Run = match ds {
   [] => Run(found: [], whole: true)
-  [Declarator(BindName(_) as name, init), rest...] if not (init is None()) => match b[name.lo], known(written-in(init, b, before), b) {
+  [Declarator(BindName(_) as name, init), rest...] if not (init is None()) => match b[name.lo], known(written-in(init, b, before, {}), b) {
     some(s), some(v) => with-constant(Constant(symbol: s, value: v), declarators(rest, b, before ++ {s: v}))
     _, _ => Run(found: [], whole: false)
   }
@@ -160,13 +214,15 @@ fn value-of(v: Node, b: {Int:Int}) -> Node? = match v {
 # Each read of a constant, its value, where the read was; `{ C }` becomes `{ C: 2 }`. A constant's
 # declaration inside a function or a block, which nothing reads now, goes, as esbuild drops it; one
 # at the top level is a `var` by now, which tree shaking keeps only if it is exported.
-everywhere fn written-in(n: Node, b: {Int:Int}, known: {Int:Node}) -> Node = match n {
+everywhere fn written-in(n: Node, b: {Int:Int}, known: {Int:Node}, spaces: {Int:{Text:Node}}) -> Node = match n {
   Ident(_) => value-at(n, b, known) ?? n
+  # A name read off a namespace import whose module's export of it is known.
+  Member(Ident(_) as o, PropName(p)) if is-some(space-value(o, p, b, spaces)) => (space-value(o, p, b, spaces) ?? n) with { lo: n.lo, hi: n.hi }
   Shorthand(Ident(_) as old) => match value-at(old, b, known) {
     some(v) => Prop(PropName(old.text), v) with { lo: n.lo, hi: n.hi }
     none => n
   }
-  ConstDecl(List(ds...)) => match [written-in(d, b, known) for d in ds if not ((b[d.target.lo] ?? -1) in known)] {
+  ConstDecl(List(ds...)) => match [written-in(d, b, known, spaces) for d in ds if not ((b[d.target.lo] ?? -1) in known)] {
     [] => Empty() with { lo: n.lo, hi: n.hi }
     kept => ConstDecl(List(kept...)) with { lo: n.lo, hi: n.hi }
   }
@@ -178,6 +234,9 @@ everywhere fn written-in(n: Node, b: {Int:Int}, known: {Int:Node}) -> Node = mat
       none => init
     }) with { lo: n.lo, hi: n.hi }
 }
+
+fn space-value(o: Node, p: Text, b: {Int:Int}, spaces: {Int:{Text:Node}}) -> Node? =
+  first s in b[o.lo] for names in spaces[s] for v in names[p]: v
 
 fn value-at(n: Node, b: {Int:Int}, known: {Int:Node}) -> Node? = first s in [b[n.lo] ?? -1] for v in known[s]: v with { lo: n.lo, hi: n.hi }
 

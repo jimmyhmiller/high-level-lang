@@ -155,8 +155,9 @@ boxed record Loading {
   public-path: Text,
   # `--minify-syntax`: constants are written in where they are read (bundle.constants).
   inline-constants: Bool,
-  # A development build: a stylesheet a module imports is a module that puts it in the page.
-  dev-styles: Bool,
+  # A development build: a stylesheet a module imports is a module that puts it in the page, and one
+  # a `?url` names is at a URL that stays as it is edited (the page is told to load it again).
+  dev: Bool,
   # Vite's import queries: `x?url` is the URL of `x` as an asset of the build's (a stylesheet's
   # bundled), `x?raw` its text.
   url-queries: Bool
@@ -551,7 +552,7 @@ fn url-of(file: Text) -> Text = match path-ext(file) {
   _ => cssb.file-url(file)
 }
 
-fn css-asset-name(file: Text) -> Text = path-stem(file) ++ "-" ++ host.content-hash(url-sheet(file).text) ++ ".css"
+fn css-asset-name(file: Text) -> Text = path-stem(file) ++ "-" ++ host.content-hash(if loading.dev then real-path(file) else url-sheet(file).text) ++ ".css"
 
 # A stylesheet a `?url` names, bundled where it will be written.
 fn url-sheet(file: Text) -> cssb.Bundled = cssb.bundle([file], cssb.asset-directory ++ "/" ++ path-stem(file) ++ ".css", loading.inline-constants, false, "eof")
@@ -620,7 +621,7 @@ boxed record Analysed { analysis: Analysis, scopes: sym.Table }
 # the graph knows once every file is loaded. Not when a define is about `module` or `exports`,
 # which the wrapper would hide; such a script is analysed again inside it if it names them after
 # all. A name free in any of the analyses is free.
-fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text]) -> Analysed =
+fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text], imported: consts.Imported) -> Analysed =
   Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
                               script: not esm and not cjs, wrapped: wrapped or cjs, shift: 0, defined: changed,
                               forbidden: found-writes.forbidden, written: found-writes.written),
@@ -641,19 +642,23 @@ fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx
           false => tree
         },
         constant-tree = match loading.inline-constants {
-          true => consts.inlined(defined-tree, tree0.body.kids, first.bindings, any i in 0..sym.scope-count(first.table): sym.scope-at(first.table, i).dynamic)
+          true => consts.inlined(defined-tree, tree0.body.kids, first.bindings, dynamic?(first.table), imported)
           false => none
         },
         final-tree = (first c in constant-tree: c.tree) ?? defined-tree,
         # What a constant decided may have removed a `require`: then what the file loads is found again.
         changed = defined or (any c in constant-tree: c.decided),
         # Constants written in remove reads and declare nothing: the bindings of what is left stand.
-        final = match defined or (cjs and not wrapped) {
+        # But an import whose every read became its value is not used: the file is analysed again.
+        final = match defined or (cjs and not wrapped) or (is-some(constant-tree) and len(imported.names) + len(imported.spaces) > 0) {
           true => sc.analysis(final-tree, [x for x in ["exports", "module"] if wrapped or cjs])
           false => first
         },
         real-free = [f for f in first.free ++ [f for f in final.free if not (f in first.free)]
                      if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
+
+# Whether a file has `with` or a direct `eval`, where a name may mean something else.
+fn dynamic?(t: sym.Table) -> Bool = any i in 0..sym.scope-count(t): sym.scope-at(t, i).dynamic
 
 # The automatic JSX runtime of a file that is CommonJS (no module syntax of its own, and it names
 # `module` or `exports`), required rather than imported, which would make it an ES module.
@@ -709,7 +714,7 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
   "text" => "export default " ++ host.js-string(text) ++ ";"
   "base64" => "export default \"" ++ host.base64(text) ++ "\";"
   "dataurl" => "export default \"" ++ host.data-url-of(text, host.mime-of(path)) ++ "\";"
-  "css" if loading.dev-styles => dev-style-module(path)
+  "css" if loading.dev => dev-style-module(path)
   "empty" | "css" => ""
   "file" | "url" => panic "{}: the {} loader's text is made by the linking stage", path, loader-of(path)
   other => panic "{}: no loader named {}", path, other
@@ -775,7 +780,7 @@ fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
   true => p
   false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, required: found.requires, imports: found.imports,
                     json-imports: found.json-imports, specs: specs }
-    where a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers),
+    where a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers, consts.no-imports()),
           # The calls are the parsed tree's unless a define changed it, and those were found already.
           found = match p.found and not a.analysis.defined {
             true => Checked(tree: p.tree, requires: p.requires, imports: p.imports, json-imports: p.json-imports)
@@ -893,6 +898,32 @@ fn loaded(path: Text) -> Loaded =
          requests: requests, leads: [lead-request(request, path) for request in requests],
          whole: [lead-request(r, path).key for r in [require-request(s) for s in required]
                    ++ [r for st in tree0.body.kids for r in wholly-imported(st)]])
+  where own = own-analysed(path),
+        p = own.parsed,
+        tree0 = own.tree0,
+        # What its imports are known to be, written in: the file analysed again with them.
+        imported = imported-constants(path, own),
+        crossed = len(imported.names) + len(imported.spaces) > 0,
+        a = match crossed {
+          true => analysis-of(tree0, p.parsed, p.src, path, base-name(path), p.jsx-imports, p.helpers, imported)
+          false => own.analysed
+        },
+        # Imports in source order, then what it loads at run time. Statements `define` removed import nothing.
+        found = match p.analysed and not crossed {
+          true => Checked(tree: p.tree, requires: p.required, imports: p.imports, json-imports: p.json-imports)
+          false => loads-of(a.analysis.tree)
+        },
+        calls = found.requires ++ found.imports ++ found.json-imports,
+        required = found.requires,
+        specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls,
+        requests = requests-in(tree0, required, found.imports, found.json-imports)
+
+# A file analysed by itself: its tree as the build's transforms leave it, and its scopes, with what
+# its own defines and constants decided, before what its imports are is known. What another file
+# imports of it is read from this (`exports-of`), so no file's analysis waits on its own.
+boxed record Own { parsed: Parsed, tree0: Node, analysed: Analysed }
+
+fn own-analysed(path: Text) -> Own = Own(parsed: p, tree0: tree0, analysed: a)
   where p = parsed-of(path),
         # A spec's transform sees the tree before its scopes are analysed (see `analysed-file`).
         tree0 = match p.analysed {
@@ -901,17 +932,134 @@ fn loaded(path: Text) -> Loaded =
         },
         a = match p.analysed {
           true => Analysed(analysis: p.analysis, scopes: p.scopes)
-          false => analysis-of(tree0, p.parsed, p.src, path, base-name(path), p.jsx-imports, p.helpers)
-        },
-        # Imports in source order, then what it loads at run time. Statements `define` removed import nothing.
-        found = match p.analysed {
-          true => Checked(tree: p.tree, requires: p.required, imports: p.imports, json-imports: p.json-imports)
-          false => loads-of(a.analysis.tree)
-        },
-        calls = found.requires ++ found.imports ++ found.json-imports,
-        required = found.requires,
-        specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls,
-        requests = requests-in(tree0, required, found.imports, found.json-imports)
+          false => analysis-of(tree0, p.parsed, p.src, path, base-name(path), p.jsx-imports, p.helpers, consts.no-imports())
+        }
+
+# ---------------------------------------------------------------- constants across modules
+
+# When minifying, a constant another module exports is written in where it is imported, as esbuild
+# does it: one of the exporting file's constants as bundle.constants finds them (at the start of its
+# top level, nothing assigning to it, a small value), whether imported by name, read off a namespace
+# import (`ns.x`), re-exported (`export { x } from`), or through one `export *` that alone has the
+# name. A constant made of an imported one is not one (each file's are found by itself). As with
+# esbuild, a read that would run before the exporting module (in a cycle of imports) and throw reads
+# the value instead.
+
+# What a module exports, as far as finding its constants goes: its constants by name; every name it
+# exports (constants or not); the names it re-exports from another module, and which; and the
+# modules it exports all of.
+boxed record Exports { constants: {Text:Node}, names: {Text:Bool}, forwards: {Text:Forward}, stars: [Text] }
+record Forward { key: Text, name: Text }
+
+fn exports-of(key: Text) -> Exports = match key {
+  "external:" ++ _ | "json:" ++ _ => Exports(constants: {}, names: {}, forwards: {}, stars: [])
+  path => Exports(constants: consts.exported(a.tree, own.tree0.body.kids, a.bindings, dynamic?(own.analysed.scopes)),
+                  names: {n: true for s in top for n in names-exported(s)},
+                  forwards: {consts.exported-name(x): Forward(key: target, name: consts.name-text(x.local))
+                             for s in top for target in forwarded-from(s, path) for x in forwarded(s)},
+                  stars: [lead-request(r, path).key for s in top if s is ExportAll(...) for r in statement-request(s)])
+    where own = own-analysed(path), a = own.analysed.analysis, top = own.tree0.body.kids
+}
+
+# The specifiers of `export { … } from`, and the module it names.
+fn forwarded(s: Node) -> [Node] = match s {
+  ExportFrom(List(specs...), _, _) => specs
+  _ => []
+}
+
+fn forwarded-from(s: Node, path: Text) -> [Text] = match s {
+  ExportFrom(...) => [lead-request(r, path).key for r in statement-request(s)]
+  _ => []
+}
+
+# The names a statement exports of the module's own.
+fn names-exported(s: Node) -> [Text] = match s {
+  ExportLexical(LetDecl(List(ds...))) | ExportLexical(ConstDecl(List(ds...))) | ExportVar(List(ds...)) => [n for d in ds for n in bound-names(d.target)]
+  ExportFunction(d) | ExportClass(d) => [d.kids[0].text]
+  ExportDefault(_) | ExportDefaultDecl(_) => ["default"]
+  ExportNamed(List(specs...)) => [consts.exported-name(x) for x in specs]
+  ExportAllAs(name, _, _) => [consts.name-text(name)]
+  _ => []
+}
+
+everywhere fn bound-names(n: Node) -> [Text] = match n {
+  BindName(name) => [name]
+}
+
+# The value a module's export is known to be, if it is a constant, by where it comes from: the
+# module's own, a re-export's, or the one `export *` that has the name. `seen`: the modules asked
+# already, so a cycle of re-exports ends.
+fn constant-of(key: Text, name: Text, seen: [Text]) -> Node? = match key in seen {
+  true => none
+  false => match e.constants[name] {
+    some(v) => some(v)
+    none if name in e.names => none
+    none => match e.forwards[name] {
+      some(f) => constant-of(f.key, f.name, seen ++ [key])
+      none if name == "default" => none
+      none => match [t for t in e.stars if exports?(t, name, seen ++ [key])] {
+        [t] => constant-of(t, name, seen ++ [key])
+        _ => none
+      }
+    }
+  } where e = exports-of(key)
+}
+
+# Whether a module exports a name at all: its own, re-exported, or through `export *`.
+fn exports?(key: Text, name: Text, seen: [Text]) -> Bool = match key in seen {
+  true => false
+  false => name in e.names or name in e.forwards or (name != "default" and (any t in e.stars: exports?(t, name, seen ++ [key])))
+    where e = exports-of(key)
+}
+
+# What a file's imports are known to be: each name it imports that is another module's constant, by
+# where it binds it; each namespace it imports, by where it binds it, with the constants of the names
+# read off it.
+fn imported-constants(path: Text, own: Own) -> consts.Imported = match loading.inline-constants and not dynamic?(own.analysed.scopes) {
+  false => consts.no-imports()
+  true => consts.Imported(
+    names: {name.lo: v for s in top for key in import-key(s, path) for b in imported-names(s) for name in [b.name] for v in constant-of(key, b.imported, [])},
+    spaces: {name.lo: values for s in top for key in import-key(s, path) for name in namespace-imported(s)
+             for values in [{p: v for p in read-off(own.analysed.analysis.tree, bindings, bindings[name.lo] ?? -1) distinct p
+                             for v in constant-of(key, p, [])}]
+             if len(values) > 0})
+    where bindings = own.analysed.analysis.bindings
+} where top = own.tree0.body.kids
+
+# The module an `import` statement takes from: a file, not one left outside or a JSON module.
+fn import-key(s: Node, path: Text) -> [Text] = match s {
+  Import(...) => [k for r in statement-request(s) if not r.json for k in [lead-request(r, path).key] if not external?(k)]
+  _ => []
+}
+
+# A name an import binds, and the name it imports.
+record ImportedName { name: Node, imported: Text }
+
+fn imported-names(s: Node) -> [ImportedName] = match s {
+  Import(clause, _, _) => names-of-clause(clause)
+  _ => []
+}
+
+fn names-of-clause(c: Node) -> [ImportedName] = match c {
+  ImportDefaultAnd(_, rest) => names-of-clause(rest)
+  ImportNamed(List(specs...)) => [n for x in specs for n in match x {
+    ImportAs(imported, BindName(_) as name) => [ImportedName(name: name, imported: module-name(imported))]
+    ImportName(BindName(local) as name) => [ImportedName(name: name, imported: local)]
+    _ => []
+  }]
+  _ => []
+}
+
+fn namespace-imported(s: Node) -> [Node] = match s {
+  Import(ImportNamespace(BindName(_) as name), _, _) => [name]
+  Import(ImportDefaultAnd(_, ImportNamespace(BindName(_) as name)), _, _) => [name]
+  _ => []
+}
+
+# The names read off a namespace's symbol, `ns.x`.
+everywhere fn read-off(n: Node, b: {Int:Int}, space: Int) -> [Text] = match n {
+  Member(Ident(_) as o, PropName(p)) if (b[o.lo] ?? -1) == space => [p]
+}
 
 fn transformed(tree: Node, path: Text, src: Text) -> Node =
   transform(fold t = rewritten for f in loading.transforms: f(t, path, src))

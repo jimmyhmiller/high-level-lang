@@ -350,11 +350,13 @@ root = fixture("inert-demand", {
 for policy, fragments in MODES:
     output = build(root, ["a.js", "b.js"], policy, fragments)
     assert execute(root, output, ["a.js", "b.js"], "[m0.result,m1.result]") == "[7,7]"
-    assert ("UNUSED_GETTER_BODY" not in closure(output, "a.js")) == fragments
+    # Defining a getter does nothing, so the unused object goes with or without fragments, as
+    # esbuild drops it.
+    assert "UNUSED_GETTER_BODY" not in closure(output, "a.js")
     retained = build(root, ["a.js", "b.js"], policy, fragments,
                      ["--tree-shaking=false"], tag=f"no-shake-{policy}-{fragments}")
     assert "UNUSED_GETTER_BODY" in closure(retained, "a.js")
-print("ok   inert getter allocations use actual demand while no-tree-shaking retains all declarations")
+print("ok   an unused object of getters goes, as esbuild drops it, while no-tree-shaking retains all declarations")
 
 root = fixture("effect-islands", {
     "library.js": '''globalThis.__islands = ["start"];

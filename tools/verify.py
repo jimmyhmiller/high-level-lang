@@ -496,6 +496,9 @@ if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
     code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "start-check.py"), ESB], 1200)
     check(code == 0 and " 0 failed" in out, "a TanStack Start application, both builds: "
           + (out.strip().splitlines()[-1] + " (its route tree, server functions with Vite's ids, run as Start's server runs it, in a browser)" if code == 0 else out[-1800:]))
+    code, out = sh(["node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "start-dev-check.mjs"), ESB], 300)
+    check(code == 0 and " 0 failed" in out, "a TanStack Start application in development: "
+          + (out.strip().splitlines()[-1] + " (rendered by the server, routes and components updated in place, server code run as edited, stylesheets reloaded, a route added)" if code == 0 else out[-1800:]))
 else:
     check(False, "TanStack Start application: benchmarks/tanstack-start has no node_modules (npm ci --prefix benchmarks/tanstack-start --ignore-scripts)")
 
@@ -644,6 +647,9 @@ for flags in [[], ["--minify"]]:
 put("u.js", 'import {unused} from "dep"\nimport "dep2"\nconsole.log(1)\n')
 sh([ESB, f"{OUT}/u.js", "--format=esm", "--minify-syntax", f"--outfile={OUT}/u.mjs"] + ext)
 check(re.search(r'import\s*"dep"', open(f"{OUT}/u.mjs").read()) is not None, "--minify-syntax leaves out an import's unused names, as esbuild does")
+code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "constants-check.py"), ESB], 300)
+check(code == 0 and " 0 failed" in out, "constants another module exports, written in where they are imported: "
+      + (out.strip().splitlines()[-1] + " (by name, renamed, off a namespace, re-exported, through export *, by import(); what is no constant left; whole and split, against esbuild)" if code == 0 else out[-1500:]))
 # A package left external takes its subpaths with it; one `*` stands for anything.
 # `export *` from an outside module: kept in an entry, copied at run time from a module inside.
 put("star-entry.js", 'export * from "dep"\nexport const own = 1\n')

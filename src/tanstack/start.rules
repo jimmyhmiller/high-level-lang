@@ -20,6 +20,8 @@ use tanstack.plugin as plugin
 use tanstack.config as cfg
 use tanstack.routes as routes
 use tanstack.start-compiler as compiler
+use tanstack.dev as dev
+use bundle.hmr as hmr
 use vite.env as env
 use vite.compat as vite
 
@@ -198,11 +200,14 @@ fn route-text(a: Assets) -> Text =
 
 # ---------------------------------------------------------------- the two builds
 
-# Start's defines, each as `process.env.X` and as `import.meta.env.X`.
-fn start-defines() -> [api.DefineText] =
-  [api.DefineText(key: prefix ++ k, value: host.js-string(v)) for kv in [["TSS_SERVER_FN_BASE", "/_serverFn/"], ["TSS_ROUTER_BASEPATH", ""],
-     ["TSS_DEV_SERVER", "false"], ["TSS_DEV_SSR_STYLES_ENABLED", "true"], ["TSS_DEV_SSR_STYLES_BASEPATH", "/"],
-     ["TSS_INLINE_CSS_ENABLED", "false"], ["TSS_DISABLE_CSRF_MIDDLEWARE_WARNING", "false"]]
+# Start's defines, each as `process.env.X` and as `import.meta.env.X`. In development, as its plugin
+# for a bundler that bundles in development (Rsbuild's) gives them: the dev server's, with no
+# middleware for styles (the root route's stylesheets are files of the browser's build).
+fn start-defines(developing: Bool) -> [api.DefineText] =
+  [api.DefineText(key: prefix ++ k, value: host.js-string(v)) for kv in [["TSS_SERVER_FN_BASE", "/_serverFn/"], ["TSS_ROUTER_BASEPATH", ""]]
+     ++ (if developing then [["TSS_SHELL", "false"], ["TSS_DEV_SERVER", "true"], ["TSS_DEV_SSR_STYLES_ENABLED", "false"]]
+         else [["TSS_DEV_SERVER", "false"], ["TSS_DEV_SSR_STYLES_ENABLED", "true"]])
+     ++ [["TSS_DEV_SSR_STYLES_BASEPATH", "/"], ["TSS_INLINE_CSS_ENABLED", "false"], ["TSS_DISABLE_CSRF_MIDDLEWARE_WARNING", "false"]]
    for k in [kv[0]] for v in [kv[1]] for prefix in ["process.env.", "import.meta.env."]]
 
 # The route tree's footer that Start's generator adds: the router's type registered with Start.
@@ -262,7 +267,7 @@ fn key-of(p: Node) -> [Text] = match p {
 
 # One build's options, from what the command line gave. The browser's is minified, as Vite's is.
 fn side-options(o: api.Options, root: Text, e: Entries, client: Bool) -> api.Options =
-  vite.compatible(envd with { defines: envd.defines ++ [d for d in start-defines() if not api.has-define?(envd, d.key)] })
+  side-analyzed(vite.compatible(start-defined(env.with-env(base, root, "production", not client), false)), if client then "client" else "server")
   where common = (if o.jsx.explicit then o else api.with-jsx-runtime(o, "automatic")) with { splitting: true, format: api.esm-format(), manifest: client, url-queries: true,
                           on-resolve: o.on-resolve ++ [resolved, split.resolved], on-load: o.on-load ++ [loaded, split.loaded],
                           transforms: o.transforms ++ [compiler.compiled, split.split-route],
@@ -272,12 +277,23 @@ fn side-options(o: api.Options, root: Text, e: Entries, client: Bool) -> api.Opt
           true => common with { entry: e.client, entries: [e.client], outdir: out, asset-dir: out ++ "/assets", minify-identifiers: true, minify-syntax: true,
                                 entry-names: "assets/index-[hash]", conditions: some(["module", "browser", "production"]) }
             where out = path-normalize(root ++ "/dist/client")
-          false => api.on-node(common) with { entry: e.server, entries: [e.server], outdir: out, asset-dir: out ++ "/assets",
-                                              entry-names: "[name]", packages-external: true, minify-identifiers: false, minify-syntax: false,
-                                              conditions: some(["module", "node", "production"]), url-assets: false }
-            where out = path-normalize(root ++ "/dist/server")
-        },
-        envd = env.with-env(base, root, "production", not client)
+          false => server-options(common, e, path-normalize(root ++ "/dist/server"), "production")
+        }
+
+fn server-options(common: api.Options, e: Entries, out: Text, mode: Text) -> api.Options =
+  api.on-node(common) with { entry: e.server, entries: [e.server], outdir: out, asset-dir: out ++ "/assets",
+                             entry-names: "[name]", packages-external: true, minify-identifiers: false, minify-syntax: false,
+                             conditions: some(["module", "node", mode]), url-assets: false }
+
+# Each side's analysis (`--analyze=DIR`) in a directory of its own, DIR/client and DIR/server.
+fn side-analyzed(o: api.Options, side: Text) -> api.Options = match o.analyze {
+  "" => o
+  dir => o with { analyze: dir ++ "/" ++ side }
+}
+
+# Start's defines added to a build's, where the command line gave none of the same name.
+fn start-defined(o: api.Options, developing: Bool) -> api.Options =
+  o with { defines: o.defines ++ [d for d in start-defines(developing) if not api.has-define?(o, d.key)] }
 
 # The route tree generated, as Start's generator writes it, and written where it changed.
 fn generated!(c: cfg.Config) -> routes.Generated = with routes.config = c { routes.written!(routes.generated-with(c)) }
@@ -424,3 +440,84 @@ fn violation(d: Denial, root: Text, client: Bool) -> Text =
                  "Use createIsomorphicFn().client(() => ...).server(() => ...) to provide separate client and server implementations",
                  "Move the client-only import out of this file into a separate .client.ts module that is not imported by any server code"]
      })], "")
+
+# ---------------------------------------------------------------- development
+
+# Start in development (`esb --tanstack-start --hmr`), as its plugin for a bundler that bundles in
+# development makes it: the browser's code one development bundle (`/assets/index.js`), its modules
+# replaced as they change (React Fast Refresh and the router's own route updates, as with Router's
+# plugin); the server's built again for each change, which the server's process (dev_host.mjs)
+# imports again before it next answers. Neither build is split, and the server's manifest is the
+# one Start gives in development: the root route loads the bundle. Both are written under
+# node_modules/.esb/start, not dist.
+
+fn dev-dir(root: Text) -> Text = path-normalize(real-path(root) ++ "/node_modules/.esb/start")
+
+fn dev-client-dir(root: Text) -> Text = dev-dir(root) ++ "/client"
+
+fn dev-server-dir(root: Text) -> Text = dev-dir(root) ++ "/server"
+
+const dev-bundle: Text = "/assets/index.js"
+
+fn dev-manifest-text() -> Text =
+  "export const tsrStartManifest = () => ({\n  routes: {\n    __root__: {\n      preloads: [" ++ host.js-string(dev-bundle)
+  ++ "],\n      scripts: [{ attrs: { type: 'module', async: true, src: " ++ host.js-string(dev-bundle) ++ " } }],\n    },\n  },\n})\n"
+
+# What both development builds share: Start's modules and its compiler, React's JSX, no splitting.
+fn dev-common(o: api.Options) -> api.Options =
+  (if o.jsx.explicit then o else api.with-jsx-runtime(o, "automatic")) with {
+    splitting: false, format: api.esm-format(), url-queries: true, chunk-names: "assets/[name]-[hash]", public-path: "/assets/",
+    on-resolve: o.on-resolve ++ [resolved], on-load: o.on-load ++ [loaded], transforms: o.transforms ++ [compiler.compiled] }
+
+# The browser's development bundle, its route modules taking their own updates (tanstack.dev) and
+# its components refreshed.
+fn dev-client-options(o: api.Options, root: Text, e: Entries) -> api.Options =
+  plugin.refreshed(api.dev-options(vite.compatible(start-defined(env.with-env(base, root, "development", false), true))))
+  where c = dev-common(o),
+        out = dev-client-dir(root),
+        base = c with { entry: e.client, entries: [e.client], outfile: out ++ dev-bundle, outdir: out, asset-dir: out ++ "/assets",
+                        conditions: some(["module", "browser", "development"]), transforms: c.transforms ++ [dev.hot-route] }
+
+# The server's, split only where Start's resolver imports a server function's module, and a
+# development build, so the stylesheets it names are where the browser's are.
+fn dev-server-options(o: api.Options, root: Text, e: Entries) -> api.Options =
+  vite.compatible(start-defined(env.with-env(server-options(dev-common(o) with { splitting: true, dev: true }, e, dev-server-dir(root), "development"),
+                                             root, "development", true), true))
+
+# What a development build of either side is told: Start's side, and the build's setting, with the
+# route tree as generated. In development an import a side may not make is the mock alone, which
+# throws where it is used, as Start's import protection does in development.
+fn dev-build(root: Text, e: Entries, g: routes.Generated, c: cfg.Config, client: Bool) -> Build =
+  Build(root: root, entries: e, client: client, manifest: dev-manifest-text(), tree-path: if client then real-path(c.tree-path) else "",
+        tree-config: c, generated: g)
+
+# One development step: the browser's bundle and what changed since `before`.
+fn dev-client-step(o: api.Options, root: Text, e: Entries, g: routes.Generated, c: cfg.Config, before: hmr.Dev, events: Text) -> api.DevStep =
+  with split.options = split-options(g, []), compiler.side = compiler.Side(client: true, root: real-path(root)),
+       build = dev-build(root, e, g, c, true) {
+    api.dev-step-of(dev-client-options(o, root, e), before, events)
+  }
+
+fn dev-server-files(o: api.Options, root: Text, e: Entries, g: routes.Generated, c: cfg.Config) -> [api.Written] =
+  with split.options = split-options(g, []), compiler.side = compiler.Side(client: false, root: real-path(root)),
+       build = dev-build(root, e, g, c, false) {
+    api.files(dev-server-options(o, root, e))
+  }
+
+fn dev-bundle-file(root: Text) -> Text = dev-client-dir(root) ++ dev-bundle
+
+# Written last of each development build's files: the build's number, which tells the server's
+# process the server's build is whole and new.
+fn dev-stamp(root: Text, builds: Int) -> api.Written = api.Written(path: dev-server-dir(root) ++ "/build", text: int-text(builds), said: "")
+
+# The server's process (dev_host.mjs, run by Node), started once the first build is written: it
+# serves the browser's files and the project's public/, and answers every other request with the
+# server build's `fetch`, imported again after each build.
+fn dev-host-started!(root: Text, port: Int) -> Void {
+  let host = dev-dir(root) ++ "/host.mjs"
+  write-files!([host], [include-text("dev_host.mjs")], [""])
+  match spawn-process!(["node", host, dev-server-dir(root), dev-client-dir(root), path-normalize(real-path(root) ++ "/public"), int-text(port)]) {
+    pid if pid < 0 => fail-build("tanstack.start: could not start node, which runs the server in development")
+    _ => {}
+  }
+}

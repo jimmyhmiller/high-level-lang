@@ -268,6 +268,7 @@ const usage: [Text] = [
   "usage: esb --lint-relations    what lint rules (--lint=FILE) can read of a build",
   "  --watch --hmr --serve=PORT --cache --no-cache --cache-dir=DIR",
   "  --strategy=NAME --pipeline=NAME --threads=N --size:NAME=N --timing",
+  "  --tanstack-start[=DIR]    a TanStack Start application, as Start's Vite plugin builds it; with --hmr [--serve=PORT], in development",
   "  --tanstack-router[=DIR]   TanStack Router's plugin: route files split as its autoCodeSplitting does (tsr.config.json in DIR)",
   "usage: esb --tanstack-router-generate[=DIR]   TanStack Router's route tree for the project in DIR, written as its generator writes it"
 ]
@@ -313,8 +314,57 @@ fn start-root() -> Text? = last i in 1..arg-count() for a in [arg-at(i)]
 
 fn start-run(root: Text, r: Run) -> Void {
   let o = fold o = api.options-new("", "") for i in 1..arg-count() if starts-with(arg-at(i), "--"): with-flag(o, arg-at(i))
-  started(o, r)
-  api.written(start.built(o, root))
+  strategy-started(o, r)
+  match r.hmr {
+    true => with react-refresh.options = react-refresh.Options(entries: [real-path(start.entries-of(root).client)]) { start-developing(o, root, r) }
+    false => api.written(start.built(o, root))
+  }
+}
+
+# Start in development (`--tanstack-start --hmr [--serve=PORT]`): each change built again, the
+# browser's bundle sent to the page as an update, the server's written for the server's process,
+# which answers on PORT (3000 when none is given), as Start's dev server does. Builds' events are
+# served on a port of their own, which the bundle listens to.
+fn start-developing(o: api.Options, root: Text, r: Run) -> Void {
+  let e = start.entries-of(root)
+  let events-path = "/hmr"
+  let served = serve!(0, start.dev-client-dir(root), "", events-path)
+  let events = "http://127.0.0.1:" ++ int-text(served) ++ events-path
+  let port = if r.serve-port >= 0 then r.serve-port else 3000
+  var before = hmr.Dev(text: "", functions: {}, shapes: {})
+  var sheets: [api.Written] = []
+  var builds = 0
+  while true {
+    let began = now-us()
+    let computed = memo-computed()
+    let c = start.generator-config(root, e)
+    let g = start.generated!(c)
+    let step = start.dev-client-step(o, root, e, g, c, before, events)
+    let bundle = start.dev-bundle-file(root)
+    builds = builds + 1
+    api.written([api.Written(path: bundle, text: step.dev.text, said: api.said-of(step.dev.text, bundle))] ++ step.files
+                ++ start.dev-server-files(o, root, e, g, c) ++ [start.dev-stamp(root, builds)])
+    let took = now-us() - began
+    print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
+      memo-computed() - computed, inputs-watched()
+    if builds == 1 { start.dev-host-started!(root, port) }
+    if builds > 1 {
+      match step.sent {
+        some(sent) => {
+          broadcast!(sent.event, sent.text)
+          print "[hmr] {} to {} listening: {}", sent.event, listeners(), join(sent.changed, " ")
+          for note in sent.notes { print "[hmr] {}", note }
+        }
+        none => print "[hmr] no module of the browser's changed"
+      }
+      restyled!(sheets, step.files)
+    }
+    before = step.dev
+    sheets = step.files
+    cache-kept(o, r)
+    let changed = wait-for-changes!(r.interval)
+    print "[watch] changed: {}", join(changed, " ")
+  }
 }
 
 # `--tanstack-router[=DIR]`: the project TanStack Router's plugin is given, DIR its root.
@@ -422,6 +472,18 @@ fn strategy-of(r: Run) -> Text = match r.strategy {
 # The run's strategy chosen, before anything is computed; builds that watch, or start from the
 # cache, track what each answer was made from, and the first starts from what an earlier run kept.
 fn started(o: api.Options, r: Run) -> Void {
+  if r.watch or cached?(r) {
+    match r.hmr {
+      true => one-entry(o)
+      false if o.outfile == "" and o.outdir == "" => panic "--watch and --cache need --outfile or --outdir"
+      false => true
+    }
+  }
+  strategy-started(o, r)
+}
+
+# The run's strategy chosen, for builds whose outputs the command line does not name (Start's).
+fn strategy-started(o: api.Options, r: Run) -> Void {
   let strategy = strategy-of(r)
   match r.plan, r.threads {
     "", 0 => true
@@ -430,11 +492,6 @@ fn started(o: api.Options, r: Run) -> Void {
   }
   for s in r.sizes { plans.use-size!(s.key, parse-int(s.value)) }
   if r.watch or cached?(r) {
-    match r.hmr {
-      true => one-entry(o)
-      false if o.outfile == "" and o.outdir == "" => panic "--watch and --cache need --outfile or --outdir"
-      false => true
-    }
     if not plans.strategy-tracks?(strategy) {
       panic "--watch and --cache keep answers from one build to the next, which strategy {} does not track", strategy
     }
@@ -460,6 +517,15 @@ fn one-entry(o: api.Options) -> Bool = match o.splitting, o.outfile, len(o.entri
 # for one build, before the program ends.
 fn cache-kept(o: api.Options, r: Run) -> Void = plans.build-done!(strategy-of(r), cache-of(r), r.watch, o.timing)
 
+# The page told which of the stylesheets its links load were edited, to load them again.
+fn restyled!(before: [api.Written], now: [api.Written]) -> Void = match api.sheets-changed(before, now) {
+  [] => {}
+  names => {
+    broadcast!("styles", join(names, "\n"))
+    print "[hmr] styles to {} listening: {}", listeners(), join(names, " ")
+  }
+}
+
 # Hot module replacement: each build in the development format, written, and after the first what
 # changed sent to the page as an update, or a reload when nothing that changed can take one.
 fn dev-rebuilding(o: api.Options, r: Run) -> Void {
@@ -471,13 +537,14 @@ fn dev-rebuilding(o: api.Options, r: Run) -> Void {
   }
   if events != "" { print "[hmr] serving {} at {}", dir-of(o.outfile), text-before(events, events-path) }
   var before = hmr.Dev(text: "", functions: {}, shapes: {})
+  var sheets: [api.Written] = []
   var builds = 0
   while true {
     let start = now-us()
     let computed = memo-computed()
     tanstack-generated!()
     let step = api.dev-step-of(o, before, events)
-    api.written([api.Written(path: o.outfile, text: step.dev.text, said: api.said-of(step.dev.text, o.outfile))])
+    api.written([api.Written(path: o.outfile, text: step.dev.text, said: api.said-of(step.dev.text, o.outfile))] ++ step.files)
     builds = builds + 1
     let took = now-us() - start
     print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
@@ -491,8 +558,10 @@ fn dev-rebuilding(o: api.Options, r: Run) -> Void {
         }
         none => print "[hmr] no module changed"
       }
+      restyled!(sheets, step.files)
     }
     before = step.dev
+    sheets = step.files
     # Last: the cache is saved on a thread of its own until the wait for a change joins it, and
     # nothing may read or write a cached value meanwhile (keeping `before` copies it).
     cache-kept(o, r)

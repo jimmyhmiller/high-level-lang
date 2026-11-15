@@ -186,6 +186,18 @@ var __hmr = (() => {
     if (boundaries.length > 0) log("updated " + boundaries.map(display).join(", "));
   };
 
+  // Stylesheets edited, by the names their files have: each link to one loads it again, in place.
+  var restyle = (names) => {
+    if (typeof document === "undefined") return;
+    for (var link of document.querySelectorAll('link[rel="stylesheet"]')) {
+      var url = new URL(link.href, location.href);
+      if (!names.includes(url.pathname.slice(url.pathname.lastIndexOf("/") + 1))) continue;
+      url.searchParams.set("t", String(Date.now()));
+      link.href = url.pathname + url.search;
+    }
+    log("restyled " + names.join(", "));
+  };
+
   // Each update is a script, run by `apply`, which the bundle gives from its own top level: where
   // the first build's modules were defined, seeing the same names they did.
   var connect = (url, apply) => {
@@ -193,6 +205,7 @@ var __hmr = (() => {
       var source = new EventSource(url);
       source.addEventListener("update", (e) => apply(e.data));
       source.addEventListener("reload", (e) => reload(e.data));
+      source.addEventListener("styles", (e) => restyle(e.data.split("\n")));
       return;
     }
     if (typeof require !== "function") return;

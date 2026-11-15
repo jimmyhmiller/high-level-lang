@@ -825,6 +825,7 @@ A project written for Vite with TanStack Router or TanStack Start builds here wi
 esb index.html --outdir=dist --tanstack-router            # a Router app, as `vite build` makes it
 esb index.html --hmr --serve=3000 --tanstack-router        # ... and as `vite dev` serves it
 esb --tanstack-start                                       # a Start app: dist/client, dist/server/server.js
+esb --tanstack-start --hmr --serve=3000                    # ... and as `vite dev` serves it, rendered in Node
 ```
 
 Each part of what TanStack's and Vite's plugins do is a language's here (`src/tanstack`, `src/vite`,
@@ -851,7 +852,8 @@ Each part of what TanStack's and Vite's plugins do is a language's here (`src/ta
 - **Development.** React Fast Refresh (`react.refresh`): components registered with React's refresh
   runtime, hooks as signatures, a module of components accepting its updates. A route file gets
   TanStack's route update statement, so an edit updates the route in the running router. Stylesheets
-  are `<style>`s that take their updates; the server answers an app's routes with the page.
+  are `<style>`s that take their updates, and a `?url` stylesheet keeps its URL while it is edited,
+  the page told to load it again; the server answers an app's routes with the page.
   `tools/router-dev-check.mjs` edits a running app's files in a browser and checks state is kept.
 - **Start.** Two builds, the browser's then the server's, with Start's compiler before splitting
   (`tanstack.start-compiler`): `createServerFn` is an RPC in the browser, a call of the function's own
@@ -863,13 +865,22 @@ Each part of what TanStack's and Vite's plugins do is a language's here (`src/ta
   Import protection fails the build when a `.server` module (or a marked one) is still read in the
   browser's output. `tools/start-check.py` builds the reference app and runs it as Start's server
   runs it, in a browser.
+- **Start in development.** As Start's plugin for a bundler that bundles in development (Rsbuild's)
+  has it: the browser's code one development bundle with Fast Refresh and route updates, the
+  server's built again on each change into `node_modules/.esb/start`, and a Node process
+  (`tanstack/dev_host.mjs`, started by esb, ending with it) serving the browser's files and
+  answering every other request with the server build's `fetch`, imported again after each build.
+  An import a side may not make is the mock, which throws where it is used, as Start does in
+  development. `tools/start-dev-check.mjs` edits a running app — a route, a server-only module, an
+  isomorphic function, the stylesheet, a route added — and checks the browser and the server.
 
 Sizes against Vite 8 (`benchmarks/tanstack-router`, `benchmarks/tanstack-start`, minified browser
-JavaScript): Router 282.0 KB against 272.6 KB, Start 341.6 KB against 318.7 KB; esbuild's own bundle of
-the Router app is 275.7 KB, so most of the difference is the minifier. Not yet: Start in development
-(server rendering run in Node with updates), Start's `<Hydrate>`, a Start factory re-exported
-through a project's own file (recognised only when imported from Start's packages), a stylesheet's
-`url()` files and `?url` stylesheets in development.
+JavaScript): Router 279.1 KB against 272.6 KB, Start 327.0 KB against 318.7 KB; esbuild's own bundle of
+the Router app is 275.7 KB, so most of the difference is the minifier. Start's build evaluates
+modules in the order native ES modules would (`--strict-execution-order`), which costs it the
+initializers of the modules that observe it. Not yet: Start's `<Hydrate>`,
+a Start factory re-exported through a project's own file (recognised only when imported from
+Start's packages), and in development a stylesheet's `url()` files (the build fails, saying so).
 
 ## Results
 
@@ -1464,8 +1475,12 @@ minification (private names too, each class's own the shortest after those of th
 it), `const`s written in where they are read with `--minify-syntax`, as esbuild does as it parses
 (those at the start of a statement list whose values are numbers, booleans, `null`, `undefined`,
 `NaN`, `Infinity` or strings of up to three characters, before tree shaking, so the branches they
-decide are gone: `src/bundle/constants.rules`), source maps, output to standard output when no path
-is given (its map inline), and resolve, load, transform and optimize hooks.
+decide are gone: `src/bundle/constants.rules`), and one another module exports written in where it
+is imported, as esbuild does it: by name, renamed, read off a namespace, through `export { } from`
+or the one `export *` that has it, each file's constants found by itself so no file's analysis
+waits on its own (`imported-constants` in `src/bundle/modules.rules`; `tools/constants-check.py`
+builds every way against esbuild's), source maps, output to standard output when no path is given
+(its map inline), and resolve, load, transform and optimize hooks.
 
 ## What it does not do
 
@@ -1473,8 +1488,7 @@ Being explicit, because "everything esbuild does" is a lot:
 
 - **Not built:** CSS modules, CSS nesting and other CSS lowering, JavaScript
   (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
-  inlining enum values across files, and writing in a constant another module exports (esbuild
-  prints an imported `const`'s value where it is read). A `switch` on a constant is not folded.
+  and inlining enum values across files. A `switch` on a constant is not folded.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside
   another, `--legal-comments=inline`, `--jsx=preserve` with `--pretty`, a decorated class expression or `export default`
   class, and decorators on members with computed names.
