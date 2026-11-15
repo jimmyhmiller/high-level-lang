@@ -1,0 +1,184 @@
+# `import.meta.glob`, as Vite reads it: the files the patterns match, as an object whose keys are the
+# paths as the patterns wrote them and whose values load each module (`() => import("./a.js")`), or,
+# with `eager: true`, the module itself, imported where the module begins. `import: "name"` takes
+# one export of each (`.then((m) => m.name)`, or a named import); `query: "?raw"` (or an object of
+# names and values) is added to each path. Patterns are relative to the module (`./`, `../`) or to
+# the project's root (`/`); `!` before one leaves out what it matches; `*` is any name, `**` any
+# depth of directories, `?` one character, and `{a,b}` either. Keys are in order, and a package's
+# files (under `node_modules`) match only a pattern that names node_modules.
+rules vite.glob over bundle.js
+use bundle.js as js
+use bundle.made as mk
+use bundle.minhost as host
+use bundle.resolve as res
+
+# The project's root, from which a pattern starting with `/` is read: where the build runs.
+fn root() -> Text = real-path(working-dir())
+
+fn globbed(tree: Node, path: Text, src: Text) -> Node = match contains-text?(src, "import.meta.glob") {
+  false => tree
+  true => match calls-in(tree) {
+    [] => tree
+    calls => mk.placed-program(Program(tree.hashbang, List(([mk.made(i) for g in globs for i in g.imports] ++ [rewritten(k, globs) for k in tree.body.kids])...))
+                               with { lo: tree.lo, hi: tree.hi })
+      where globs = [glob-of(calls[i], i, path, src) for i in 0..len(calls)]
+  }
+}
+
+# Each `import.meta.glob(…)` call of the module, in the order a walk meets them.
+fn calls-in(n: Node) -> [Node] = match n {
+  CallExpr(Member(ImportMeta(), PropName("glob")), _) => [n] ++ [c for k in n.kids for c in calls-in(k)]
+  _ => [c for k in n.kids for c in calls-in(k)]
+}
+
+# A call read: where it is, the object it becomes, and the imports an eager one needs.
+record Glob { lo: Int, hi: Int, value: Text, imports: [Text] }
+
+record Settings { eager: Bool, name: Text, query: Text }
+
+fn glob-of(call: Node, k: Int, path: Text, src: Text) -> Glob = match call {
+  CallExpr(_, Args(List(patterns, rest...))) => built(call, k, path, matched(texts-of(patterns, path), path), settings-of(rest, path))
+  _ => fail-build(path ++ ": import.meta.glob takes the patterns of the files it loads")
+}
+
+fn texts-of(n: Node, path: Text) -> [Text] = match n {
+  Str(raw) => [unquote(raw)]
+  TemplateFull(raw) => [raw[1..len(raw) - 1]]
+  ArrayLit(List(xs...)) => [t for x in xs for t in texts-of(element(x), path)]
+  _ => fail-build(path ++ ": import.meta.glob's patterns are strings written out, not computed")
+}
+
+fn element(n: Node) -> Node = match n {
+  Elem(v) | ElemLast(v) => v
+  _ => n
+}
+
+fn settings-of(rest: [Node], path: Text) -> Settings = match rest {
+  [] => Settings(eager: false, name: "", query: "")
+  [ObjectLit(List(props...))] => fold s = Settings(eager: false, name: "", query: "") for p in props: setting-of(s, p, path)
+  _ => fail-build(path ++ ": import.meta.glob's options are an object written out")
+}
+
+fn setting-of(s: Settings, p: Node, path: Text) -> Settings = match p {
+  Prop(PropName("eager"), True()) => s with { eager: true }
+  Prop(PropName("eager"), False()) => s with { eager: false }
+  Prop(PropName("import"), Str(raw)) => s with { name: unquote(raw) }
+  Prop(PropName("query"), Str(raw)) => s with { query: match unquote(raw) { "" => ""  q if starts-with(q, "?") => q  q => "?" ++ q } }
+  Prop(PropName("query"), ObjectLit(List(qs...))) => s with { query: "?" ++ join([query-pair(q, path) for q in qs], "&") }
+  _ => fail-build(path ++ ": import.meta.glob takes eager, import and query, written out; not " ++ js.render(p, false))
+}
+
+fn query-pair(q: Node, path: Text) -> Text = match q {
+  Prop(PropName(k), Str(raw)) => k ++ "=" ++ unquote(raw)
+  Prop(PropName(k), True()) => k ++ "=true"
+  Prop(PropName(k), False()) => k ++ "=false"
+  _ => fail-build(path ++ ": import.meta.glob's query object holds names and strings")
+}
+
+# The object a call becomes, and for an eager one, the imports it reads.
+fn built(call: Node, k: Int, path: Text, files: [Matched], s: Settings) -> Glob = match s.eager {
+  false => Glob(lo: call.lo, hi: call.hi, value: "{" ++ join([host.js-string(f.key) ++ ": () => import(" ++ host.js-string(f.spec ++ s.query) ++ ")"
+                                                            ++ (if s.name == "" then "" else ".then((m) => m[" ++ host.js-string(s.name) ++ "])")
+                                                            for f in files], ", ") ++ "}", imports: [])
+  true => Glob(lo: call.lo, hi: call.hi, value: "{" ++ join([host.js-string(files[i].key) ++ ": " ++ local(k, i) for i in 0..len(files)], ", ") ++ "}",
+               imports: [match s.name {
+                 "" => "import * as " ++ local(k, i) ++ " from " ++ host.js-string(files[i].spec ++ s.query) ++ ";"
+                 name => "import { " ++ host.js-string(name) ++ " as " ++ local(k, i) ++ " } from " ++ host.js-string(files[i].spec ++ s.query) ++ ";"
+               } for i in 0..len(files)])
+}
+
+fn local(k: Int, i: Int) -> Text = "__vite_glob_" ++ int-text(k) ++ "_" ++ int-text(i)
+
+everywhere fn rewritten(n: Node, globs: [Glob]) -> Node = match n {
+  CallExpr(Member(ImportMeta(), PropName("glob")), _) => match first g in globs if g.lo == n.lo and g.hi == n.hi: g {
+    some(g) => mk.made-expression("(" ++ g.value ++ ")")
+    none => n
+  }
+}
+
+# ---------------------------------------------------------------- matching
+
+# A file a pattern matched: its key (the path as the pattern wrote it) and the specifier that loads it.
+record Matched { key: Text, spec: Text }
+
+fn matched(patterns: [Text], path: Text) -> [Matched] =
+  sort m in [Matched(key: k, spec: if starts-with(k, "/") then f else k) for f in found for k in [key-of(f, path, patterns)] distinct k] by m.key
+  where positive = [x for p in patterns if not starts-with(p, "!") for x in expanded(p)],
+        negative = [x for p in patterns if starts-with(p, "!") for x in expanded(relative-negative(p[1..len(p)]))],
+        found = [f for p in positive for f in files-matching(absolute(p, path), named-modules?(p))
+                 if not (any n in negative: matches?(segments(absolute(n, path)), segments(f)))]
+
+# A pattern from the project's root keeps that form in its keys; one relative to the module, its.
+fn key-of(file: Text, path: Text, patterns: [Text]) -> Text = match any p in patterns: starts-with(p, "/") {
+  true => "/" ++ relative(root(), file)
+  false => match relative(dir-of(path), file) {
+    r if starts-with(r, "../") => r
+    r => "./" ++ r
+  }
+}
+
+fn relative(from: Text, to: Text) -> Text = join([".." for i in common..len(a)] ++ b[common..len(b)], "/")
+  where a = segments(from), b = segments(to),
+        common = len([i for i in 0..min(len(a), len(b)) while a[i] == b[i]])
+
+fn absolute(pattern: Text, path: Text) -> Text = match pattern {
+  "/" ++ rest => path-normalize(root() ++ "/" ++ rest)
+  "./" ++ _ | "../" ++ _ => path-normalize(dir-of(path) ++ "/" ++ pattern)
+  _ => fail-build(path ++ ": an import.meta.glob pattern starts with ./, ../ or /, not " ++ pattern)
+}
+
+# A pattern leaving files out may be written without `./` (`!**/skip.js`): it is the module's.
+fn relative-negative(p: Text) -> Text = match p {
+  "./" ++ _ | "../" ++ _ | "/" ++ _ => p
+  _ => "./" ++ p
+}
+
+fn named-modules?(pattern: Text) -> Bool = contains-text?(pattern, "node_modules")
+
+fn segments(p: Text) -> [Text] = [s for s in split(p, "/") if s != ""]
+
+# `{a,b}` written out: each alternative a pattern of its own.
+fn expanded(p: Text) -> [Text] = match index-of(p, "{") {
+  none => [p]
+  some(open) => match index-of(p[open..len(p)], "}") {
+    none => [p]
+    some(n) => [x for alt in split(p[open + 1..open + n], ",") for x in expanded(p[0..open] ++ alt ++ p[open + n + 1..len(p)])]
+  }
+}
+
+# The files under the pattern's fixed directory that it matches.
+fn files-matching(pattern: Text, modules: Bool) -> [Text] =
+  [f for f in files-under("/" ++ join(fixed, "/"), modules) if matches?(parts, segments(f))]
+  where parts = segments(pattern),
+        fixed = [s for s in parts[0..max(0, len(parts) - 1)] while not wild?(s)]
+
+fn wild?(s: Text) -> Bool = contains-text?(s, "*") or contains-text?(s, "?") or contains-text?(s, "[")
+
+# Read through the resolver's listings, which a watching build is told of: a file added is a change.
+fn files-under(dir: Text, modules: Bool) -> [Text] =
+  [f for name in sort n in keys(listing) by n
+   if not starts-with(name, ".") and (modules or name != "node_modules")
+   for f in (match listing[name] ?? 0 {
+     'd' => files-under(dir ++ "/" ++ name, modules)
+     'f' | 'l' => [dir ++ "/" ++ name]
+     _ => []
+   })]
+  where listing = res.listing-of(dir)
+
+fn matches?(pattern: [Text], path: [Text]) -> Bool = match pattern, path {
+  [], [] => true
+  ["**", rest...], _ => matches?(rest, path) or (match path { [_, more...] => matches?(pattern, more)  [] => false })
+  [p, rest...], [s, more...] => segment-matches?(p, 0, s, 0) and matches?(rest, more)
+  _, _ => false
+}
+
+# A name against a segment of a pattern: `*` any run of characters, `?` one.
+fn segment-matches?(p: Text, i: Int, s: Text, j: Int) -> Bool = match i == len(p) {
+  true => j == len(s)
+  false => match p[i] {
+    '*' => segment-matches?(p, i + 1, s, j) or (j < len(s) and segment-matches?(p, i, s, j + 1))
+    '?' => j < len(s) and segment-matches?(p, i + 1, s, j + 1)
+    '[' => fail-build("import.meta.glob: a [class] in a pattern is not read; write the names out")
+    c => j < len(s) and s[j] == c and segment-matches?(p, i + 1, s, j + 1)
+  }
+}
