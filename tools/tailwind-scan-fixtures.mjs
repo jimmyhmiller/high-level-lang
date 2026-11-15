@@ -233,8 +233,45 @@ const outside = {
   },
 }
 
+// Random projects: files at paths made of awkward names, gitignore files of random globs at a few
+// levels, and random @source patterns (and `@source not`) beside the root's `**/*`.
+function fuzzFixture(seedValue) {
+  let seed = seedValue >>> 0 || 1
+  const random = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296)
+  const pick = (xs) => xs[Math.floor(random() * xs.length)]
+  const names = ['a', 'b', 'ab', 'a.html', 'b.js', 'c.ts', 'x.y.vue', '.hidden', 'build', 'dist', 'node_modules', 'src',
+    'lib', '[x]', 'b c', 'é.md', 'q1.txt', 'log.log', 'img.png', 'data.json', 'a-b_c', '{a}', '#x', '!y', 'deep']
+  const dirs = ['src', 'lib', 'src/a', 'src/b', 'lib/deep', 'build', 'dist', 'src/a/build', 'x', 'x/y', 'node_modules/p', 'ab', '[x]']
+  const files = {}
+  const taken = new Set(dirs.flatMap((d) => d.split('/').map((_, i, parts) => parts.slice(0, i + 1).join('/'))))
+  for (let i = 0; i < 40; i++) {
+    const dir = random() < 0.2 ? '' : pick(dirs) + '/'
+    const name = pick(names)
+    if (!taken.has(dir + name)) files[dir + name] = tag(dir + name)
+  }
+  const glob = () => {
+    const parts = []
+    const n = 1 + Math.floor(random() * 3)
+    for (let i = 0; i < n; i++) parts.push(pick(['*', '**', 'a', 'b', 'src', 'build', '*.html', '*.{js,ts}', '?', '[ab]', '[!a]*', 'x', 'y',
+      'a*', '*b', 'deep', '{a,b}', '\\[x]', 'é*', '[a-c]*', '.*']))
+    return (random() < 0.3 ? '/' : '') + parts.join('/') + (random() < 0.2 ? '/' : '')
+  }
+  const ignore = () => Array.from({ length: 1 + Math.floor(random() * 5) }, () => (random() < 0.25 ? '!' : '') + glob()).join('\n') + '\n'
+  files['.gitignore'] = ignore()
+  for (const d of ['src', 'lib', 'x']) if (random() < 0.5) files[d + '/.gitignore'] = ignore()
+  if (random() < 0.3) files['.ignore'] = ignore()
+  const sources = [{ base: '.', pattern: '**/*' }]
+  for (let i = 0; i < Math.floor(random() * 3); i++) {
+    sources.push({ base: '.', pattern: glob().replace(/^\//, ''), negated: random() < 0.4 })
+  }
+  return { git: true, files, sources }
+}
+
+const fuzzCount = Number(process.env.TAILWIND_SCAN_FUZZ ?? 60)
+
 // Makes every fixture afresh and answers each one's name and sources (bases absolute).
 export function makeFixtures(inRepo) {
+  for (let k = 1; k <= fuzzCount; k++) fixtures[`fuzz-${k}`] = fuzzFixture(k * 7919)
   const made = []
   fs.rmSync(inRepo, { recursive: true, force: true })
   for (const [name, f] of Object.entries(fixtures)) {
