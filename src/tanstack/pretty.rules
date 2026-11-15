@@ -1,0 +1,741 @@
+# A route tree (tree.syntax) printed as Prettier 3.10 prints it with TanStack's options: `semi` and
+# `singleQuote` as configured, the rest Prettier's defaults (80 columns, two-space indents, trailing
+# commas everywhere they may go, objects kept broken when their source broke after `{`). Each
+# function is the printer of Prettier's that its comment names (src/language-js/print/*), building
+# the same document, which `hl.doc` lays out as Prettier's printer does.
+rules tanstack.pretty over tanstack.tree-file
+use tanstack.tree-file as tf
+use hl.doc as doc
+
+# The text being printed (for what Prettier reads of the original: newlines after `{`, empty lines
+# after a statement), and the options.
+setting source: Text
+setting semi: Bool
+setting single: Bool
+
+const width: Int = 80
+
+fn formatted(text: Text, path: Text, semicolons: Bool, single-quote: Bool) -> Text =
+  with source = text, semi = semicolons, single = single-quote { doc.printed(program(tf.parse(text, path)), width) }
+
+fn t(s: Text) -> doc.Doc = doc.text(s)
+fn cat(parts: [doc.Doc]) -> doc.Doc = doc.cat(parts)
+fn nothing() -> doc.Doc = doc.empty()
+fn semicolon() -> doc.Doc = t(if semi then ";" else "")
+fn trailing-comma() -> doc.Doc = doc.if-break(t(","), nothing())
+
+# --- What Prettier reads of the original text ----------------------------------------------------
+
+fn at-char(i: Int) -> Int = if i >= 0 and i < len(source) then source[i] else -1
+fn newline-char?(i: Int) -> Bool = at-char(i) == 10 or at-char(i) == 13
+# utilities/skip.js's skipSpaces, forwards and backwards.
+fn spaces-from(i: Int) -> Int = i + span-of(source, i, " \t")
+fn back-spaces(i: Int) -> Int = if at-char(i) == 32 or at-char(i) == 9 then back-spaces(i - 1) else i
+# skip-newline.js, forwards and backwards.
+fn newline-at(i: Int) -> Int = match at-char(i) {
+  13 if at-char(i + 1) == 10 => i + 2
+  10 | 13 => i + 1
+  _ => i
+}
+fn newline-back(i: Int) -> Int = match at-char(i) {
+  10 if at-char(i - 1) == 13 => i - 2
+  10 | 13 => i - 1
+  _ => i
+}
+# has-newline.js: after spaces, a newline; and backwards from just before `i`.
+fn newline-after?(i: Int) -> Bool = newline-char?(spaces-from(i))
+fn newline-before?(i: Int) -> Bool = newline-char?(back-spaces(i - 1))
+# skip-inline-comment.js
+fn inline-comment-end(i: Int) -> Int = match at?(source, i, "/*") {
+  true => (match index-of(source[i + 2..len(source)], "*/") { some(k) => i + 2 + k + 2  none => i })
+  false => i
+}
+# skipToLineEnd (commas, semicolons, spaces), inline comments and spaces, until none is left.
+fn line-end-from(i: Int) -> Int = match spaces-from(inline-comment-end(i + span-of(source, i, ",; \t"))) {
+  k if k == i => i
+  k => line-end-from(k)
+}
+fn trailing-comment-end(i: Int) -> Int = if at?(source, i, "//") then i + span-not-of(source, i, "\n\r") else i
+# utilities/is-next-line-empty.js: past what ends the line (commas, semicolons, comments), one
+# newline, and then another.
+fn next-line-empty?(i: Int) -> Bool = newline-after?(newline-at(trailing-comment-end(line-end-from(i))))
+# utilities/is-previous-line-empty.js
+fn previous-line-empty?(i: Int) -> Bool = newline-char?(back-spaces(newline-back(back-spaces(i - 1))))
+# Whether the source breaks a line between two places (object.js's hasNewLineAfterOpeningBrace).
+fn newline-between?(from: Int, to: Int) -> Bool = any i in from..to: newline-char?(i)
+fn brace-at(from: Int) -> Int = from + span-not-of(source, from, "{")
+
+# --- Strings and keys -------------------------------------------------------------------------------
+
+# utilities/print-string.js: the preferred quote unless the text holds more of it than of the other.
+fn printed-string(raw: Text) -> Text = match raw[0] == enclosing {
+  true => raw
+  false => made-string(content, enclosing)
+} where content = raw[1..len(raw) - 1],
+        preferred = if single then 39 else 34,
+        alternate = if single then 34 else 39,
+        enclosing = if count-byte(content, 0, len(content), preferred) > count-byte(content, 0, len(content), alternate) then alternate else preferred
+
+# utilities/make-string.js: an escaped other quote unescaped, an unescaped enclosing quote escaped.
+fn made-string(content: Text, quote: Int) -> Text = byte-text(quote) ++ escaped(content, 0, quote) ++ byte-text(quote)
+fn escaped(s: Text, i: Int, quote: Int) -> Text = match i {
+  _ if i >= len(s) => ""
+  _ if s[i] == 92 and i + 1 < len(s) and (s[i + 1] == 34 or s[i + 1] == 39 or s[i + 1] == 92) =>
+    (if s[i + 1] != quote and s[i + 1] != 92 then byte-text(s[i + 1]) else s[i..i + 2]) ++ escaped(s, i + 2, quote)
+  _ if s[i] == quote => "\\" ++ byte-text(quote) ++ escaped(s, i + 1, quote)
+  _ => byte-text(s[i]) ++ escaped(s, i + 1, quote)
+}
+
+# A string's value: its escapes read.
+fn string-value(raw: Text) -> Text = unescaped(raw[1..len(raw) - 1], 0)
+fn unescaped(s: Text, i: Int) -> Text = match i {
+  _ if i >= len(s) => ""
+  _ if s[i] == 92 and i + 1 < len(s) => match s[i + 1] {
+    110 => "\n" ++ unescaped(s, i + 2)
+    116 => "\t" ++ unescaped(s, i + 2)
+    c if c == 34 or c == 39 or c == 92 or c == 47 => byte-text(c) ++ unescaped(s, i + 2)
+    _ => panic "tanstack.pretty: the escape \\{} in a route tree string is not one its generator writes", byte-text(s[i + 1])
+  }
+  _ => byte-text(s[i]) ++ unescaped(s, i + 1)
+}
+
+# is-es5-identifier-name: a letter, `$` or `_`, then those and digits and joining marks.
+fn identifier-name?(s: Text) -> Bool = len(points) > 0 and start?(points[0]) and (all i in 1..len(points): part?(points[i]))
+  where points = code-points-of(s)
+fn start?(cp: Int) -> Bool = match cp {
+  36 | 95 => true
+  _ if (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) => true
+  _ if cp < 128 => false
+  _ => match unicode-category(cp) { "Lu" | "Ll" | "Lt" | "Lm" | "Lo" | "Nl" => true  _ => false }
+}
+fn part?(cp: Int) -> Bool = start?(cp) or (cp >= 48 and cp <= 57) or (cp >= 128 and (match unicode-category(cp) {
+  "Mn" | "Mc" | "Nd" | "Pc" => true
+  _ => false
+})) or cp == 8204 or cp == 8205
+
+# key.js's printKey, as-needed: a string key that is an identifier name, and prints as its value,
+# loses its quotes.
+fn key(k: Node) -> doc.Doc = match k {
+  tf.Str(raw) if printed-string(raw)[1..len(printed-string(raw)) - 1] == string-value(raw) and identifier-name?(string-value(raw)) => t(string-value(raw))
+  tf.Str(raw) => t(printed-string(raw))
+  _ => t(k.text)
+}
+
+# --- The program ---------------------------------------------------------------------------------
+
+fn comment?(n: Node) -> Bool = n is LineComment(...) or n is BlockComment(...)
+
+# block.js's printBlock for a Program: the statements (statement-sequence.js), each with the
+# comments before it as its leading comments and those after the last as its trailing ones
+# (main/comments/print.js), and a newline to end.
+fn program(f: Node) -> doc.Doc = cat([sequence(statements)] ++ [footer(i) for i in tail] ++ [doc.hardline()])
+  where items = f.items.kids,
+        positions = [i for i in 0..len(items) if not comment?(items[i])],
+        statements = [with-comments(items, positions, k) for k in 0..len(positions)],
+        tail = [items[i] for i in (if len(positions) == 0 then 0 else positions[len(positions) - 1] + 1)..len(items)]
+
+fn with-comments(items: [Node], positions: [Int], k: Int) -> Placed =
+  Placed(node: items[positions[k]], doc: cat([leading(items[i]) for i in from..positions[k]] ++ [statement(items[positions[k]])]))
+  where from = if k == 0 then 0 else positions[k - 1] + 1
+
+record Placed { node: Node, doc: doc.Doc }
+
+fn sequence(statements: [Placed]) -> doc.Doc =
+  cat([d for i in 0..len(statements)
+         for d in [statements[i].doc] ++ (if i + 1 < len(statements) then [doc.hardline()] ++ (if next-line-empty?(statements[i].node.hi) then [doc.hardline()] else []) else [])])
+
+# printLeadingComment: a block comment followed by a newline keeps it (a line comment always
+# does), and an empty line after it stays.
+fn leading(c: Node) -> doc.Doc = cat([comment-text(c), after, if newline-after?(newline-at(spaces-from(c.hi))) then doc.hardline() else nothing()])
+  where after = match c {
+          BlockComment(_) => if newline-after?(c.hi) then (if newline-before?(c.lo) then doc.hardline() else doc.line()) else t(" ")
+          _ => doc.hardline()
+        }
+
+# printTrailingComment, for a comment on a line of its own after the last statement.
+fn footer(c: Node) -> doc.Doc = doc.line-suffix(cat([doc.hardline(), if previous-line-empty?(c.lo) then doc.hardline() else nothing(), comment-text(c)]))
+
+# printer-estree's printComment: a line comment without what trails it; a block comment whose lines
+# all start with `*` indented again, any other as it is.
+fn comment-text(c: Node) -> doc.Doc = match c {
+  LineComment(text) => t(text[0..len(text) - span-back-of(text, " \t\r")])
+  BlockComment(text) if indentable?(text) => cat([t("/*"), doc.joined(doc.hardline(), [t(block-line(ls, i)) for i in 0..len(ls)]), t("*/")])
+    where ls = split(text[2..len(text) - 2], "\n")
+  BlockComment(text) => t(text)
+}
+
+fn indentable?(text: Text) -> Bool = len(ls) > 1 and (all l in ls: at?(l, span-of(l, 0, " \t"), "*"))
+  where ls = split("*" ++ text[2..len(text) - 2] ++ "*", "\n")
+
+fn block-line(ls: [Text], i: Int) -> Text = match i {
+  0 => trim-right(ls[0])
+  _ if i < len(ls) - 1 => " " ++ trim(ls[i])
+  _ => " " ++ ls[i][span-of(ls[i], 0, " \t\n\r")..len(ls[i])]
+}
+fn trim-right(s: Text) -> Text = s[0..len(s) - span-back-of(s, " \t\n\r")]
+
+fn statement(s: Node) -> doc.Doc = match s {
+  # module.js's printImportDeclaration.
+  Import(specifiers, source, _) => cat([t("import"), specifiers-doc([specifier(x) for x in specifiers.kids]), t(" from"), t(" "), t(printed-string(source.text)), semicolon()])
+  ImportAll(name, source, _) => cat([t("import"), t(" "), t("* as " ++ name.text), t(" from"), t(" "), t(printed-string(source.text)), semicolon()])
+  # function.js's printFunction, its body a block (block.js) of return statements.
+  Function(name, body, _) => cat([t("function"), t(" "), t(name.text), doc.group(doc.group(cat([t("("), t(")")]))), t(" "),
+                                  match len(body.kids) {
+                                    0 => t("{}")
+                                    _ => cat([t("{"), doc.indent(cat([doc.hardline(), sequence([Placed(node: r, doc: return-statement(r)) for r in body.kids])])), doc.hardline(), t("}")])
+                                  }])
+  # module.js's printExportDeclaration.
+  Export(declaration) => cat([t("export"), t(" "), statement(declaration)])
+  # variable-declaration.js
+  Const(name, value, _) => doc.group(cat([t("const"), t(" "), declarator(s, t(name.text), whole(value)), semicolon()]))
+  TypedConst(name, type, value, _) => doc.group(cat([t("const"), t(" "), declarator(s, cat([t(name.text), t(": "), type-doc(type)]), whole(value)), semicolon()]))
+  # class.js's printClass and class-body.js for an interface: always one member a line.
+  Interface(name, members) => cat([t("interface"), t(" "), t(name.text), t(" "), interface-body(members.kids)])
+  # module-declaration.js, its body a block.
+  Module(name, body) => cat([t("declare "), t("module "), t(printed-string(name.text)), t(" "),
+                             doc.group(match len(body.kids) {
+                               0 => t("{}")
+                               _ => cat([t("{"), doc.indent(cat([doc.hardline(), sequence([Placed(node: b, doc: statement(b)) for b in body.kids])])), doc.hardline(), t("}")])
+                             })])
+}
+
+fn specifier(x: Node) -> doc.Doc = match x {
+  Renamed(imported, local) => cat([t(imported.text), t(" as "), t(local.text)])
+  Same(name) => t(name.text)
+}
+
+# printModuleSpecifiers: one specifier is never broken; more are a group.
+fn specifiers-doc(specs: [doc.Doc]) -> doc.Doc = match len(specs) {
+  0 => t(" {}")
+  1 => cat([t(" "), t("{"), t(" "), specs[0], t(" "), t("}")])
+  _ => cat([t(" "), doc.group(cat([t("{"), doc.indent(cat([doc.line(), doc.joined(cat([t(","), doc.line()]), specs)])), trailing-comma(), doc.line(), t("}")]))])
+}
+
+fn interface-body(members: [Node]) -> doc.Doc = match len(members) {
+  0 => t("{}")
+  _ => cat([t("{"), doc.indent(cat([doc.hardline(), cat(parts)])), doc.hardline(), t("}")])
+} where parts = [d for i in 0..len(members)
+                   for d in [cat([doc.group(member-doc(members[i])), semicolon()])]
+                            ++ (if i + 1 < len(members) then [doc.hardline()] ++ (if next-line-empty?(members[i].hi) then [doc.hardline()] else []) else [])]
+
+fn member-doc(m: Node) -> doc.Doc = match m { Member(k, type, _) => cat([key(k), t(": "), property-type(type)]) }
+
+# return-statement.js: `return`, a space and the value (JSX wrapped in parentheses once it breaks).
+fn return-statement(r: Node) -> doc.Doc = match r {
+  Return(value, _) => cat([t("return"), t(" "), returned(value), semicolon()])
+}
+
+fn returned(v: Node) -> doc.Doc = match v {
+  JsxElement(...) | JsxFragment(...) | JsxSelfClosing(...) => jsx-wrapped(v)
+  _ => expression(whole(v), false)
+}
+
+# --- jsx.js --------------------------------------------------------------------------------------
+
+# maybeWrapJsxElementInParens, for an element a statement returns.
+fn jsx-wrapped(e: Node) -> doc.Doc =
+  doc.group(cat([doc.if-break(t("("), nothing()), doc.indent(cat([doc.softline(), jsx(e)])), doc.softline(), doc.if-break(t(")"), nothing())]))
+
+fn jsx-name(n: Node) -> Text = match n { JsxName(first, rest) => join([first.text] ++ [p.name.text for p in rest.kids], ".") }
+
+fn jsx-children(e: Node) -> [Node] = match e {
+  JsxElement(_, children, _) | JsxFragment(children) => children.kids
+  _ => []
+}
+
+fn jsx-space?(c: Int) -> Bool = c == 32 or c == 10 or c == 13 or c == 9
+fn has-newline-text?(s: Text) -> Bool = contains-text?(s, "\n")
+# is-meaningful-jsx-text.js: text with more than whitespace, or whitespace with no newline.
+fn meaningful?(n: Node) -> Bool = n is JsxText(...) and ((any i in 0..len(n.text): not jsx-space?(n.text[i])) or not has-newline-text?(n.text))
+fn self-closing?(n: Node) -> Bool = n is JsxSelfClosing(...)
+
+# jsxWhitespace.split(text, true): words and the whitespace between them, a leading or trailing
+# run of whitespace after or before an empty word.
+fn jsx-words(s: Text) -> [Text] = match len(s) {
+  0 => [""]
+  _ => [s[0..first-ws]] ++ (if first-ws == len(s) then [] else [s[first-ws..after-ws]] ++ jsx-words-rest(s[after-ws..len(s)]))
+} where first-ws = (first i in 0..len(s) if jsx-space?(s[i]): i) ?? len(s),
+        after-ws = (first i in first-ws..len(s) if not jsx-space?(s[i]): i) ?? len(s)
+fn jsx-words-rest(s: Text) -> [Text] = jsx-words(s)
+
+# A JSX child as printJsxChildren gives it: what it is, for the comparisons printJsxElementInternal
+# makes by identity (the empty string, each kind of line, the JSX whitespace), and its document.
+enum Tag { Empty, Hard, Soft, Plain, Space, Made }
+record Part { tag: Tag, doc: doc.Doc }
+
+fn part(tag: Tag) -> Part = Part(tag: tag, doc: match tag {
+  Empty => nothing()
+  Hard => doc.hardline()
+  Soft => doc.softline()
+  Plain => doc.line()
+  Space => jsx-whitespace()
+  Made => nothing()
+})
+fn jsx-whitespace() -> doc.Doc = doc.if-break(cat([t(if single then "{' '}" else "{\" \"}"), doc.softline()]), t(" "))
+
+record Collecting { parts: [Part], prev: Text }
+
+# push: onto the last part; pushLine: a part of its own, then an empty one.
+fn pushed(c: Collecting, d: doc.Doc, word: Text) -> Collecting =
+  Collecting(parts: c.parts[0..len(c.parts) - 1] ++ [Part(tag: Made, doc: cat([c.parts[len(c.parts) - 1].doc, d]))], prev: word)
+fn pushed-line(c: Collecting, tag: Tag) -> Collecting = match tag {
+  Empty => c
+  _ => Collecting(parts: c.parts ++ [part(tag), part(Empty)], prev: c.prev)
+}
+
+fn separator-no-whitespace(child: Text, node: Node, next: Node?) -> Tag = match self-closing?(node) or (match next { some(x) => self-closing?(x)  none => false }) {
+  true => if len(child) == 1 then Soft else Hard
+  false => Soft
+}
+fn separator-with-whitespace(child: Text, node: Node, next: Node?) -> Tag = match len(child) {
+  1 => if self-closing?(node) or (match next { some(x) => self-closing?(x)  none => false }) then Hard else Soft
+  _ => Hard
+}
+
+fn jsx-children-parts(children: [Node]) -> [Part] = (fold c = Collecting(parts: [part(Empty)], prev: "") for i in 0..len(children):
+  child-parts(c, children[i], if i + 1 < len(children) then some(children[i + 1]) else none)).parts
+
+fn child-parts(c: Collecting, node: Node, next: Node?) -> Collecting = match node {
+  JsxText(text) if meaningful?(node) => text-parts(c, node, text, next)
+  JsxText(text) if has-newline-text?(text) => if count-byte(text, 0, len(text), 10) > 1 then pushed-line(c, Hard) else c
+  JsxText(_) => pushed-line(c, Space)
+  _ => match next {
+    some(x) if meaningful?(x) => pushed-line(after, separator-no-whitespace(jsx-words(trimmed-jsx(x.text))[0], node, next))
+    _ => pushed-line(after, Hard)
+  } where after = pushed(c, jsx(node), c.prev)
+}
+
+fn trimmed-jsx(s: Text) -> Text = s[from..to]
+  where from = (first i in 0..len(s) if not jsx-space?(s[i]): i) ?? len(s),
+        to = (last i in 0..len(s) if not jsx-space?(s[i]): i + 1) ?? from
+
+fn text-parts(c: Collecting, node: Node, text: Text, next: Node?) -> Collecting = match len(words) {
+  0 => started
+  _ => ended
+} where all-words = jsx-words(text),
+        leading = all-words[0] == "",
+        started = match leading {
+          false => c
+          true => match has-newline-text?(all-words[1]) {
+            true => pushed-line(c, separator-with-whitespace(if len(all-words) > 2 then all-words[2] else "", node,
+                                                             if trailing != "" and not has-newline-text?(trailing) then none else next))
+            false => pushed-line(c, Space)
+          }
+        },
+        rest = if leading then all-words[2..len(all-words)] else all-words,
+        trailing-ws = len(rest) >= 2 and rest[len(rest) - 1] == "",
+        trailing = if len(all-words) >= 2 and all-words[len(all-words) - 1] == "" then all-words[len(all-words) - 2] else "",
+        words = if trailing-ws then rest[0..len(rest) - 2] else rest,
+        end-ws = if trailing-ws then some(rest[len(rest) - 2]) else none,
+        with-words = fold w = started for i in 0..len(words): if i % 2 == 1 then pushed-line(w, Plain) else pushed(w, t(words[i]), words[i]),
+        ended = match end-ws {
+          some(ws) => if has-newline-text?(ws) then pushed-line(with-words, separator-with-whitespace(with-words.prev, node, next)) else pushed-line(with-words, Space)
+          none => pushed-line(with-words, separator-no-whitespace(with-words.prev, node, next))
+        }
+
+fn empty-or-line?(p: Part) -> Bool = p.tag == Empty or p.tag == Hard or p.tag == Soft or p.tag == Plain
+fn tag-at(ps: [Part], i: Int) -> Tag? = if i >= 0 and i < len(ps) then some(ps[i].tag) else none
+fn is-tag?(ps: [Part], i: Int, tag: Tag) -> Bool = match tag-at(ps, i) { some(x) => x == tag  none => false }
+
+# The clean-up printJsxElementInternal makes of the children, from the end back.
+fn cleaned-parts(ps: [Part], i: Int, contains-text-children: Bool) -> [Part] = match i {
+  _ if i < 0 => ps
+  _ => cleaned-parts(match drop {
+         2 => ps[0..i] ++ ps[i + 2..len(ps)]
+         1 => ps[0..i + 1] ++ ps[i + 3..len(ps)]
+         _ => ps
+       }, i - 1, contains-text-children)
+} where empty-next = is-tag?(ps, i + 1, Empty),
+        drop = match ps[i].tag {
+          _ if is-tag?(ps, i, Empty) and empty-next => 2
+          Hard if empty-next and is-tag?(ps, i + 2, Hard) and contains-text-children => 2
+          Soft | Hard if empty-next and is-tag?(ps, i + 2, Space) => 2
+          Space if empty-next and (is-tag?(ps, i + 2, Soft) or is-tag?(ps, i + 2, Hard)) => 1
+          Space if empty-next and is-tag?(ps, i + 2, Space) => 2
+          Soft if empty-next and is-tag?(ps, i + 2, Hard) => 2
+          Hard if empty-next and is-tag?(ps, i + 2, Soft) => 2
+          _ => 0
+        }
+
+fn trimmed-parts(ps: [Part]) -> [Part] = leading-trimmed(trailing-trimmed(ps))
+fn trailing-trimmed(ps: [Part]) -> [Part] = match len(ps) {
+  0 => ps
+  n => if empty-or-line?(ps[n - 1]) then trailing-trimmed(ps[0..n - 1]) else ps
+}
+fn leading-trimmed(ps: [Part]) -> [Part] = match len(ps) {
+  _ if len(ps) > 1 and empty-or-line?(ps[0]) and empty-or-line?(ps[1]) => leading-trimmed(ps[2..len(ps)])
+  _ => ps
+}
+
+fn empty-element?(e: Node) -> Bool = match jsx-children(e) {
+  [] => true
+  [only] => only is JsxText(...) and not meaningful?(only)
+  _ => false
+}
+
+fn opening(e: Node) -> doc.Doc = match e {
+  JsxFragment(_) => t("<>")
+  JsxElement(name, _, _) => doc.group(cat([t("<"), t(jsx-name(name)), t(">")]))
+  JsxSelfClosing(name) => t("<" ++ jsx-name(name) ++ " />")
+}
+fn closing(e: Node) -> doc.Doc = match e {
+  JsxFragment(_) => t("</>")
+  JsxElement(name, _, _) => t("</" ++ jsx-name(name) ++ ">")
+  _ => nothing()
+}
+
+record Multi { docs: [doc.Doc], forced: Bool }
+
+# printJsxElementInternal.
+fn jsx(e: Node) -> doc.Doc = match e {
+  JsxSelfClosing(_) => opening(e)
+  _ if empty-element?(e) => cat([opening(e), closing(e)])
+  _ => if forced then multi-line else doc.conditional([doc.group(cat([opening(e)] ++ [p.doc for p in children] ++ [closing(e)])), multi-line])
+    where kids = jsx-children(e),
+          has-text = any k in kids: meaningful?(k),
+          raw-parts = jsx-children-parts(kids),
+          children = trimmed-parts(cleaned-parts(raw-parts, len(raw-parts) - 2, has-text)),
+          multi = multiline-children(children),
+          forced = (any k in kids: k is JsxElement(...) or k is JsxFragment(...) or k is JsxSelfClosing(...)) or multi.forced,
+          content = if has-text then doc.fill(multi.docs) else doc.broken-group(cat(multi.docs)),
+          multi-line = doc.group(cat([opening(e), doc.indent(cat([doc.hardline(), content])), doc.hardline(), closing(e)]))
+}
+
+fn raw-whitespace() -> Text = if single then "{' '}" else "{\" \"}"
+
+fn multiline-children(ps: [Part]) -> Multi = fold m = Multi(docs: [nothing()], forced: false) for i in 0..len(ps):
+  match ps[i].tag {
+    Space if i == 1 and ps[0].tag == Empty and len(ps) == 2 => m with { docs: merged-last(m.docs, t(raw-whitespace())) }
+    Space if i == 1 and ps[0].tag == Empty => m with { docs: m.docs ++ [cat([t(raw-whitespace()), doc.hardline()]), nothing()] }
+    Space if i == len(ps) - 1 => m with { docs: merged-last(m.docs, t(raw-whitespace())) }
+    Space if i >= 2 and ps[i - 1].tag == Empty and ps[i - 2].tag == Hard => m with { docs: merged-last(m.docs, t(raw-whitespace())) }
+    _ => Multi(docs: if i % 2 == 0 then merged-last(m.docs, ps[i].doc) else m.docs ++ [ps[i].doc, nothing()],
+               forced: m.forced or ps[i].doc.breaks)
+  }
+
+fn merged-last(ds: [doc.Doc], d: doc.Doc) -> [doc.Doc] = ds[0..len(ds) - 1] ++ [cat([ds[len(ds) - 1], d])]
+
+# --- Types ---------------------------------------------------------------------------------------
+
+fn type-doc(type: Node) -> doc.Doc = match type {
+  TypeOf(name) => cat([t("typeof "), t(name.text)])
+  LiteralType(value) => t(printed-string(value.text))
+  TypeName(name) => t(name.text)
+  TypeLiteral(members) => type-literal(type, members.kids)
+  Union(first, rest) => union(first, [a.type for a in rest.kids])
+}
+
+# A property's type: union-type.js indents a union there.
+fn property-type(type: Node) -> doc.Doc = match type {
+  Union(first, rest) => doc.group(doc.indent(cat([doc.softline(), union(first, [a.type for a in rest.kids])])))
+  _ => type-doc(type)
+}
+
+# union-type.js's printUnionType: `| ` before each type once the group breaks.
+fn union(first: Node, rest: [Node]) -> doc.Doc =
+  doc.group(cat([cat([doc.if-break(t("| "), nothing()), doc.align(2, type-doc(first))])]
+                ++ [cat([doc.line(), t("| "), doc.align(2, type-doc(r))]) for r in rest]))
+
+# class-body.js for a type literal: members a line apart, broken when the source broke after `{`;
+# a member's `;` only when semicolons are on (and the last only once broken).
+fn type-literal(lit: Node, members: [Node]) -> doc.Doc = match len(members) {
+  0 => t("{}")
+  _ => doc.group-of(cat([t("{"), doc.indent(cat([doc.line(), cat(parts)])), doc.line(), t("}")]),
+                    newline-between?(brace-at(lit.lo), members[0].lo), 0)
+} where parts = [d for i in 0..len(members)
+                   for d in [cat([doc.group(member-doc(members[i])), separator(i + 1 == len(members))])]
+                            ++ (if i + 1 < len(members) then [doc.line()] ++ (if next-line-empty?(members[i].hi) then [doc.hardline()] else []) else [])]
+
+fn separator(last: Bool) -> doc.Doc = match last {
+  true => if semi then doc.if-break(t(";"), nothing()) else nothing()
+  false => if semi then t(";") else doc.if-break(nothing(), t(";"))
+}
+
+# --- Expressions ---------------------------------------------------------------------------------
+
+# An expression as Prettier's tree has it: a node, and for a member chain how many of its links
+# (the callee of a call is the chain one link shorter).
+record X { node: Node, n: Int }
+
+fn whole(e: Node) -> X = match e {
+  Chain(_, links) => X(node: e, n: len(links.kids))
+  _ => X(node: e, n: 0)
+}
+
+enum Shape { Identifier, StringLiteral, ImportExpression, ObjectExpression, ArrayExpression, CallExpression, MemberExpression, Arrow, AsExpression }
+
+fn links(x: X) -> [Node] = match x.node { Chain(_, ls) => ls.kids  _ => [] }
+fn link(x: X) -> Node = links(x)[x.n - 1]
+fn shape(x: X) -> Shape = match x.node {
+  Arrow(...) => Arrow
+  As(...) => AsExpression
+  Chain(head, _) if x.n == 0 => match head {
+    ImportCall(_) => ImportExpression
+    Object(...) => ObjectExpression
+    Array(_) => ArrayExpression
+    tf.Str(_) => StringLiteral
+    _ => Identifier
+  }
+  Chain(...) => match link(x) { Dot(_) => MemberExpression  _ => CallExpression }
+  _ => panic "tanstack.pretty: not an expression: {}", x.node.text
+}
+fn inner(x: X) -> X = X(node: x.node, n: x.n - 1)
+fn head(x: X) -> Node = match x.node { Chain(h, _) => h  _ => x.node }
+fn call-args(x: X) -> [X] = match link(x) {
+  Call(arguments) | TypedCall(_, arguments) => [whole(a) for a in arguments.kids]
+  _ => []
+}
+fn identifier-name(x: X) -> Text = head(x).text
+fn member-name(x: X) -> Text = match link(x) { Dot(name) => name.text  _ => "" }
+
+fn call?(x: X) -> Bool = shape(x) == CallExpression
+fn member?(x: X) -> Bool = shape(x) == MemberExpression
+fn arrow?(x: X) -> Bool = shape(x) == Arrow
+
+# The expression, printed; `expand-last` the flag call-arguments.js prints a hugged last argument with.
+fn expression(x: X, expand-last: Bool) -> doc.Doc = match shape(x) {
+  Identifier => t(head(x).text)
+  StringLiteral => t(printed-string(head(x).text))
+  # call-expression.js: `import(...)` is a simple module import, never broken.
+  ImportExpression => match head(x) { ImportCall(source) => cat([t("import"), t("("), t(printed-string(source.text)), t(")")]) }
+  ObjectExpression => object(head(x))
+  ArrayExpression => array(head(x))
+  CallExpression => call-expression(x)
+  MemberExpression => member-expression(x)
+  Arrow => arrow-function(x.node, expand-last)
+  AsExpression => match x.node { As(e, type) => cat([expression(whole(e), false), t(" "), t("as"), t(" "), type-doc(type)]) }
+}
+
+# member.js: `a.b` stays together when `a` is a name; otherwise the lookup may go to the next line.
+fn member-expression(x: X) -> doc.Doc = match shape(inner(x)) {
+  Identifier => cat([expression(inner(x), false), t("."), t(member-name(x))])
+  _ => cat([expression(inner(x), false), doc.group(doc.indent(cat([doc.softline(), t("."), t(member-name(x))])))])
+}
+
+fn type-arguments(x: X) -> doc.Doc = match link(x) {
+  TypedCall(type, _) => cat([t("<"), type-doc(type), t(">")])
+  _ => nothing()
+}
+
+# call-expression.js's printCallExpression: a call on a member is a member chain; a call on a call
+# is grouped.
+fn call-expression(x: X) -> doc.Doc = match shape(inner(x)) {
+  MemberExpression => member-chain(x).doc
+  CallExpression => doc.group(cat([expression(inner(x), false), type-arguments(x), call-arguments(x)]))
+  _ => cat([expression(inner(x), false), type-arguments(x), call-arguments(x)])
+}
+
+# --- call-arguments.js ---------------------------------------------------------------------------
+
+fn call-arguments(x: X) -> doc.Doc = match len(args) {
+  0 => doc.group(cat([t("("), t(")")]))
+  _ if function-composition?(args) => all-broken-out(printed)
+  _ if expand-last?(args) => expanded-last(args, printed)
+  _ => doc.group-of(cat([t("("), doc.indent(cat([doc.softline()] ++ printed)), trailing-comma(), doc.softline(), t(")")]),
+                    any p in printed: p.breaks, 0)
+} where args = call-args(x),
+        printed = [if i + 1 == len(args) then expression(args[i], false) else cat([expression(args[i], false), t(","), doc.line()]) for i in 0..len(args)]
+
+fn all-broken-out(printed: [doc.Doc]) -> doc.Doc =
+  doc.broken-group(cat([t("("), doc.indent(cat([doc.line()] ++ printed)), trailing-comma(), doc.line(), t(")")]))
+
+fn expanded-last(args: [X], printed: [doc.Doc]) -> doc.Doc = match len(heads) {
+  _ if any h in heads: h.breaks => all-broken-out(printed)
+  _ if last.breaks => cat([doc.break-parent(), doc.conditional([cat([t("(")] ++ heads ++ [doc.broken-group(last), t(")")]), all-broken-out(printed)])])
+  _ => doc.conditional([cat([t("(")] ++ heads ++ [last, t(")")]),
+                        cat([t("(")] ++ heads ++ [doc.broken-group(last), t(")")]),
+                        all-broken-out(printed)])
+} where heads = printed[0..len(printed) - 1],
+        last = expression(args[len(args) - 1], true)
+
+fn function-composition?(args: [X]) -> Bool = len(args) > 1 and (count >= 2 or nested)
+  where count = len([a for a in args if arrow?(a)]),
+        nested = any a in args if not arrow?(a) and call?(a): (any c in call-args(a): arrow?(c))
+
+fn could-expand?(arg: X, arrow-chain: Bool) -> Bool = match shape(arg) {
+  ObjectExpression => match head(arg) { Object(props, _) => len(props.kids) > 0 }
+  ArrayExpression => match head(arg) { Array(items) => len(items.kids) > 0 }
+  AsExpression => match arg.node { As(e, _) => could-expand?(whole(e), false) }
+  Arrow => match arg.node {
+    Arrow(_, body) => match shape(whole(body)) {
+      ObjectExpression => true
+      Arrow => could-expand?(whole(body), true)
+      CallExpression => not arrow-chain
+      _ => false
+    }
+  }
+  _ => false
+}
+
+fn expand-last?(args: [X]) -> Bool = could-expand?(last, false) and (len(args) < 2 or shape(args[len(args) - 2]) != shape(last))
+  where last = args[len(args) - 1]
+
+# is-simple-call-argument.js
+fn simple-argument?(x: X, depth: Int) -> Bool = match shape(x) {
+  _ if depth <= 0 => false
+  StringLiteral | Identifier => true
+  ArrayExpression => match head(x) { Array(items) => all i in items.kids: simple-argument?(whole(i), depth - 1) }
+  ObjectExpression => match head(x) { Object(props, _) => all p in props.kids: (match p { Property(_, v) => simple-argument?(whole(v), depth - 1) }) }
+  # `import(source)`: its one argument, a string, is simple one level down.
+  ImportExpression => depth >= 2
+  CallExpression => simple-argument?(inner(x), depth) and len(call-args(x)) <= depth and (all a in call-args(x): simple-argument?(a, depth - 1))
+  MemberExpression => simple-argument?(inner(x), depth)
+  _ => false
+}
+
+# --- member-chain.js -----------------------------------------------------------------------------
+
+# A node of the chain as printMemberChain collects them: the call or member it is, printed.
+record Printed { x: X, kind: Shape, doc: doc.Doc }
+record Chained { doc: doc.Doc, labelled: Bool }
+
+fn printed-nodes(x: X) -> [Printed] = collected(inner(x)) ++ [Printed(x: x, kind: CallExpression, doc: cat([type-arguments(x), call-arguments(x)]))]
+
+fn collected(c: X) -> [Printed] = match shape(c) {
+  CallExpression if member?(inner(c)) or call?(inner(c)) =>
+    collected(inner(c)) ++ [Printed(x: c, kind: CallExpression, doc: cat([type-arguments(c), call-arguments(c)]))]
+  MemberExpression => collected(inner(c)) ++ [Printed(x: c, kind: MemberExpression, doc: cat([t("."), t(member-name(c))]))]
+  s => [Printed(x: c, kind: s, doc: expression(c, false))]
+}
+
+# Where the first group ends: the head with the calls right after it, or a name with the lookups
+# before the last.
+fn first-group-end(ps: [Printed]) -> Int = match ps[0].kind {
+  CallExpression => calls-end
+  _ => (first i in calls-end..len(ps) if not (i + 1 < len(ps) and ps[i].kind == MemberExpression and ps[i + 1].kind == MemberExpression): i) ?? len(ps)
+} where calls-end = (first i in 1..len(ps) if ps[i].kind != CallExpression: i) ?? len(ps)
+
+record Grouping { groups: [[Printed]], current: [Printed], seen-call: Bool }
+
+# The rest in groups, each lookup starting one once a call has been seen.
+fn rest-groups(ps: [Printed], from: Int) -> [[Printed]] = match len(done.current) {
+  0 => done.groups
+  _ => done.groups ++ [done.current]
+} where done = fold g = Grouping(groups: [], current: [], seen-call: false) for i in from..len(ps):
+          match g.seen-call and ps[i].kind == MemberExpression {
+            true => Grouping(groups: g.groups ++ [g.current], current: [ps[i]], seen-call: false)
+            false => g with { current: g.current ++ [ps[i]], seen-call: g.seen-call or ps[i].kind == CallExpression }
+          }
+
+fn factory?(name: Text) -> Bool = len(name) > 0 and ((name[0] >= 65 and name[0] <= 90) or all i in 0..len(name): name[i] == 36 or name[i] == 95)
+
+fn member-chain(x: X) -> Chained = match len(groups) {
+  _ if len(groups) <= cutoff => Chained(doc: doc.group(one-line), labelled: false)
+  _ if (len(calls) > 2 and (any c in calls: any a in call-args(c.x): not simple-argument?(a, 2)))
+       or (any g in printed-groups[0..len(printed-groups) - 1]: g.breaks)
+       or last-breaks-with-functions => Chained(doc: doc.group(expanded), labelled: true)
+  _ => Chained(doc: cat([if one-line.breaks then doc.break-parent() else nothing(), doc.conditional([one-line, expanded])]), labelled: true)
+} where ps = printed-nodes(x),
+        end = first-group-end(ps),
+        groups = [ps[0..end]] ++ rest-groups(ps, end),
+        merge = len(groups) >= 2 and len(groups[1]) > 0 and should-not-wrap(groups),
+        cutoff = if merge then 3 else 2,
+        printed-groups = [cat([p.doc for p in g]) for g in groups],
+        one-line = cat(printed-groups),
+        expanded = cat([printed-groups[0], if merge then printed-groups[1] else nothing(),
+                        indented-groups(printed-groups[(if merge then 2 else 1)..len(printed-groups)])]),
+        calls = [p for p in ps if p.kind == CallExpression],
+        last-group = groups[len(groups) - 1],
+        last-breaks-with-functions = last-group[len(last-group) - 1].kind == CallExpression
+          and printed-groups[len(printed-groups) - 1].breaks
+          and (any c in calls[0..len(calls) - 1]: any a in call-args(c.x): arrow?(a))
+
+fn should-not-wrap(groups: [[Printed]]) -> Bool = match len(groups[0]) {
+  1 => groups[0][0].kind == Identifier and factory?(identifier-name(groups[0][0].x))
+  _ => last.kind == MemberExpression and factory?(member-name(last.x))
+} where last = groups[0][len(groups[0]) - 1]
+
+fn indented-groups(gs: [doc.Doc]) -> doc.Doc = match len(gs) {
+  0 => nothing()
+  _ => doc.indent(cat([doc.hardline(), doc.joined(doc.hardline(), gs)]))
+}
+
+# A call printed as a member chain that is labelled one (more groups than fit on a line).
+fn labelled-chain?(x: X) -> Bool = call?(x) and member?(inner(x)) and member-chain(x).labelled
+
+# --- arrow-function.js ---------------------------------------------------------------------------
+
+fn arrow-function(a: Node, expand-last: Bool) -> doc.Doc = match a {
+  Arrow(params, body) => doc.group(cat([doc.group(signature(params.kids, expand-last)), t(" =>"),
+                                        doc.group(cat([doc.indent(cat([doc.line(), expression(whole(body), expand-last)])),
+                                                       if expand-last then trailing-comma() else nothing(),
+                                                       if expand-last then doc.softline() else nothing()]))]))
+}
+
+# printArrowFunctionSignature and function-parameters.js: parentheses always; expanded as a hugged
+# last argument, the parameters never break.
+fn signature(params: [Node], expand-last: Bool) -> doc.Doc = match len(params) {
+  0 => cat([t("("), t(")")])
+  _ if expand-last => doc.group(cat([t("("), doc.without-lines(printed), t(")")]))
+  _ => doc.group(cat([t("("), doc.indent(cat([doc.softline(), printed])), trailing-comma(), doc.softline(), t(")")]))
+} where printed = doc.joined(cat([t(","), doc.line()]), [t(p.text) for p in params])
+
+# array.js: elements a line apart, broken when each is an object or array of more than one.
+fn array(a: Node) -> doc.Doc = match a {
+  Array(items) => match len(items.kids) {
+    0 => doc.group(cat([t("["), t("]")]))
+    _ => doc.group-of(cat([t("["), doc.indent(cat([doc.softline(), doc.joined(cat([t(","), doc.line()]), [expression(whole(i), false) for i in items.kids]), trailing-comma()])),
+                          doc.softline(), t("]")]), len(items.kids) > 1 and (all k in 0..len(items.kids): nested-items?(items.kids, k)), 0)
+  }
+}
+
+# An element of an array of objects or arrays, each of more than one item and of the type of the next.
+fn nested-items?(items: [Node], k: Int) -> Bool = match shape(whole(items[k])) {
+  ObjectExpression => (match head(whole(items[k])) { Object(ps, _) => len(ps.kids) > 1 }) and same-shape?(items, k)
+  ArrayExpression => (match head(whole(items[k])) { Array(xs) => len(xs.kids) > 1 }) and same-shape?(items, k)
+  _ => false
+}
+fn same-shape?(items: [Node], k: Int) -> Bool = k + 1 >= len(items) or shape(whole(items[k])) == shape(whole(items[k + 1]))
+
+# --- object.js and property.js -------------------------------------------------------------------
+
+fn object(o: Node) -> doc.Doc = match o {
+  Object(props, _) => match len(props.kids) {
+    0 => doc.group(cat([t("{"), t("}")]))
+    _ => doc.group-of(cat([t("{"), doc.indent(cat([doc.line()] ++ parts)), trailing-comma(), doc.line(), t("}")]),
+                      newline-between?(brace-at(o.lo), props.kids[0].lo), 0)
+      where ps = props.kids,
+            parts = [cat((if i == 0 then [] else [t(","), doc.line()] ++ (if next-line-empty?(ps[i - 1].hi) then [doc.hardline()] else [])) ++ [property(ps[i])])
+                     for i in 0..len(ps)]
+  }
+}
+
+fn property(p: Node) -> doc.Doc = match p {
+  Property(k, value) => assignment(p, t(k.text), t(":"), whole(value), len(k.text) < 5)
+}
+
+# --- assignment.js -------------------------------------------------------------------------------
+
+fn declarator(d: Node, left: doc.Doc, value: X) -> doc.Doc = assignment(d, left, t(" ="), value, false)
+
+enum Layout { BreakAfterOperator, NeverBreakAfterOperator, Fluid }
+
+fn assignment(at: Node, left: doc.Doc, operator: doc.Doc, right: X, short-key: Bool) -> doc.Doc = match layout(right, short-key) {
+  BreakAfterOperator => doc.group(cat([doc.group(left), operator, doc.group(doc.indent(cat([doc.line(), right-doc])))]))
+  NeverBreakAfterOperator => doc.group(cat([doc.group(left), operator, t(" "), right-doc]))
+  Fluid => doc.group(cat([doc.group(left), operator, doc.group-id(doc.indent(doc.line()), id), doc.line-suffix-boundary(), doc.indent-if-break(right-doc, id)]))
+} where right-doc = expression(right, false), id = at.lo + 1
+
+# chooseLayout, for what a route tree assigns: a name or a short key on the left.
+fn layout(right: X, short-key: Bool) -> Layout = match shape(right) {
+  _ if not short-key and (shape(right) == StringLiteral or poorly-breakable?(right, false)) => BreakAfterOperator
+  _ if short-key => NeverBreakAfterOperator
+  _ => Fluid
+}
+
+# isPoorlyBreakableMemberOrCallChain: a chain of calls with no arguments or one short one.
+fn poorly-breakable?(x: X, deep: Bool) -> Bool = match shape(x) {
+  CallExpression => not labelled-chain?(x) and (len(args) == 0 or (len(args) == 1 and lone-short?(args[0]))) and poorly-breakable?(inner(x), true)
+    where args = call-args(x)
+  MemberExpression => poorly-breakable?(inner(x), true)
+  Identifier => deep
+  _ => false
+}
+
+# is-lone-short-argument.js, at 80 columns: a fifth of the width or less.
+fn lone-short?(arg: X) -> Bool = match shape(arg) {
+  Identifier => len(head(arg).text) <= 20
+  StringLiteral => len(printed-string(head(arg).text)) <= 20
+  CallExpression => len(call-args(arg)) == 0 and shape(inner(arg)) == Identifier and len(head(arg).text) <= 18
+  _ => false
+}

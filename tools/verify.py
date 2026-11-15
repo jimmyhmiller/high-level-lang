@@ -469,6 +469,14 @@ code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__
 check(code == 0 and " 0 where shaking changed what runs" in out, "shake-fuzz: "
       + (out.strip().splitlines()[-1] if code == 0 else out[-1800:]))
 
+print("== TanStack Router's route tree")
+if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmarks/tanstack-router/node_modules/@tanstack/router-generator")):
+    code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "router-gen-check.py"), "300", "1", ESB], 900)
+    check(code == 0 and " 0 differ" in out, "route trees against TanStack's generator: "
+          + (out.strip().splitlines()[-1] + " (trees and route files, byte for byte)" if code == 0 else out[-1800:]))
+else:
+    check(False, "route trees: benchmarks/tanstack-router has no node_modules (npm ci --prefix benchmarks/tanstack-router --ignore-scripts)")
+
 print("== ESM evaluation across split chunks")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation-check.py"), ESB], 300)
 check(code == 0 and out.strip().endswith("all evaluation checks passed"), "split evaluation: "

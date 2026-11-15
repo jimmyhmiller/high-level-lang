@@ -1,0 +1,253 @@
+# Documents laid out at a width: Prettier's algebra (src/document in prettier 3.10) and its printer,
+# so that what a program prints through it is what Prettier would print. A document is text, a
+# list, a line that is a space or a newline (or nothing, or always a newline), a group whose lines
+# break together when the group does not fit, an indent, and the rest of Prettier's kinds: a group
+# with states tried in turn (`conditional`), text for when a group broke and when it did not
+# (`if-break`), an indent only when a named group broke, a suffix printed at the next newline.
+#
+# A group breaks when told to, or when what it holds forces a break (a hard line, `break-parent`,
+# a group that breaks), as Prettier's `propagateBreaks` decides before printing; a conditional
+# group only when told to. Each document says so of itself as it is made.
+rules hl.doc
+
+enum Kind { Str, Cat, Line, Group, Indent, Align, IfBreak, IndentIfBreak, BreakParent, LineSuffix, Boundary, Fill }
+
+boxed record Doc {
+  kind: Kind,
+  text: Text,
+  # Cat, Fill: the parts. Group, Indent, Align, IndentIfBreak, LineSuffix: [contents].
+  # IfBreak: [when broken, when flat].
+  parts: [Doc],
+  # A conditional group's states, the first its contents.
+  states: [Doc],
+  # Group, IfBreak, IndentIfBreak: a group's id (0: none). Align: its width. Line: 0 a line, 1 soft,
+  # 2 hard, 3 literal.
+  n: Int,
+  # Group: it breaks (told to, or forced). IndentIfBreak: negated.
+  broken: Bool,
+  # It makes the group around it break (`propagateBreaks`).
+  forces: Bool,
+  # Prettier's `willBreak`: a hard line, a break-parent, or a group told to break, anywhere in it.
+  breaks: Bool
+}
+
+fn made(kind: Kind, text: Text, parts: [Doc], states: [Doc], n: Int, broken: Bool) -> Doc =
+  Doc(kind: kind, text: text, parts: parts, states: states, n: n, broken: broken, forces: forces, breaks: breaks)
+  where forces = match kind {
+          BreakParent => true
+          Group => broken
+          Str | Line | Boundary => false
+          _ => any p in parts: p.forces
+        },
+        breaks = match kind {
+          BreakParent => true
+          Line => n >= 2
+          Group => broken or parts[0].breaks
+          Str | Boundary => false
+          _ => any p in parts: p.breaks
+        }
+
+fn text(s: Text) -> Doc = made(Str, s, [], [], 0, false)
+fn cat(parts: [Doc]) -> Doc = made(Cat, "", parts, [], 0, false)
+fn empty() -> Doc = text("")
+fn line() -> Doc = made(Line, "", [], [], 0, false)
+fn softline() -> Doc = made(Line, "", [], [], 1, false)
+fn hardline-alone() -> Doc = made(Line, "", [], [], 2, false)
+fn literalline-alone() -> Doc = made(Line, "", [], [], 3, false)
+fn break-parent() -> Doc = made(BreakParent, "", [], [], 0, false)
+fn hardline() -> Doc = cat([hardline-alone(), break-parent()])
+fn literalline() -> Doc = cat([literalline-alone(), break-parent()])
+
+# A group breaks when told to or when what it holds forces it.
+fn group-of(contents: Doc, should-break: Bool, id: Int) -> Doc =
+  made(Group, "", [contents], [], id, should-break or contents.forces)
+fn group(contents: Doc) -> Doc = group-of(contents, false, 0)
+fn broken-group(contents: Doc) -> Doc = group-of(contents, true, 0)
+fn group-id(contents: Doc, id: Int) -> Doc = group-of(contents, false, id)
+# The states are tried in turn; nothing in them breaks it.
+fn conditional(states: [Doc]) -> Doc = made(Group, "", [states[0]], states, 0, false)
+
+fn indent(contents: Doc) -> Doc = made(Indent, "", [contents], [], 0, false)
+fn align(n: Int, contents: Doc) -> Doc = made(Align, "", [contents], [], n, false)
+fn if-break(broken: Doc, flat: Doc) -> Doc = made(IfBreak, "", [broken, flat], [], 0, false)
+fn if-break-of(broken: Doc, flat: Doc, id: Int) -> Doc = made(IfBreak, "", [broken, flat], [], id, false)
+fn indent-if-break(contents: Doc, id: Int) -> Doc = made(IndentIfBreak, "", [contents], [], id, false)
+fn line-suffix(contents: Doc) -> Doc = made(LineSuffix, "", [contents], [], 0, false)
+fn line-suffix-boundary() -> Doc = made(Boundary, "", [], [], 0, false)
+fn fill(parts: [Doc]) -> Doc = made(Fill, "", parts, [], 0, false)
+
+fn joined(sep: Doc, docs: [Doc]) -> Doc = cat([d for i in 0..len(docs) for d in (if i == 0 then [docs[i]] else [sep, docs[i]])])
+
+# Prettier's `removeLines`: lines become what they print as flat, a choice its flat side.
+fn without-lines(d: Doc) -> Doc = match d.kind {
+  Line if d.n < 2 => text(if d.n == 1 then "" else " ")
+  IfBreak => without-lines(d.parts[1])
+  Group if len(d.states) > 0 => made(Group, "", [without-lines(d.states[0])], [without-lines(s) for s in d.states], d.n, false)
+  Group => group-of(without-lines(d.parts[0]), d.broken and not d.parts[0].forces, d.n)
+  Str | Line | BreakParent | Boundary => d
+  _ => made(d.kind, d.text, [without-lines(p) for p in d.parts], [], d.n, d.broken)
+}
+
+# --- Printing -------------------------------------------------------------------------------------
+
+record Ind { value: Text, length: Int }
+record Cmd { ind: Ind, flat: Bool, doc: Doc }
+# What follows a command: the parts of a list from one on, each with the list's indent and mode.
+record Seg { ind: Ind, flat: Bool, docs: [Doc], from: Int }
+
+record Out {
+  lines: [Text],
+  line: Text,
+  pos: Int,
+  # The mode each named group was printed in: true flat.
+  modes: {Int:Bool},
+  remeasure: Bool,
+  suffix: [Cmd]
+}
+
+# Prettier's `getStringWidth`: printable ASCII is a column each; past it, control characters and
+# combining marks take none, and wide and full-width characters (East Asian, emoji) two.
+fn width-of(s: Text) -> Int = match all i in 0..len(s): s[i] >= 32 and s[i] < 128 {
+  true => len(s)
+  false => sum cp in code-points-of(s): point-width(cp)
+}
+
+fn point-width(cp: Int) -> Int = match cp {
+  _ if cp <= 31 or (cp >= 127 and cp <= 159) => 0
+  _ if unicode-category(cp) == "Mn" or unicode-category(cp) == "Me" => 0
+  _ if wide?(cp) => 2
+  _ => 1
+}
+
+# East Asian Wide and Fullwidth (Unicode's EastAsianWidth.txt, W and F), and the emoji blocks.
+fn wide?(cp: Int) -> Bool = any r in wide-ranges(): cp >= r[0] and cp <= r[1]
+
+fn wide-ranges() -> [[Int]] = [
+  [4352, 4447], [8986, 8987], [9001, 9002], [9193, 9196], [9200, 9200], [9203, 9203], [9725, 9726],
+  [9748, 9749], [9800, 9811], [9855, 9855], [9875, 9875], [9889, 9889], [9898, 9899], [9917, 9918],
+  [9924, 9925], [9934, 9934], [9940, 9940], [9962, 9962], [9970, 9971], [9973, 9973], [9978, 9978],
+  [9981, 9981], [9989, 9989], [9994, 9995], [10024, 10024], [10060, 10060], [10062, 10062],
+  [10067, 10069], [10071, 10071], [10133, 10135], [10160, 10160], [10175, 10175], [11035, 11036],
+  [11088, 11088], [11093, 11093], [11904, 12350], [12353, 13311], [13312, 19903], [19968, 42191],
+  [43360, 43391], [44032, 55203], [63744, 64255], [65040, 65049], [65072, 65131], [65281, 65376],
+  [65504, 65510], [94176, 101640], [110576, 111355], [126980, 126980], [127183, 127183],
+  [127374, 127374], [127377, 127386], [127488, 127569], [127584, 127589], [127744, 128591],
+  [128640, 128767], [128992, 129003], [129280, 129535], [129648, 129791], [131072, 196605],
+  [196608, 262141]]
+
+fn root-ind() -> Ind = Ind(value: "", length: 0)
+fn indented(i: Ind) -> Ind = Ind(value: i.value ++ "  ", length: i.length + 2)
+fn aligned(i: Ind, n: Int) -> Ind = Ind(value: i.value ++ repeated(" ", n), length: i.length + n)
+
+fn trimmed-end(s: Text) -> Text = s[0..len(s) - span-back-of(s, " \t")]
+
+# The document as Prettier prints it at `width` columns, two spaces an indent.
+fn printed(d: Doc, width: Int) -> Text = join(done.lines ++ [done.line], "\n")
+  where start = Out(lines: [], line: "", pos: 0, modes: {}, remeasure: false, suffix: []),
+        ran = run(Cmd(ind: root-ind(), flat: false, doc: d), [], start, width),
+        done = flushed(ran, width)
+
+# What waits for a newline, printed at the end.
+fn flushed(o: Out, width: Int) -> Out = match len(o.suffix) {
+  0 => o
+  _ => flushed(fold s = o with { suffix: [] } for c in o.suffix: run(c, [], s, width), width)
+}
+
+fn run(c: Cmd, rest: [Seg], o: Out, width: Int) -> Out = match d.kind {
+  Str => o with { line: o.line ++ d.text, pos: o.pos + width-of(d.text) }
+  Cat => fold s = o for i in 0..len(d.parts):
+    run(Cmd(ind: c.ind, flat: c.flat, doc: d.parts[i]), [Seg(ind: c.ind, flat: c.flat, docs: d.parts, from: i + 1)] ++ rest, s, width)
+  Fill => filled(c, d.parts, 0, rest, o, width)
+  Indent => run(Cmd(ind: indented(c.ind), flat: c.flat, doc: d.parts[0]), rest, o, width)
+  Align => run(Cmd(ind: aligned(c.ind, d.n), flat: c.flat, doc: d.parts[0]), rest, o, width)
+  Group => run(chosen, rest, decided with { modes: named }, width)
+    where decided = if c.flat and not o.remeasure then o else o with { remeasure: false },
+          chosen = group-command(c, rest, o, width),
+          named = if d.n != 0 then decided.modes ++ {d.n: chosen.flat} else decided.modes
+  IfBreak | IndentIfBreak => match (if d.n != 0 then o.modes[d.n] else some(c.flat)) {
+    some(false) => run(Cmd(ind: c.ind, flat: c.flat, doc: broken-side(d)), rest, o, width)
+    some(true) => run(Cmd(ind: c.ind, flat: c.flat, doc: flat-side(d)), rest, o, width)
+    none => o
+  }
+  LineSuffix => o with { suffix: o.suffix ++ [Cmd(ind: c.ind, flat: c.flat, doc: d.parts[0])] }
+  Boundary if len(o.suffix) > 0 => run(Cmd(ind: c.ind, flat: c.flat, doc: hardline-alone()), rest, o, width)
+  Boundary | BreakParent => o
+  Line if c.flat and d.n < 2 => if d.n == 0 then o with { line: o.line ++ " ", pos: o.pos + 1 } else o
+  Line => newline(c, rest, if c.flat then o with { remeasure: true } else o, width)
+} where d = c.doc
+
+fn broken-side(d: Doc) -> Doc = match d.kind {
+  IfBreak => d.parts[0]
+  _ => if d.broken then d.parts[0] else indent(d.parts[0])
+}
+
+fn flat-side(d: Doc) -> Doc = match d.kind {
+  IfBreak => d.parts[1]
+  _ => if d.broken then indent(d.parts[0]) else d.parts[0]
+}
+
+# A newline in break mode: what waits for one first, then the line itself.
+fn newline(c: Cmd, rest: [Seg], o: Out, width: Int) -> Out = match len(o.suffix) {
+  _ if len(o.suffix) > 0 => run(c, rest, fold s = o with { suffix: [] } for w in o.suffix: run(w, rest, s, width), width)
+  _ if c.doc.n == 3 => o with { lines: o.lines ++ [o.line], line: "", pos: 0 }
+  _ => o with { lines: o.lines ++ [trimmed-end(o.line)], line: c.ind.value, pos: c.ind.length }
+}
+
+# printDocToString's printGroup: flat if it fits; else a conditional group's first state that fits
+# flat, or its last broken; else broken.
+fn group-command(c: Cmd, rest: [Seg], o: Out, width: Int) -> Cmd = match d {
+  _ if c.flat and not o.remeasure => Cmd(ind: c.ind, flat: not d.broken, doc: d.parts[0])
+  _ if not d.broken and fits(flat-contents, rest, width - o.pos, len(o.suffix) > 0, o.modes, false) => flat-contents
+  _ if len(d.states) == 0 => Cmd(ind: c.ind, flat: false, doc: d.parts[0])
+  _ => (first i in 1..len(d.states) - 1 if not d.broken
+          and fits(Cmd(ind: c.ind, flat: true, doc: d.states[i]), rest, width - o.pos, len(o.suffix) > 0, o.modes, false):
+          Cmd(ind: c.ind, flat: true, doc: d.states[i]))
+       ?? Cmd(ind: c.ind, flat: false, doc: d.states[len(d.states) - 1])
+} where d = c.doc, flat-contents = Cmd(ind: c.ind, flat: true, doc: d.parts[0])
+
+# printDocToString's fill: each content flat if it fits, each separator a newline unless the content
+# after it fits too.
+fn filled(c: Cmd, parts: [Doc], at: Int, rest: [Seg], o: Out, width: Int) -> Out = match len(parts) - at {
+  0 => o
+  1 => run(Cmd(ind: c.ind, flat: content-fits, doc: parts[at]), rest, o, width)
+  2 => run(Cmd(ind: c.ind, flat: content-fits, doc: parts[at + 1]), rest,
+           run(Cmd(ind: c.ind, flat: content-fits, doc: parts[at]), rest, o, width), width)
+  _ => filled(c, parts, at + 2, rest, after-white, width)
+      where both-fit = fits(Cmd(ind: c.ind, flat: true, doc: cat([parts[at], parts[at + 1], parts[at + 2]])), [], width - o.pos, len(o.suffix) > 0, o.modes, true),
+            after-content = run(Cmd(ind: c.ind, flat: content-fits, doc: parts[at]), rest, o, width),
+            after-white = run(Cmd(ind: c.ind, flat: both-fit, doc: parts[at + 1]), rest, after-content, width)
+} where content-fits = fits(Cmd(ind: c.ind, flat: true, doc: parts[at]), [], width - o.pos, len(o.suffix) > 0, o.modes, true)
+
+# --- Fitting --------------------------------------------------------------------------------------
+
+# How far a measure has got: the columns left, a space owed (a line printed flat is a space only if
+# something follows it on the line), whether a line suffix waits, and the verdict once there is one
+# (0 none yet, 1 fits, 2 does not).
+record Measure { left: Int, pending: Bool, suffix: Bool, verdict: Int }
+
+# Prettier's `fits`: the command flat, then what follows it, up to the first newline.
+fn fits(next: Cmd, rest: [Seg], left: Int, suffix: Bool, modes: {Int:Bool}, must-be-flat: Bool) -> Bool = match left {
+  _ if left < 0 => false
+  _ => final.verdict != 2
+} where first-measure = measure(next.flat, next.doc, Measure(left: left, pending: false, suffix: suffix, verdict: 0), modes, must-be-flat),
+        final = fold m = first-measure for seg in rest for i in seg.from..len(seg.docs) while m.verdict == 0:
+          measure(seg.flat, seg.docs[i], m, modes, must-be-flat)
+
+fn measure(flat: Bool, d: Doc, m: Measure, modes: {Int:Bool}, must-be-flat: Bool) -> Measure = match d.kind {
+  _ if m.verdict != 0 => m
+  Str if d.text == "" => m
+  Str => Measure(left: left, pending: false, suffix: m.suffix, verdict: if left < 0 then 2 else 0)
+    where left = m.left - (if m.pending then 1 else 0) - width-of(d.text)
+  Cat | Fill => fold n = m for p in d.parts while n.verdict == 0: measure(flat, p, n, modes, must-be-flat)
+  Indent | Align | IndentIfBreak => measure(flat, d.parts[0], m, modes, must-be-flat)
+  Group if must-be-flat and d.broken => m with { verdict: 2 }
+  Group => measure(group-flat, contents, m, modes, must-be-flat)
+    where group-flat = flat and not d.broken,
+          contents = if len(d.states) > 0 and not group-flat then d.states[len(d.states) - 1] else d.parts[0]
+  IfBreak => measure(flat, if (if d.n != 0 then modes[d.n] ?? true else flat) then d.parts[1] else d.parts[0], m, modes, must-be-flat)
+  Line if not flat or d.n >= 2 => m with { verdict: 1 }
+  Line => if d.n == 0 then m with { pending: true } else m
+  LineSuffix => m with { suffix: true }
+  Boundary => if m.suffix then m with { verdict: 2 } else m
+  BreakParent => m
+}
