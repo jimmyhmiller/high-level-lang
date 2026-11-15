@@ -66,6 +66,8 @@ boxed record Options {
   page: Text,
   # A development build (`--hmr`).
   dev: Bool,
+  # `--manifest`: what each entry and `import()` became, as Vite's `.vite/manifest.json` says it.
+  manifest: Bool,
   outfile: Text,
   outdir: Text,
   outbase: Text,
@@ -150,7 +152,7 @@ fn paged(o: Options) -> Options = match o.entry {
 }
 
 fn options-new(entry: Text, outfile: Text) -> Options =
-  Options(entry: entry, entries: [entry], page: "", dev: false, outfile: outfile, outdir: "", outbase: "", splitting: false,
+  Options(entry: entry, entries: [entry], page: "", dev: false, manifest: false, outfile: outfile, outdir: "", outbase: "", splitting: false,
           entry-names: "[dir]/[name]", chunk-names: "[name]-[hash]", chunking: packing.options(),
           format: iife-format(), global-name: "",
           minify-identifiers: false, minify-syntax: false, pretty: false, timing: false, sourcemap: false,
@@ -920,6 +922,7 @@ fn chunks-written(o: Options, all: [chunks.Chunk], styles: [RootStylesheet]) -> 
                       m.entries ++ an.linked.dynamic-roots)
   ++ assets-written([a for s in styles for a in s.bundle.assets] ++ module-assets(o.outdir))
   ++ page-written(o, all, paths, styles)
+  ++ manifest-written(o, all, paths, styles)
   where unit-index = {p: i for i in 0..len(e.units) for p in e.units[i].parts},
         printed = chunk-programs(o, all, [chunk-units(c, unit-index) for c in all]),
         js = [chunk-written(o, all[i], printed[i], holes[i], paths[i], paths, homes) for i in 0..len(all)],
@@ -960,6 +963,45 @@ fn reached(edges: [[Int]], todo: [Int], seen: [Int]) -> [Int] = match todo {
 fn chunk-imports(all: [chunks.Chunk], i: Int) -> [Int] =
   [other.id for other in all if other.id != c.id if other.id in c.needs or (c.root >= 0 and c.root in other.roots)]
   where c = all[i]
+
+# With `--manifest`, the output directory's `.vite/manifest.json`, as Vite writes it: for each entry
+# and each module an `import()` names, by its path from where the build runs (a page's script by the
+# page's), the file it became, its name, whether it is an entry or loaded by `import()`, the chunks
+# it imports and the roots it loads (by their keys), and its stylesheets; each other chunk by `_`
+# and its file's name. Keys in order.
+fn manifest-written(o: Options, all: [chunks.Chunk], paths: [Text], styles: [RootStylesheet]) -> [Written] = match o.manifest {
+  false => []
+  true => [Written(path: out, text: t, said: said-of(t, out))]
+    where out = o.outdir ++ "/.vite/manifest.json",
+          keys = [chunk-key(o, all[i], paths[i]) for i in 0..len(all)],
+          t = "{\n" ++ join([manifest-entry(o, all, paths, styles, keys, i) for i in sort i in [i for i in 0..len(all)] by keys[i]], ",\n") ++ "\n}\n"
+}
+
+fn chunk-key(o: Options, c: chunks.Chunk, path: Text) -> Text = match c.root {
+  r if r < 0 => "_" ++ path-base(path)
+  r if r in m.entries and o.page != "" => m.shown-path(o.page)
+  r => m.shown-path(m.modules[r].path)
+}
+
+fn manifest-entry(o: Options, all: [chunks.Chunk], paths: [Text], styles: [RootStylesheet], keys: [Text], i: Int) -> Text =
+  "  " ++ host.js-string(keys[i]) ++ ": {\n" ++ join(fields, ",\n") ++ "\n  }"
+  where c = all[i],
+        fields = ["    \"file\": " ++ host.js-string(below(o.outdir, paths[i])),
+                  "    \"name\": " ++ host.js-string(path-stem(text-before(below(o.outdir, paths[i]), "-")))]
+                 ++ ["    \"src\": " ++ host.js-string(keys[i]) for r in [c.root] if r >= 0]
+                 ++ ["    \"isEntry\": true" for r in [c.root] if r in m.entries]
+                 ++ ["    \"isDynamicEntry\": true" for r in [c.root] if r >= 0 and not (r in m.entries)]
+                 ++ ["    \"imports\": [" ++ join([host.js-string(keys[j]) for j in chunk-imports(all, i)], ", ") ++ "]"
+                     for js in [chunk-imports(all, i)] if len(js) > 0]
+                 ++ ["    \"dynamicImports\": [" ++ join([host.js-string(keys[first-chunk(all, r)]) for r in ds], ", ") ++ "]"
+                     for ds in [loaded-roots(all, i)] if len(ds) > 0]
+                 ++ ["    \"css\": [" ++ join([host.js-string(below(o.outdir, s.path)) for s in styles if s.root == c.root], ", ") ++ "]"
+                     for r in [c.root] if r >= 0 and any s in styles: s.root == r]
+
+# The roots a chunk's statements `import()`.
+fn loaded-roots(all: [chunks.Chunk], i: Int) -> [Int] =
+  sort r in [r for p in keys(all[i].parts) for id in [first m.db.part-of(p, ?mo): mo] if let some(mo) = id
+             for t in fragments.dynamic-targets(mo, p) for r in [t] if r in an.linked.dynamic-roots distinct r] by r
 
 # Every file under a directory, copied to the same place under the output directory.
 fn public-written(dir: Text, out: Text) -> [Written] =
