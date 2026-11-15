@@ -1,0 +1,450 @@
+# Tailwind's extractor (oxide's `extractor`): the class names and CSS variables a line of source
+# text holds, as oxide's state machines find them. Each machine is a function from where its cursor
+# starts to where it stopped and whether it found what it looks for; a machine that gives up
+# leaves its cursor where it gave up, and the candidate machine goes on from there, as oxide's
+# does. A position past the end reads as byte 0, as oxide's cursor does.
+rules tailwind.extract
+
+# Where a machine's cursor stopped, and whether it found what it looks for: then `pos` is the
+# last byte of it.
+record Run { done: Bool, pos: Int }
+
+fn found(pos: Int) -> Run = Run(done: true, pos: pos)
+fn failed(pos: Int) -> Run = Run(done: false, pos: pos)
+
+# A candidate the candidate machine found (`start` to `end`, both included), and where its cursor
+# stopped.
+record Found { done: Bool, start: Int, end: Int, pos: Int }
+
+record Span { start: Int, end: Int }
+
+fn ch(s: Text, i: Int) -> Int = if i >= 0 and i < len(s) then s[i] else 0
+
+# ---------------------------------------------------------------- byte classes
+
+fn white?(c: Int) -> Bool = c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12
+fn quote?(c: Int) -> Bool = c == '"' or c == '\'' or c == '`'
+fn lower?(c: Int) -> Bool = c >= 'a' and c <= 'z'
+fn upper?(c: Int) -> Bool = c >= 'A' and c <= 'Z'
+fn alpha?(c: Int) -> Bool = lower?(c) or upper?(c)
+fn digit?(c: Int) -> Bool = c >= '0' and c <= '9'
+fn alnum?(c: Int) -> Bool = alpha?(c) or digit?(c)
+fn opener?(c: Int) -> Bool = c == '(' or c == '[' or c == '{'
+fn closer?(c: Int) -> Bool = c == ')' or c == ']' or c == '}'
+
+# What may stand before a candidate (boundary.rs): white space, quotes, the end, and `.` (Angular's
+# `[class.foo]`), `}` (Twig's `{% … %}flex`), `>` (`<f:case>flex`).
+fn before-boundary?(c: Int) -> Bool = white?(c) or quote?(c) or c == 0 or c == '.' or c == '}' or c == '>'
+
+# What may stand after one: white space, quotes, the end, and `]` (`[:div.p-2]`), `{`, `=`
+# (Svelte's `class:flex=`), `\` (an escaped quote around it) and `<`.
+fn after-boundary?(c: Int) -> Bool =
+  white?(c) or quote?(c) or c == 0 or c == ']' or c == '{' or c == '=' or c == '\\' or c == '<'
+
+fn closing(c: Int) -> Int = match c {
+  '(' => ')'
+  '[' => ']'
+  _ => '}'
+}
+
+# oxide's bracket stack holds 32 brackets; one more makes the machine give up.
+const bracket-depth: Int = 32
+
+# ---------------------------------------------------------------- strings
+
+# A string (string_machine.rs): from the quote at `i` to the same quote again, with no white space
+# in it; a backslash takes the byte after it, unless that is white space.
+fn string-run(s: Text, i: Int) -> Run = if quote?(ch(s, i)) then string-body(s, i + 1, s[i]) else failed(i)
+
+fn string-body(s: Text, i: Int, q: Int) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  '\\' if white?(ch(s, i + 1)) => failed(i)
+  '\\' => string-body(s, i + 2, q)
+  c if c == q => found(i)
+  c if white?(c) => failed(i)
+  _ => string-body(s, i + 1, q)
+}
+
+# ---------------------------------------------------------------- arbitrary values
+
+# `[…]` (arbitrary_value_machine.rs): brackets balanced, strings whole, no white space and no
+# `${`, and something between the brackets.
+fn arbitrary-value(s: Text, i: Int) -> Run = if ch(s, i) == '[' then value-body(s, i + 1, i, []) else failed(i)
+
+fn value-body(s: Text, i: Int, start: Int, open: [Int]) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  '\\' if white?(ch(s, i + 1)) => failed(i + 2)
+  '\\' => value-body(s, i + 2, start, open)
+  c if opener?(c) and len(open) >= bracket-depth => failed(i)
+  c if opener?(c) => value-body(s, i + 1, start, open ++ [closing(c)])
+  c if closer?(c) and len(open) > 0 and last(open) != c => failed(i)
+  c if closer?(c) and len(open) > 0 => value-body(s, i + 1, start, open[0..len(open) - 1])
+  ']' if start + 1 != i => found(i)
+  c if quote?(c) => match string-run(s, i) {
+    Run(done: true, pos: p) => value-body(s, p + 1, start, open)
+    r => r
+  }
+  c if white?(c) => failed(i)
+  '$' if ch(s, i + 1) == '{' => failed(i)
+  _ => value-body(s, i + 1, start, open)
+}
+
+# ---------------------------------------------------------------- CSS variables
+
+# A byte of a custom property's name (css_variable_machine.rs): letters, digits, `_` and any
+# non-ASCII byte.
+fn ident-byte?(c: Int) -> Bool = alnum?(c) or c == '_' or c >= 128
+
+# `--name`: at least one byte after the dashes; a backslash takes the byte after it, unless that
+# is white space or the end.
+fn css-variable(s: Text, i: Int) -> Run =
+  if ch(s, i) == '-' and ch(s, i + 1) == '-' then variable-body(s, i + 2, i) else failed(i)
+
+fn variable-body(s: Text, i: Int, start: Int) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  c if ident-byte?(c) or c == '-' => match ch(s, i + 1) {
+    n if ident-byte?(n) or n == '-' or n == '\\' => variable-body(s, i + 1, start)
+    _ if i - start < 2 => failed(i)
+    _ => found(i)
+  }
+  '\\' if white?(ch(s, i + 1)) or ch(s, i + 1) == 0 => failed(i)
+  '\\' => variable-body(s, i + 2, start)
+  _ => failed(i)
+}
+
+# ---------------------------------------------------------------- arbitrary variables
+
+# `(--name)`, `(--name,fallback)` and `(type:--name)` (arbitrary_variable_machine.rs).
+fn arbitrary-variable(s: Text, i: Int) -> Run = match ch(s, i) {
+  '(' if ch(s, i + 1) == '-' => variable-reference(s, i + 1)
+  '(' if lower?(ch(s, i + 1)) => data-type(s, i + 1)
+  _ => failed(i)
+}
+
+fn variable-reference(s: Text, i: Int) -> Run = match css-variable(s, i) {
+  Run(done: false, ...) as r => r
+  Run(pos: p, ...) if ch(s, p + 1) == ',' => fallback(s, p + 2, [])
+  Run(pos: p, ...) if ch(s, p + 1) == ')' => found(p + 1)
+  Run(pos: p, ...) => failed(p + 1)
+}
+
+fn data-type(s: Text, i: Int) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  c if lower?(c) or c == '-' => data-type(s, i + 1)
+  ':' if ch(s, i + 1) == '-' => variable-reference(s, i + 1)
+  _ => failed(i)
+}
+
+# A fallback: to the `)` that closes the variable, brackets balanced, strings whole, and a `:` only
+# inside brackets.
+fn fallback(s: Text, i: Int, open: [Int]) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  '\\' if white?(ch(s, i + 1)) => failed(i)
+  '\\' => fallback(s, i + 2, open)
+  c if opener?(c) and len(open) >= bracket-depth => failed(i)
+  c if opener?(c) => fallback(s, i + 1, open ++ [closing(c)])
+  c if closer?(c) and len(open) > 0 and last(open) != c => failed(i)
+  c if closer?(c) and len(open) > 0 => fallback(s, i + 1, open[0..len(open) - 1])
+  ')' => found(i)
+  c if quote?(c) => match string-run(s, i) {
+    Run(done: true, pos: p) => fallback(s, p + 1, open)
+    r => r
+  }
+  ':' if len(open) == 0 => failed(i)
+  c if white?(c) => failed(i)
+  '$' if ch(s, i + 1) == '{' => failed(i)
+  _ => fallback(s, i + 1, open)
+}
+
+# ---------------------------------------------------------------- modifiers
+
+# `/20`, `/[20%]`, `/(--x)` (modifier_machine.rs): a named one is letters and digits, with `-`,
+# `_` and `.` between them.
+fn modifier(s: Text, i: Int) -> Run = match ch(s, i) {
+  '/' => match ch(s, i + 1) {
+    '[' => arbitrary-value(s, i + 1)
+    '(' => arbitrary-variable(s, i + 1)
+    c if alnum?(c) => modifier-body(s, i + 1)
+    _ => failed(i + 1)
+  }
+  _ => failed(i)
+}
+
+fn modifier-byte?(c: Int) -> Bool = alnum?(c) or c == '-' or c == '_' or c == '.'
+
+fn modifier-body(s: Text, i: Int) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  c if modifier-byte?(c) and modifier-byte?(ch(s, i + 1)) => modifier-body(s, i + 1)
+  c if modifier-byte?(c) => found(i)
+  _ => failed(i)
+}
+
+# ---------------------------------------------------------------- utilities
+
+# A utility (utility_machine.rs): an arbitrary property or a named utility, then a modifier, then
+# `!`; or the legacy `!` before it, and then no `!` after.
+fn utility(s: Text, i: Int) -> Run = match ch(s, i) {
+  '!' if ch(s, i + 1) == '[' => utility-end(s, arbitrary-property(s, i + 1), true)
+  '!' => utility-end(s, named-utility(s, i + 1), true)
+  '[' => utility-end(s, arbitrary-property(s, i), false)
+  _ => utility-end(s, named-utility(s, i), false)
+}
+
+fn utility-end(s: Text, r: Run, legacy: Bool) -> Run = match r {
+  Run(done: false, ...) => r
+  Run(pos: p, ...) if ch(s, p + 1) == '/' => match modifier(s, p + 1) {
+    Run(done: false, ...) as m => m
+    Run(pos: q, ...) if ch(s, q + 1) == '/' => failed(q)
+    Run(pos: q, ...) if ch(s, q + 1) == '!' => important(q + 1, legacy)
+    m => m
+  }
+  Run(pos: p, ...) if ch(s, p + 1) == '!' => important(p + 1, legacy)
+  _ => r
+}
+
+fn important(p: Int, legacy: Bool) -> Run = if legacy then failed(p) else found(p)
+
+# A named utility (named_utility_machine.rs): a lowercase letter alone between quotes or spaces;
+# or a lowercase letter, `@`, or `-` and a lowercase letter, then letters, digits and dashes to
+# a boundary.
+fn named-utility(s: Text, i: Int) -> Run = match ch(s, i) {
+  c if lower?(c) and (white?(ch(s, i + 1)) or quote?(ch(s, i + 1)) or ch(s, i + 1) == 0) => found(i)
+  c if lower?(c) or c == '@' => utility-body(s, i + 1)
+  '-' if lower?(ch(s, i + 1)) => utility-body(s, i + 1)
+  _ => failed(i)
+}
+
+# Where a utility may end: a boundary, or `:` (a JavaScript object's key), `/` (a modifier) or
+# `!`.
+fn utility-ends?(c: Int) -> Bool = after-boundary?(c) or c == ':' or c == '/' or c == '!'
+
+# A digit follows a letter, a digit, `-`, `_` or `.`, and goes on to a letter, a digit, `.`,
+# `%`, `_` or `-`; anything else after it ends the utility.
+fn number-follows?(p: Int) -> Bool = alnum?(p) or p == '-' or p == '_' or p == '.'
+fn number-goes-on?(n: Int) -> Bool = alnum?(n) or n == '.' or n == '%' or n == '_' or n == '-'
+
+fn utility-body(s: Text, i: Int) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  c if alpha?(c) and utility-ends?(ch(s, i + 1)) => found(i)
+  c if alpha?(c) => utility-body(s, i + 1)
+  '-' => match ch(s, i + 1) {
+    '[' => arbitrary-value(s, i + 1)
+    '(' => arbitrary-variable(s, i + 1)
+    n if alnum?(n) or n == '-' => utility-body(s, i + 1)
+    _ => failed(i)
+  }
+  '_' => match ch(s, i + 1) {
+    n if alnum?(n) or n == '_' => utility-body(s, i + 1)
+    n if utility-ends?(n) => found(i)
+    _ => failed(i)
+  }
+  '.' if digit?(ch(s, i - 1)) and digit?(ch(s, i + 1)) => utility-body(s, i + 1)
+  '.' => failed(i)
+  c if digit?(c) and not number-follows?(ch(s, i - 1)) => failed(i)
+  c if digit?(c) and number-goes-on?(ch(s, i + 1)) => utility-body(s, i + 1)
+  c if digit?(c) => found(i)
+  '%' if digit?(ch(s, i - 1)) => found(i)
+  _ => failed(i)
+}
+
+# ---------------------------------------------------------------- arbitrary properties
+
+# `[property:value]` (arbitrary_property_machine.rs): lowercase letters and dashes, or a custom
+# property, then a `:`, then a value: brackets balanced, strings whole, no white space, `${`, or
+# `:` or `!` outside brackets, and no `/` first (a URL).
+fn arbitrary-property(s: Text, i: Int) -> Run = if ch(s, i) == '[' then property-name(s, i + 1, i) else failed(i)
+
+fn property-name(s: Text, i: Int, start: Int) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  '-' if ch(s, i + 1) == '-' => match css-variable(s, i) {
+    Run(done: false, ...) as r => r
+    Run(pos: p, ...) if ch(s, p + 1) == ':' => property-value(s, p + 2, start, p + 2, [])
+    Run(pos: p, ...) => failed(p)
+  }
+  c if c == '-' or lower?(c) => property-name(s, i + 1, start)
+  ':' if i > start + 1 => property-value(s, i + 1, start, i + 1, [])
+  _ => failed(i)
+}
+
+fn property-value(s: Text, i: Int, start: Int, value-start: Int, open: [Int]) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  '\\' if white?(ch(s, i + 1)) => failed(i)
+  '\\' => property-value(s, i + 2, start, value-start, open)
+  c if opener?(c) and len(open) >= bracket-depth => failed(i)
+  c if opener?(c) => property-value(s, i + 1, start, value-start, open ++ [closing(c)])
+  c if closer?(c) and len(open) > 0 and last(open) != c => failed(i)
+  c if closer?(c) and len(open) > 0 => property-value(s, i + 1, start, value-start, open[0..len(open) - 1])
+  ']' if start + 1 != i => found(i)
+  # After a string the value is read as from its start again (oxide's machine calls itself).
+  c if quote?(c) => match string-run(s, i) {
+    Run(done: true, pos: p) => property-value(s, p + 1, start, p + 1, open)
+    r => r
+  }
+  ':' if len(open) == 0 => failed(i)
+  c if white?(c) => failed(i)
+  '/' if value-start == i => failed(i)
+  '$' if ch(s, i + 1) == '{' => failed(i)
+  '!' if len(open) == 0 => failed(i)
+  _ => property-value(s, i + 1, start, value-start, open)
+}
+
+# ---------------------------------------------------------------- variants
+
+# A variant and its `:` (variant_machine.rs): an arbitrary one, `[…]:`, or a named one.
+fn variant(s: Text, i: Int) -> Run = match ch(s, i) {
+  '[' => arbitrary-end(s, arbitrary-value(s, i))
+  _ => named-variant(s, i)
+}
+
+fn arbitrary-end(s: Text, r: Run) -> Run = match r {
+  Run(done: false, ...) => r
+  Run(pos: p, ...) if ch(s, p + 1) == ':' => found(p + 1)
+  Run(pos: p, ...) => failed(p)
+}
+
+# A named variant (named_variant_machine.rs): `x:` and `*:`, or letters, digits, `*`, `@` and
+# dashes, an arbitrary value or variable after a dash (or `@[…]`), then a modifier, then `:`.
+fn named-variant(s: Text, i: Int) -> Run = match ch(s, i) {
+  c if (lower?(c) or c == '*') and ch(s, i + 1) == ':' => found(i + 1)
+  c if lower?(c) or c == '*' or digit?(c) or c == '@' => variant-body(s, i + 1)
+  _ => failed(i)
+}
+
+fn variant-inner?(c: Int) -> Bool = alnum?(c) or c == '-' or c == '_'
+
+fn variant-body(s: Text, i: Int) -> Run = match ch(s, i) {
+  _ if i >= len(s) => failed(i)
+  '-' if ch(s, i + 1) == '[' => variant-arbitrary-end(s, arbitrary-value(s, i + 1))
+  '-' if ch(s, i + 1) == '(' => variant-arbitrary-end(s, arbitrary-variable(s, i + 1))
+  '-' | '_' if variant-inner?(ch(s, i + 1)) => variant-body(s, i + 1)
+  '-' | '_' => failed(i)
+  '[' => variant-arbitrary-end(s, arbitrary-value(s, i))
+  c if alnum?(c) or c == '*' => variant-body(s, i + 1)
+  '/' => variant-modifier(s, i)
+  ':' => found(i)
+  '.' if digit?(ch(s, i - 1)) and digit?(ch(s, i + 1)) => variant-body(s, i + 1)
+  _ => failed(i)
+}
+
+fn variant-arbitrary-end(s: Text, r: Run) -> Run = match r {
+  Run(done: false, ...) => r
+  Run(pos: p, ...) if ch(s, p + 1) == '/' => variant-modifier(s, p + 1)
+  Run(pos: p, ...) if ch(s, p + 1) == ':' => found(p + 1)
+  Run(pos: p, ...) => failed(p)
+}
+
+fn variant-modifier(s: Text, i: Int) -> Run = match modifier(s, i) {
+  Run(done: false, ...) as r => r
+  Run(pos: p, ...) if ch(s, p + 1) == ':' => found(p + 1)
+  Run(pos: p, ...) => failed(p)
+}
+
+# ---------------------------------------------------------------- candidates
+
+# A whole candidate (candidate_machine.rs): variants, each touching the one before, then a
+# utility touching the last, with boundaries around it all. `start` is where the first variant
+# began and `last` where the last one ended (-1: none yet).
+fn candidate(s: Text, i: Int, start: Int, last: Int) -> Found = match ch(s, i) {
+  _ if i >= len(s) => idle-at(i)
+  c if white?(c) or c == ':' or quote?(c) => candidate(s, i + 1, 0, -1)
+  # `<` and capitals cannot begin one, nor can anything before the next boundary.
+  c if c == '<' or upper?(c) => match boundary-at(s, i) {
+    b if b < 0 => idle-at(i)
+    b => candidate(s, b + 1, 0, -1)
+  }
+  _ => candidate-step(s, i, start, last, variant(s, i), utility(s, i))
+}
+
+fn idle-at(pos: Int) -> Found = Found(done: false, start: 0, end: 0, pos: pos)
+
+# The first byte from `i` on that may stand before a candidate, or -1.
+fn boundary-at(s: Text, i: Int) -> Int = match i {
+  _ if i >= len(s) => -1
+  _ if before-boundary?(s[i]) => i
+  _ => boundary-at(s, i + 1)
+}
+
+# What the variant and utility machines, both started at `i`, found there.
+fn candidate-step(s: Text, i: Int, start: Int, last: Int, v: Run, u: Run) -> Found = match v.done, u.done {
+  false, true if last >= 0 and last + 1 != i => idle-at(u.pos + 1)
+  false, true if last >= 0 => bounded(s, Span(start: start, end: u.pos), u.pos + 1)
+  false, true => bounded(s, Span(start: i, end: u.pos), u.pos + 1)
+  true, true if last >= 0 and last + 1 != i => idle-at(v.pos + 1)
+  true, true if last >= 0 => candidate(s, v.pos + 1, start, v.pos)
+  # A JavaScript object's key, `{ underline: true }`: a utility when no variant came before it and
+  # white space or the end follows its `:`.
+  true, true if white?(ch(s, u.pos + 2)) or ch(s, u.pos + 2) == 0 => Found(done: true, start: i, end: u.pos, pos: min(u.pos + 2, len(s)))
+  true, true => candidate(s, v.pos + 1, i, v.pos)
+  true, false if last >= 0 and last + 1 > i => idle-at(v.pos + 1)
+  true, false if last >= 0 => candidate(s, v.pos + 1, start, v.pos)
+  true, false => candidate(s, v.pos + 1, i, v.pos)
+  false, false => candidate(s, min(max(i, max(v.pos, u.pos)), len(s)) + 1, 0, -1)
+}
+
+# A candidate with boundaries around it, or nothing.
+fn bounded(s: Text, span: Span, pos: Int) -> Found = match span {
+  _ if before-boundary?(ch(s, span.start - 1)) and after-boundary?(if span.end >= len(s) - 1 then 0 else s[span.end + 1]) =>
+    Found(done: true, start: span.start, end: span.end, pos: pos)
+  _ => idle-at(pos)
+}
+
+# ---------------------------------------------------------------- lines
+
+# The candidates of a line (Extractor::extract): each one the candidate machine finds, and those
+# inside the `[…]` it passed on the way, less those a longer one covers.
+fn candidates(s: Text) -> [Text] = [s[sp.start..sp.end + 1] for sp in uncovered(line-spans(s, 0))]
+
+fn line-spans(s: Text, p: Int) -> [Span] = match ch(s, p) {
+  _ if p >= len(s) => []
+  c if white?(c) => line-spans(s, p + 1)
+  _ => spans-of(s, p, candidate(s, p, 0, -1))
+}
+
+fn spans-of(s: Text, p: Int, f: Found) -> [Span] = match f {
+  Found(done: true, ...) => [Span(start: f.start, end: f.end)] ++ inner-spans(s, p, f.start) ++ line-spans(s, f.pos + 1)
+  _ => inner-spans(s, p, min(f.pos, len(s))) ++ line-spans(s, f.pos + 1)
+}
+
+# Candidates inside the brackets between `from` and `to`: for each `[`, a candidate machine of its
+# own from the byte after it, while its cursor is before `to`.
+fn inner-spans(s: Text, from: Int, to: Int) -> [Span] = [sp for i in from..to if s[i] == '[' for sp in bracket-spans(s, i + 1, to)]
+
+fn bracket-spans(s: Text, p: Int, to: Int) -> [Span] = match p {
+  _ if p >= to => []
+  _ => match candidate(s, p, 0, -1) {
+    Found(done: true, ...) as f => [Span(start: f.start, end: f.end)] ++ bracket-spans(s, f.pos + 1, to)
+    f => bracket-spans(s, f.pos + 1, to)
+  }
+}
+
+# drop_covered_spans: by start, the longest first; a span is kept when it ends after all kept ones.
+fn uncovered(spans: [Span]) -> [Span] = match spans {
+  [] | [_] => spans
+  _ => [ordered[k] for k in 0..len(ordered) if k == 0 or ordered[k].end > ends[k - 1]]
+    where ordered = sort sp in spans by sp.start * span-scale - sp.end,
+          ends = scan e = -1 for sp in ordered: max(e, sp.end)
+}
+
+# Sorting by start, then by end descending, as one key: a line is shorter than this.
+const span-scale: Int = 4294967296
+
+# The CSS variables of a line (the first pass of Extractor::extract): `--name` wherever the
+# machine finds one, its cursor going on from where it stopped.
+fn variables(s: Text) -> [Text] = [s[sp.start..sp.end + 1] for sp in variable-spans(s, 0)]
+
+fn variable-spans(s: Text, p: Int) -> [Span] = match ch(s, p) {
+  _ if p >= len(s) => []
+  c if white?(c) => variable-spans(s, p + 1)
+  _ => match css-variable(s, p) {
+    Run(done: true, pos: q) => [Span(start: p, end: q)] ++ variable-spans(s, q + 1)
+    r => variable-spans(s, r.pos + 1)
+  }
+}
+
+# The CSS variables a stylesheet uses (Extractor::extract_variables_from_css): those inside
+# `var(`.
+fn used-variables(s: Text) -> [Text] =
+  [s[sp.start..sp.end + 1] for sp in variable-spans(s, 0) if sp.start >= 4 and s[sp.start - 4..sp.start] == "var("]
+
+# What a line gives: its CSS variables and its candidates.
+fn extracted(s: Text) -> [Text] = variables(s) ++ candidates(s)

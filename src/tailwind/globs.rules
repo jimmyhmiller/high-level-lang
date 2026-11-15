@@ -1,0 +1,560 @@
+# The three kinds of pattern oxide's scanner reads paths with: gitignore lines (the `ignore`
+# crate's, compiled by `globset` as ripgrep does: `*` and `?` stop at `/`, a backslash escapes, an
+# unclosed `[` is a literal), source patterns (`fast-glob`'s `glob_match`), and the brace expansion
+# of a source's pattern before either (`bexpand`).
+rules tailwind.globs
+
+# ---------------------------------------------------------------- gitignore lines
+
+enum TokKind { Lit, AnyByte, Star, RecursivePrefix, RecursiveSuffix, RecursiveZeroOrMore, Class, Alternates }
+
+# A token of a glob, as globset parses one. A literal holds its bytes; a class its ranges (pairs
+# of bytes, as the regex globset writes reads them) and whether it is negated; alternates their
+# branches, and when every branch is a literal, the words and their lengths.
+boxed record Tok {
+  kind: TokKind,
+  text: Text,
+  negated: Bool,
+  ranges: [Int],
+  branches: [[Tok]],
+  words: {Text:Bool},
+  lengths: [Int]
+}
+
+fn tok(kind: TokKind) -> Tok = Tok(kind: kind, text: "", negated: false, ranges: [], branches: [], words: {}, lengths: [])
+fn literal(text: Text) -> Tok = tok(Lit) with { text: text }
+
+# A line of a gitignore file, compiled: whether it whitelists (`!`), whether it matches only
+# directories (a trailing `/`), and its glob, or none when the line is a comment, blank, or not a
+# glob globset can build.
+record Rule { whitelist: Bool, only-dir: Bool, tokens: [Tok], everything: Bool }
+
+record Line { text: Text, whitelist: Bool, absolute: Bool }
+
+fn rule-of(raw: Text) -> Rule? = match trimmed-line(raw) {
+  "" => none
+  "#" ++ _ => none
+  line => rule-from(flagged(line))
+}
+
+# `trim_right` unless the line ends with an escaped space.
+fn trimmed-line(raw: Text) -> Text = if ends-with(raw, "\\ ") then raw else trim-end-space(raw)
+
+fn flagged(line: Text) -> Line = match line {
+  "\\!" ++ rest | "\\#" ++ rest => Line(text: line[1..len(line)], whitelist: false, absolute: false)
+  "!/" ++ rest => Line(text: rest, whitelist: true, absolute: true)
+  "!" ++ rest => Line(text: rest, whitelist: true, absolute: false)
+  "/" ++ rest => Line(text: rest, whitelist: false, absolute: true)
+  _ => Line(text: line, whitelist: false, absolute: false)
+}
+
+fn rule-from(l: Line) -> Rule? = match parsed-glob(actual) {
+  some(tokens) => some(Rule(whitelist: l.whitelist, only-dir: only-dir, tokens: tokens,
+                            everything: len(tokens) == 1 and tokens[0].kind == RecursivePrefix))
+  none => none
+} where only-dir = ends-with(l.text, "/"),
+        body = if only-dir then without-escape(l.text[0..len(l.text) - 1]) else l.text,
+        prefixed = if not l.absolute and not has-byte?(body, '/') and not (starts-with(body, "**/") or body == "**")
+                   then "**/" ++ body else body,
+        actual = if ends-with(prefixed, "/**") then prefixed ++ "/*" else prefixed
+
+# A trailing `/` that was escaped loses its backslash too.
+fn without-escape(s: Text) -> Text = if ends-with(s, "\\") then s[0..len(s) - 1] else s
+
+# Rust's `trim_end`: Unicode's white space off the end.
+fn trim-end-space(s: Text) -> Text = match trailing-space(s, len(s)) {
+  n if n == len(s) => s
+  n => trim-end-space(s[0..n])
+}
+
+# Where the text ends without the white space character that ends it (the text's length when
+# none does).
+fn trailing-space(s: Text, n: Int) -> Int = match n {
+  0 => 0
+  _ if white-byte?(s[n - 1]) => n - 1
+  _ if n >= 2 and at?(s, n - 2, byte-text(194) ++ byte-text(133)) => n - 2
+  _ if n >= 2 and at?(s, n - 2, byte-text(194) ++ byte-text(160)) => n - 2
+  _ if n >= 3 and wide-space?(s[n - 3..n]) => n - 3
+  _ => n
+}
+
+fn white-byte?(c: Int) -> Bool = c == ' ' or (c >= 9 and c <= 13)
+
+# The three-byte white space characters: U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F,
+# U+205F and U+3000.
+fn wide-space?(t: Text) -> Bool = match code-points-of(t) {
+  [cp] => cp == 5760 or (cp >= 8192 and cp <= 8202) or cp == 8232 or cp == 8233 or cp == 8239 or cp == 8287 or cp == 12288
+  _ => false
+}
+
+# ---------------------------------------------------------------- globset's parser
+
+# The parser's state (globset's `Parser`): the branches being parsed (tokens go to the last), where
+# each open `{` began among them, the byte before the one just read, and whether a `[` was found
+# never to close (after which `[` is a literal).
+record Parsing { branches: [[Tok]], open: [Int], prev: Int, unclosed: Bool, failed: Bool }
+
+fn parsed-glob(glob: Text) -> [Tok]? = match parse-from(glob, 0, Parsing(branches: [[]], open: [], prev: -1, unclosed: false, failed: false)) {
+  p if p.failed or len(p.branches) != 1 => none
+  p => some(merged(p.branches[0]))
+}
+
+fn pushed-tok(p: Parsing, t: Tok) -> Parsing =
+  p with { branches: p.branches[0..len(p.branches) - 1] ++ [last(p.branches) ++ [t]] }
+
+fn popped-tok(p: Parsing) -> Parsing =
+  p with { branches: p.branches[0..len(p.branches) - 1] ++ [last(p.branches)[0..len(last(p.branches)) - 1]] }
+
+fn failure(p: Parsing) -> Parsing = p with { failed: true }
+
+# Parse from byte `i`; `p.prev` is the byte before it (-1 at the start).
+fn parse-from(g: Text, i: Int, p: Parsing) -> Parsing = match i {
+  _ if p.failed or i >= len(g) => p
+  _ => match g[i] {
+    '?' => parse-from(g, i + 1, pushed-tok(p, tok(AnyByte)) with { prev: '?' })
+    '*' => parse-star(g, i, p)
+    '[' if not p.unclosed => parse-class(g, i, p)
+    '{' => parse-from(g, i + 1, p with { open: p.open ++ [len(p.branches)], branches: p.branches ++ [[]], prev: '{' })
+    '}' if len(p.open) == 0 => failure(p)
+    '}' => parse-from(g, i + 1, pushed-tok(p with { branches: p.branches[0..last(p.open)], open: p.open[0..len(p.open) - 1] },
+                                           tok(Alternates) with { branches: p.branches[last(p.open)..len(p.branches)] }) with { prev: '}' })
+    ',' if len(p.open) == 0 => parse-from(g, i + 1, pushed-tok(p, literal(",")) with { prev: ',' })
+    ',' => parse-from(g, i + 1, p with { branches: p.branches ++ [[]], prev: ',' })
+    '\\' if i + 1 >= len(g) => failure(p)
+    '\\' => parse-from(g, i + 1 + w, pushed-tok(p, literal(g[i + 1..i + 1 + w])) with { prev: g[i + w] }) where w = char-width(g, i + 1)
+    _ => parse-from(g, i + w, pushed-tok(p, literal(g[i..i + w])) with { prev: g[i + w - 1] }) where w = char-width(g, i)
+  }
+}
+
+fn char-width(g: Text, i: Int) -> Int = match g[i] {
+  c if c < 192 => 1
+  c if c < 224 => 2
+  c if c < 240 => 3
+  _ => 4
+}
+
+fn star2(p: Parsing) -> Parsing = pushed-tok(pushed-tok(p, tok(Star)), tok(Star))
+
+# `*`, `**`, and `**` as a whole path component (`**/`, `/**/`, `/**`).
+fn parse-star(g: Text, i: Int, p: Parsing) -> Parsing = match i {
+  _ if ch(g, i + 1) != '*' => parse-from(g, i + 1, pushed-tok(p, tok(Star)) with { prev: '*' })
+  # A branch's first tokens: `**` and a separator (or the end) is a recursive prefix.
+  _ if len(last(p.branches)) == 0 and i + 2 < len(g) and g[i + 2] != '/' => parse-from(g, i + 2, star2(p) with { prev: '*' })
+  _ if len(last(p.branches)) == 0 and i + 2 < len(g) => parse-from(g, i + 3, pushed-tok(p, tok(RecursivePrefix)) with { prev: '/' })
+  _ if len(last(p.branches)) == 0 => parse-from(g, i + 2, pushed-tok(p, tok(RecursivePrefix)) with { prev: '*' })
+  _ if p.prev != '/' and (len(p.branches) <= 1 or (p.prev != ',' and p.prev != '{')) => parse-from(g, i + 2, star2(p) with { prev: '*' })
+  _ if i + 2 >= len(g) => parse-from(g, i + 2, recursive(p, true) with { prev: '*' })
+  _ if (g[i + 2] == ',' or g[i + 2] == '}') and len(p.branches) >= 2 => parse-from(g, i + 2, recursive(p, true) with { prev: '*' })
+  _ if g[i + 2] == '/' => parse-from(g, i + 3, recursive(p, false) with { prev: '/' })
+  _ => parse-from(g, i + 2, star2(p) with { prev: '*' })
+}
+
+# The token before the `**` gives way to a recursive one (a prefix or suffix before stays one).
+fn recursive(p: Parsing, suffix: Bool) -> Parsing = match last(last(p.branches)).kind {
+  RecursivePrefix => p
+  RecursiveSuffix => p
+  _ => pushed-tok(popped-tok(p), tok(if suffix then RecursiveSuffix else RecursiveZeroOrMore))
+}
+
+# `[…]`: ranges of characters, `!` or `^` first to negate, `]` or `-` first as themselves, `-` last
+# as itself. Never closed, it is a literal `[`.
+fn parse-class(g: Text, i: Int, p: Parsing) -> Parsing = match class-from(g, i + 1 + neg, [], true, false) {
+  c if c.failed => failure(p)
+  c if c.end < 0 => parse-from(g, i + 1, pushed-tok(p, literal("[")) with { unclosed: true, prev: '[' })
+  c => parse-from(g, c.end + 1, pushed-tok(p, tok(Class) with { negated: neg == 1, ranges: class-bytes(c.ranges) }) with { prev: ']' })
+} where neg = if ch(g, i + 1) == '!' or ch(g, i + 1) == '^' then 1 else 0
+
+# A class's ranges as code points (pairs), and where its `]` is (-1: none).
+record ClassParse { ranges: [Int], end: Int, failed: Bool }
+
+fn class-from(g: Text, i: Int, ranges: [Int], first: Bool, in-range: Bool) -> ClassParse = match i {
+  _ if i >= len(g) => ClassParse(ranges: [], end: -1, failed: false)
+  _ => match g[i] {
+    ']' if first => class-from(g, i + 1, ranges ++ [']', ']'], false, false)
+    ']' => ClassParse(ranges: if in-range then ranges ++ ['-', '-'] else ranges, end: i, failed: false)
+    '-' if first => class-from(g, i + 1, ranges ++ ['-', '-'], false, false)
+    '-' if in-range => range-to(g, i, 1, ranges, '-')
+    '-' => class-from(g, i + 1, ranges, false, true)
+    _ if in-range => range-to(g, i, char-width(g, i), ranges, point-at(g, i))
+    _ => class-from(g, i + char-width(g, i), ranges ++ [point-at(g, i), point-at(g, i)], false, false)
+  }
+}
+
+# The last range ends at this character; one that would end before it starts is an error.
+fn range-to(g: Text, i: Int, w: Int, ranges: [Int], hi: Int) -> ClassParse = match hi {
+  _ if hi < ranges[len(ranges) - 2] => ClassParse(ranges: [], end: 0, failed: true)
+  _ => class-from(g, i + w, ranges[0..len(ranges) - 1] ++ [hi], false, false)
+}
+
+fn point-at(g: Text, i: Int) -> Int = match code-points-of(g[i..i + char-width(g, i)]) {
+  [cp] => cp
+  _ => g[i]
+}
+
+# The ranges as the regex globset writes (`(?-u)`, a character as its UTF-8 bytes) reads them: a
+# character of several bytes is that many bytes in the class, and a range's ends meet at its
+# bytes' middle.
+fn class-bytes(ranges: [Int]) -> [Int] = [b for k in 0..len(ranges) / 2 for b in range-bytes(ranges[2 * k], ranges[2 * k + 1])]
+
+fn range-bytes(lo: Int, hi: Int) -> [Int] = match utf8-bytes(lo), utf8-bytes(hi) {
+  a, b if lo == hi => [x for c in a for x in [c, c]]
+  a, b => [x for c in a[0..len(a) - 1] for x in [c, c]] ++ [last(a), b[0]] ++ [x for c in b[1..len(b)] for x in [c, c]]
+}
+
+fn utf8-bytes(cp: Int) -> [Int] = match cp {
+  _ if cp < 128 => [cp]
+  _ if cp < 2048 => [192 + cp / 64, 128 + cp % 64]
+  _ if cp < 65536 => [224 + cp / 4096, 128 + (cp / 64) % 64, 128 + cp % 64]
+  _ => [240 + cp / 262144, 128 + (cp / 4096) % 64, 128 + (cp / 64) % 64, 128 + cp % 64]
+}
+
+# Literals next to each other as one; alternates whose branches are all literals as words; a
+# branch that makes no regex at all is dropped, as globset drops it.
+fn merged(toks: [Tok]) -> [Tok] = match toks {
+  [] => []
+  [a, b, rest...] if a.kind == Lit and b.kind == Lit => merged([literal(a.text ++ b.text)] ++ rest)
+  [a, rest...] if a.kind == Alternates => [alternates(a)] ++ merged(rest)
+  [a, rest...] => [a] ++ merged(rest)
+}
+
+fn alternates(a: Tok) -> Tok = match kept {
+  _ if all b in kept: len(b) == 1 and b[0].kind == Lit =>
+    a with { branches: kept, words: {b[0].text: true for b in kept}, lengths: distinct-ints([len(b[0].text) for b in kept]) }
+  _ => a with { branches: kept }
+} where kept = [merged(b) for b in a.branches if not empty-regex?(b)]
+
+fn distinct-ints(xs: [Int]) -> [Int] = [xs[k] for k in 0..len(xs) if not (any j in 0..k: xs[j] == xs[k])]
+
+fn empty-regex?(toks: [Tok]) -> Bool = all t in toks: t.kind == Alternates and (all b in t.branches: empty-regex?(b))
+
+fn ch(s: Text, i: Int) -> Int = if i >= 0 and i < len(s) then s[i] else 0
+
+# ---------------------------------------------------------------- matching
+
+# Whether a rule's glob matches a whole path, as its regex `^…$` does.
+fn rule-matches?(r: Rule, path: Text) -> Bool = if r.everything then not has-byte?(path, '\n') else matches?(r.tokens, 0, path, 0)
+
+fn matches?(toks: [Tok], k: Int, s: Text, i: Int) -> Bool = match k {
+  _ if k == len(toks) => i == len(s)
+  _ => token-matches?(toks[k], toks, k, s, i)
+}
+
+fn token-matches?(t: Tok, toks: [Tok], k: Int, s: Text, i: Int) -> Bool = match t.kind {
+  Lit => at?(s, i, t.text) and matches?(toks, k + 1, s, i + len(t.text))
+  AnyByte => i < len(s) and s[i] != '/' and matches?(toks, k + 1, s, i + 1)
+  # `[^/]*`: the longest first, as the regex tries.
+  Star => any j in 0..span-not-of(s, i, "/") + 1: matches?(toks, k + 1, s, i + j)
+  # `(?:/?|.*/)`: nothing, a `/`, or anything to a `/` (`.` is any byte but a line end).
+  RecursivePrefix => matches?(toks, k + 1, s, i) or (ch(s, i) == '/' and matches?(toks, k + 1, s, i + 1))
+                     or (any j in i + 1..i + 1 + span-not-of(s, i, "\n") if s[j - 1] == '/': matches?(toks, k + 1, s, j))
+  # `/.*`
+  RecursiveSuffix => ch(s, i) == '/' and (any j in i + 1..i + 2 + span-not-of(s, i + 1, "\n"): matches?(toks, k + 1, s, j))
+  # `(?:/|/.*/)`
+  RecursiveZeroOrMore => ch(s, i) == '/' and (matches?(toks, k + 1, s, i + 1)
+                         or (any j in i + 2..i + 2 + span-not-of(s, i + 1, "\n") if s[j - 1] == '/': matches?(toks, k + 1, s, j)))
+  Class => i < len(s) and in-class?(t.ranges, s[i]) != t.negated and matches?(toks, k + 1, s, i + 1)
+  Alternates => match t.branches {
+    [] => matches?(toks, k + 1, s, i)
+    _ if len(t.lengths) > 0 => any n in t.lengths if i + n <= len(s) and s[i..i + n] in t.words: matches?(toks, k + 1, s, i + n)
+    branches => any b in branches: matches?(b ++ toks[k + 1..len(toks)], 0, s, i)
+  }
+}
+
+fn in-class?(ranges: [Int], c: Int) -> Bool = any k in 0..len(ranges) / 2: c >= ranges[2 * k] and c <= ranges[2 * k + 1]
+
+# ---------------------------------------------------------------- fast-glob
+
+# fast-glob's `glob_match`: `!` at the start negates, `*` stops at `/`, `**` as a component crosses
+# them, `[…]` and `{…}` (nested at most 10 deep), `\` escapes. Its backtracking is its own: one
+# place to go back to for `*` and one for `**`, which is not the same as trying every way.
+fn glob-match?(glob: Text, path: Text) -> Bool = (bangs % 2 == 1) != glob-from(glob, path, start, [])
+  where bangs = span-of(glob, 0, "!"),
+        start = Glob(gi: bangs, pi: 0, depth: 0, wild: no-wild, star: no-wild)
+
+# A place to go back to: a pattern position, a path position and a brace depth.
+record Wild { gi: Int, pi: Int, depth: Int }
+
+const no-wild: Wild = Wild(gi: 0, pi: 0, depth: 0)
+
+record Glob { gi: Int, pi: Int, depth: Int, wild: Wild, star: Wild }
+
+# A brace being matched: where it opens, and the branch taken.
+record Brace { open: Int, branch: Int }
+
+fn glob-from(g: Text, path: Text, s: Glob, braces: [Brace]) -> Bool = match s.gi < len(g), s.pi < len(path) {
+  false, false => true
+  true, _ => glob-step(g, path, s, braces, g[s.gi])
+  false, true => glob-back(g, path, s, braces)
+}
+
+# No match here: back to the last wildcard, or no match at all.
+fn glob-back(g: Text, path: Text, s: Glob, braces: [Brace]) -> Bool = match s.wild {
+  w if w.pi > 0 and w.pi <= len(path) => glob-from(g, path, s with { gi: w.gi, pi: w.pi, depth: w.depth }, braces)
+  _ => false
+}
+
+fn glob-step(g: Text, path: Text, s: Glob, braces: [Brace], c: Int) -> Bool = match c {
+  '*' => glob-star(g, path, s, braces)
+  '?' if s.pi < len(path) and path[s.pi] != '/' => glob-from(g, path, s with { gi: s.gi + 1, pi: s.pi + 1 }, braces)
+  '?' => glob-back(g, path, s, braces)
+  '[' if s.pi < len(path) => glob-class(g, path, s, braces)
+  '{' => match first b in braces if b.open == s.gi: b {
+    some(b) => glob-from(g, path, s with { gi: b.branch, depth: s.depth + 1 }, braces)
+    none => glob-brace(g, path, s, braces, s.gi, s.gi, 0, false, 0)
+  }
+  ',' if s.depth > 0 => glob-from(g, path, skip-branch(g, s, s.gi, false), braces)
+  '}' if s.depth > 0 => glob-from(g, path, skip-branch(g, s, s.gi, false), braces)
+  _ if s.pi < len(path) => match unescaped(g, s.gi) {
+    e if e.gi < 0 => false
+    e if path[s.pi] == e.byte and e.byte == '/' => glob-from(g, path, s with { gi: e.gi + 1, pi: s.pi + 1, wild: s.star }, braces)
+    e if path[s.pi] == e.byte => glob-from(g, path, s with { gi: e.gi + 1, pi: s.pi + 1 }, braces)
+    _ => glob-back(g, path, s, braces)
+  }
+  _ => glob-back(g, path, s, braces)
+}
+
+# A pattern byte with `\` read: the byte meant and where it is (-1: a `\` at the end, which
+# matches nothing).
+record Escaped { byte: Int, gi: Int }
+
+fn unescaped(g: Text, gi: Int) -> Escaped = match g[gi] {
+  '\\' if gi + 1 >= len(g) => Escaped(byte: 0, gi: -1)
+  '\\' => Escaped(byte: match g[gi + 1] { 'b' => 8 'n' => '\n' 'r' => '\r' 't' => '\t' c => c }, gi: gi + 1)
+  c => Escaped(byte: c, gi: gi)
+}
+
+fn glob-star(g: Text, path: Text, s: Glob, braces: [Brace]) -> Bool = match ch(g, s.gi + 1) == '*' {
+  false => glob-after-star(g, path, s with { gi: s.gi + 1, wild: Wild(gi: s.gi, pi: s.pi + 1, depth: s.depth) }, braces)
+  true => glob-globstar(g, path, s with { gi: at, wild: Wild(gi: at, pi: s.pi + 1, depth: s.depth) }, braces)
+    where at = skipped-globstars(g, s.gi + 2) - 2
+}
+
+# After a `*`: at a `/` in the path, the place to go back to is the last `**`'s.
+fn glob-after-star(g: Text, path: Text, s: Glob, braces: [Brace]) -> Bool = match s {
+  _ if s.pi < len(path) and path[s.pi] == '/' => glob-from(g, path, s with { wild: s.star }, braces)
+  _ => glob-from(g, path, s, braces)
+}
+
+# Past `/**/` repeated, and a final `/**`.
+fn skipped-globstars(g: Text, i: Int) -> Int = match i {
+  _ if i + 4 <= len(g) and g[i..i + 4] == "/**/" => skipped-globstars(g, i + 3)
+  _ if g[i..len(g)] == "/**" => i + 3
+  _ => i
+}
+
+fn glob-globstar(g: Text, path: Text, s: Glob, braces: [Brace]) -> Bool = match s.gi + 2 {
+  gi if (gi < 3 or g[gi - 3] == '/') and (gi == len(g) or g[gi] == '/') =>
+    glob-from(g, path, to-separator(path, s with { gi: if gi != len(g) then gi + 1 else gi }, gi != len(g)), braces)
+  gi => glob-from(g, path, if s.pi < len(path) and path[s.pi] == '/' then s with { gi: gi, wild: s.star } else s with { gi: gi }, braces)
+}
+
+fn to-separator(path: Text, s: Glob, end-invalid: Bool) -> Glob = match s.pi {
+  pi if pi == len(path) => s with { wild: s.wild with { pi: s.wild.pi + 1 } }
+  pi => s with { wild: w, star: w }
+    where stop = pi + span-not-of(path, pi, "/"),
+          w = s.wild with { pi: if end-invalid or stop != len(path) then stop + 1 else stop }
+}
+
+# `[…]` at the path's byte: ranges, `!` or `^` first to negate, `\` escapes.
+fn glob-class(g: Text, path: Text, s: Glob, braces: [Brace]) -> Bool =
+  match class-scan(g, s.gi + 1 + neg, path[s.pi], true, false) {
+    r if r.gi < 0 => false
+    r if r.gi >= len(g) => false
+    r if r.matched != (neg == 1) => glob-from(g, path, s with { gi: r.gi + 1, pi: s.pi + 1 }, braces)
+    r => glob-back(g, path, s with { gi: r.gi + 1 }, braces)
+  } where neg = if ch(g, s.gi + 1) == '^' or ch(g, s.gi + 1) == '!' then 1 else 0
+
+record ClassScan { gi: Int, matched: Bool }
+
+fn class-scan(g: Text, gi: Int, c: Int, first: Bool, matched: Bool) -> ClassScan = match gi {
+  _ if gi >= len(g) or (not first and g[gi] == ']') => ClassScan(gi: gi, matched: matched)
+  _ => match unescaped(g, gi) {
+    lo if lo.gi < 0 => ClassScan(gi: -1, matched: false)
+    lo if lo.gi + 2 < len(g) and g[lo.gi + 1] == '-' and g[lo.gi + 2] != ']' => match unescaped(g, lo.gi + 2) {
+      hi if hi.gi < 0 => ClassScan(gi: -1, matched: false)
+      hi => class-scan(g, hi.gi + 1, c, false, matched or (lo.byte <= c and c <= hi.byte))
+    }
+    lo => class-scan(g, lo.gi + 1, c, false, matched or lo.byte == c)
+  }
+}
+
+# Past the branch the cursor is in, to after the `}` that closes it.
+fn skip-branch(g: Text, s: Glob, gi: Int, brackets: Bool) -> Glob = match gi {
+  _ if gi >= len(g) => s with { gi: gi }
+  _ => match g[gi] {
+    '{' if not brackets => skip-branch(g, s with { depth: s.depth + 1 }, gi + 1, brackets)
+    '}' if not brackets and s.depth == 1 => s with { gi: gi + 1, depth: 0 }
+    '}' if not brackets => skip-branch(g, s with { depth: s.depth - 1 }, gi + 1, brackets)
+    '[' if not brackets => skip-branch(g, s, gi + 1, true)
+    ']' => skip-branch(g, s, gi + 1, false)
+    '\\' => skip-branch(g, s, gi + 2, brackets)
+    _ => skip-branch(g, s, gi + 1, brackets)
+  }
+}
+
+# A brace: each of its branches tried in turn, with the rest of the pattern after it.
+fn glob-brace(g: Text, path: Text, s: Glob, braces: [Brace], open: Int, gi: Int, depth: Int, brackets: Bool, branch: Int) -> Bool = match gi {
+  _ if gi >= len(g) => false
+  _ => match g[gi] {
+    '{' if not brackets and depth == 0 => glob-brace(g, path, s, braces, open, gi + 1, 1, brackets, gi + 1)
+    '{' if not brackets => glob-brace(g, path, s, braces, open, gi + 1, depth + 1, brackets, branch)
+    '}' if not brackets and depth == 1 => brace-branch(g, path, s, braces, open, branch)
+    '}' if not brackets => glob-brace(g, path, s, braces, open, gi + 1, depth - 1, brackets, branch)
+    ',' if depth == 1 => brace-branch(g, path, s, braces, open, branch) or glob-brace(g, path, s, braces, open, gi + 1, depth, brackets, gi + 1)
+    '[' if not brackets => glob-brace(g, path, s, braces, open, gi + 1, depth, true, branch)
+    ']' => glob-brace(g, path, s, braces, open, gi + 1, depth, false, branch)
+    '\\' => glob-brace(g, path, s, braces, open, gi + 2, depth, brackets, branch)
+    _ => glob-brace(g, path, s, braces, open, gi + 1, depth, brackets, branch)
+  }
+}
+
+fn brace-branch(g: Text, path: Text, s: Glob, braces: [Brace], open: Int, branch: Int) -> Bool = match len(braces) {
+  n if n >= 10 => fail-build("fast-glob nests braces 10 deep at most, and this source pattern nests more: " ++ g)
+  n => glob-from(g, path, s with { gi: branch, depth: n + 1 }, braces ++ [Brace(open: open, branch: branch)])
+}
+
+# ---------------------------------------------------------------- brace expansion
+
+# bexpand's expansion of a source's pattern: `{a,b}` lists (nested, items may be empty),
+# `{1..9}` and `{a..e}` sequences (with a step, and `{=01..10}` padded), `\` escaping `{`, `}`,
+# `\` (and `,` in a list). A pattern bexpand cannot parse is kept whole.
+fn expanded(pattern: Text) -> [Text] = match expression(pattern, 0, true) {
+  some(e) if e.end == len(pattern) => product(e.parts)
+  _ => [pattern]
+}
+
+# A part of an expression: each of its expansions.
+record Parsed { parts: [[Text]], end: Int }
+
+fn product(parts: [[Text]]) -> [Text] = match parts {
+  [] => []
+  [only] => only
+  [first-part, rest...] => [a ++ b for a in first-part for b in product(rest)]
+}
+
+# An expression's parts from `i` (`top`: plain text may hold commas; else at least one part).
+fn expression(s: Text, i: Int, top: Bool) -> Parsed? = match part(s, i, top) {
+  none if top => some(Parsed(parts: [], end: i))
+  none => none
+  some(p) => match expression(s, p.end, top) {
+    some(more) => some(Parsed(parts: p.parts ++ more.parts, end: more.end))
+    none => some(p)
+  }
+}
+
+fn part(s: Text, i: Int, top: Bool) -> Parsed? = match sequence(s, i) {
+  some(q) => some(q)
+  none => match list(s, i) {
+    some(l) => some(l)
+    none => plain(s, i, top)
+  }
+}
+
+# Plain text: not empty, with `\` before one of the bytes it would otherwise stop at.
+fn plain(s: Text, i: Int, top: Bool) -> Parsed? = match plain-end(s, i, if top then "\\{}" else "\\{},") {
+  e if e <= i => none
+  e if e < len(s) and s[e] == '\\' => none
+  e => some(Parsed(parts: [[unescaped-plain(s[i..e])]], end: e))
+}
+
+fn plain-end(s: Text, i: Int, stops: Text) -> Int = match i + span-not-of(s, i, stops) {
+  e if ch(s, e) == '\\' and e + 1 < len(s) and has-byte?(stops, s[e + 1]) => plain-end(s, e + 2, stops)
+  e => e
+}
+
+fn unescaped-plain(s: Text) -> Text = match index-of(s, "\\") {
+  none => s
+  some(k) => s[0..k] ++ s[k + 1..k + 2] ++ unescaped-plain(s[k + 2..len(s)])
+}
+
+# `{item,item,…}`: each item an expression, or empty.
+fn list(s: Text, i: Int) -> Parsed? = match ch(s, i) {
+  '{' => items(s, i + 1, [])
+  _ => none
+}
+
+fn items(s: Text, i: Int, got: [Text]) -> Parsed? = match expression(s, i, false) {
+  some(e) => item-end(s, e.end, got ++ product(e.parts))
+  none => item-end(s, i, got ++ [""])
+}
+
+fn item-end(s: Text, i: Int, got: [Text]) -> Parsed? = match ch(s, i) {
+  ',' => items(s, i + 1, got)
+  '}' => some(Parsed(parts: [got], end: i + 1))
+  _ => none
+}
+
+# `{a..b}` or `{a..b..step}`, numbers (with `=` for padding) or single characters.
+fn sequence(s: Text, i: Int) -> Parsed? = match ch(s, i) {
+  '{' => match number-sequence(s, i + 1) {
+    some(q) => some(q)
+    none => char-sequence(s, i + 1)
+  }
+  _ => none
+}
+
+record Number { value: Int, end: Int }
+
+fn number-at(s: Text, i: Int) -> Number? = match span-of(s, i + sign, "0123456789") {
+  0 => none
+  n => some(Number(value: if s[i] == '-' then 0 - magnitude else magnitude, end: i + sign + n))
+    where magnitude = parse-int(s[i + sign..i + sign + n])
+} where sign = if ch(s, i) == '-' or ch(s, i) == '+' then 1 else 0
+
+fn number-sequence(s: Text, i: Int) -> Parsed? = match number-at(s, i + pad) {
+  some(a) if at?(s, a.end, "..") => match number-at(s, a.end + 2) {
+    some(b) => match step(s, b.end) {
+      some(st) if ch(s, st.end) == '}' =>
+        some(Parsed(parts: [[padded(int-text(v), width) for v in counted(a.value, b.value, max(st.value, 1))]], end: st.end + 1))
+        where width = if pad == 1 then max(a.end - i - pad, b.end - a.end - 2) else 0
+      _ => none
+    }
+    none => none
+  }
+  _ => none
+} where pad = if ch(s, i) == '=' then 1 else 0
+
+# `..step` after a sequence's end, or nothing (a step of 1).
+fn step(s: Text, i: Int) -> Number? = match at?(s, i, "..") {
+  true => match span-of(s, i + 2, "0123456789") {
+    0 => none
+    n => some(Number(value: parse-int(s[i + 2..i + 2 + n]), end: i + 2 + n))
+  }
+  false => some(Number(value: 1, end: i))
+}
+
+# From one end to the other by the step, either way, both ends included when reached.
+fn counted(a: Int, b: Int, by: Int) -> [Int] = match a {
+  _ if a == b => [a]
+  _ if a < b => [a + k * by for k in 0..(b - a) / by + 1]
+  _ => [a - k * by for k in 0..(a - b) / by + 1]
+}
+
+# Rust's `{:0width$}`: zeros after the sign.
+fn padded(t: Text, width: Int) -> Text = match t {
+  "-" ++ digits if len(t) < width => "-" ++ repeated("0", width - len(t)) ++ digits
+  _ if len(t) < width => repeated("0", width - len(t)) ++ t
+  _ => t
+}
+
+fn char-sequence(s: Text, i: Int) -> Parsed? = match sequence-char(s, i) {
+  some(a) if at?(s, a.end, "..") => match sequence-char(s, a.end + 2) {
+    some(b) => match step(s, b.end) {
+      some(st) if ch(s, st.end) == '}' =>
+        some(Parsed(parts: [[text-of-points([cp]) for cp in counted(a.value, b.value, max(st.value, 1)) if not (cp >= 55296 and cp <= 57343)]],
+                    end: st.end + 1))
+      _ => none
+    }
+    none => none
+  }
+  _ => none
+}
+
+# A character of a sequence: anything but `.`, `{`, `}` and `,`; `\` takes the character after it.
+fn sequence-char(s: Text, i: Int) -> Number? = match ch(s, i) {
+  _ if i >= len(s) => none
+  '.' | '{' | '}' | ',' => none
+  '\\' if i + 1 < len(s) => some(Number(value: point-at(s, i + 1), end: i + 1 + char-width(s, i + 1)))
+  '\\' => none
+  _ => some(Number(value: point-at(s, i), end: i + char-width(s, i)))
+}

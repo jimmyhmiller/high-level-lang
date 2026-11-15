@@ -1,0 +1,581 @@
+# oxide's pre-processors (extractor/pre_processors): what a file of a template language is made
+# into before its candidates are extracted. Each keeps the text's length, blanking what would hide
+# a class name (Pug's `.` between class names, Clojure's `:` before a keyword, JSON's brackets) and
+# handing embedded languages to their own. A pre-processor is its loop's positions written as a
+# function from where its cursor is to the bytes it blanks from there on.
+rules tailwind.preprocess
+use tailwind.extract as ex
+
+# A file's text as oxide gives it to the extractor, by the file's extension (`pre_process_input`).
+fn processed(content: Text, extension: Text) -> Text = match extension {
+  "clj" | "cljs" | "cljc" => clojure(content)
+  "heex" | "eex" | "ex" | "exs" => spaced(content, elixir-blanks(content, 0))
+  "cshtml" | "razor" => replace-all(replace-all(content, "@@", " @"), "@(\"@\")", "     @")
+  "haml" => haml(content)
+  "json" | "jsonl" | "ndjson" => spaced(content, json-blanks(content, 0))
+  "md" | "mdx" => spaced(content, markdown-blanks(content, 0, false, 0))
+  "pug" => spaced(content, pug-blanks(content, 0, pug-start))
+  "rb" | "erb" => ruby(content)
+  "slim" | "slang" => spaced(content, slim-blanks(content, 0, 0))
+  "svelte" => class-colons(content)
+  "rs" => rust(content)
+  "tt" | "tt2" | "tx" => spaced(content, template-toolkit-blanks(content))
+  "twig" => spaced(content, twig-blanks(content, 0, 0))
+  "vue" => vue(content)
+  _ => content
+}
+
+# ---------------------------------------------------------------- edits
+
+# A text with the bytes at these positions made spaces (any order, any repeated).
+fn spaced(s: Text, at: [Int]) -> Text = match at {
+  [] => s
+  _ => join([s[if k == 0 then 0 else ps[k - 1] + 1..ps[k]] for k in 0..len(ps)] ++ [s[last(ps) + 1..len(s)]], " ")
+    where ps = distinct-ints(sort p in at by p)
+}
+
+fn distinct-ints(sorted: [Int]) -> [Int] = [sorted[k] for k in 0..len(sorted) if k == 0 or sorted[k] != sorted[k - 1]]
+
+# A text with a stretch replaced by another as long.
+fn replaced-at(s: Text, start: Int, by: Text) -> Text = s[0..start] ++ by ++ s[start + len(by)..len(s)]
+
+fn white?(c: Int) -> Bool = c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12
+fn digit?(c: Int) -> Bool = c >= '0' and c <= '9'
+fn alpha?(c: Int) -> Bool = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+fn alnum?(c: Int) -> Bool = alpha?(c) or digit?(c)
+fn punctuation?(c: Int) -> Bool = (c >= 33 and c <= 47) or (c >= 58 and c <= 64) or (c >= 91 and c <= 96) or (c >= 123 and c <= 126)
+fn ch(s: Text, i: Int) -> Int = if i >= 0 and i < len(s) then s[i] else 0
+
+# oxide's bracket stack: 32 brackets at most (a push past that is dropped), each remembered as
+# the bracket that closes it.
+fn pushed(stack: [Int], c: Int) -> [Int] = if len(stack) >= 32 then stack else stack ++ [closer(c)]
+fn popped(stack: [Int]) -> [Int] = stack[0..len(stack) - 1]
+fn pushed-count(depth: Int) -> Int = if depth >= 32 then depth else depth + 1
+
+fn closer(c: Int) -> Int = match c {
+  '(' => ')'
+  '[' => ']'
+  '{' => '}'
+  _ => '>'
+}
+
+# A `.` between two digits stays (`px-2.5`), unless a variant starts after it (`bg-red-500.2xl:flex`).
+fn dot-blanks(s: Text, i: Int) -> [Int] = match i {
+  _ if digit?(ch(s, i - 1)) and digit?(ch(s, i + 1)) and not ex.variant(s, i + 1).done => []
+  _ => [i]
+}
+
+# ---------------------------------------------------------------- Svelte, Leptos, Razor
+
+# `class:flex` (Svelte's directive, Leptos's attribute) read as `class flex`.
+fn class-colons(s: Text) -> Text = replace-all(replace-all(replace-all(s, " class:", " class "), "\tclass:", " class "), "\nclass:", " class ")
+
+# ---------------------------------------------------------------- JSON
+
+# Brackets and braces outside strings.
+fn json-blanks(s: Text, i: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '"' => json-blanks(s, string-close(s, i + 1, '"') + 1)
+  '[' | '{' | ']' | '}' => [i] ++ json-blanks(s, i + 1)
+  _ => json-blanks(s, i + 1)
+}
+
+# Where a string whose body starts at `i` closes: its quote, or past the end; a backslash takes
+# the byte after it.
+fn string-close(s: Text, i: Int, q: Int) -> Int = match ch(s, i) {
+  _ if i >= len(s) => i
+  '\\' => string-close(s, i + 2, q)
+  c if c == q => i
+  _ => string-close(s, i + 1, q)
+}
+
+# ---------------------------------------------------------------- Markdown
+
+# MDX's `{…}` expressions: the braces, and each `.` in them outside brackets.
+fn markdown-blanks(s: Text, i: Int, inside: Bool, depth: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '{' if not inside => [i] ++ markdown-blanks(s, i + 1, true, depth)
+  c if inside and (c == '(' or c == '[' or c == '{' or c == '<') => markdown-blanks(s, i + 1, inside, depth + 1)
+  c if inside and depth > 0 and (c == ')' or c == ']' or c == '}' or c == '>') => markdown-blanks(s, i + 1, inside, depth - 1)
+  '}' if inside => [i] ++ markdown-blanks(s, i + 1, false, depth)
+  '.' if inside and depth == 0 => [i] ++ markdown-blanks(s, i + 1, inside, depth)
+  _ => markdown-blanks(s, i + 1, inside, depth)
+}
+
+# ---------------------------------------------------------------- Template Toolkit
+
+# `[%` and `%]`: their brackets.
+fn template-toolkit-blanks(s: Text) -> [Int] =
+  [p for p in 0..len(s) if s[p] == '[' and ch(s, p + 1) == '%'] ++ [p + 1 for p in 0..len(s) if s[p] == '%' and ch(s, p + 1) == ']']
+
+# ---------------------------------------------------------------- Twig
+
+# `addClass(…)` and `removeClass(…)`: their parentheses.
+fn twig-blanks(s: Text, i: Int, depth: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '(' if depth == 0 and (ends-at(s, i, "addClass") or ends-at(s, i, "removeClass")) => [i] ++ twig-blanks(s, i + 1, 1)
+  '(' if depth > 0 => twig-blanks(s, i + 1, depth + 1)
+  ')' if depth == 1 => [i] ++ twig-blanks(s, i + 1, 0)
+  ')' if depth > 0 => twig-blanks(s, i + 1, depth - 1)
+  _ => twig-blanks(s, i + 1, depth)
+}
+
+fn ends-at(s: Text, i: Int, what: Text) -> Bool = i >= len(what) and at?(s, i - len(what), what)
+
+# ---------------------------------------------------------------- Elixir
+
+# Sigils `~c(…)`, `~s[…]`, `~w{…}` and their capitals: the brackets that open and close them.
+fn elixir-blanks(s: Text, i: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '~' if sigil?(ch(s, i + 1)) and opening?(ch(s, i + 2)) => [i + 2] ++ elixir-sigil(s, i + 2, 1)
+  '~' if sigil?(ch(s, i + 1)) => elixir-blanks(s, i + 2)
+  _ => elixir-blanks(s, i + 1)
+}
+
+fn sigil?(c: Int) -> Bool = c == 'c' or c == 'C' or c == 's' or c == 'S' or c == 'w' or c == 'W'
+fn opening?(c: Int) -> Bool = c == '(' or c == '[' or c == '{'
+
+# Inside a sigil, the cursor at `i`: each step moves first. A backslash skips two more bytes.
+fn elixir-sigil(s: Text, i: Int, depth: Int) -> [Int] = match ch(s, i + 1) {
+  _ if i >= len(s) => []
+  '\\' => elixir-sigil(s, i + 3, depth)
+  c if opening?(c) => elixir-sigil(s, i + 1, pushed-count(depth))
+  c if depth > 0 and depth == 1 and (c == ')' or c == ']' or c == '}') => [i + 1] ++ elixir-blanks(s, i + 2)
+  c if depth > 0 and (c == ')' or c == ']' or c == '}') => elixir-sigil(s, i + 1, depth - 1)
+  _ => elixir-sigil(s, i + 1, depth)
+}
+
+# ---------------------------------------------------------------- Clojure
+
+# Everything but keywords (`:flex`, `'bg-white`, the strings' bodies are kept), and `.` between
+# a keyword's class names (`:div.flex.gap-1.5`).
+fn clojure(content: Text) -> Text = spaced(s, clojure-blanks(s, 0))
+  where s = replace-all(replace-all(content, ":class", "      "), ":className", "          ")
+
+fn keyword-byte?(c: Int) -> Bool = alnum?(c) or c == '!' or c == '#' or c == '%' or c == '*' or c == '+' or c == '-'
+  or c == '.' or c == '/' or c == ':' or c == '_'
+
+fn clojure-blanks(s: Text, i: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '"' => [i] ++ clojure-string(s, i + 1, clojure-blanks)
+  ';' if ch(s, i + 1) == ';' => [p for p in i..e] ++ clojure-blanks(s, e + 1) where e = line-end(s, i)
+  ':' => [i] ++ clojure-keyword(s, i + 1, true)
+  '\'' if ch(s, i + 1) == '[' or ch(s, i + 1) == '(' => [i, i + 1] ++ clojure-quoted(s, i + 1, closer(s[i + 1]))
+  '\'' if not white?(ch(s, i + 1)) => [i] ++ clojure-keyword(s, i + 1, false)
+  _ => [i] ++ clojure-blanks(s, i + 1)
+}
+
+# A string's body to its closing quote, which is blanked; then `next` goes on after it.
+fn clojure-string(s: Text, i: Int, next: Fn(Text, Int) -> [Int]) -> [Int] = match string-close(s, i, '"') {
+  e if e >= len(s) => next(s, e + 1)
+  e => [e] ++ next(s, e + 1)
+}
+
+# A keyword's bytes to the first that is not one, which is blanked; `.` between class names is
+# blanked too, where `dots` (after `:`).
+fn clojure-keyword(s: Text, i: Int, dots: Bool) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => clojure-blanks(s, i + 1)
+  '.' if dots and digit?(ch(s, i - 1)) and digit?(ch(s, i + 1)) => clojure-keyword(s, i + 1, dots)
+  '.' if dots => [i] ++ clojure-keyword(s, i + 1, dots)
+  c if not keyword-byte?(c) => [i] ++ clojure-blanks(s, i + 1)
+  _ => clojure-keyword(s, i + 1, dots)
+}
+
+# A quoted list or vector, `'(…)` or `'[…]`, to its first closer: strings' quotes are blanked.
+fn clojure-quoted(s: Text, i: Int, end: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => clojure-blanks(s, i + 1)
+  c if c == end => [i] ++ clojure-blanks(s, i + 1)
+  '"' => [i] ++ (match string-close(s, i + 1, '"') {
+    e if e >= len(s) => clojure-quoted(s, e + 1, end)
+    e => [e] ++ clojure-quoted(s, e + 1, end)
+  })
+  _ => clojure-quoted(s, i + 1, end)
+}
+
+fn line-end(s: Text, i: Int) -> Int = match index-of(s[i..len(s)], "\n") {
+  some(k) => i + k
+  none => len(s)
+}
+
+# ---------------------------------------------------------------- Rust
+
+# Leptos's `class:flex`; and in a file with Maud's `html!`, its `.` between class names and `[`
+# after a tag, outside strings and brackets.
+fn rust(content: Text) -> Text = if contains-text?(s, "html!") then spaced(s, maud-blanks(s, 0, 0)) else s
+  where s = class-colons(content)
+
+fn maud-blanks(s: Text, i: Int, depth: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '\\' => maud-blanks(s, i + 2, depth)
+  '"' => [i] ++ (match string-close(s, i + 1, '"') {
+    e if e >= len(s) => maud-blanks(s, e + 1, depth)
+    e => [e] ++ maud-blanks(s, e + 1, depth)
+  })
+  '.' if depth > 0 => maud-blanks(s, i + 1, depth)
+  '.' => dot-blanks(s, i) ++ maud-blanks(s, i + 1, depth)
+  '[' if ch(s, i - 1) != '-' => [i] ++ maud-blanks(s, i + 1, pushed-count(depth))
+  '[' => maud-blanks(s, i + 1, pushed-count(depth))
+  ']' if depth > 0 => maud-blanks(s, i + 1, depth - 1)
+  _ => maud-blanks(s, i + 1, depth)
+}
+
+# ---------------------------------------------------------------- Pug
+
+# Pug: `.` between class names (`a.flex.p-4`), and the `(` and `)` of an attribute list, unless
+# they belong to a utility (`bg-(--x)`). What a line's state holds is a record.
+record Pug {
+  depth: Int,
+  # The outermost open bracket opened an attribute list; the cursor is in a line's leading white
+  # space; in its tag part; after a block expansion's `:`.
+  attributes: Bool,
+  line-start: Bool,
+  tag: Bool,
+  expansion: Bool,
+  # The quote of the attribute's string the cursor is in (0: none), where it opened, and whether
+  # quotes are text to the end of the line (a string that did not close on it).
+  quote: Int,
+  quote-start: Int,
+  quotes-text: Bool
+}
+
+const pug-start: Pug = Pug(depth: 0, attributes: false, line-start: true, tag: false, expansion: false, quote: 0,
+                           quote-start: 0, quotes-text: false)
+
+fn pug-blanks(s: Text, i: Int, p: Pug) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  _ if p.quote != 0 => pug-quoted(s, i, p)
+  _ => pug-step(s, i, if p.line-start and not (c == ' ' or c == '\t' or c == '\r' or c == '\n')
+                        then p with { line-start: false, tag: alpha?(c) or c == '.' or c == '#' or c == '+' } else p)
+} where c = ch(s, i)
+
+# In a string: only a template literal may go past the line's end; another that does is no
+# string, and the line is read again from after its quote, quotes as text.
+fn pug-quoted(s: Text, i: Int, p: Pug) -> [Int] = match s[i] {
+  '\\' => pug-blanks(s, i + 2, p)
+  c if c == p.quote => pug-blanks(s, i + 1, p with { quote: 0 })
+  c if p.quote != '`' and (c == '\n' or i + 1 == len(s)) => pug-blanks(s, p.quote-start + 1, p with { quote: 0, quotes-text: true })
+  _ => pug-blanks(s, i + 1, p)
+}
+
+fn pug-step(s: Text, i: Int, p: Pug) -> [Int] = match s[i] {
+  '\n' if not p.attributes => pug-next(s, i, p with { depth: 0, line-start: true, tag: false, expansion: false })
+  c if (c == '"' or c == '\'' or c == '`') and p.attributes and not p.quotes-text => pug-next(s, i, p with { quote: c, quote-start: i })
+  c if (c == ' ' or c == '\t') and p.depth == 0 and not p.expansion => pug-next(s, i, p with { tag: false })
+  ':' if p.depth == 0 => pug-next(s, i, p with { expansion: true })
+  '.' if p.depth > 0 => pug-blanks(s, i + 1, p)
+  '.' => dot-blanks(s, i) ++ pug-next(s, i, p)
+  '(' if p.depth == 0 and ch(s, i - 1) != '-' and ch(s, i - 1) != '/' =>
+    [i] ++ pug-next(s, i, p with { depth: pushed-count(p.depth), attributes: p.tag })
+  c if opening?(c) => pug-next(s, i, p with { depth: pushed-count(p.depth) })
+  c if (c == ')' or c == ']' or c == '}') and p.depth > 0 =>
+    pug-next(s, i, p with { depth: p.depth - 1, attributes: p.attributes and p.depth > 1 })
+  _ => pug-next(s, i, p)
+}
+
+# After a byte: a block expansion's white space ends at anything else, a line's end makes quotes
+# strings again.
+fn pug-next(s: Text, i: Int, p: Pug) -> [Int] =
+  pug-blanks(s, i + 1, p with { expansion: p.expansion and (c == ' ' or c == '\t' or c == ':'), quotes-text: p.quotes-text and c != '\n' })
+  where c = s[i]
+
+# ---------------------------------------------------------------- Slim and Haml
+
+# Slim: `.` between class names, `[` right after a word (`.text-xl[`), `(` of attributes, and
+# Ruby's `%w[…]` literals.
+fn slim-blanks(s: Text, i: Int, depth: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '.' if depth > 0 => slim-blanks(s, i + 1, depth)
+  '.' => dot-blanks(s, i) ++ slim-blanks(s, i + 1, depth)
+  '%' if word-literal?(s, i) => w.blanks ++ slim-blanks(s, w.end, depth) where w = word-literal(s, i)
+  '[' if depth == 0 and alnum?(ch(s, i - 1)) => [i] ++ slim-blanks(s, i + 1, pushed-count(depth))
+  '(' if depth == 0 and ch(s, i - 1) != '-' and ch(s, i - 1) != '/' => [i] ++ slim-blanks(s, i + 1, pushed-count(depth))
+  c if opening?(c) => slim-blanks(s, i + 1, pushed-count(depth))
+  c if (c == ')' or c == ']' or c == '}') and depth > 0 => slim-blanks(s, i + 1, depth - 1)
+  _ => slim-blanks(s, i + 1, depth)
+}
+
+# `%w[…]` or `%W[…]`, not after a value (`50%w` is a modulo), with a delimiter after it.
+fn word-literal?(s: Text, i: Int) -> Bool =
+  (ch(s, i + 1) == 'w' or ch(s, i + 1) == 'W') and not alnum?(p) and p != '_' and p != ')' and p != ']' and p != '}'
+  and i + 2 < len(s) and (opening?(s[i + 2]) or s[i + 2] == '<' or punctuation?(s[i + 2]))
+  where p = ch(s, i - 1)
+
+# The literal's `%`, `w`, delimiters and backslashed spaces, and where the cursor goes on after
+# it: paired delimiters nest, and a backslash takes the byte after it (unless it is the delimiter).
+record Literal { end: Int, blanks: [Int] }
+
+fn word-literal(s: Text, i: Int) -> Literal =
+  Literal(end: e + 1, blanks: [i, i + 1, i + 2] ++ word-escapes(s, i + 3, e, close) ++ (if e < len(s) then [e] else []))
+  where open = s[i + 2], close = word-close(open), e = word-end(s, i + 3, open, close, 1)
+
+fn word-close(open: Int) -> Int = match open {
+  '[' => ']'
+  '(' => ')'
+  '{' => '}'
+  '<' => '>'
+  c => c
+}
+
+# Where the literal closes (past the end when it does not).
+fn word-end(s: Text, i: Int, open: Int, close: Int, nesting: Int) -> Int = match ch(s, i) {
+  _ if i >= len(s) => i
+  '\\' if close != '\\' => word-end(s, i + 2, open, close, nesting)
+  c if c == open and open != close => word-end(s, i + 1, open, close, nesting + 1)
+  c if c == close and nesting == 1 => i
+  c if c == close => word-end(s, i + 1, open, close, nesting - 1)
+  _ => word-end(s, i + 1, open, close, nesting)
+}
+
+# A backslash before a space in the literal (a space inside a word) is blanked.
+fn word-escapes(s: Text, i: Int, e: Int, close: Int) -> [Int] = match ch(s, i) {
+  _ if i >= e or i >= len(s) => []
+  '\\' if close != '\\' and ch(s, i + 1) == ' ' => [i] ++ word-escapes(s, i + 2, e, close)
+  '\\' if close != '\\' => word-escapes(s, i + 2, e, close)
+  _ => word-escapes(s, i + 1, e, close)
+}
+
+# Haml: what Slim blanks, and `#` and `=` outside brackets, the first bracket and its closer;
+# silent (`-#`) and HTML (`/`) comments and their indented blocks are passed; Ruby after `-`, `=`
+# or `~` at a line's start is Ruby's to pre-process.
+fn haml(content: Text) -> Text = edited(content, haml-edits(content, 0, 0, 0))
+
+record Edit { at: Int, text: Text }
+
+# A text with edits made, in order, none overlapping.
+fn edited(s: Text, edits: [Edit]) -> Text = match edits {
+  [] => s
+  _ => join([s[if k == 0 then 0 else edits[k - 1].at + len(edits[k - 1].text)..edits[k].at] ++ edits[k].text for k in 0..len(edits)]
+            ++ [s[last(edits).at + len(last(edits).text)..len(s)]], "")
+}
+
+fn blank(at: Int) -> Edit = Edit(at: at, text: " ")
+
+fn haml-edits(s: Text, i: Int, newline: Int, depth: Int) -> [Edit] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '\\' => haml-edits(s, i + 2, newline, depth)
+  '\n' => haml-edits(s, i + 1, i, depth)
+  '-' if line-blank?(s, newline, i) and ch(s, i + 1) == '#' => haml-edits(s, b.pos + 1, b.value, depth) where b = indented-block(s, i, newline)
+  '/' if line-blank?(s, newline, i) => haml-edits(s, b.pos + 1, b.value, depth) where b = indented-block(s, i, newline)
+  c if (c == '-' or c == '=' or c == '~') and line-blank?(s, newline, i) =>
+    [Edit(at: i + 1, text: processed(s[i + 1..b.value], "rb"))] ++ haml-edits(s, b.pos + 1, b.value, depth)
+    where b = indented-block(s, i, newline)
+  '.' if depth > 0 => haml-edits(s, i + 1, newline, depth)
+  '.' => [blank(p) for p in dot-blanks(s, i)] ++ haml-edits(s, i + 1, newline, depth)
+  '%' if word-literal?(s, i) => [blank(p) for p in w.blanks] ++ haml-edits(s, w.end, newline, depth) where w = word-literal(s, i)
+  c if (c == '#' or c == '=') and depth == 0 => [blank(i)] ++ haml-edits(s, i + 1, newline, depth)
+  c if opening?(c) and depth == 0 => [blank(i)] ++ haml-edits(s, i + 1, newline, pushed-count(depth))
+  c if opening?(c) => haml-edits(s, i + 1, newline, pushed-count(depth))
+  c if (c == ')' or c == ']' or c == '}') and depth == 1 => [blank(i)] ++ haml-edits(s, i + 1, newline, 0)
+  c if (c == ')' or c == ']' or c == '}') and depth > 0 => haml-edits(s, i + 1, newline, depth - 1)
+  _ => haml-edits(s, i + 1, newline, depth)
+}
+
+# Whether everything from the last line's end to `i` is white space.
+fn line-blank?(s: Text, newline: Int, i: Int) -> Bool = span-of(s, newline, " \t\n\r" ++ byte-text(12)) >= i - newline
+
+# Where an indented block oxide skips ends (`skip_indented_block`): the cursor's place and the
+# line end it gives back.
+record Block { pos: Int, value: Int }
+
+fn indented-block(s: Text, i: Int, newline: Int) -> Block = match s[i] {
+  '=' if ch(s, e - 1) != ',' => Block(pos: e, value: e)
+  kind => block-scan(s, e, kind, max(0, max(0, i - newline) - 1), newline, newline)
+} where e = line-end(s, i)
+
+fn block-scan(s: Text, i: Int, kind: Int, level: Int, known: Int, last: Int) -> Block = match ch(s, i) {
+  _ if i >= len(s) => block-end(i, known, last)
+  '\\' => block-scan(s, i + 2, kind, level, known, last)
+  '\n' if kind == '=' and ch(s, i - 1) != ',' => block-end(i, known, i)
+  '\n' => block-scan(s, i + 1, kind, level, known, i)
+  c if white?(c) => block-indent(s, i, kind, level, known, last)
+  _ => block-end(i, known, last)
+}
+
+fn block-indent(s: Text, i: Int, kind: Int, level: Int, known: Int, last: Int) -> Block = match ch(s, i) {
+  '\n' if i < len(s) and kind == '=' and ch(s, i - 1) != ',' => block-end(i, known, i)
+  c if i < len(s) and white?(c) => block-indent(s, i + 1, kind, level, known, if c == '\n' then i else last)
+  _ if max(0, max(0, i - last) - 1) < level => block-end(i, known, last)
+  _ => block-scan(s, i + 1, kind, level, known, last)
+}
+
+fn block-end(pos: Int, known: Int, last: Int) -> Block = if known == last then Block(pos: pos, value: pos) else Block(pos: last, value: last)
+
+# ---------------------------------------------------------------- Ruby
+
+# Ruby: comments, and the delimiters of `%w`, `%W` and `%p` literals; first the bodies of
+# ViewComponent's templates (`erb_template <<~ERB … ERB`) as their language has them.
+fn ruby(content: Text) -> Text = spaced(templated, ruby-blanks(content, 0))
+  where templated = if utf8?(content) then heredocs(content, heredoc-starts(content, 0), heredoc-ends(content, 0)) else content
+
+# A heredoc's start (`\s*([a-z0-9_-]+)_template\s*<<[-~]?([A-Z]+)$`): its language, its
+# delimiter, and where its body starts.
+record Heredoc { lang: Text, delimiter: Text, body: Int }
+
+# A heredoc's possible end (`^\s*([A-Z]+)`): where its line starts, and the word.
+record Closing { at: Int, word: Text }
+
+fn heredocs(content: Text, starts: [Heredoc], ends: [Closing]) -> Text =
+  fold r = content for h in starts for e in (first e in ends if e.at >= h.body and e.word == h.delimiter: e):
+    replaced-at(r, h.body, processed(content[h.body..e.at], ascii-lower(h.lang)))
+
+fn heredoc-starts(s: Text, i: Int) -> [Heredoc] = match index-of(s[i..len(s)], "_template") {
+  none => []
+  some(k) => match heredoc-at(s, i + k) {
+    some(h) => [h] ++ heredoc-starts(s, h.body)
+    none => heredoc-starts(s, i + k + 1)
+  }
+}
+
+# A heredoc whose `_template` is at `at`: the word before it all name bytes, ending there, and
+# `<<`, maybe `-` or `~`, capitals to the line's end after it.
+fn heredoc-at(s: Text, at: Int) -> Heredoc? = match name-start(s, at) {
+  b if b == at or name-byte?(ch(s, at + 9)) => none
+  b => match after-space(s, at + 9) {
+    q if at?(s, q, "<<") => match q + 2 + (if ch(s, q + 2) == '-' or ch(s, q + 2) == '~' then 1 else 0) {
+      w if capitals(s, w) > 0 and line-ends-at?(s, w + capitals(s, w)) =>
+        some(Heredoc(lang: s[b..at], delimiter: s[w..w + capitals(s, w)], body: w + capitals(s, w)))
+      _ => none
+    }
+    _ => none
+  }
+}
+
+fn name-byte?(c: Int) -> Bool = (c >= 'a' and c <= 'z') or digit?(c) or c == '_' or c == '-'
+
+fn name-start(s: Text, i: Int) -> Int = if i > 0 and name-byte?(s[i - 1]) then name-start(s, i - 1) else i
+
+fn capitals(s: Text, i: Int) -> Int = span-of(s, i, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+fn line-ends-at?(s: Text, i: Int) -> Bool = i >= len(s) or s[i] == '\n'
+
+# Past white space (Unicode's, as the regex's `\s`).
+fn after-space(s: Text, i: Int) -> Int = match space-width(s, i) {
+  0 => i
+  n => after-space(s, i + n)
+}
+
+# The length of the white space character at `i` (Unicode's White_Space), or 0.
+fn space-width(s: Text, i: Int) -> Int = match ch(s, i) {
+  _ if i >= len(s) => 0
+  c if c == ' ' or (c >= 9 and c <= 13) => 1
+  194 if ch(s, i + 1) == 133 or ch(s, i + 1) == 160 => 2
+  225 if ch(s, i + 1) == 154 and ch(s, i + 2) == 128 => 3
+  226 if ch(s, i + 1) == 128 and ((ch(s, i + 2) >= 128 and ch(s, i + 2) <= 138) or ch(s, i + 2) == 168 or ch(s, i + 2) == 169 or ch(s, i + 2) == 175) => 3
+  226 if ch(s, i + 1) == 129 and ch(s, i + 2) == 159 => 3
+  227 if ch(s, i + 1) == 128 and ch(s, i + 2) == 128 => 3
+  _ => 0
+}
+
+# Each line start from `i` on whose white space is followed by capitals; the search goes on after
+# the capitals.
+fn heredoc-ends(s: Text, i: Int) -> [Closing] = match i {
+  _ if i > len(s) => []
+  _ => match after-space(s, i) {
+    w if capitals(s, w) > 0 => [Closing(at: i, word: s[w..w + capitals(s, w)])] ++ heredoc-ends(s, next-line(s, w + capitals(s, w)))
+    _ => heredoc-ends(s, next-line(s, i))
+  }
+}
+
+# The start of the line after the one `i` is on (past the end when there is none).
+fn next-line(s: Text, i: Int) -> Int = match index-of(s[min(i, len(s))..len(s)], "\n") {
+  some(k) => min(i, len(s)) + k + 1
+  none => len(s) + 1
+}
+
+fn ruby-blanks(s: Text, i: Int) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => []
+  '"' | '\'' => ruby-blanks(s, string-close(s, i + 1, s[i]) + 1)
+  '#' if ch(s, i - 1) != '%' and ch(s, i + 1) != '{' => [p for p in i..e] ++ ruby-blanks(s, e + 1) where e = line-end(s, i)
+  '%' if (n == 'w' or n == 'W' or n == 'p') and not (alnum?(p) or p == '_' or p == ')' or p == ']' or p == '}') and percent-delimiter(ch(s, i + 2)) != 0 =>
+    [i + 2] ++ percent-body(s, i + 3, percent-delimiter(s[i + 2]), [])
+  '%' if (n == 'w' or n == 'W' or n == 'p') and not (alnum?(p) or p == '_' or p == ')' or p == ']' or p == '}') => ruby-blanks(s, i + 3)
+  _ => ruby-blanks(s, i + 1)
+} where n = ch(s, i + 1), p = ch(s, i - 1)
+
+# What closes a percent literal opened by this byte (0: it opens none): a bracket's closer, a line
+# end for a space, the byte itself for other punctuation.
+fn percent-delimiter(c: Int) -> Int = match c {
+  '[' => ']'
+  '(' => ')'
+  '{' => '}'
+  '<' => '>'
+  ' ' => '\n'
+  c if punctuation?(c) => c
+  _ => 0
+}
+
+# A percent literal's body: brackets in it nest (and `<…>` in a `%w<…>`); a closer that does not
+# match skips the byte after it. At its end the cursor stays on the delimiter.
+fn percent-body(s: Text, i: Int, boundary: Int, stack: [Int]) -> [Int] = match ch(s, i) {
+  _ if i >= len(s) => ruby-blanks(s, i)
+  '\\' if boundary != '\\' and ch(s, i + 1) == ' ' => [i] ++ percent-body(s, i + 2, boundary, stack)
+  '\\' if boundary != '\\' => percent-body(s, i + 2, boundary, stack)
+  c if opening?(c) or (c == '<' and boundary == '>') => percent-body(s, i + 1, boundary, pushed(stack, c))
+  c if (c == ']' or c == ')' or c == '}' or (c == '>' and boundary == '>')) and len(stack) > 0 =>
+    percent-body(s, if last(stack) == c then i + 1 else i + 2, boundary, popped(stack))
+  c if c == boundary and boundary != '\n' => [i] ++ ruby-blanks(s, i)
+  c if c == boundary => ruby-blanks(s, i)
+  _ => percent-body(s, i + 1, boundary, stack)
+}
+
+# ---------------------------------------------------------------- Vue
+
+# A `<template lang="…">` block's body, as its language has it: the first such tag with a
+# `</template>` after it, to the last `</template>`.
+fn vue(content: Text) -> Text = match template-tag(content, 0) {
+  some(t) if utf8?(content) and t.body != t.end =>
+    replace-all(content, content[t.body..t.end], processed(content[t.body..t.end], t.lang))
+  _ => content
+}
+
+record Template { lang: Text, body: Int, end: Int }
+
+fn template-tag(s: Text, i: Int) -> Template? = match index-of(s[i..len(s)], "<template lang=") {
+  none => none
+  some(k) => match template-at(s, i + k + 15) {
+    some(t) => some(t)
+    none => template-tag(s, i + k + 1)
+  }
+}
+
+# After `<template lang=`: a quote, no quotes, a quote and `>`, then a `</template>` somewhere after.
+fn template-at(s: Text, i: Int) -> Template? = match ch(s, i) {
+  q if q == '"' or q == '\'' => match span-not-of(s, i + 1, "\"'") {
+    n if (ch(s, i + 1 + n) == '"' or ch(s, i + 1 + n) == '\'') and ch(s, i + 2 + n) == '>' =>
+      match last-index-of(s[i + 3 + n..len(s)], "</template>") {
+        some(e) => some(Template(lang: s[i + 1..i + 1 + n], body: i + 3 + n, end: i + 3 + n + e))
+        none => none
+      }
+    _ => none
+  }
+  _ => none
+}
+
+# Whether bytes are UTF-8 (Rust's `std::str::from_utf8`).
+fn utf8?(s: Text) -> Bool = ascii-text?(s) or utf8-from?(s, 0)
+
+fn utf8-from?(s: Text, i: Int) -> Bool = match i {
+  _ if i >= len(s) => true
+  _ => match utf8-width(s, i) {
+    0 => false
+    n => utf8-from?(s, i + n)
+  }
+}
+
+# The length of the UTF-8 character at `i`, or 0 when the bytes there are not one: no overlong
+# forms, no surrogates, nothing past U+10FFFF.
+fn utf8-width(s: Text, i: Int) -> Int = match s[i] {
+  c if c < 128 => 1
+  c if c >= 194 and c <= 223 and cont?(s, i + 1) => 2
+  224 if within(s, i + 1, 160, 191) and cont?(s, i + 2) => 3
+  237 if within(s, i + 1, 128, 159) and cont?(s, i + 2) => 3
+  c if c >= 225 and c <= 239 and c != 237 and cont?(s, i + 1) and cont?(s, i + 2) => 3
+  240 if within(s, i + 1, 144, 191) and cont?(s, i + 2) and cont?(s, i + 3) => 4
+  244 if within(s, i + 1, 128, 143) and cont?(s, i + 2) and cont?(s, i + 3) => 4
+  c if c >= 241 and c <= 243 and cont?(s, i + 1) and cont?(s, i + 2) and cont?(s, i + 3) => 4
+  _ => 0
+}
+
+fn cont?(s: Text, i: Int) -> Bool = within(s, i, 128, 191)
+
+fn within(s: Text, i: Int, low: Int, high: Int) -> Bool = i < len(s) and s[i] >= low and s[i] <= high
