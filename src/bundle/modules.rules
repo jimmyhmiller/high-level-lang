@@ -41,10 +41,7 @@ fn request-of(key: Text) -> Request = match key {
 fn requests-in(tree: Node, required: [Text], dynamic: [Text], json-dynamic: [Text]) -> [Request] =
   [r for s in tree.body.kids if let some(r) = statement-request(s)] ++ [require-request(s) for s in required]
   ++ [import-request(s) for s in dynamic] ++ [json-request(s) for s in json-dynamic]
-fn requests-of(p: Parsed) -> [Request] = match p.analysed {
-  true => requests-in(p.tree, p.required, p.imports, p.json-imports)
-  false => requests-in(p.tree, p.requires, p.imports, p.json-imports)
-}
+fn requests-of(p: Parsed) -> [Request] = requests-in(p.tree, p.requires, p.imports, p.json-imports)
 
 # Where a module's import leads, by what it asks for.
 fn request-target(mo: Module, r: Request) -> Int? = match r.json {
@@ -133,10 +130,8 @@ setting names: rt.Names = names-new()
 # How the build loads, given before it does.
 boxed record Loading {
   defines: [Define],
-  # A spec's transform runs before scopes are analysed; it is a function value, so while there is
-  # one the analysis stays on the thread that links.
+  # A spec's transform, run on each side's tree after the rewrites and the framework's transforms.
   transform: Fn(Node)->Node,
-  has-transform: Bool,
   # A build's rewrite files (bundle.lint's `rewrite` rules), and what makes them, given a module's
   # tree, path and text (bundle.rewrites): before its spec's transform, before its scopes.
   rewrites: [Text],
@@ -145,16 +140,26 @@ boxed record Loading {
   # before the spec's transform: what a plugin's `transform` hook does, on the tree.
   transforms: [Fn(Node,Text,Text)->Node],
   aliases: [TextPair],
-  loaders: [TextPair],
   on-resolve: [Fn(Text,Text)->Text?],
   on-load: [Fn(Text)->Text?],
-  jsx-options: jsx.Options,
   # Where the output goes, for the paths the file loader writes into modules.
   out-dir: Text,
   packages-external: Bool,
   public-path: Text,
   # `--minify-syntax`: constants are written in where they are read (bundle.constants).
-  inline-constants: Bool,
+  inline-constants: Bool
+}
+
+setting loading: Loading
+
+# What reading a file needs that is the same for every side of one build (a framework's browser
+# build and server build): how its JSX is compiled, which loader reads it, and whether the build is
+# for development. Parsing a file reads only this, never `loading`, so a file is parsed and its
+# scopes analysed once however many sides build it (see `parsed-of`, and `own-analysed` for what
+# each side does after).
+boxed record Parsing {
+  jsx-options: jsx.Options,
+  loaders: [TextPair],
   # A development build: a stylesheet a module imports is a module that puts it in the page, and one
   # a `?url` names is at a URL that stays as it is edited (the page is told to load it again).
   dev: Bool,
@@ -163,7 +168,7 @@ boxed record Loading {
   url-queries: Bool
 }
 
-setting loading: Loading
+setting parsing: Parsing
 
 fn name-id(s: Text) -> Int = intern!(names, s)
 
@@ -323,28 +328,32 @@ fn dotted-name(n: Node, b: {Int:Int}) -> Text? = match n {
   _ => none
 }
 
-# Does this source mention the first name of any define? Most files do not, and they need no
-# substitution or second analysis.
-fn mentions-define?(src: Text) -> Bool = any d in loading.defines: contains-text?(src, text-before(d.key, "."))
+# The defines of a side's (`defs`) whose first name this source mentions: most files mention none,
+# and need no substitution or second analysis, on any side.
+fn mentioned-defines(src: Text, defs: [Define]) -> [Define] = match defs {
+  [] => []
+  _ => [d for d in defs if text-before(d.key, ".") in named]
+    where named = {n: true for n in [text-before(d.key, ".") for d in defs] distinct n if contains-text?(src, n)}
+}
 
 # Whether `substitute` would replace anything here: a free name, or a chain from one, that a define
 # names. A file can mention a define's name, in a comment or as a property, and use none.
-fn defines-apply?(n: Node, b: {Int:Int}) -> Bool = is-some(defined(n, b)) or (any k in n.kids: defines-apply?(k, b))
+fn defines-apply?(n: Node, b: {Int:Int}, defs: [Define]) -> Bool = is-some(defined(n, b, defs)) or (any k in n.kids: defines-apply?(k, b, defs))
 
-fn define-of(key: Text) -> Node? = last d in loading.defines if d.key == key: d.value
+fn define-of(key: Text, defs: [Define]) -> Node? = last d in defs if d.key == key: d.value
 
 # What a define replaces this node with: a free name, or a chain from one, that a define names.
-fn defined(n: Node, b: {Int:Int}) -> Node? = match n {
-  Ident(_) | Member(...) | ImportMeta() => first key in dotted-name(n, b): define-of(key)
+fn defined(n: Node, b: {Int:Int}, defs: [Define]) -> Node? = match n {
+  Ident(_) | Member(...) | ImportMeta() => first key in dotted-name(n, b): define-of(key, defs)
   _ => none
 }
 
 # Replace defined names. This needs the scope analysis, because a local with the same name is not
 # the define.
-fn substitute(n: Node, b: {Int:Int}) -> Node = match defined(n, b) {
+fn substitute(n: Node, b: {Int:Int}, defs: [Define]) -> Node = match defined(n, b, defs) {
   some(v) => v
   none if len(n.kids) == 0 => n
-  none => n with { kids: [substitute(k, b) for k in n.kids] }
+  none => n with { kids: [substitute(k, b, defs) for k in n.kids] }
 }
 
 # ---------------------------------------------------------------- loading
@@ -487,7 +496,7 @@ fn resolved-now(request: Request, importer: Text) -> res.Resolved = match hook-p
 }
 
 # The query of a specifier Vite reads (`?url`, `?raw`), when the build reads them.
-fn url-query(spec: Text) -> Text? = match loading.url-queries, spec {
+fn url-query(spec: Text) -> Text? = match parsing.url-queries, spec {
   true, _ ++ "?url" => some("url")
   true, _ ++ "?raw" => some("raw")
   _, _ => none
@@ -515,7 +524,7 @@ fn loader-of(path: Text) -> Text = match path {
   _ ++ "?raw" => "text"
   # A module of a file with a query (a framework's view of it, `x.tsx?split`) is read as its file is.
   _ if contains-text?(path, "?") => loader-of(text-before(path, "?"))
-  _ => (first l in loading.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
+  _ => (first l in parsing.loaders if ends-with(path, l.key): l.value) ?? default-loader(path)
 }
 
 fn default-loader(path: Text) -> Text = match path {
@@ -527,11 +536,21 @@ fn default-loader(path: Text) -> Text = match path {
   _ => "js"
 }
 
-# A file's text as a module, by what its loader says it is.
+# A file's text as a module, by what its loader says it is, on this side of the build: the file and
+# url loaders give where the side writes the file, and in development a stylesheet is a module that
+# puts it in the page; any other loader's module is the same on every side (`module-text`).
 fn as-module(text: Text, path: Text) -> Text = match loader-of(path) {
   "file" => "export default " ++ host.js-string(cssb.file-url(path)) ++ ";"
   "url" => "export default " ++ host.js-string(url-of(queried-file(path))) ++ ";"
+  "css" if parsing.dev => dev-style-module(path)
   _ => module-text(text, path)
+}
+
+# Whether a file's module is its side's own (see `as-module`), not one every side shares.
+fn side-module?(path: Text) -> Bool = match loader-of(path) {
+  "file" | "url" => true
+  "css" => parsing.dev
+  _ => false
 }
 
 # A load hook may supply a file's text, or the file does. A JSON module's is its file's.
@@ -541,6 +560,7 @@ fn source-of(path: Text) -> Text = match path {
 }
 
 fn file-source(path: Text) -> Text = match path {
+  "json:" ++ file => file-source(file)
   "disabled:" ++ _ => "module.exports = {};"
   _ => read-file(queried-file(path))
 }
@@ -552,7 +572,7 @@ fn url-of(file: Text) -> Text = match path-ext(file) {
   _ => cssb.file-url(file)
 }
 
-fn css-asset-name(file: Text) -> Text = path-stem(file) ++ "-" ++ host.content-hash(if loading.dev then real-path(file) else url-sheet(file).text) ++ ".css"
+fn css-asset-name(file: Text) -> Text = path-stem(file) ++ "-" ++ host.content-hash(if parsing.dev then real-path(file) else url-sheet(file).text) ++ ".css"
 
 # A stylesheet a `?url` names, bundled where it will be written.
 fn url-sheet(file: Text) -> cssb.Bundled = cssb.bundle([file], cssb.asset-directory ++ "/" ++ path-stem(file) ++ ".css", loading.inline-constants, false, "eof")
@@ -584,12 +604,7 @@ boxed record Parsed {
   pure-at: {Int:Bool},
   legal: [Text],
   specs: [Text],
-  targets: {Text:Text}, # where each specifier led, when it was resolved ahead
-  analysed: Bool,       # whether `scopes` and `analysis` hold its scope analysis already
-  scopes: sym.Table,
-  analysis: Analysis,
-  calls: [Text],        # with the analysis: what its final tree `require`s, then `import()`s
-  required: [Text],     # with the analysis: what its final tree `require`s
+  base: Base?,          # its scopes as written, which every side starts from (`with-base`)
   requires: [Text],     # what the tree as parsed `require`s, and `import()`s, when `found`
   imports: [Text],
   json-imports: [Text], # and `import()`s of JSON modules
@@ -613,36 +628,66 @@ fn no-analysis() -> Analysis =
 # A file's scopes, and the table they are in.
 boxed record Analysed { analysis: Analysis, scopes: sym.Table }
 
-# What a file declares and uses, in a table of its own. Defines are substituted and the branches
-# they decide removed, and so, when minifying, are constants (bundle.constants), then the result is
-# analysed again, so what they kill is never seen by tree shaking. A file with no module syntax is analysed inside CommonJS's (exports, module) wrapper:
-# it is CommonJS when it names `module` or `exports`, and otherwise a script, which becomes
-# CommonJS only if it is required, or its default or namespace imported, as esbuild has it; which
-# the graph knows once every file is loaded. Not when a define is about `module` or `exports`,
-# which the wrapper would hide; such a script is analysed again inside it if it names them after
-# all. A name free in any of the analyses is free.
-fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx-imports: Bool, helpers: [Text], imported: consts.Imported) -> Analysed =
-  Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: cjs,
-                              script: not esm and not cjs, wrapped: wrapped or cjs, shift: 0, defined: changed,
-                              forbidden: found-writes.forbidden, written: found-writes.written),
-           scopes: final.table)
+# What one side of a build analyses a file under, beyond the file itself: the defines of its that the
+# file mentions, whether it writes constants in (when minifying), and what the file's imports are
+# known to be (constants another module exports). A side with none of these analyses a file as
+# every side does.
+record Side { defines: [Define], inline: Bool, imported: consts.Imported }
+
+fn no-side() -> Side = Side(defines: [], inline: false, imported: consts.no-imports())
+
+fn plain-side?(sd: Side) -> Bool = len(sd.defines) == 0 and not sd.inline and len(sd.imported.names) + len(sd.imported.spaces) == 0
+
+# A tree's scopes as written: whether it is an ES module, its normal form (bundle.modules'
+# `normalized-tree`), whether it is analysed inside CommonJS's wrapper, the analysis, and whether it
+# is CommonJS. What every side's analysis of the file starts from: a file is analysed this way
+# once, whatever sides build it.
+boxed record Base { esm: Bool, tree: Node, wrapped: Bool, first: sym.Analysis, cjs: Bool }
+
+# `defines-module`: whether a define of the side's is about `module` or `exports`, which the wrapper
+# would hide (then a script is not analysed inside it).
+fn base-of(tree0: Node, src: Text, path: Text, base: Text, defines-module: Bool) -> Base =
+  Base(esm: esm, tree: tree, wrapped: wrapped, first: first, cjs: cjs)
   where esm = module-file?(tree0, src, path),
-        found-writes = writes.checked(final-tree, tree0.body.kids, final.bindings, esm),
         tree = normalized-tree(tree0, base),
-        wrapped = wrapper-wanted?(esm),
+        wrapped = not esm and not defines-module,
         first = sc.analysis(tree, [x for x in ["exports", "module"] if wrapped]),
         # Whether it names `module` or `exports` without declaring them.
         cjs = commonjs-extension?(path) or (match wrapped {
           true => wrapper-names-module?(first)
           false => not esm and ("module" in first.free or "exports" in first.free)
-        }),
-        defined = mentions-define?(src) and defines-apply?(tree, first.bindings),
+        })
+
+fn defines-module?(defs: [Define]) -> Bool = any d in defs: text-before(d.key, ".") in ["module", "exports"]
+
+# What a file declares and uses, in a table of its own, on one side. Defines are substituted and the
+# branches they decide removed, and so, when minifying, are constants (bundle.constants), then the
+# result is analysed again, so what they kill is never seen by tree shaking. A file with no module
+# syntax is analysed inside CommonJS's (exports, module) wrapper: it is CommonJS when it names
+# `module` or `exports`, and otherwise a script, which becomes CommonJS only if it is required, or
+# its default or namespace imported, as esbuild has it; which the graph knows once every file is
+# loaded. Not when a define is about `module` or `exports`, which the wrapper would hide; such a
+# script is analysed again inside it if it names them after all. A name free in any of the
+# analyses is free.
+fn analysis-of(tree0: Node, src: Text, path: Text, base: Text, helpers: [Text], sd: Side) -> Analysed =
+  sided(base-of(tree0, src, path, base, defines-module?(sd.defines)), tree0, src, path, helpers, sd)
+
+# The same from a base already made (`base-of`): its scopes are used again, and analysed again only
+# when what the side does changed the tree.
+fn sided(b: Base, tree0: Node, src: Text, path: Text, helpers: [Text], sd: Side) -> Analysed =
+  Analysed(analysis: Analysis(tree: final-tree, root: final.root, bindings: final.bindings, free: real-free, cjs: b.cjs,
+                              script: not b.esm and not b.cjs, wrapped: b.wrapped or b.cjs, shift: 0, defined: changed,
+                              forbidden: found-writes.forbidden, written: found-writes.written),
+           scopes: final.table)
+  where found-writes = writes.checked(final-tree, tree0.body.kids, final.bindings, b.esm),
+        first = b.first,
+        defined = len(sd.defines) > 0 and defines-apply?(b.tree, first.bindings, sd.defines),
         defined-tree = match defined {
-          true => dce.run(substitute(tree, first.bindings))
-          false => tree
+          true => dce.run(substitute(b.tree, first.bindings, sd.defines))
+          false => b.tree
         },
-        constant-tree = match loading.inline-constants {
-          true => consts.inlined(defined-tree, tree0.body.kids, first.bindings, dynamic?(first.table), imported)
+        constant-tree = match sd.inline {
+          true => consts.inlined(defined-tree, tree0.body.kids, first.bindings, dynamic?(first.table), sd.imported)
           false => none
         },
         final-tree = (first c in constant-tree: c.tree) ?? defined-tree,
@@ -650,12 +695,12 @@ fn analysis-of(tree0: Node, parsed: Node, src: Text, path: Text, base: Text, jsx
         changed = defined or (any c in constant-tree: c.decided),
         # Constants written in remove reads and declare nothing: the bindings of what is left stand.
         # But an import whose every read became its value is not used: the file is analysed again.
-        final = match defined or (cjs and not wrapped) or (is-some(constant-tree) and len(imported.names) + len(imported.spaces) > 0) {
-          true => sc.analysis(final-tree, [x for x in ["exports", "module"] if wrapped or cjs])
+        final = match defined or (b.cjs and not b.wrapped) or (is-some(constant-tree) and len(sd.imported.names) + len(sd.imported.spaces) > 0) {
+          true => sc.analysis(final-tree, [x for x in ["exports", "module"] if b.wrapped or b.cjs])
           false => first
         },
         real-free = [f for f in first.free ++ [f for f in final.free if not (f in first.free)]
-                     if not ((cjs and (f == "exports" or f == "module")) or f in helpers)]
+                     if not ((b.cjs and (f == "exports" or f == "module")) or f in helpers)]
 
 # Whether a file has `with` or a direct `eval`, where a name may mean something else.
 fn dynamic?(t: sym.Table) -> Bool = any i in 0..sym.scope-count(t): sym.scope-at(t, i).dynamic
@@ -677,10 +722,6 @@ everywhere fn reads-import-meta?(n: Node) -> Bool = match n { ImportMeta() => tr
 # A `.mjs` file is an ES module and a `.cjs` file CommonJS, whatever they hold, as esbuild has them.
 fn module-extension?(path: Text) -> Bool = ends-with(path, ".mjs") or ends-with(path, ".mts")
 fn commonjs-extension?(path: Text) -> Bool = ends-with(path, ".cjs") or ends-with(path, ".cts")
-
-# A file with no module syntax is analysed inside CommonJS's wrapper, unless a define is about
-# `module` or `exports`, which the wrapper would hide.
-fn wrapper-wanted?(esm: Bool) -> Bool = not esm and not (any d in loading.defines: text-before(d.key, ".") in ["module", "exports"])
 
 # Whether code in CommonJS's wrapper reads `module` or `exports`.
 fn wrapper-names-module?(w: sym.Analysis) -> Bool =
@@ -714,7 +755,6 @@ fn module-text(text: Text, path: Text) -> Text = match loader-of(path) {
   "text" => "export default " ++ host.js-string(text) ++ ";"
   "base64" => "export default \"" ++ host.base64(text) ++ "\";"
   "dataurl" => "export default \"" ++ host.data-url-of(text, host.mime-of(path)) ++ "\";"
-  "css" if loading.dev => dev-style-module(path)
   "empty" | "css" => ""
   "file" | "url" => panic "{}: the {} loader's text is made by the linking stage", path, loader-of(path)
   other => panic "{}: no loader named {}", path, other
@@ -748,12 +788,12 @@ fn parsed-file(item: Pending) -> Parsed = parsed-with(item.path, src, checked.tr
 fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Checked?) -> Parsed =
   Parsed(path: path, src: src, parsed: parsed, tree: typed.tree, pure-calls: pure-calls,
          helpers: typed.helpers, jsx-imports: lowered.imports, pure-at: pure-annotations(src),
-         legal: legal.of-file(src, parsed), specs: specs, targets: {}, requires: found.requires, imports: found.imports,
+         legal: legal.of-file(src, parsed), specs: specs, requires: found.requires, imports: found.imports,
          json-imports: found.json-imports, found: is-none(known),
-         analysed: false, scopes: sym.table-new(), analysis: no-analysis(), calls: [], required: [])
+         base: none)
   where loader = loader-of(path),
         config = tsc.for-file(path),
-        file-jsx = configured-jsx(loading.jsx-options, config),
+        file-jsx = configured-jsx(parsing.jsx-options, config),
         lowered = match loader {
           "jsx" | "tsx" => commonjs-runtime(jsx.lower(parsed, src, path, file-jsx), parsed, src)
           _ => jsx.Lowered(tree: parsed, pure-calls: {}, imports: false)
@@ -774,68 +814,54 @@ fn parsed-with(path: Text, src: Text, parsed: Node, known: [Text]?, checked: Che
         },
         specs = known ?? (imported-specs(typed.tree) ++ found.requires ++ found.imports ++ found.json-imports)
 
-# The same, with scopes analysed too, in a table of the file's own. Not while a spec's transform
-# has to see the tree first.
-fn analysed-file(p: Parsed) -> Parsed = match loading.has-transform {
-  true => p
-  false => p with { analysed: true, scopes: a.scopes, analysis: a.analysis, calls: calls, required: found.requires, imports: found.imports,
-                    json-imports: found.json-imports, specs: specs }
-    where a = analysis-of(p.tree, p.parsed, p.src, p.path, base-name(p.path), p.jsx-imports, p.helpers, consts.no-imports()),
-          # The calls are the parsed tree's unless a define changed it, and those were found already.
-          found = match p.found and not a.analysis.defined {
-            true => Checked(tree: p.tree, requires: p.requires, imports: p.imports, json-imports: p.json-imports)
-            false => loads-of(a.analysis.tree)
-          },
-          calls = found.requires ++ found.imports ++ found.json-imports,
-          # Once defines have removed code, what it loads is what is left: `require`s a define
-          # removed, as of a development build, are not read ahead.
-          specs = match a.analysis.defined {
-            true => imported-specs(p.tree) ++ calls
-            false => p.specs
-          }
+# A file's scopes as written (`base-of`): what every side's analysis starts from. The analysis of a
+# side that changes nothing is made from it when a side asks (`plain-analysed`).
+fn with-base(p: Parsed) -> Parsed = p with { base: some(base-of(p.tree, p.src, p.path, base-name(p.path), false)) }
+
+# The analysis of a file no side's steps change: made once from its base, whatever sides ask.
+fn plain-analysed(path: Text) -> Analysed = plain-of(parsed-of(path))
+
+fn plain-of(p: Parsed) -> Analysed = match p.base {
+  some(b) => sided(b, p.tree, p.src, p.path, p.helpers, no-side())
+  none => panic "{}: parsed without its scopes", p.path
 }
 
 fn imported-specs(tree: Node) -> [Text] = [spec for s in tree.body.kids if let some(spec) = import-spec-of(s)]
 
-# A file parsed: its text parsed and analysed and its imports resolved.
-fn parsed-of(path: Text) -> Parsed =
-  targets-of(analysed-file(parsed-file(Pending(path: path, text: as-module(source-of(path), path), ready: true))))
+# A file parsed as every side of the build reads it: its own text, parsed, checked, its JSX and
+# TypeScript lowered, and its scopes analysed as written (`with-base`). It reads `parsing`,
+# never `loading`: a load hook's text, transforms, defines, constants and where imports lead are each
+# side's (`side-parsed`, `own-analysed`, `loaded`), so however many sides build the file, it is
+# parsed and analysed once.
+fn parsed-of(path: Text) -> Parsed = with-base(parsed-file(Pending(path: path, text: module-text(file-source(path), path), ready: true)))
 
-# Where each of a file's imports leads, by what it asks for.
-fn targets-of(p: Parsed) -> Parsed =
-  p with { targets: {request-key(requests[i]): t for i in 0..len(requests) if let some(t) = found[i]} }
-  where requests = requests-of(p),
-        found = [target-of(r, p.path) for r in requests]
+# A text a side gives for a path (a load hook's, or the module the side makes of a file), parsed and
+# analysed as a file of its own.
+fn parsed-text(path: Text, text: Text) -> Parsed = with-base(parsed-file(Pending(path: path, text: text, ready: true)))
 
-# The files a file's imports lead to: what loading follows from the entries.
-# What loading ahead follows from a file: where its specifiers led as it was parsed; or, when the
-# build transforms modules, where its imports lead once transformed, as the graph will follow them.
-# A transform may take an import away, and loading what it named could fail (a server-only
-# package in the browser's build).
-fn led-ahead(path: Text) -> [Text] = match loading.transforms {
-  [] => values-of(loaded(path).parsed.targets)
-  _ => [k for k in led-to(path) if not external?(k)]
+# A file parsed, as this side reads it: what a load hook gives, or the side's own module of it
+# (`side-module?`), parsed apart; any other file as every side reads it.
+fn side-parsed(path: Text) -> Parsed = match hooked(path) {
+  some(text) => parsed-text(path, as-module(text, path))
+  none if side-module?(path) => parsed-text(path, as-module(file-source(path), path))
+  none => parsed-of(path)
 }
+
+# What a load hook gives for a path, if one does. A JSON module's is its file's.
+fn hooked(path: Text) -> Text? = match path {
+  "json:" ++ file => hooked(file)
+  _ => first hook in loading.on-load: hook(path)
+}
+
+# The files a file's imports lead to: what loading follows from the entries, on this side: where
+# its imports lead once its side's transforms and defines are done, as the graph will follow them.
+# A transform may take an import away, and loading what it named could fail (a server-only package
+# in the browser's build).
+fn led-ahead(path: Text) -> [Text] = [k for k in led-to(path) if not external?(k)]
 
 fn wrapper-used?(t: sym.Table, wrapper: Int, name: Text) -> Bool = any s in sym.scope-at(t, wrapper).names[name]: sym.symbol-at(t, s).uses > 0
 
 fn values-of(m: {Text:Text}) -> [Text] = [m[k] ?? k for k in keys(m)]
-
-# Where the search finds it. A relative alias is relative to where the build runs.
-fn searched(request: Request, wanted: Text, importer: Text) -> Text? =
-  first r in res.resolve-opt-kind(wanted, match wanted != request.spec and res.relative?(wanted) {
-    true => "alias"
-    false => importer
-  }, request.kind): r.path
-
-# Where an import would lead, or nothing if it leads nowhere or stays outside the bundle.
-fn target-of(request: Request, importer: Text) -> Text? = match request.spec {
-  _ if stays-external?(request.spec, importer) => none
-  _ => match hook-path(wanted, importer) ?? configured-path(wanted, importer) ?? searched(request, wanted, importer) {
-    some(path) => some(module-key(request, path))
-    none => none
-  } where spec = request.spec, wanted = aliased(spec)
-}
 
 # Every file the entries can reach, loaded before the graph is made; how many.
 fn parsed-ahead(paths: [Text]) -> Int = reach([real-path(p) for p in paths distinct real-path(p)], led-ahead)
@@ -901,16 +927,17 @@ fn loaded(path: Text) -> Loaded =
   where own = own-analysed(path),
         p = own.parsed,
         tree0 = own.tree0,
-        # What its imports are known to be, written in: the file analysed again with them.
+        # What its imports are known to be, written in: the side's steps again, with them.
         imported = imported-constants(path, own),
         crossed = len(imported.names) + len(imported.spaces) > 0,
         a = match crossed {
-          true => analysis-of(tree0, p.parsed, p.src, path, base-name(path), p.jsx-imports, p.helpers, imported)
+          true => side-analysed(p, tree0, path, own.side with { imported: imported })
           false => own.analysed
         },
-        # Imports in source order, then what it loads at run time. Statements `define` removed import nothing.
-        found = match p.analysed and not crossed {
-          true => Checked(tree: p.tree, requires: p.required, imports: p.imports, json-imports: p.json-imports)
+        # Imports in source order, then what it loads at run time: what the parse found, unless the
+        # side's steps changed the tree (statements a define removed import nothing).
+        found = match p.found and tree0 == p.tree and not a.analysis.defined {
+          true => Checked(tree: p.tree, requires: p.requires, imports: p.imports, json-imports: p.json-imports)
           false => loads-of(a.analysis.tree)
         },
         calls = found.requires ++ found.imports ++ found.json-imports,
@@ -918,22 +945,29 @@ fn loaded(path: Text) -> Loaded =
         specs = [spec for s in tree0.body.kids if let some(spec) = import-spec-of(s)] ++ calls,
         requests = requests-in(tree0, required, found.imports, found.json-imports)
 
-# A file analysed by itself: its tree as the build's transforms leave it, and its scopes, with what
-# its own defines and constants decided, before what its imports are is known. What another file
-# imports of it is read from this (`exports-of`), so no file's analysis waits on its own.
-boxed record Own { parsed: Parsed, tree0: Node, analysed: Analysed }
+# A file as this side has it, before what its imports are known to be: its parse (every side's, or
+# one of the side's own, `side-parsed`), its tree as the side's transforms leave it, what the side
+# analyses it under (`Side`), and its analysis. What another file imports of it is read from this
+# (`exports-of`), so no file's analysis waits on its own.
+boxed record Own { parsed: Parsed, tree0: Node, side: Side, analysed: Analysed }
 
-fn own-analysed(path: Text) -> Own = Own(parsed: p, tree0: tree0, analysed: a)
-  where p = parsed-of(path),
-        # A spec's transform sees the tree before its scopes are analysed (see `analysed-file`).
-        tree0 = match p.analysed {
-          true => p.tree
-          false => transformed(p.tree, path, p.src)
-        },
-        a = match p.analysed {
-          true => Analysed(analysis: p.analysis, scopes: p.scopes)
-          false => analysis-of(tree0, p.parsed, p.src, path, base-name(path), p.jsx-imports, p.helpers, consts.no-imports())
-        }
+fn own-analysed(path: Text) -> Own = Own(parsed: p, tree0: tree0, side: sd, analysed: side-analysed(p, tree0, path, sd))
+  where p = side-parsed(path),
+        # A spec's transform sees the tree before its scopes are analysed again.
+        tree0 = transformed(p.tree, path, p.src),
+        sd = Side(defines: mentioned-defines(p.src, loading.defines), inline: loading.inline-constants, imported: consts.no-imports())
+
+# One side's analysis of a file: the one every side shares, when the side's transforms left the tree
+# as it was and nothing else the side does applies; the side's steps on the shared scopes, when only
+# its defines or constants do; and when a transform changed the tree, that tree analysed afresh.
+fn side-analysed(p: Parsed, tree0: Node, path: Text, sd: Side) -> Analysed = match p.base {
+  some(b) if tree0 == p.tree and not defines-module?(sd.defines) => match plain-side?(sd) {
+    true if is-none(hooked(path)) and not side-module?(path) => plain-analysed(path)
+    true => plain-of(p)
+    false => sided(b, tree0, p.src, path, p.helpers, sd)
+  }
+  _ => analysis-of(tree0, p.src, path, base-name(path), p.helpers, sd)
+}
 
 # ---------------------------------------------------------------- constants across modules
 
