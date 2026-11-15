@@ -17,6 +17,7 @@ use tailwind.utilities as ut
 use tailwind.variants as vr
 use tailwind.property-order as po
 use vite.stylesheets as sheets
+use tailwind.output as out
 
 # Tailwind's `Features`: what a stylesheet uses, as bits.
 const at-apply: Int = 1
@@ -211,13 +212,15 @@ record Found {
   custom-variants: [ast.Css],
   # A `@theme` was found, so the first is the theme's rule.
   themed: Bool,
+  # The theme's `@keyframes`, in order.
+  keyframes: [ast.Css],
   features: Int
 }
 
 record Source { base: Text, pattern: Text, negated: Bool }
 
 fn nothing-found() -> Found = Found(theme: th.empty(), sources: [], inline: [], ignored: [], root: "", root-base: "", utilities: false,
-  custom-utilities: [], custom-variants: [], themed: false, features: 0)
+  custom-utilities: [], custom-variants: [], themed: false, keyframes: [], features: 0)
 
 # The tree with the directives read out of it, and what they said.
 record Read { nodes: [ast.Css], found: Found }
@@ -258,8 +261,9 @@ fn directive(n: ast.Css, c: {Text:Text}, top: Bool, f: Found) -> Read = match n.
   "@custom-variant" => custom-variant(n, top, f)
   "@theme" => match theme-read(n, c, f) {
     t => match f.themed {
-      false => Read(nodes: [ast.context({"theme-rule": "true"}, [])], found: f with { theme: t, themed: true, features: bit-or(f.features, at-theme) })
-      true => dropped(f with { theme: t, features: bit-or(f.features, at-theme) })
+      false => Read(nodes: [ast.context({"theme-rule": "true"}, [])],
+                    found: f with { theme: t, themed: true, keyframes: f.keyframes ++ theme-keyframes([n]), features: bit-or(f.features, at-theme) })
+      true => dropped(f with { theme: t, keyframes: f.keyframes ++ theme-keyframes([n]), features: bit-or(f.features, at-theme) })
     }
   }
   "@plugin" | "@config" => fail-build("`" ++ n.head ++ " " ++ n.params ++ "`: Tailwind's JavaScript plugins and configuration files are not implemented")
@@ -965,7 +969,7 @@ fn theme-fill(n: ast.Css, t: th.Theme) -> ast.Css = match n.kind {
 # The theme's `@keyframes`, at the end, each hoisted to the root.
 fn keyframe-roots(nodes: [ast.Css], f: Found) -> [ast.Css] = match f.themed {
   false => []
-  true => [ast.context({"theme": "true"}, [ast.at-root([k])]) for k in theme-keyframes(nodes)]
+  true => [ast.context({"theme": "true"}, [ast.at-root([k])]) for k in f.keyframes]
 }
 
 fn without-utility-rules(nodes: [ast.Css]) -> [ast.Css] = [y for n in nodes for y in without-utility(n)]
@@ -992,3 +996,30 @@ fn scan-sources(c: Compiler, project-root: Text) -> [Source] = (match c.found.ro
   "" => [Source(base: project-root, pattern: "**/*", negated: false)]
   pattern => [Source(base: c.found.root-base, pattern: pattern, negated: false)]
 }) ++ c.found.sources
+
+# ---------------------------------------------------------------- building
+
+# Tailwind's `compiler.build(candidates)`: the stylesheet with the candidates' utilities where
+# `@tailwind utilities` was, written as Tailwind writes it, after its license comment. A candidate
+# that is a variable (`--x`) marks that theme variable used.
+fn build(c: Compiler, candidates: [Text], version: Text) -> Text = match c.features {
+  0 => c.input
+  _ => ast.css([ast.comment("! tailwindcss v" ++ version ++ " | MIT License | https://tailwindcss.com ")]
+               ++ out.optimized(filled-utilities(c.nodes, [m.node for m in compiled-candidates(utility-candidates(c, candidates), c.ds, true)]),
+                                c.ds.theme, [x for x in candidates if starts-with(x, "--") and not (x in c.ds.invalid)]))
+}
+
+# The candidates compiled: `@source inline(…)`'s first, then the scanned ones, each once, the
+# disabled ones and variables left out.
+fn utility-candidates(c: Compiler, candidates: [Text]) -> [Text] = match c.found.utilities {
+  false => []
+  true => [x for x in c.found.inline ++ candidates if not (x in c.ds.invalid) and not starts-with(x, "--") distinct x]
+}
+
+fn filled-utilities(nodes: [ast.Css], made: [ast.Css]) -> [ast.Css] = [filled-one(n, made) for n in nodes]
+
+fn filled-one(n: ast.Css, made: [ast.Css]) -> ast.Css = match n.kind {
+  ast.Context if "utilities" in n.context => n with { nodes: made }
+  ast.Decl | ast.Comment => n
+  _ => n with { nodes: filled-utilities(n.nodes, made) }
+}

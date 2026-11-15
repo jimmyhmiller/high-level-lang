@@ -1,0 +1,586 @@
+# What Tailwind's compiler writes (tailwindcss/src/ast.ts `optimizeAst` and `handleNesting`, v4.3.5):
+# contexts flattened and `@reference` imports gone; the theme's variables only where something uses
+# them (a utility, the stylesheet, a candidate naming one, another used variable), its keyframes only
+# when an animation names them; each `@property` once, with a fallback for browsers without it in
+# `@layer properties`; a `color-mix()` of theme colors given a fallback for browsers without it; and
+# nesting the output does not need undone: a rule with declarations stays whole, a rule of rules and
+# at-rules becomes the rules it nests, under the at-rules around them, joined with the rule before
+# when they say the same.
+rules tailwind.output
+use tailwind.ast as ast
+use tailwind.theme as th
+use tailwind.text as tx
+use tailwind.values as vp
+use tailwind.selectors as sel
+use tailwind.utilities as ut
+
+# ---------------------------------------------------------------- what is used
+
+# What the whole tree says before anything is dropped: the variables declarations outside the theme
+# read, each theme variable's own reads, and the keyframes animations name.
+record Uses { reads: {Text:Bool}, depends: {Text:[Text]}, keyframes: {Text:Bool} }
+
+fn uses-of(nodes: [ast.Css]) -> Uses = Uses(reads: {v: true for x in visits for v in x.reads},
+                                              depends: {d: [x.property for x in visits if d in x.theme-reads] for x in visits for d in x.theme-reads distinct d},
+                                              keyframes: {k: true for x in visits for k in x.animations})
+  where visits = visited(nodes, {}, 0)
+
+record Visit { property: Text, reads: [Text], theme-reads: [Text], animations: [Text] }
+
+fn visited(nodes: [ast.Css], c: {Text:Text}, depth: Int) -> [Visit] = [v for n in nodes for v in visit-one(n, c, depth)]
+
+fn visit-one(n: ast.Css, c: {Text:Text}, depth: Int) -> [Visit] = match n.kind {
+  ast.Decl if n.head == "--tw-sort" or is-none(n.value) => []
+  ast.Decl if "theme" in c and starts-with(n.head, "--") and valued?(n, "initial") => []
+  ast.Decl => [Visit(property: n.head,
+                     reads: if theme-var?(n, c) then [] else vp.used-variables(v),
+                     theme-reads: if theme-var?(n, c) then vp.used-variables(v) else [],
+                     animations: if n.head == "animation" then keyframe-names(v) else [])] where v = n.value ?? ""
+  ast.Context if "reference" in n.context => []
+  ast.Context => visited(n.nodes, c ++ n.context, depth)
+  ast.AtRule if n.head == "@keyframes" => visited(n.nodes, c ++ {"keyframes": "true"}, depth + 1)
+  ast.AtRule | ast.StyleRule => visited(n.nodes, c, depth + 1)
+  ast.AtRoot => visited(n.nodes, c, 0)
+  ast.Comment => []
+}
+
+fn theme-var?(n: ast.Css, c: {Text:Text}) -> Bool = "theme" in c and starts-with(n.head, "--")
+
+fn keyframe-names(value: Text) -> [Text] = [p for p in split-any(value, " \t\n\r,") ]
+
+# `value.split(/[\s,]+/)`: empty pieces at the ends kept, as JavaScript's split keeps them.
+fn split-any(value: Text, seps: Text) -> [Text] = pieces(value, seps, 0, 0)
+
+fn pieces(s: Text, seps: Text, start: Int, i: Int) -> [Text] = match i {
+  _ if i >= len(s) => [s[start..len(s)]]
+  _ if has-byte?(seps, s[i]) => [s[start..i]] ++ pieces(s, seps, i + span-of(s, i, seps), i + span-of(s, i, seps))
+  _ => pieces(s, seps, start, i + 1)
+}
+
+# Tailwind's `isVariableUsed`: static, used by name, or read by a used variable (a cycle counts).
+fn used?(variable: Text, t: th.Theme, u: Uses, marked: {Text:Bool}, seen: [Text]) -> Bool = match variable in seen {
+  true => true
+  false => match th.options-of(t, variable) {
+    some(e) if e.static => true
+    _ if marked[tx.unescape(th.unprefix-key(t, variable))] ?? false => true
+    _ => any d in u.depends[variable] ?? []: used?(d, t, u, marked, seen ++ [variable])
+  }
+}
+
+# The theme variables marked used: those read outside the theme and the candidates that are
+# variables, as the theme knows them.
+fn marked-of(u: Uses, t: th.Theme, candidates: [Text]) -> {Text:Bool} =
+  {k: true for v in keys(u.reads) ++ candidates for k in [tx.unescape(th.unprefix-key(t, v))] if th.has?(t, k)}
+
+# ---------------------------------------------------------------- optimizing
+
+record Opt { theme: th.Theme, uses: Uses, marked: {Text:Bool} }
+
+# What one node becomes: nodes in its parent's place, nodes hoisted to the root, and the `@property`
+# fallbacks. `poisoned`: a rule emptied by dropping its theme variables, which Tailwind removes with
+# every at-rule around it up to a rule or the root; `emptied` is what is left where a rule stops it.
+record Out { nodes: [ast.Css], roots: [ast.Css], poisoned: Bool, emptied: [ast.Css], root-props: [ast.Css],
+             universal-props: [ast.Css], seen-props: [Text] }
+
+fn nothing() -> Out = Out(nodes: [], roots: [], poisoned: false, emptied: [], root-props: [], universal-props: [], seen-props: [])
+fn just(nodes: [ast.Css]) -> Out = nothing() with { nodes: nodes }
+
+# The children in order, each seeing the `@property` rules kept before it.
+fn transformed(nodes: [ast.Css], c: {Text:Text}, depth: Int, o: Opt, seen: [Text]) -> [Out] {
+  let outs: [Out] = fold acc = [] for n in nodes: acc ++ [transform(n, c, depth, o, seen ++ [p for a in acc for p in a.seen-props])]
+  outs
+}
+
+# What a list of children's outputs gives their parent: in a rule, an emptied child's remains; in
+# an at-rule or the root, nothing of it, and the parent poisoned.
+fn merged(outs: [Out], in-rule: Bool) -> Out = Out(
+  nodes: [n for o in outs for n in (if o.poisoned and in-rule then o.emptied else o.nodes)],
+  roots: [n for o in outs for n in o.roots], poisoned: not in-rule and (any o in outs: o.poisoned), emptied: [],
+  root-props: [n for o in outs for n in o.root-props], universal-props: [n for o in outs for n in o.universal-props],
+  seen-props: [p for o in outs for p in o.seen-props])
+
+fn transform(n: ast.Css, c: {Text:Text}, depth: Int, o: Opt, seen: [Text]) -> Out = match n.kind {
+  ast.Decl if n.head == "--tw-sort" or is-none(n.value) => nothing()
+  ast.Decl if theme-var?(n, c) and valued?(n, "initial") => nothing()
+  ast.Decl if pruned?(n, c, o) => nothing()
+  ast.Decl if not ("supportsColorMix" in c) and not ("keyframes" in c) and contains-text?(n.value ?? "", "color-mix(") =>
+    just(color-mixed(n, o.theme))
+  ast.Decl | ast.Comment => just([n])
+  ast.StyleRule => match merged(transformed(n.nodes, c, depth + 1, o, seen), true) {
+    inner if len(inner.nodes) == 0 and any x in n.nodes: pruned?(x, c, o) => inner with { poisoned: true, emptied: [n with { nodes: [] }] }
+    inner if len(inner.nodes) > 0 => inner with { nodes: [n with { nodes: inner.nodes }] }
+    inner => inner
+  }
+  ast.AtRule if n.head == "@property" and depth == 0 => match n.params in seen {
+    true => nothing()
+    false => match merged(transformed(n.nodes, c, depth + 1, o, seen), false) {
+      inner => inner with { nodes: [n with { nodes: inner.nodes }], seen-props: inner.seen-props ++ [n.params],
+                            root-props: inner.root-props ++ (if inherits?(n) then [property-fallback(n)] else []),
+                            universal-props: inner.universal-props ++ (if inherits?(n) then [] else [property-fallback(n)]) }
+    }
+  }
+  ast.AtRule => match merged(transformed(n.nodes, at-context(n, c), depth + 1, o, seen), false) {
+    inner if inner.poisoned => inner with { nodes: [], emptied: [n with { nodes: inner.nodes }] }
+    inner if len(inner.nodes) > 0 or n.head in ["@layer", "@charset", "@custom-media", "@namespace", "@import", "@apply"] =>
+      inner with { nodes: [n with { nodes: inner.nodes }] }
+    inner => inner
+  }
+  ast.AtRoot => match merged([transform(x, c, 0, o, seen) for x in n.nodes], false) {
+    inner => inner with { nodes: [], roots: inner.roots ++ inner.nodes, poisoned: false }
+  }
+  ast.Context if "reference" in n.context => nothing()
+  ast.Context if "source" in n.context => match merged(transformed(n.nodes, c ++ n.context, depth, o, seen), false) {
+    inner if len(inner.nodes) > 0 => inner with { nodes: [n with { nodes: inner.nodes }] }
+    inner => inner
+  }
+  ast.Context => match transformed(n.nodes, c ++ n.context, depth, o, seen) {
+    outs => passed(outs)
+  }
+}
+
+# A context is not there once flattened: what its children give, it gives, poison and all.
+fn passed(outs: [Out]) -> Out = match merged(outs, false) {
+  m => m with { emptied: [e for x in outs for e in (if x.poisoned then x.emptied else x.nodes)] }
+}
+
+# A theme variable nothing uses, which Tailwind drops after the fact.
+fn pruned?(n: ast.Css, c: {Text:Text}, o: Opt) -> Bool = n.kind == ast.Decl and theme-var?(n, c) and not ("keyframes" in c)
+  and n.head != "--tw-sort" and is-some(n.value) and not valued?(n, "initial") and not used?(n.head, o.theme, o.uses, o.marked, [])
+
+fn at-context(n: ast.Css, c: {Text:Text}) -> {Text:Text} = match n.head {
+  "@keyframes" => c ++ {"keyframes": "true"}
+  "@supports" if contains-text?(n.params, "color-mix(") => c ++ {"supportsColorMix": "true"}
+  _ => c
+}
+
+fn inherits?(n: ast.Css) -> Bool = any x in n.nodes: x.kind == ast.Decl and x.head == "inherits" and valued?(x, "true")
+
+fn property-fallback(n: ast.Css) -> ast.Css = ast.decl(n.params, initial-of(n))
+
+fn initial-of(n: ast.Css) -> Text = match [x for x in n.nodes if x.kind == ast.Decl and x.head == "initial-value"] {
+  [] => "initial"
+  xs => last(xs).value ?? "initial"
+}
+
+# Tailwind's color-mix polyfill: theme colors inlined, in sRGB, with the original after it under
+# `@supports (color: color-mix(in lab, red, red))`.
+fn color-mixed(n: ast.Css, t: th.Theme) -> [ast.Css] = match mixed-values(vp.parse(n.value ?? ""), t, false) {
+  m if not m.polyfill => [n]
+  m => [n with { value: some(vp.css(m.nodes)) }, ast.rule("@supports (color: color-mix(in lab, red, red))", [n])]
+}
+
+# The walk over a declaration's value, in order: `polyfill` is Tailwind's one flag for the whole
+# declaration, set by the first color-mix that inlines a variable and seen by every one after it.
+record Mixed { nodes: [vp.Value], polyfill: Bool }
+
+fn mixed-values(nodes: [vp.Value], t: th.Theme, polyfill: Bool) -> Mixed =
+  fold m = Mixed(nodes: [], polyfill: polyfill) for x in nodes: match mixed-one(x, t, m.polyfill) {
+    one => Mixed(nodes: m.nodes ++ one.nodes, polyfill: one.polyfill)
+  }
+
+fn mixed-one(x: vp.Value, t: th.Theme, polyfill: Bool) -> Mixed = match x.kind {
+  vp.Function if x.value == "color-mix" => color-mix-polyfill(uncommented(x), t, polyfill)
+  vp.Function => match mixed-values(x.nodes, t, polyfill) {
+    inner => Mixed(nodes: [x with { nodes: inner.nodes }], polyfill: inner.polyfill)
+  }
+  _ => Mixed(nodes: [x], polyfill: polyfill)
+}
+
+# One `color-mix(in …)`: its variables inlined; one that cannot be (or `currentcolor`) makes the
+# fallback its first color; with the flag set, it mixes in sRGB. Then what it holds (or what
+# replaced it), as Tailwind's walk goes on into it.
+fn color-mix-polyfill(f: vp.Value, t: th.Theme, polyfill: Bool) -> Mixed = match interpolated?(f) {
+  false => match mixed-values(f.nodes, t, polyfill) {
+    inner => Mixed(nodes: [f with { nodes: inner.nodes }], polyfill: inner.polyfill)
+  }
+  true => match inlined-all(f.nodes, t) {
+    r if r.unresolvable or r.current => match first i in 0..len(r.nodes) if r.nodes[i].kind == vp.Separator and contains-text?(tx.js-trim(r.nodes[i].value), ","): i {
+      some(at) if at + 1 < len(r.nodes) => mixed-one(r.nodes[at + 1], t, polyfill or r.polyfill)
+      _ => match mixed-values(r.nodes, t, polyfill or r.polyfill) {
+        inner => Mixed(nodes: [f with { nodes: inner.nodes }], polyfill: inner.polyfill)
+      }
+    }
+    r => match mixed-values(if polyfill or r.polyfill then srgb-of(r.nodes) else r.nodes, t, polyfill or r.polyfill) {
+      inner => Mixed(nodes: [f with { nodes: inner.nodes }], polyfill: inner.polyfill)
+    }
+  }
+}
+
+fn uncommented(f: vp.Value) -> vp.Value = match contains-text?(vp.css(f.nodes), "/*") {
+  true => f with { nodes: vp.parse(without-comments(vp.css(f.nodes))) }
+  false => f
+}
+
+fn without-comments(s: Text) -> Text = match index-of(s, "/*") {
+  none => s
+  some(at) => match index-of(s[at + 2..len(s)], "*/") {
+    some(end) => s[0..at] ++ " " ++ without-comments(s[at + 2 + end + 2..len(s)])
+    none => s
+  }
+}
+
+# `/^in\s/i` on the arguments.
+fn interpolated?(f: vp.Value) -> Bool = match ascii-lower(tx.js-trim-start(vp.css(f.nodes))) {
+  "in" ++ rest => rest != "" and has-byte?(" \t\n\r" ++ byte-text(11) ++ byte-text(12), rest[0])
+  _ => false
+}
+
+record Inlining { nodes: [vp.Value], polyfill: Bool, unresolvable: Bool, current: Bool }
+
+fn no-inlining(nodes: [vp.Value]) -> Inlining = Inlining(nodes: nodes, polyfill: false, unresolvable: false, current: false)
+
+fn inlined-all(nodes: [vp.Value], t: th.Theme) -> Inlining = match [inlined(a, t) for a in nodes] {
+  parts => Inlining(nodes: [x for p in parts for x in p.nodes], polyfill: any p in parts: p.polyfill,
+                    unresolvable: any p in parts: p.unresolvable, current: any p in parts: p.current)
+}
+
+# A color-mix argument with its theme variables inlined (a `var(…)` followed through the theme to a
+# color); one that cannot be is walked into, as Tailwind's walk does.
+fn inlined(a: vp.Value, t: th.Theme) -> Inlining = match a.kind {
+  vp.Word if ascii-lower(a.value) == "currentcolor" => Inlining(nodes: [a], polyfill: true, unresolvable: false, current: true)
+  vp.Function if a.value == "var" => match var-chain(a, t, [], false) {
+    c if is-some(c.color) => Inlining(nodes: [vp.word(c.color ?? "")], polyfill: c.polyfill, unresolvable: false, current: false)
+    c => match inlined-all(a.nodes, t) {
+      inner => Inlining(nodes: [a with { nodes: inner.nodes }], polyfill: c.polyfill or inner.polyfill,
+                        unresolvable: c.unresolvable or inner.unresolvable, current: c.current or inner.current)
+    }
+  }
+  vp.Function => match inlined-all(a.nodes, t) {
+    inner => inner with { nodes: [a with { nodes: inner.nodes }] }
+  }
+  _ => no-inlining([a])
+}
+
+record Chain { color: Text?, polyfill: Bool, unresolvable: Bool, current: Bool }
+
+fn var-chain(v: vp.Value, t: th.Theme, seen: [Text], polyfill: Bool) -> Chain = match v.nodes {
+  [name, ...] if name.kind == vp.Word and name.value in seen => Chain(color: none, polyfill: polyfill, unresolvable: true, current: false)
+  [name, ...] if name.kind == vp.Word => match th.resolve-value(t, none, [name.value]) {
+    none => Chain(color: none, polyfill: true, unresolvable: true, current: false)
+    some(c) if ascii-lower(c) == "currentcolor" => Chain(color: none, polyfill: true, unresolvable: false, current: true)
+    some(c) if starts-with(c, "var(") => match vp.parse(c) {
+      [inner, ...] if inner.kind == vp.Function and inner.value == "var" => var-chain(inner, t, seen ++ [name.value], true)
+      _ => Chain(color: none, polyfill: true, unresolvable: false, current: false)
+    }
+    some(c) => Chain(color: some(c), polyfill: true, unresolvable: false, current: false)
+  }
+  _ => Chain(color: none, polyfill: polyfill, unresolvable: false, current: false)
+}
+
+fn srgb-of(nodes: [vp.Value]) -> [vp.Value] = match first i in 0..len(nodes) if nodes[i].kind != vp.Separator: i {
+  some(i) if i + 2 < len(nodes) and nodes[i + 2].kind == vp.Word and nodes[i + 2].value in ["oklab", "oklch", "lab", "lch"] =>
+    nodes[0..i + 2] ++ [nodes[i + 2] with { value: "srgb" }] ++ nodes[i + 3..len(nodes)]
+  _ => nodes
+}
+
+# Tailwind's `optimizeAst`, `candidates` the scanned ones that name variables.
+fn optimized(nodes: [ast.Css], t: th.Theme, candidates: [Text]) -> [ast.Css] =
+  nesting-handled(with-property-fallbacks(main.nodes ++ kept-roots, main.root-props, main.universal-props))
+  where uses = uses-of(nodes),
+        marked = marked-of(uses, t, candidates),
+        o = Opt(theme: t, uses: uses, marked: marked),
+        main = merged(transformed(nodes, {}, 0, o, []), false),
+        used-keyframes = {k: true for k in keys(uses.keyframes) ++ animate-keyframes(t, uses, marked)},
+        theme-frames = theme-keyframe-names(nodes, false),
+        kept-roots = [r for r in main.roots if not (r.kind == ast.AtRule and r.head == "@keyframes" and r.params in theme-frames and not (r.params in used-keyframes))]
+
+# Keyframes the used `--animate-*` theme variables name.
+fn animate-keyframes(t: th.Theme, u: Uses, marked: {Text:Bool}) -> [Text] =
+  [k for e in t.entries if starts-with(tx.escape(th.prefix-key(t, e.key)), th.prefix-key(t, "--animate-")) and not e.reference
+       and used?(tx.escape(th.prefix-key(t, e.key)), t, u, marked, [])
+   for k in keyframe-names(e.value)]
+
+# The names of the keyframes a `@theme` gave (only those are dropped when unused).
+fn theme-keyframe-names(nodes: [ast.Css], theme: Bool) -> {Text:Bool} = {k: true for n in nodes for k in theme-frames-of(n, theme)}
+
+fn theme-frames-of(n: ast.Css, theme: Bool) -> [Text] = match n.kind {
+  ast.Context => [k for x in n.nodes for k in theme-frames-of(x, theme or "theme" in n.context)]
+  ast.AtRule if theme and n.head == "@keyframes" => [n.params]
+  ast.Decl | ast.Comment => []
+  _ => [k for x in n.nodes for k in theme-frames-of(x, theme)]
+}
+
+fn with-property-fallbacks(nodes: [ast.Css], root: [ast.Css], universal: [ast.Css]) -> [ast.Css] = match fallbacks {
+  [] => nodes
+  _ => nodes[0..at] ++ [ast.at-rule("@layer", "properties", [])] ++ nodes[at..len(nodes)]
+       ++ [ast.rule("@layer properties", [ast.at-rule("@supports",
+            "((-webkit-hyphens: none) and (not (margin-trim: block))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b))))",
+            fallbacks)])]
+} where fallbacks = (if len(root) > 0 then [ast.rule(":root, :host", root)] else [])
+                    ++ (if len(universal) > 0 then [ast.rule("*, ::before, ::after, ::backdrop", universal)] else []),
+        at = (first i in 0..len(nodes) if not (nodes[i].kind == ast.Comment or (nodes[i].kind == ast.AtRule and (nodes[i].head == "@charset" or nodes[i].head == "@import"))): i) ?? len(nodes)
+
+# ---------------------------------------------------------------- nesting
+
+# Tailwind's `handleNesting`, as a walk that threads what it has made: the output, where the list
+# being filled is (how deep along the output's last nodes; -1 none, -2 a list nothing holds, whose
+# nodes Tailwind drops), the selectors and at-rules the walk is inside (a selector that can never
+# match is dead: what is under it goes, but for hoistable at-rules).
+record Entry { selector: Text, dead: Bool }
+record AtEntry { name: Text, params: Text }
+record Nest { result: [ast.Css], open: Int, selectors: [Entry], at-rules: [AtEntry] }
+
+fn nesting-handled(nodes: [ast.Css]) -> [ast.Css] = match any n in nodes: has-scope?(n) {
+  true => fail-build("tailwind: `@scope` in a stylesheet is not implemented")
+  false => (fold st = Nest(result: [], open: -1, selectors: [], at-rules: []) for n in nodes: entered(st, n)).result
+}
+
+fn has-scope?(n: ast.Css) -> Bool = match n.kind {
+  ast.AtRule if n.head == "@scope" => true
+  ast.Decl | ast.Comment => false
+  _ => any c in n.nodes: has-scope?(c)
+}
+
+const hoistable: [Text] = ["@container", "@layer", "@media", "@page", "@scope", "@starting-style", "@supports", "@view-transition"]
+const droppable-if-empty: [Text] = ["@container", "@media", "@page", "@scope", "@starting-style", "@supports", "@view-transition"]
+
+fn dead?(st: Nest) -> Bool = match st.selectors {
+  [] => false
+  entries => last(entries).dead
+}
+
+fn entered(st: Nest, n: ast.Css) -> Nest = match n.kind {
+  ast.StyleRule => rule-entered(st with { open: -1 }, n)
+  ast.AtRule => at-rule-entered(st with { open: -1 }, n)
+  ast.Decl | ast.Comment => if dead?(st) then st else emitted(st, n)
+  ast.Context | ast.AtRoot => fold s = st for c in n.nodes: entered(s, c)
+}
+
+fn rule-entered(st: Nest, n: ast.Css) -> Nest = match st.selectors {
+  [] => inside-rule(st, n, Entry(selector: top-selector(n.head), dead: false))
+  entries if n.head == "&" => fold s = st for c in n.nodes: entered(s, c)
+  entries => match [nested-selector(s, last(entries).selector) for s in tx.segment(n.head, ',')] {
+    selectors => match [s for s in selectors if not never-matches?(sel.parse(s))] {
+      [] => children-walked(st with { selectors: st.selectors ++ [Entry(selector: join(selectors, ", "), dead: true)] }, n)
+      live => inside-rule(st, n, Entry(selector: join(live, ", "), dead: false))
+    }
+  }
+}
+
+# A rule with declarations of its own is emitted whole, its nested rules and all.
+fn inside-rule(st: Nest, n: ast.Css, e: Entry) -> Nest = match any c in n.nodes: c.kind == ast.Decl {
+  true => exited-rule(fold s = st with { selectors: st.selectors ++ [e] } for c in n.nodes: emitted(s, c))
+  false => children-walked(st with { selectors: st.selectors ++ [e] }, n)
+}
+
+fn children-walked(st: Nest, n: ast.Css) -> Nest = exited-rule(fold s = st for c in n.nodes: entered(s, c))
+
+fn exited-rule(st: Nest) -> Nest = st with { open: -1, selectors: st.selectors[0..len(st.selectors) - 1] }
+
+# A top-level selector's `&` is `:scope`.
+fn top-selector(s: Text) -> Text = match has-byte?(s, '&') {
+  false => s
+  true => match amp-replaced(sel.parse(s), ":scope") {
+    r if r.changed => sel.css(r.nodes)
+    _ => s
+  }
+}
+
+record Replaced { nodes: [sel.Sel], changed: Bool }
+
+fn amp-replaced(nodes: [sel.Sel], by: Text) -> Replaced = match [amp-one(n, by) for n in nodes] {
+  rs => Replaced(nodes: [r.nodes[0] for r in rs], changed: any r in rs: r.changed)
+}
+
+fn amp-one(n: sel.Sel, by: Text) -> Replaced = match n.kind {
+  sel.Simple if n.value == "&" => Replaced(nodes: [n with { value: by }], changed: true)
+  sel.Simple | sel.Raw | sel.Combinator => Replaced(nodes: [n], changed: false)
+  _ => match amp-replaced(n.nodes, by) {
+    inner => Replaced(nodes: [n with { nodes: inner.nodes }], changed: inner.changed)
+  }
+}
+
+fn at-rule-entered(st: Nest, n: ast.Css) -> Nest = match n {
+  _ if dead?(st) and n.head == "@layer" and len(n.nodes) == 0 =>
+    emitted(st with { selectors: [] }, n) with { selectors: st.selectors }
+  _ if dead?(st) and (len(n.nodes) == 0 or not (n.head in hoistable)) => st
+  _ if len(n.nodes) == 0 and not (n.head in droppable-if-empty) => emitted(st, n)
+  _ if n.head in hoistable => match fold s = st with { at-rules: st.at-rules ++ [AtEntry(name: n.head, params: n.params)] } for c in n.nodes: entered(s, c) {
+    s => s with { open: -1, at-rules: s.at-rules[0..len(s.at-rules) - 1] }
+  }
+  _ => emitted(st, n)
+}
+
+# Tailwind's `emit`: into the list being filled; else at the top when outside every rule; else a
+# new rule for the selector (or the rule before, when it is the same selector), inside the at-rules
+# that are not already the last node's.
+fn emitted(st: Nest, n: ast.Css) -> Nest = match st.open {
+  d if d == -2 => st
+  d if d >= 0 => st with { result: spine-append-unique(st.result, d, n) }
+  _ => match st.selectors, st.at-rules {
+    [], [] => match st.result {
+      [init..., prev] if prev.kind == ast.AtRule and n.kind == ast.AtRule and len(prev.nodes) == 0 and len(n.nodes) == 0
+                         and prev.head == n.head and prev.params == n.params => st
+      _ => st with { result: st.result ++ [n] }
+    }
+    _, _ => placed(st, n, matched-at-rules(st.result, st.at-rules, 0))
+  }
+}
+
+# How many of the at-rules the walk is inside are already the output's last nodes, outermost first.
+fn matched-at-rules(nodes: [ast.Css], ats: [AtEntry], i: Int) -> Int = match i < len(ats) {
+  false => i
+  true => match nodes {
+    [init..., prev] if prev.kind == ast.AtRule and prev.head == ats[i].name and prev.params == ats[i].params =>
+      matched-at-rules(prev.nodes, ats, i + 1)
+    _ => i
+  }
+}
+
+fn placed(st: Nest, n: ast.Css, offset: Int) -> Nest = match st.selectors {
+  [] => match wrapped([n], st.at-rules[offset..len(st.at-rules)]) {
+    roots if offset == len(st.at-rules) => st with { result: spine-append(st.result, offset, roots), open: -2 }
+    roots => st with { result: spine-append(st.result, offset, roots), open: offset + len(st.at-rules) - offset }
+  }
+  entries if offset == len(st.at-rules) and same-rule-last?(st.result, offset, last(entries).selector) =>
+    st with { result: spine-append-unique(st.result, offset + 1, n), open: offset + 1 }
+  entries => st with { result: spine-append(st.result, offset, wrapped([ast.rule(last(entries).selector, [n])], st.at-rules[offset..len(st.at-rules)])),
+                       open: offset + (len(st.at-rules) - offset) + 1 }
+}
+
+fn wrapped(nodes: [ast.Css], ats: [AtEntry]) -> [ast.Css] = match ats {
+  [] => nodes
+  [outer, inner...] => [ast.at-rule(outer.name, outer.params, wrapped(nodes, inner))]
+}
+
+fn same-rule-last?(nodes: [ast.Css], depth: Int, selector: Text) -> Bool = match spine-last(nodes, depth) {
+  some(r) => r.kind == ast.StyleRule and r.head == selector
+  none => false
+}
+
+fn spine-last(nodes: [ast.Css], depth: Int) -> ast.Css? = match nodes {
+  [] => none
+  [init..., l] if depth == 0 => some(l)
+  [init..., l] => spine-last(l.nodes, depth - 1)
+}
+
+fn spine-append(nodes: [ast.Css], depth: Int, more: [ast.Css]) -> [ast.Css] = match depth {
+  0 => nodes ++ more
+  _ => match nodes {
+    [init..., l] => init ++ [l with { nodes: spine-append(l.nodes, depth - 1, more) }]
+    [] => panic "tailwind: nothing to nest into"
+  }
+}
+
+# Tailwind dedupes the declarations of the lists it fills: an earlier one the same as a later one
+# (property, value and importance) goes. Doing it as each comes is the same; lists taken whole are
+# left alone.
+fn spine-append-unique(nodes: [ast.Css], depth: Int, n: ast.Css) -> [ast.Css] = match depth {
+  0 => [x for x in nodes if not (n.kind == ast.Decl and x.kind == ast.Decl and x.head == n.head and (x.value ?? "") == (n.value ?? "") and is-some(x.value) == is-some(n.value) and x.important == n.important)] ++ [n]
+  _ => match nodes {
+    [init..., l] => init ++ [l with { nodes: spine-append-unique(l.nodes, depth - 1, n) }]
+    [] => panic "tailwind: nothing to nest into"
+  }
+}
+
+# ---------------------------------------------------------------- substituting `&`
+
+# Tailwind's `substituteNestingSelector`.
+fn nested-selector(s: Text, parent: Text) -> Text = match has-byte?(s, '&') {
+  true => match amp-substituted(sel.parse(s), parent, parent-ast, none, []) {
+    r if r.changed => sel.css(r.nodes)
+    _ => unnested(s, parent, parent-ast)
+  }
+  false => unnested(s, parent, parent-ast)
+} where parent-ast = sel.parse(parent)
+
+fn unnested(s: Text, parent: Text, parent-ast: [sel.Sel]) -> Text =
+  (if listed?(parent-ast) then ":is(" ++ parent ++ ")" else parent) ++ " " ++ s
+
+fn listed?(parent-ast: [sel.Sel]) -> Bool = match parent-ast {
+  [only] => only.kind == sel.SelectorList
+  _ => false
+}
+
+# Each `&` replaced as Tailwind replaces it, given its place: inside what (`within`, none at the
+# top), and the path of nodes above that.
+fn amp-substituted(nodes: [sel.Sel], parent: Text, parent-ast: [sel.Sel], within: sel.Sel?, path: [sel.Sel]) -> Replaced =
+  match [amp-at(nodes, i, parent, parent-ast, within, path) for i in 0..len(nodes)] {
+    rs => Replaced(nodes: [x for r in rs for x in r.nodes], changed: any r in rs: r.changed)
+  }
+
+fn amp-at(siblings: [sel.Sel], i: Int, parent: Text, parent-ast: [sel.Sel], within: sel.Sel?, path: [sel.Sel]) -> Replaced = match siblings[i] {
+  n if n.kind == sel.Simple and n.value == "&" => exited-node(Replaced(nodes: [n with { value: amp-value(siblings, i, parent, parent-ast, within, path) }], changed: true),
+                                                              siblings, i, within)
+  n if n.kind == sel.Simple or n.kind == sel.Raw or n.kind == sel.Combinator => exited-node(Replaced(nodes: [n], changed: false), siblings, i, within)
+  n => match amp-substituted(n.nodes, parent, parent-ast, some(n), path ++ [n]) {
+    inner => exited-node(Replaced(nodes: [n with { nodes: inner.nodes }], changed: inner.changed), siblings, i, within)
+  }
+}
+
+# Tailwind's exit hook: a universal selector first in a compound with more goes (but before a `|`).
+fn exited-node(r: Replaced, siblings: [sel.Sel], i: Int, within: sel.Sel?) -> Replaced = match within {
+  some(w) if w.kind == sel.Compound and i == 0 and len(siblings) > 1 and sel.universal?(r.nodes[0])
+             and not (siblings[1].kind == sel.Simple and starts-with(siblings[1].value, "|")) => r with { nodes: [] }
+  _ => r
+}
+
+fn amp-value(siblings: [sel.Sel], i: Int, parent: Text, parent-ast: [sel.Sel], within: sel.Sel?, path: [sel.Sel]) -> Text = match within {
+  none => is-form
+  _ if listed?(parent-ast) => is-form
+  some(w) if w.kind == sel.Complex => match i {
+    0 => parent
+    _ if first-complex?(parent-ast) => is-form
+    _ => parent
+  }
+  some(w) if w.kind == sel.Compound => match i {
+    _ if first-complex?(parent-ast) and grandparent-complex-elsewhere?(path, w) => is-form
+    _ if any s in siblings[i + 1..len(siblings)]: sel.universal?(s) or sel.type-selector?(s) => is-form
+    0 => parent
+    _ if first-complex?(parent-ast) or first-universal-or-type?(parent-ast) => is-form
+    _ => parent
+  }
+  some(w) if w.kind == sel.Function => parent
+  _ => is-form
+} where is-form = ":is(" ++ parent ++ ")"
+
+fn first-complex?(parent-ast: [sel.Sel]) -> Bool = len(parent-ast) > 0 and parent-ast[0].kind == sel.Complex
+
+fn first-universal-or-type?(parent-ast: [sel.Sel]) -> Bool =
+  len(parent-ast) > 0 and (sel.universal?(parent-ast[0]) or sel.type-selector?(parent-ast[0]))
+
+# The compound is inside a complex selector, but not its first part.
+fn grandparent-complex-elsewhere?(path: [sel.Sel], compound: sel.Sel) -> Bool = match path {
+  [..., g, _] => g.kind == sel.Complex and len(g.nodes) > 0 and g.nodes[0] != compound
+  _ => false
+}
+
+# ---------------------------------------------------------------- selectors that never match
+
+# Tailwind's `canNeverMatch`: a selector that is only dead parts, a dead part being a standard
+# pseudo-element followed by a combinator, or an `:is`/`:where` of dead selectors.
+fn never-matches?(nodes: [sel.Sel]) -> Bool = len(nodes) > 0 and (all n in nodes: dead-selector?(n))
+
+fn dead-selector?(n: sel.Sel) -> Bool = match n.kind {
+  sel.SelectorList => all x in n.nodes: dead-selector?(x)
+  sel.Complex => any i in 0..len(n.nodes): dead-at?(n.nodes, i)
+  sel.Compound => any x in n.nodes: dead-selector?(x)
+  sel.Function => (n.value == ":is" or n.value == ":where") and never-matches?(n.nodes)
+  _ => false
+}
+
+fn dead-at?(nodes: [sel.Sel], i: Int) -> Bool = match nodes[i].kind {
+  sel.Combinator => i > 0 and (standard-pseudo-element?(nodes[i - 1]) or (nodes[i - 1].kind == sel.Compound and (any x in nodes[i - 1].nodes: standard-pseudo-element?(x))))
+  _ => dead-selector?(nodes[i])
+}
+
+const standard-pseudo-elements: [Text] = ["::after", "::backdrop", "::before", "::checkmark", "::column", "::cue", "::cue-region",
+  "::details-content", "::file-selector-button", "::first-letter", "::first-line", "::grammar-error", "::highlight", "::marker", "::part",
+  "::picker", "::picker-icon", "::placeholder", "::scroll-button", "::scroll-marker", "::scroll-marker-group", "::search-text",
+  "::selection", "::slotted", "::spelling-error", "::target-text", "::view-transition", "::view-transition-group",
+  "::view-transition-group-children", "::view-transition-image-pair", "::view-transition-new", "::view-transition-old"]
+
+fn standard-pseudo-element?(n: sel.Sel) -> Bool = match (n.kind == sel.Simple or n.kind == sel.Function) and sel.pseudo-element?(n) {
+  false => false
+  true => match ascii-lower(n.value) {
+    v if not starts-with(v, "::") => true
+    v if starts-with(v, "::-") => true
+    v => v in standard-pseudo-elements
+  }
+}
+
+# Whether a declaration has this value.
+fn valued?(n: ast.Css, v: Text) -> Bool = match n.value {
+  some(x) => x == v
+  none => false
+}

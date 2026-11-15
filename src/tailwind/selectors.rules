@@ -1,0 +1,155 @@
+# Tailwind's selector parser (tailwindcss/src/selector-parser.ts): a selector as lists, complex
+# selectors (compounds and the combinators between them), compounds, simple selectors, and
+# functions (`:is(…)` holding selectors, `:nth-child(…)` holding a value). As Tailwind's: space at
+# a selector's start, before a comma or at its end is no combinator, but before a `)` it is.
+rules tailwind.selectors
+
+enum Kind { SelectorList, Combinator, Complex, Compound, Simple, Function, Raw }
+
+boxed record Sel { kind: Kind, value: Text, nodes: [Sel] }
+
+fn simple(v: Text) -> Sel = Sel(kind: Simple, value: v, nodes: [])
+fn raw(v: Text) -> Sel = Sel(kind: Raw, value: v, nodes: [])
+fn combinator(v: Text) -> Sel = Sel(kind: Combinator, value: v, nodes: [])
+fn function(name: Text, nodes: [Sel]) -> Sel = Sel(kind: Function, value: name, nodes: nodes)
+fn compound(nodes: [Sel]) -> Sel = Sel(kind: Compound, value: "", nodes: nodes)
+fn complex(nodes: [Sel]) -> Sel = Sel(kind: Complex, value: "", nodes: nodes)
+fn selector-list(nodes: [Sel]) -> Sel = Sel(kind: SelectorList, value: "", nodes: nodes)
+
+fn universal?(n: Sel) -> Bool = n.kind == Simple and starts-with(n.value, "*")
+
+fn type-selector?(n: Sel) -> Bool = n.kind == Simple and n.value != "" and not has-byte?("*&.#:[", n.value[0])
+
+fn pseudo-element?(n: Sel) -> Bool = (n.kind == Simple or n.kind == Function)
+  and (starts-with(n.value, "::") or ascii-lower(n.value) in [":before", ":after", ":first-line", ":first-letter"])
+
+fn css(nodes: [Sel]) -> Text = join([printed(n) for n in nodes], "")
+
+fn printed(n: Sel) -> Text = match n.kind {
+  Simple | Raw => n.value
+  Combinator => if n.value == " " then " " else " " ++ n.value ++ " "
+  Function => n.value ++ "(" ++ css(n.nodes) ++ ")"
+  Complex | Compound => css(n.nodes)
+  SelectorList => join([printed(x) for x in n.nodes], ", ")
+}
+
+# ---------------------------------------------------------------- parsing
+
+fn parse(input: Text) -> [Sel] = (level(replace-all(input, "\r\n", "\n"), 0, false)).nodes
+
+# A level of the selector (the whole of it, or what a function holds) up to its `)`: its nodes,
+# and where it ended (after the `)`).
+record Level { nodes: [Sel], next: Int }
+
+# What is being read at a level: the items of a list so far (when a comma was seen), the nodes of
+# the item being read, whether a combinator is among them, and the simple selector being read.
+record St { items: [Sel], listed: Bool, target: [Sel], combined: Bool, buffer: Text }
+
+fn level(s: Text, i: Int, inner: Bool) -> Level = read(s, i, inner, St(items: [], listed: false, target: [], combined: false, buffer: ""))
+
+fn current(st: St) -> Sel = match st.target {
+  [only] => only
+  nodes if st.combined => complex(nodes)
+  nodes => compound(nodes)
+}
+
+# The level's nodes when it ends: the list, or the item's nodes (a complex selector if it has a
+# combinator).
+fn ended(st: St) -> [Sel] = match st.listed {
+  true => [selector-list(st.items ++ [current(st)])]
+  false if st.combined => [complex(st.target)]
+  false => st.target
+}
+
+fn flushed(st: St) -> St = match st.buffer {
+  "" => st
+  b => appended(st, simple(b)) with { buffer: "" }
+}
+
+# Tailwind's `append`: a node joins the compound before it.
+fn appended(st: St, n: Sel) -> St = match st.target {
+  [init..., c] if c.kind == Compound => st with { target: init ++ [c with { nodes: c.nodes ++ [n] }] }
+  [init..., e] if e.kind != SelectorList and e.kind != Combinator => st with { target: init ++ [compound([e, n])] }
+  _ => st with { target: st.target ++ [n] }
+}
+
+const combinator-bytes: Text = ">\n +\t~"
+
+fn read(s: Text, i: Int, inner: Bool, st: St) -> Level = match i {
+  _ if i >= len(s) => Level(nodes: ended(flushed(st)), next: len(s))
+  _ => match s[i] {
+    44 => match flushed(st) {
+      f => read(s, i + 1 + span-of(s, i + 1, "\n \t"), inner,
+                f with { items: f.items ++ [current(f)], listed: true, target: [], combined: false })
+    }
+    c if has-byte?(combinator-bytes, c) => match flushed(st) {
+      f => match tx-trim(s[i..end]) {
+        "" if len(f.target) == 0 or end >= len(s) or s[end] == ',' => read(s, end, inner, f)
+        v => read(s, end, inner, f with { target: f.target ++ [combinator(if v == "" then " " else v)], combined: true })
+      } where end = i + span-of(s, i, combinator-bytes)
+    }
+    40 => opened(s, i, inner, st)
+    41 if inner => Level(nodes: ended(flushed(st)), next: i + 1)
+    41 => read(s, i + 1, inner, flushed(st))
+    c if c == '.' or c == ':' or c == '#' => match st.buffer {
+      ":" if c == ':' => read(s, i + 1, inner, st with { buffer: "::" })
+      _ => read(s, i + 1, inner, flushed(st) with { buffer: byte-text(c) })
+    }
+    91 => match flushed(st) {
+      f => read(s, close + 1, inner, appended(f, simple(s[i..close + 1]))) where close = bracket-end(s, i + 1, 0, i)
+    }
+    34 | 39 => match quote-end(s, i + 1, s[i]) {
+      some(j) => read(s, j + 1, inner, st with { buffer: st.buffer ++ s[i..j + 1] })
+      none => read(s, i + 1, inner, st with { buffer: st.buffer ++ s[i..i + 1] })
+    }
+    38 | 42 => read(s, i + 1, inner, appended(flushed(st), simple(byte-text(s[i]))))
+    92 => read(s, i + 2, inner, st with { buffer: st.buffer ++ s[i..min(len(s), i + 2)] })
+    c => read(s, i + 1, inner, st with { buffer: st.buffer ++ byte-text(c) })
+  }
+}
+
+fn tx-trim(v: Text) -> Text = trim-bytes(v, " \t\n\r" ++ byte-text(11) ++ byte-text(12))
+
+# A function: `:is(…)` and its kind hold selectors; any other its contents raw (`:nth-child(… of
+# selectors)` the selectors after `of`).
+fn opened(s: Text, i: Int, inner: Bool, st: St) -> Level = match st.buffer {
+  ":not" | ":where" | ":has" | ":is" | ":-moz-any" | ":-webkit-any" => match level(s, i + 1, true) {
+    args => read(s, args.next, inner, appended(st with { buffer: "" }, function(st.buffer, args.nodes)))
+  }
+  name => match paren-end(s, i + 1, 0) {
+    some(close) => read(s, close + 1, inner, appended(st with { buffer: "" }, function(name, raw-args(name, s[i + 1..close]))))
+    none => read(s, i + 1, inner, appended(st with { buffer: "" }, function(name, [raw("")])))
+  }
+}
+
+fn raw-args(name: Text, contents: Text) -> [Sel] = match name == ":nth-child" or name == ":nth-last-child" {
+  true => match index-of(contents, "of ") {
+    some(at) => [raw(contents[0..at + 3])] ++ parse(contents[at + 3..len(contents)])
+    none => [raw(contents)]
+  }
+  false => [raw(contents)]
+}
+
+fn paren-end(s: Text, j: Int, nesting: Int) -> Int? = match j {
+  _ if j >= len(s) => none
+  _ if s[j] == '(' => paren-end(s, j + 1, nesting + 1)
+  _ if s[j] == ')' and nesting == 0 => some(j)
+  _ if s[j] == ')' => paren-end(s, j + 1, nesting - 1)
+  _ => paren-end(s, j + 1, nesting)
+}
+
+# Where an attribute selector's `]` is; without one, the `[` stands alone.
+fn bracket-end(s: Text, j: Int, nesting: Int, open: Int) -> Int = match j {
+  _ if j >= len(s) => open
+  _ if s[j] == '[' => bracket-end(s, j + 1, nesting + 1, open)
+  _ if s[j] == ']' and nesting == 0 => j
+  _ if s[j] == ']' => bracket-end(s, j + 1, nesting - 1, open)
+  _ => bracket-end(s, j + 1, nesting, open)
+}
+
+fn quote-end(s: Text, j: Int, q: Int) -> Int? = match j {
+  _ if j >= len(s) => none
+  _ if s[j] == 92 => quote-end(s, j + 2, q)
+  _ if s[j] == q => some(j)
+  _ => quote-end(s, j + 1, q)
+}
