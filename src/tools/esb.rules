@@ -266,7 +266,7 @@ fn for-each-time(times: Int, o: api.Options, r: Run) -> Void = match tanstack-ro
 }
 
 fn with-tanstack(times: Int, o: api.Options, r: Run, c: tsr.Config) -> Void {
-  with tsr-split.options = tsr.split-options(c, tsr.generated!(c)) { times-built(times, tsr.with-plugin(o, c), r) }
+  with tsr-split.options = tsr.split-options(c, tsr.generated!(c)) { times-built(times, tsr.with-plugin(o, c, r.hmr), r) }
 }
 
 fn times-built(times: Int, o: api.Options, r: Run) -> Void {
@@ -282,6 +282,14 @@ fn generate-root() -> Text? = last i in 1..arg-count() for a in [arg-at(i)]
     _ => none
   }] if let some(root) = found: root
 
+# With TanStack Router's plugin, the route tree generated as each build starts, as its plugin does:
+# while watching, a route file added is a change to a directory the build listed, and the next
+# build's tree has it.
+fn tanstack-generated!() -> Void = match tanstack-root() {
+  none => {}
+  some(root) => match tsr.generated!(tsr.config-of(root)) { _ => {} }
+}
+
 # `--tanstack-router[=DIR]`: the project TanStack Router's plugin is given, DIR its root.
 fn tanstack-root() -> Text? = last i in 1..arg-count() for a in [arg-at(i)]
   for found in [match a {
@@ -294,10 +302,14 @@ fn tanstack-root() -> Text? = last i in 1..arg-count() for a in [arg-at(i)]
 # else, until the process is stopped; with hot module replacement, each in the development format.
 fn build(o: api.Options, r: Run) -> Void {
   timed(o.timing, "command line", 0)
-  timed(o.timing, "strategy", started(o, r))
+  let made = match r.hmr {
+    true => api.dev-options(o)
+    false => o
+  }
+  timed(o.timing, "strategy", started(made, r))
   match r.hmr {
-    true => dev-rebuilding(api.dev-options(o), r)
-    false => builds(o, r)
+    true => dev-rebuilding(made, r)
+    false => builds(made, r)
   }
   memo-audit-report!()
 }
@@ -319,6 +331,7 @@ fn builds(o: api.Options, r: Run) -> Void {
     let faults = page-faults()
     let waited = switches-waiting()
     let forced = switches-forced()
+    tanstack-generated!()
     let files = api.files(o)
     if o.fix {
       # `--fix`: what the lints found is said, and their fixes written to the sources; nothing else.
@@ -344,16 +357,18 @@ fn builds(o: api.Options, r: Run) -> Void {
           cpu-system-us() - system, page-faults() - faults, switches-waiting() - waited, switches-forced() - forced
       }
     }
-    let saving = now-us()
-    cache-kept(o, r)
-    if o.timing and cached?(r) and not r.watch {
-      print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100
-    }
     # Watching with a ledger: what this build changed in each route, and which edit did it.
     if r.watch and o.ledger {
       let now = api.ledger-written(o, files)
       if count > 1 { write-standard-output!(blame.text-of(blame.blame(ledger.ledger-of(last-ledger), ledger.ledger-of(now)))) }
       last-ledger = now
+    }
+    # Last before waiting: the cache is saved on a thread of its own until the wait joins it, and
+    # nothing may read or write a cached value meanwhile.
+    let saving = now-us()
+    cache-kept(o, r)
+    if o.timing and cached?(r) and not r.watch {
+      print "[cache] saved in {}.{} ms", (now-us() - saving) / 1000, (now-us() - saving) % 1000 / 100
     }
     if r.watch {
       let changed = wait-for-changes!(r.interval)
@@ -424,7 +439,7 @@ fn dev-rebuilding(o: api.Options, r: Run) -> Void {
   let events-path = "/hmr"
   let events = match r.serve-port {
     port if port >= 0 => "http://127.0.0.1:" ++ int-text(served) ++ events-path
-      where served = serve!(port, dir-of(o.outfile), "<!doctype html>\n<meta charset=\"utf-8\">\n<body>\n<script src=\"/" ++ path-base(o.outfile) ++ "\"></script>\n</body>\n", events-path)
+      where served = serve!(port, dir-of(o.outfile), api.dev-page(o) ?? ("<!doctype html>\n<meta charset=\"utf-8\">\n<body>\n<script src=\"/" ++ path-base(o.outfile) ++ "\"></script>\n</body>\n"), events-path)
     _ => ""
   }
   if events != "" { print "[hmr] serving {} at {}", dir-of(o.outfile), text-before(events, events-path) }
@@ -433,13 +448,13 @@ fn dev-rebuilding(o: api.Options, r: Run) -> Void {
   while true {
     let start = now-us()
     let computed = memo-computed()
+    tanstack-generated!()
     let step = api.dev-step-of(o, before, events)
     api.written([api.Written(path: o.outfile, text: step.dev.text, said: api.said-of(step.dev.text, o.outfile))])
     builds = builds + 1
     let took = now-us() - start
     print "[watch] build {}: {}.{} ms, {} memo answers computed, {} inputs watched", builds, took / 1000, took % 1000 / 100,
       memo-computed() - computed, inputs-watched()
-    cache-kept(o, r)
     if builds > 1 {
       match step.sent {
         some(sent) => {
@@ -451,6 +466,9 @@ fn dev-rebuilding(o: api.Options, r: Run) -> Void {
       }
     }
     before = step.dev
+    # Last: the cache is saved on a thread of its own until the wait for a change joins it, and
+    # nothing may read or write a cached value meanwhile (keeping `before` copies it).
+    cache-kept(o, r)
     let changed = wait-for-changes!(r.interval)
     print "[watch] changed: {}", join(changed, " ")
   }

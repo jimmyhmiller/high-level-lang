@@ -107,11 +107,15 @@ var __hmr = (() => {
     };
   };
 
+  // `import.meta.hot`, as Vite has it: `data` is the module's one object for as long as the page
+  // lives, given to each run and to the disposers; each `accept(callback)` is kept, and when the
+  // module runs again the last run's are called with its new exports (and, after them, the exports
+  // the last run had).
   var hotFor = (id, rec) => ({
-    data: datas[id] || {},
-    accept(callback) { rec.accepted = callback || (() => {}); },
+    data: datas[id] || (datas[id] = {}),
+    accept(callback) { rec.accepted.push(callback || null); },
     dispose(callback) { rec.disposers.push(callback); },
-    invalidate() { reload(id + " asked to be reloaded"); }
+    invalidate(why) { reload(display(id) + (why ? ": " + why : " asked to be reloaded")); }
   });
 
   // A module, run the first time it is asked for. One being run is answered as it is so far, as a
@@ -120,7 +124,7 @@ var __hmr = (() => {
     if (running[id]) return running[id];
     var def = defined[id];
     if (!def) throw new Error("[hmr] no module " + id);
-    var rec = running[id] = { id, esm: def.esm, ns: space(id), module: null, accepted: null, disposers: [], scope: null };
+    var rec = running[id] = { id, esm: def.esm, ns: space(id), module: null, accepted: [], disposers: [], scope: null };
     rec.hot = hotFor(id, rec);
     for (var name of Reflect.ownKeys(rec.ns)) if (name !== Symbol.toStringTag) delete rec.ns[name];
     stars[id] = [];
@@ -163,17 +167,21 @@ var __hmr = (() => {
         return;
       }
     }
+    var last = Object.create(null);
     for (var id of stale) {
       var rec = running[id];
       if (!rec) continue;
-      var data = {};
+      var data = datas[id] || (datas[id] = {});
       for (var dispose of rec.disposers) dispose(data);
-      datas[id] = data;
+      var exports = {};
+      for (var key of Reflect.ownKeys(rec.ns)) if (typeof key === "string") exports[key] = rec.ns[key];
+      last[id] = { accepted: rec.accepted, exports };
       delete running[id];
     }
     for (var id of boundaries) {
       var rec = load(id);
-      if (rec.accepted) rec.accepted(rec.ns);
+      var before = last[id];
+      for (var accepted of before ? before.accepted : rec.accepted) if (accepted) accepted(rec.ns, before && before.exports);
     }
     if (boundaries.length > 0) log("updated " + boundaries.map(display).join(", "));
   };

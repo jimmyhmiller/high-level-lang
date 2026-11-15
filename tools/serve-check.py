@@ -63,9 +63,12 @@ try:
     assert response.status == 200 and response.read() == b"static asset\n"
     print("ok   static file")
     response = get("/hmr")
+    assert response.status == 200 and response.getheader("Content-Type").startswith("text/html") and response.read() == b"fallback page"
+    print("ok   /hmr is not reserved by the runtime: a path of no file and no extension is a page of the app")
+    response = get("/missing.js")
     assert response.status == 404
     response.read()
-    print("ok   /hmr is not reserved by the runtime")
+    print("ok   a file that is not there is not found")
     response = get("/events/custom?client=probe")
     assert response.status == 200
     assert response.getheader("Content-Type") == "text/event-stream"
