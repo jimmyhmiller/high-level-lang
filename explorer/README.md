@@ -9,9 +9,15 @@ build holds and why, and examples kept for each rule.
 
 ## What it is made of
 
-- **The map** is the tower: every module under `src/`, colored by its language, in columns by how
-  far it builds on others (grammars and facts on the left, the bundler's top on the right). Hover
-  one for what it builds on and what builds on it; click to open its code.
+- **Every definition** (the first page) is all of `src/` at once: every declaration a small card drawn
+  the way the code view draws it:
+  - functions and their matches, patterns and comprehensions;
+  - records' fields, attribute equations by child;
+  - Datalog rules as joined atoms, rewrite rules as trees, grammar productions as railroads;
+  - scopes and pipeline items as the kinds and names they list.
+
+  Files are in order, a list of them at the side. Filter by name or doc, or by language. A card
+  opens its code; a name in it, what it names.
 - **Structure** is how a module opens: each declaration drawn from the tree its own grammar reads
   (`out/bin/hltree LANG FILE`, which prints a file's parse tree as JSON from the compilers' own
   parsers), so a rule is read by its shape:

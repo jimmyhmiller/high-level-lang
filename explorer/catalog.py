@@ -91,7 +91,11 @@ def build(root):
         out = []
         j = i - 1
         while j >= 0 and lines[j].lstrip().startswith("#"):
-            out.append(lines[j].lstrip()[1:].strip())
+            line = lines[j].lstrip()[1:].strip()
+            # `# ---- classes` heads a section of the file; it says nothing of the declaration under it.
+            if re.match(r"-{2,}", line):
+                break
+            out.append(line)
             j -= 1
         text = " ".join(reversed(out))
         return re.sub(r"-{6,}", "", text).strip()

@@ -76,7 +76,9 @@ function rr(n) {
   }
   return box("cls", "?");
 }
-function box(cls, label) { const w = tw(label) + 18; return { w, up: BH / 2, down: BH / 2, draw: (x, y) => `<g class="${cls}"${cls === "nt" ? ` data-nt="${esc(label)}"` : ""}><rect x="${x}" y="${y - BH / 2}" width="${w}" height="${BH}" rx="${cls === "term" || cls === "flag" ? 11 : 3}"/><text x="${x + w / 2}" y="${y}">${esc(label)}</text></g>` }; }
+// A literal's characters that show as nothing (separators, controls, other spaces) are spelled out.
+const visible = t => t.replace(/[\u0000-\u001f\u007f-\u00a0\u2000-\u200f\u2028-\u202f\u205f\u3000\ufeff]/g, c => c === " " ? c : "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+function box(cls, rawLabel) { const label = cls === "term" ? visible(rawLabel) : rawLabel; const w = tw(label) + 18; return { w, up: BH / 2, down: BH / 2, draw: (x, y) => `<g class="${cls}"${cls === "nt" ? ` data-nt="${esc(label)}"` : ""}><rect x="${x}" y="${y - BH / 2}" width="${w}" height="${BH}" rx="${cls === "term" || cls === "flag" ? 11 : 3}"/><text x="${x + w / 2}" y="${y}">${esc(label)}</text></g>` }; }
 function act(a) { const l = "→ " + a.kind + (a.fields.length ? "(" + a.fields.join(", ") + ")" : ""); const w = tw(l) + 16; return { w, up: BH / 2, down: BH / 2, draw: (x, y) => `<g class="act"><rect x="${x}" y="${y - BH / 2}" width="${w}" height="${BH}" rx="4"/><text x="${x + w / 2}" y="${y}">${esc(l)}</text></g>` }; }
 function skip() { return { w: 0, up: 0, down: 0, draw: () => "" }; }
 function seq(items) {

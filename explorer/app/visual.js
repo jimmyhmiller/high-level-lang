@@ -100,47 +100,6 @@ const EDGE_WORD = { "called by": "calls", "asserted from attrs": "asserts", "ass
 
 // ------------------------------------------------------------ the map
 
-MORE.map = function (main) {
-  const files = Object.keys(CAT.files).sort();
-  const dirs = [...new Set(files.map(dirOf))];
-  const off = new Set(JSON.parse(sessionStorage.getItem("mapoff") || "[]"));
-  main.innerHTML = `<div class="page wide"><div class="row"><h1>The tower</h1><span class="muted">every module, colored by its language; an arrow runs from what a module builds on to the module. Scroll to zoom, drag to move, click to open.</span></div>
-    <div class="row" id="dirs">${dirs.map(d => `<label class="check"><input type="checkbox" value="${esc(d)}"${off.has(d) ? "" : " checked"}> ${esc(d)}</label>`).join("")}
-      <span class="faint">·</span>${["syntax", "rules", "attrs", "facts", "rewrite", "scopes", "pipeline", "bundler"].map(l => `<span class="tag lc-${l}">${esc(LANG_NAME[l])}</span>`).join("")}
-      <input type="search" id="mapq" placeholder="find a module" style="margin-left:auto"></div>
-    <div class="canvas-row"><div class="canvas faint-edges" id="map"></div><aside class="panel side-info" id="mapinfo"><div class="body"><p class="muted">Hover a module to see what it builds on and what builds on it.</p></div></aside></div></div>`;
-  const draw = () => {
-    const keep = files.filter(f => !off.has(dirOf(f)));
-    const set = new Set(keep);
-    const seen = new Set(), edges = [];
-    for (const d of CAT.deps) if (set.has(d.from) && set.has(d.to)) { const k = d.to + ">" + d.from; if (!seen.has(k)) { seen.add(k); edges.push({ from: d.to, to: d.from, dashed: !!d.over, label: d.over ? "is over" : "uses" }); } }
-    // How high in the tower a module stands: one above the highest of what it builds on.
-    const uses = new Map(keep.map(f => [f, []])); for (const e of edges) uses.get(e.to).push(e.from);
-    const depth = new Map(), busy = new Set();
-    const level = f => { if (depth.has(f)) return depth.get(f); if (busy.has(f)) return 0; busy.add(f); const l = Math.max(-1, ...uses.get(f).map(level)) + 1; busy.delete(f); depth.set(f, l); return l; };
-    keep.forEach(level);
-    const nodes = keep.map(f => ({ id: f, label: baseOf(f), sub: dirOf(f) + " · " + fileLines(f) + " lines", lang: langOf(f), title: f }));
-    const order = ["languages", "bundle", "app", "react", "tanstack", "vite", "tools"];
-    const gr = drawGraph($("#map"), nodes, edges, { layers: depth, colWidth: 200, rowHeight: 42, colGap: 60, minScale: 0.85, topLeft: true,
-      order: (a, b) => order.indexOf(dirOf(a.id)) - order.indexOf(dirOf(b.id)) || a.label.localeCompare(b.label),
-      columnLabel: l => l === 0 ? "builds on nothing" : l === 1 ? "on those" : "level " + l,
-      onClick: id => location.hash = "code/" + enc(id + ":1"),
-      onHover: id => info(id) });
-    $("#mapq").oninput = e => { const q = e.target.value.toLowerCase(); const hit = q && keep.find(f => f.toLowerCase().includes(q)); if (hit) { gr.select(hit, true); info(hit); } };
-  };
-  const info = f => {
-    const uses = CAT.deps.filter(d => d.from === f), usedBy = CAT.deps.filter(d => d.to === f);
-    const ds = declsIn(f);
-    $("#mapinfo").innerHTML = `<header><span class="tag lc-${langOf(f)}">${esc(LANG_NAME[langOf(f)])}</span><code>${esc(short(f))}</code></header><div class="body">
-      ${ds[0] && ds[0].doc ? `<p class="muted">${esc(ds[0].doc.slice(0, 220))}</p>` : linesOf(f)[0].startsWith("#") ? `<p class="muted">${esc(linesOf(f).filter(l => l.startsWith("#")).slice(0, 3).map(l => l.slice(1).trim()).join(" ").slice(0, 260))}</p>` : ""}
-      <p><b>${fileLines(f)}</b> lines · <b>${ds.length}</b> declarations</p>
-      <p class="faint">builds on</p><div class="row">${uses.map(d => `<a class="chip lc-${langOf(d.to)}" href="#code/${enc(d.to + ":1")}">${esc(baseOf(d.to))}</a>`).join("") || "<span class='faint'>nothing</span>"}</div>
-      <p class="faint">built on by</p><div class="row">${usedBy.map(d => `<a class="chip lc-${langOf(d.from)}" href="#code/${enc(d.from + ":1")}">${esc(baseOf(d.from))}</a>`).join("") || "<span class='faint'>nothing</span>"}</div>
-      <a class="btn" href="#code/${enc(f + ":1")}">Open its code</a></div>`;
-  };
-  $("#dirs").onchange = e => { if (e.target.value) { e.target.checked ? off.delete(e.target.value) : off.add(e.target.value); sessionStorage.setItem("mapoff", JSON.stringify([...off])); draw(); } };
-  draw();
-};
 
 // ------------------------------------------------------------ code: every name a link
 
@@ -216,7 +175,7 @@ function wireCode(pane, file, onLine) {
   });
 }
 
-const STRUCTURED = new Set(["rules", "attrs", "facts", "rewrite", "syntax"]);
+const STRUCTURED = new Set(["rules", "attrs", "facts", "rewrite", "syntax", "scopes", "pipeline"]);
 MORE.code = async function (main, rest) {
   const textMode = rest[rest.length - 1] === "text"; if (textMode) rest = rest.slice(0, -1);
   const spec = rest.join("/");

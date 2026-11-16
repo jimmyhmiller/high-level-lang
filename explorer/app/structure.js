@@ -134,7 +134,8 @@ function Projector(file) {
   }
   // ---------------------------------------------------------------- declarations
   const declAt = new Map(declsIn(file).map(d => [d.line, d]));
-  const lineOf = n => sl(0, n.lo).split("\n").length;
+  const breaks = []; { const b = new TextEncoder().encode(text); for (let i = 0; i < b.length; i++) if (b[i] === 10) breaks.push(i); }
+  const lineOf = n => { let lo = 0, hi = breaks.length; while (lo < hi) { const m = (lo + hi) >> 1; if (breaks[m] < n.lo) lo = m + 1; else hi = m; } return lo + 1; };
   function card(n, kind, name, head, body) {
     const line = lineOf(n), d = declAt.get(line) || CAT.decls.find(x => x.file === file && x.line === line);
     return `<section class="s-card" id="D${line}" data-l="${line}"><header><span class="tag lc-${langOf(file)}">${esc(kind)}</span><span class="s-dname">${esc(name)}</span>${head || ""}
@@ -186,17 +187,50 @@ function Projector(file) {
       <div class="f-body">${body.map(b => b.k === "Negated" ? atom(kidsOf(b)[0], "neg") : b.k === "Differs" ? `<span class="f-atom differs"><span class="f-var" style="--c:var(${color(kidsOf(b)[0].t)})">${esc(kidsOf(b)[0].t)}</span><span class="s-op">≠</span><span class="f-var" style="--c:var(${color(kidsOf(b)[1].t)})">${esc(kidsOf(b)[1].t)}</span></span>` : atom(b, "")).join("")}</div></section>`;
   }
 
+  // ---------------------------------------------------------------- tables (.scopes, .pipeline)
+  // Each item a keyword and the names it lists: node kinds as the nodes they are, a nested clause as
+  // a row of its own.
+  const label = k => k.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  function value(v) {
+    if (v.k === "List") return kidsOf(v).map(value).join("");
+    if (v.k === "Name" || v.k === "Upper") { const d = resolve(file, v.t); return /^[A-Z]/.test(v.t) ? `<span class="p-node"><span class="p-kind">${d ? `<a class="sym" data-d="${d.id}">${esc(v.t)}</a>` : esc(v.t)}</span></span>` : `<span class="s-chipname">${d ? `<a class="sym" data-d="${d.id}">${esc(v.t)}</a>` : esc(v.t)}</span>`; }
+    if (v.t) return `<span class="p-lit">${esc(v.t)}</span>`;
+    if (isNone(v)) return "";
+    if (!kidsOf(v).length) return `<span class="s-flag">${esc(label(v.k))}</span>`;
+    // `check by f`: the clause says its own keyword; the item around it need not say it again.
+    const only = kidsOf(v).length === 1 ? kidsOf(v)[0] : null;
+    if (only && kidsOf(only).length && label(only.k).startsWith(label(v.k))) return value(only);
+    return `<div class="s-trow"><span class="s-kw">${esc(label(v.k))}</span><span class="s-tvals">${kidsOf(v).map(value).join("")}</span></div>`;
+  }
+  function tableItem(n) {
+    const k = kidsOf(n), d = declAt.get(lineOf(n));
+    const named = k[0] && (k[0].k === "Name") && d && d.name === k[0].t;
+    const rest = named ? k.slice(1) : k;
+    const flags = rest.filter(v => !v.t && !isNone(v) && !kidsOf(v).length && v.k !== "List");
+    const rows = rest.filter(v => !flags.includes(v));
+    return card(n, d ? d.kind : label(n.k), named ? k[0].t : "", flags.map(value).join(""), `<div class="s-table">${rows.map(v => v.k === "List" && kidsOf(v).some(x => kidsOf(x).length) ? kidsOf(v).map(value).join("") : `<div class="s-trow"><span class="s-tvals">${value(v)}</span></div>`).join("")}</div>`);
+  }
+
+  function items(tree) {
+    const lang = langOf(file);
+    if (lang === "facts") return kidsOf(kidsOf(tree)[0]);
+    if (lang === "scopes" || lang === "pipeline") return kidsOf(tree).filter(c => c.k === "List").flatMap(kidsOf);
+    const list = kidsOf(tree).find(c => c.k === "List");
+    return list ? kidsOf(list) : [];
+  }
+  const render = n => { const lang = langOf(file); return lang === "facts" ? factsItem(n) : lang === "scopes" || lang === "pipeline" ? tableItem(n) : decl(n); };
   return {
+    // One card per declaration, each with the line it starts on.
+    cards(tree) {
+      if (tree.error) return [{ line: 1, html: `<p class="empty">The grammar does not read this file: ${esc(tree.error)} (line ${tree.line}, column ${tree.col}).</p>` }];
+      return items(tree).filter(d => d.k !== "Use").map(n => ({ line: lineOf(n), html: render(n) })).filter(c => c.html);
+    },
     file(tree) {
-      if (tree.error) return `<p class="empty">The grammar does not read this file: ${esc(tree.error)} (line ${tree.line}, column ${tree.col}).</p>`;
-      const lang = langOf(file);
-      if (lang === "facts") return kidsOf(kidsOf(tree)[0]).map(factsItem).join("");
-      const list = kidsOf(tree).find(c => c.k === "List");
-      const items = list ? kidsOf(list) : [];
-      const uses = items.filter(d => d.k === "Use");
+      if (tree.error) return this.cards(tree)[0].html;
+      const uses = items(tree).filter(d => d.k === "Use");
       const strip = uses.length ? `<section class="s-uses"><span class="s-kw">uses</span>${uses.map(u => { const m = kidsOf(u)[0], a = kidsOf(u)[1]; const f = fileOfModule()[m.t || src(m)];
         return f ? `<a class="chip lc-${langOf(f)}" href="#code/${enc(f + ":1")}">${esc(a.t)} = ${esc(baseOf(f))}</a>` : `<span class="chip">${esc(a.t)} = ${esc(m.t || src(m))}</span>`; }).join("")}</section>` : "";
-      return strip + items.filter(d => d.k !== "Use").map(decl).join("");
+      return strip + this.cards(tree).map(c => c.html).join("");
     },
   };
 }
@@ -234,3 +268,69 @@ async function appliedUnder(card, file) {
   box.innerHTML = `<div class="s-eqh">where it applied · ${total.toLocaleString()} in ${occ.length} build${occ.length === 1 ? "" : "s"} · <a href="#rule/${enc(key)}">all, and its examples</a></div>${shown.join("")}`;
   wirePins(box, key);
 }
+
+// ------------------------------------------------------------ the atlas: every definition, drawn
+
+const TREE_LANGS = new Set(["rules", "attrs", "facts", "scopes", "pipeline"]);
+// Every declaration of a file as a card: drawn from its tree, its rewrite trees, its railroads; a
+// file no grammar here reads (a .bundler target) as its text.
+async function cardsOf(file) {
+  const lang = langOf(file);
+  if (lang === "rewrite") return rewriteStructure(file);
+  if (lang === "syntax") return grammarStructure(file) || textCards(file);
+  if (TREE_LANGS.has(lang)) return Projector(file).cards(await api("tree?path=" + enc(file))).map(c => c.html).join("");
+  return textCards(file);
+}
+function textCards(file) {
+  const lines = linesOf(file);
+  return declsIn(file).map(d => `<section class="s-card" data-l="${d.line}"><header><span class="tag lc-${langOf(file)}">${esc(d.kind)}</span><span class="s-dname">${esc(d.name)}</span><span class="s-tools"><a class="s-line" href="#code/${enc(file + ":" + d.line)}/text">${d.line}</a></span></header>
+    <div class="s-raw">${lines.slice(d.line - 1, Math.min(d.end || d.line, d.line + 14)).map(l => codeLine(l, file)).join("<br>")}</div></section>`).join("");
+}
+
+const ATLAS_DIRS = ["languages", "bundle", "app", "react", "tanstack", "vite", "tools"];
+MORE.map = function (main) {
+  const files = Object.keys(CAT.files).filter(f => f.startsWith("src/") && declsIn(f).length)
+    .sort((a, b) => (ATLAS_DIRS.indexOf(dirOf(a)) + 99) % 99 - (ATLAS_DIRS.indexOf(dirOf(b)) + 99) % 99 || a.localeCompare(b));
+  const langs = [...new Set(files.map(langOf))];
+  let off = new Set(); try { off = new Set(JSON.parse(localStorage.getItem("atlasoff") || "[]")); } catch (e) {}
+  const total = files.reduce((a, f) => a + declsIn(f).length, 0);
+  main.innerHTML = `<div class="atlas">
+    <div class="atlas-bar"><h1>Every definition</h1><span class="muted">${total.toLocaleString()} in ${files.length} files</span>
+      <input type="search" id="aq" placeholder="find a definition by name or doc">
+      <span class="row" id="alangs">${langs.map(l => `<button class="tag lc-${l} toggle" data-l="${l}" aria-pressed="${!off.has(l)}">${esc(LANG_NAME[l])}</button>`).join("")}</span>
+      <span class="faint" id="acount"></span></div>
+    <nav class="atlas-toc">${ATLAS_DIRS.filter(d => files.some(f => dirOf(f) === d)).map(d => `<div class="toc-dir"><b>${esc(d)}</b>${files.filter(f => dirOf(f) === d).map(f => `<a href="#" data-f="${esc(f)}" class="lc-${langOf(f)}">${esc(baseOf(f))}<span>${declsIn(f).length}</span></a>`).join("")}</div>`).join("")}</nav>
+    <div class="atlas-files" id="afiles">${files.map(f => `<section class="atlas-file" data-f="${esc(f)}" style="--n:${declsIn(f).length}">
+      <header><span class="tag lc-${langOf(f)}">${esc(LANG_NAME[langOf(f)])}</span><a href="#code/${enc(f + ":1")}"><code>${esc(short(f))}</code></a><span class="faint">${declsIn(f).length} · ${fileLines(f)} lines</span></header>
+      <div class="atlas-grid"></div></section>`).join("")}</div></div>`;
+  const box = $("#afiles");
+  const q = () => $("#aq").value.trim().toLowerCase();
+  const matches = d => { const s = q(); return !s || d.name.toLowerCase().includes(s) || (d.doc || "").toLowerCase().includes(s); };
+  const filterSection = sec => {
+    const f = sec.dataset.f, hit = !off.has(langOf(f)) && declsIn(f).some(matches);
+    sec.hidden = !hit;
+    if (sec.dataset.done) { const names = new Map(declsIn(f).map(d => [d.line, d])); sec.querySelectorAll(".s-card").forEach(c => { const d = names.get(+c.dataset.l); c.hidden = !!q() && !(d ? matches(d) : false); }); }
+  };
+  const filter = () => { box.querySelectorAll(".atlas-file").forEach(filterSection); const shown = [...box.querySelectorAll(".atlas-file:not([hidden])")].map(x => x.dataset.f); $("#acount").textContent = q() || off.size ? `${shown.reduce((a, f) => a + declsIn(f).filter(matches).length, 0).toLocaleString()} shown` : ""; };
+  // Drawn when near the screen: thousands of cards, a few hundred at a time.
+  const draw = async sec => {
+    if (sec.dataset.done || sec.dataset.busy) return; sec.dataset.busy = 1;
+    const f = sec.dataset.f, grid = sec.querySelector(".atlas-grid");
+    try { grid.innerHTML = await cardsOf(f); } catch (e) { grid.innerHTML = `<p class="empty">${esc(String(e.message || e))}</p>`; }
+    sec.dataset.done = 1; sec.style.removeProperty("--n");
+    requestAnimationFrame(() => grid.querySelectorAll(".s-card").forEach(c => { if (c.scrollHeight > c.clientHeight + 2) c.classList.add("clipped"); }));
+    filterSection(sec);
+  };
+  const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) draw(e.target); }), { root: null, rootMargin: "1600px 0px" });
+  box.querySelectorAll(".atlas-file").forEach(sec => io.observe(sec));
+  wireCode(box, null, null);
+  box.addEventListener("click", e => {
+    if (e.target.closest("a, button, .s-applied")) return;
+    const c = e.target.closest(".s-card"), sec = e.target.closest(".atlas-file");
+    if (c && sec) location.hash = "code/" + enc(sec.dataset.f + ":" + c.dataset.l);
+  });
+  main.querySelector(".atlas-toc").addEventListener("click", e => { const a = e.target.closest("a[data-f]"); if (!a) return; e.preventDefault(); const sec = box.querySelector(`.atlas-file[data-f="${CSS.escape(a.dataset.f)}"]`); if (sec) { draw(sec); sec.scrollIntoView({ block: "start" }); } });
+  $("#aq").oninput = filter;
+  $("#alangs").onclick = e => { const b = e.target.closest("button[data-l]"); if (!b) return; off.has(b.dataset.l) ? off.delete(b.dataset.l) : off.add(b.dataset.l); b.setAttribute("aria-pressed", !off.has(b.dataset.l)); try { localStorage.setItem("atlasoff", JSON.stringify([...off])); } catch (e) {} filter(); };
+  filter();
+};
