@@ -3,16 +3,23 @@
 # found to be used (`const DEV = process.env.NODE_ENV !== "production"; if (DEV) …`).
 #
 # Which `const`s, as esbuild has them: those at the start of a statement list (a program, a block,
-# a function's body, a `case`), before any other statement, so that nothing can read one before it
-# is set; in a list of declarators, up to the first whose value is not known. A value is known when
-# it is, once the constants before it are written in and it is folded, a number, `true`, `false`,
-# `null`, `undefined`, `NaN`, `Infinity`, or a string of at most three characters. A constant that
-# anything assigns to is left as it is (esbuild rejects that program; it throws when it runs), as
-# is every constant of a file with `with` or a direct `eval`, where a name may mean something else.
+# a function's body, a `case`), so that nothing can read one before it is set. That start runs
+# through declarations (`const`, `let`, `var`), empty statements, `debugger` and directives, and
+# ends at anything else, or at a declaration whose value, folded, is not one esbuild writes in and
+# could not be read too soon (bundle.jsvalue's `prefix-safe?`: a string, a function, `{}`), or that
+# binds a pattern. A file that imports or re-exports anything has none at its top level: through an
+# import cycle, its constants could be read before they are set. In that start every initializer is
+# folded with every operator (as TypeScript's constant expressions are: `1 / 3` is
+# 0.3333333333333333), once the constants before it are written in; a `const` whose value is then
+# null, undefined, a boolean, a short number or a string of at most three characters is written in
+# where it is read (`jsvalue.const-value?`). A constant that anything assigns to is left as it is
+# (esbuild rejects that program; it throws when it runs), as is every constant of a file with `with`
+# or a direct `eval`, where a name may mean something else.
 rules bundle.constants over bundle.js
 use bundle.js as js
 use bundle.minify as minify
 use bundle.dce as dce
+use bundle.jsvalue as jv
 use bundle.minhost as host
 use bundle.literal as lit
 
@@ -35,13 +42,23 @@ fn no-imports() -> Imported = Imported(names: {}, spaces: {})
 # the file has `with` or a direct `eval`; `imported`: what its imports are known to be.
 fn inlined(tree: Node, top: [Node], b: {Int:Int}, dynamic: Bool, imported: Imported) -> Inlined? = match dynamic {
   true => none
-  false => written(tree, b, [seen(c) for c in leading(as-defined(top, tree), b, {})] ++ imported-seen(imported, b),
+  false => written(tree, b, [seen(c) for c in top-prefix(top, tree, b)] ++ imported-seen(imported, b),
                    [seen-in(s, b) for s in tree.body.kids],
                    {s: names for lo in keys(imported.spaces) for s in b[lo] for names in imported.spaces[lo]})
 }
 
 fn imported-seen(imported: Imported, b: {Int:Int}) -> [Seen] =
-  [Seen(symbol: s, value: v, assigned: false) for lo in keys(imported.names) for s in b[lo] for v in imported.names[lo]]
+  [Seen(symbol: s, value: v, assigned: false, at: -1, inlined: true) for lo in keys(imported.names) for s in b[lo] for v in imported.names[lo]]
+
+# The constants at the start of the program, none if the file imports or re-exports anything.
+fn top-prefix(top: [Node], tree: Node, b: {Int:Int}) -> [Constant] = match any s in top: imports?(s) {
+  true => []
+  false => leading(as-defined(top, tree), b, {})
+}
+
+fn imports?(s: Node) -> Bool =
+  s is Import(...) or s is ImportBare(...) or s is ImportDefault(...) or s is ImportDefaultAnd(...)
+    or s is ExportFrom(...) or s is ExportAll(...) or s is ExportAllAs(...)
 
 # The constants a file exports, by the names it exports them as: its leading constants at the top
 # level, as `inlined` finds them, that nothing assigns to, exported where declared or by name.
@@ -50,7 +67,7 @@ fn exported(tree: Node, top: [Node], b: {Int:Int}, dynamic: Bool) -> {Text:Node}
   false => {e.name: v for s in top for e in exports-in(s, b, by-name) for v in values[e.symbol]}
     where by-name = {d.target.text: sym for s in top for d in top-consts(s) if d.target is BindName(_) for sym in b[d.target.lo]},
           assigned-to = {x.symbol: true for s in tree.body.kids for x in seen-in(s, b) if x.assigned},
-          values = {c.symbol: c.value for c in leading(as-defined(top, tree), b, {}) if not (c.symbol in assigned-to)}
+          values = {c.symbol: c.value for c in top-prefix(top, tree, b) if c.inlined and not (c.symbol in assigned-to)}
 }
 
 # A name a statement exports, and the symbol it is.
@@ -78,11 +95,13 @@ fn name-text(n: Node) -> Text = match n {
   _ => n.text
 }
 
-# What one walk of the tree finds: a constant at the start of a list, or a symbol assigned to.
-record Seen { symbol: Int, value: Node, assigned: Bool }
+# What one walk of the tree finds: a declaration at the start of a list, its value folded, or a
+# symbol assigned to. `at`: the declarator's place; `inlined`: whether the value is written in where
+# it is read, or only where it was declared.
+record Seen { symbol: Int, value: Node, assigned: Bool, at: Int, inlined: Bool }
 
-fn seen(c: Constant) -> Seen = Seen(symbol: c.symbol, value: c.value, assigned: false)
-fn assigned(symbols: [Int]) -> [Seen] = [Seen(symbol: s, value: None(), assigned: true) for s in symbols]
+fn seen(c: Constant) -> Seen = Seen(symbol: c.symbol, value: c.value, assigned: false, at: c.at, inlined: c.inlined)
+fn assigned(symbols: [Int]) -> [Seen] = [Seen(symbol: s, value: None(), assigned: true, at: -1, inlined: false) for s in symbols]
 
 # What is written in: the constants nothing assigns to. One that something does still has its value
 # where a constant after it reads it, as it never changes (assigning to it throws). Only the
@@ -90,19 +109,23 @@ fn assigned(symbols: [Int]) -> [Seen] = [Seen(symbol: s, value: None(), assigned
 # decide a branch: with constants at the top level, those that name one; else those holding one,
 # as a constant inside a statement is read only there. `within`: what each statement holds.
 fn written(tree: Node, b: {Int:Int}, top: [Seen], within: [[Seen]], spaces: {Int:{Text:Node}}) -> Inlined? = match known {
-  _ if len(known) == 0 and len(read-spaces) == 0 => none
+  _ if len(known) == 0 and len(read-spaces) == 0 and len(refolded) == 0 => none
   _ => some(Inlined(tree: Program(tree.hashbang, List(stmts...)) with { lo: tree.lo, hi: tree.hi }, decided: deciding))
     where deciding = (any x in found: not x.assigned and deciding?(x.value)) or (any s in keys(read-spaces): any v in values-of(read-spaces[s] ?? {}): deciding?(v)),
           named = known ++ {s: None() for s in keys(read-spaces)},
           stmts = [match touched {
-                     true => folded(written-in(ss[i], b, known, read-spaces), deciding)
+                     true => folded(written-in(ss[i], b, known, read-spaces, refolded), deciding)
                      false => ss[i]
                    } for i in 0..len(ss)
-                   for touched in [(any x in within[i]: x.symbol in known) or (len(top) > 0 and mentions?(ss[i], b, named))]]
+                   for touched in [(any x in within[i]: x.symbol in known or x.at in refolded)
+                                   or (len(top) > 0 and mentions?(ss[i], b, named))
+                                   or (any d in top-declarators(ss[i]): d.lo in refolded)]]
 } where ss = tree.body.kids,
         found = top ++ [x for w in within for x in w],
         written-to = {x.symbol: true for x in found if x.assigned},
-        known = {x.symbol: x.value for x in found if not x.assigned and not (x.symbol in written-to)},
+        known = {x.symbol: x.value for x in found if x.inlined and not x.assigned and not (x.symbol in written-to)},
+        # What is folded where it is declared and not written in: `const third = 1 / 3`.
+        refolded = {x.at: x.value for x in found if not x.inlined and not x.assigned},
         # A namespace written through (which throws) is left as it is.
         read-spaces = {s: names for s in keys(spaces) if not (s in written-to) for names in spaces[s]}
 
@@ -136,8 +159,10 @@ fn restated(s: Node, now: {Int:Node}) -> Node = match s {
   _ => s
 }
 
-# A constant: the symbol a declarator binds, and its value.
-record Constant { symbol: Int, value: Node }
+# A declaration at the start of a list: the symbol its declarator binds, its value folded, the
+# declarator's place, and whether the value is written in where it is read (`inlined`) or only
+# where it is declared.
+record Constant { symbol: Int, value: Node, at: Int, inlined: Bool }
 
 # The constants at the start of every statement list inside the program (its own top level is
 # `as-defined`'s), and the symbols anything assigns to: a name, or one inside a pattern, assigned,
@@ -153,41 +178,107 @@ everywhere fn seen-in(n: Node, b: {Int:Int}) -> [Seen] = match n {
   Delete(t) => assigned(names-in(t, b))
 }
 
-# The constants at the start of a list, `before` those already found in it.
-fn leading(ss: [Node], b: {Int:Int}, before: {Int:Node}) -> [Constant] = match ss {
-  [] => []
-  [ExprStmt(Str(_)), rest...] => leading(rest, b, before)
-  [ConstDecl(List(ds...)), rest...] => continued(declarators(ds, b, before), rest, b, before)
-  [ExportLexical(ConstDecl(List(ds...))), rest...] => continued(declarators(ds, b, before), rest, b, before)
-  _ => []
+# What the declarations at the start of a list fold to, `before` the constants already found in
+# it: each `const` esbuild writes in where it is read (`inlined`), and each other initializer that
+# folds, written where it is declared.
+fn leading(ss: [Node], b: {Int:Int}, before: {Int:Node}) -> [Constant] = leading-from(ss, 0, b, before)
+
+# From the `i`th statement on: a list is read by place, never copied.
+fn leading-from(ss: [Node], i: Int, b: {Int:Int}, before: {Int:Node}) -> [Constant] = match i < len(ss) {
+  false => []
+  true => match ss[i] {
+    s if keeps-start?(s) => leading-from(ss, i + 1, b, before)
+    ConstDecl(List(ds...)) | ExportLexical(ConstDecl(List(ds...))) => continued(declarators(ds, 0, b, before, true), ss, i + 1, b, before)
+    LetDecl(List(ds...)) | ExportLexical(LetDecl(List(ds...))) | VarDecl(List(ds...)) | ExportVar(List(ds...)) =>
+      continued(declarators(ds, 0, b, before, false), ss, i + 1, b, before)
+    _ => []
+  }
 }
 
-# After one `const` statement, the rest of the list's leading constants, if all of its were.
-fn continued(run: Run, rest: [Node], b: {Int:Int}, before: {Int:Node}) -> [Constant] = match run.whole {
-  true => run.found ++ leading(rest, b, before ++ {c.symbol: c.value for c in run.found})
+# Statements the start of a list goes on past: empty ones, `debugger`, directives, and what
+# TypeScript's types left behind.
+fn keeps-start?(s: Node) -> Bool = s is Empty() or s is Debugger() or s is ExprStmt(Str(_)) or s is TsErased(...)
+
+# After one declaration, the rest of the list's, if its declarators did not end the start.
+fn continued(run: Run, ss: [Node], i: Int, b: {Int:Int}, before: {Int:Node}) -> [Constant] = match run.whole {
+  true => run.found ++ leading-from(ss, i, b, before ++ {c.symbol: c.value for c in run.found if c.inlined})
   false => run.found
 }
 
-# The constants of a list of declarators, up to the first that is not one, and whether all were.
+# A declaration's declarators folded, up to the first that ends the start, and whether none did.
 record Run { found: [Constant], whole: Bool }
 
-fn declarators(ds: [Node], b: {Int:Int}, before: {Int:Node}) -> Run = match ds {
-  [] => Run(found: [], whole: true)
-  [Declarator(BindName(_) as name, init), rest...] if not (init is None()) => match b[name.lo], known(written-in(init, b, before, {}), b) {
-    some(s), some(v) => with-constant(Constant(symbol: s, value: v), declarators(rest, b, before ++ {s: v}))
-    _, _ => Run(found: [], whole: false)
+# From the `i`th declarator on; `constant`: these are a `const`'s, whose values may be written in.
+fn declarators(ds: [Node], i: Int, b: {Int:Int}, before: {Int:Node}, constant: Bool) -> Run = match i < len(ds) {
+  false => Run(found: [], whole: true)
+  true => match ds[i] {
+    Declarator(BindName(_), None()) => declarators(ds, i + 1, b, before, constant)
+    Declarator(BindName(_) as name, init) as d => match b[name.lo], value {
+      some(s), some(v) if constant and jv.const-value?(v) =>
+        with-constant(Constant(symbol: s, value: lit, at: d.lo, inlined: true), declarators(ds, i + 1, b, before ++ {s: lit}, constant))
+        where lit = host.placed(jv.literal(v), init)
+      symbol, _ => Run(found: [Constant(symbol: s, value: host.placed(jv.literal(v), init), at: d.lo, inlined: false)
+                               for s in symbol for v in value if not literal?(init) and not gated-folds?(now)] ++ next.found,
+                       whole: next.whole)
+        where next = match jv.prefix-safe?(now, every()) {
+                true => declarators(ds, i + 1, b, before, constant)
+                false => Run(found: [], whole: false)
+              }
+    } where shaped = constant-shaped?(init),
+            now = match shaped {
+              true => written-in(init, b, before, {}, {})
+              false => init
+            },
+            value = match shaped {
+              true => folded-value(now, b)
+              false => none
+            }
+    _ => Run(found: [], whole: false)
   }
-  _ => Run(found: [], whole: false)
+}
+
+# What can fold to a literal once the constants before it are written in: literals, names,
+# operators, parentheses and templates of these. Anything else (a call, a function, an object) is
+# no literal however it folds, and is not walked: many a `var` at the start of a function's body
+# holds a function.
+fn constant-shaped?(n: Node) -> Bool = match n {
+  Num(_) | Str(_) | TemplateFull(_) | True() | False() | Null() | Ident(_) | Regex(_) => true
+  Member(Ident(_), PropName(_)) => true
+  Paren(x) | Neg(x) | Pos(x) | Not(x) | BitNot(x) | Void(x) | TypeOf(x) => constant-shaped?(x)
+  Add(x, y) | Sub(x, y) | Mul(x, y) | Div(x, y) | Mod(x, y) | Pow(x, y) | Shl(x, y) | Shr(x, y) | Ushr(x, y)
+    | BitAnd(x, y) | BitOr(x, y) | BitXor(x, y) | Lt(x, y) | Gt(x, y) | Le(x, y) | Ge(x, y)
+    | Eq(x, y) | Ne(x, y) | StrictEq(x, y) | StrictNe(x, y) | And(x, y) | Or(x, y) | Coalesce(x, y)
+    | Seq(x, y) => constant-shaped?(x) and constant-shaped?(y)
+  Cond(t, x, y) => constant-shaped?(t) and constant-shaped?(x) and constant-shaped?(y)
+  Template(_, e, List(ps...), _) => constant-shaped?(e) and (all p in ps: constant-shaped?(p.expr))
+  ArrayLit(List(xs...)) => all x in xs: x is Hole() or constant-shaped?(x)
+  _ => false
 }
 
 fn with-constant(c: Constant, next: Run) -> Run = Run(found: [c] ++ next.found, whole: next.whole)
 
-# An initializer's value, folded, if it is one esbuild writes in. Only a small expression of
-# literals, names and operators can fold to one; anything else is not tried.
-fn known(init: Node, b: {Int:Int}) -> Node? = match value-of(init, b) {
-  some(v) => some(v)
-  none if foldable?(init, 24) => value-of(dce.run(minify.run(init)), b)
-  none => none
+# Folding as at the start of a list: every operator, with minifying.
+fn every() -> jv.Folding = jv.Folding(minify: true, all: true)
+
+# What an initializer folds to, if a literal: as bundle.jsvalue folds it, or, for a small expression
+# of literals and operators it does not (`true ? 1 : 2`), as the minifier and dead code do.
+fn folded-value(init: Node, b: {Int:Int}) -> jv.Value? = match global-value(init, b) {
+  some(g) => jv.value-of(g, every())
+  none => match jv.value-of(init, every()) {
+    some(v) => some(v)
+    none if foldable?(init, 24) => jv.value-of(dce.run(minify.run(init)), every())
+    none => none
+  }
+}
+
+# What minifying folds anyway, wherever it is (bundle.minify, and tree shaking's `pure?`): only what
+# folds here and nowhere else is written where it is declared (`7 % 3`, `1 / 3`), not `!0`.
+fn gated-folds?(n: Node) -> Bool = is-some(jv.value-of(n, jv.Folding(minify: true, all: false)))
+
+# A literal is already what it folds to.
+fn literal?(n: Node) -> Bool = match n {
+  Num(_) | Neg(Num(_)) | Str(_) | TemplateFull(_) | True() | False() | Null() | Void(Num("0")) => true
+  _ => false
 }
 
 fn foldable?(n: Node, size: Int) -> Bool = match n {
@@ -200,21 +291,19 @@ fn foldable?(n: Node, size: Int) -> Bool = match n {
   _ => false
 }
 
-fn value-of(v: Node, b: {Int:Int}) -> Node? = match v {
-  Num(_) | Neg(Num(_)) | True() | False() | Null() | Void(Num("0")) as v => some(v)
-  # A global's value, unless a name of the file's own hides it.
+# A global's value, unless a name of the file's own hides it: as bundle.jsvalue reads it.
+fn global-value(v: Node, b: {Int:Int}) -> Node? = match v {
   Ident("undefined") as v if not (v.lo in b) => some(Void(Num("0")))
-  # No name stands for a value: a name is found by its place, and the place is the read's.
-  Ident("NaN") as v if not (v.lo in b) => some(exp`0 / 0`)
-  Ident("Infinity") as v if not (v.lo in b) => some(exp`1 / 0`)
-  Str(raw) as v if units(raw) <= 3 => some(v)
+  Ident("NaN") as v if not (v.lo in b) => some(Num("NaN"))
+  Ident("Infinity") as v if not (v.lo in b) => some(Div(Num("1"), Num("0")))
   _ => none
 }
 
 # Each read of a constant, its value, where the read was; `{ C }` becomes `{ C: 2 }`. A constant's
 # declaration inside a function or a block, which nothing reads now, goes, as esbuild drops it; one
 # at the top level is a `var` by now, which tree shaking keeps only if it is exported.
-everywhere fn written-in(n: Node, b: {Int:Int}, known: {Int:Node}, spaces: {Int:{Text:Node}}) -> Node = match n {
+# `refolded`: by a declarator's place, what its initializer folds to, written there.
+everywhere fn written-in(n: Node, b: {Int:Int}, known: {Int:Node}, spaces: {Int:{Text:Node}}, refolded: {Int:Node}) -> Node = match n {
   Ident(_) => value-at(n, b, known) ?? n
   # A name read off a namespace import whose module's export of it is known.
   Member(Ident(_) as o, PropName(p)) if is-some(space-value(o, p, b, spaces)) => (space-value(o, p, b, spaces) ?? n) with { lo: n.lo, hi: n.hi }
@@ -222,7 +311,7 @@ everywhere fn written-in(n: Node, b: {Int:Int}, known: {Int:Node}, spaces: {Int:
     some(v) => Prop(PropName(old.text), v) with { lo: n.lo, hi: n.hi }
     none => n
   }
-  ConstDecl(List(ds...)) => match [written-in(d, b, known, spaces) for d in ds if not ((b[d.target.lo] ?? -1) in known)] {
+  ConstDecl(List(ds...)) => match [written-in(d, b, known, spaces, refolded) for d in ds if not ((b[d.target.lo] ?? -1) in known)] {
     [] => Empty() with { lo: n.lo, hi: n.hi }
     kept => ConstDecl(List(kept...)) with { lo: n.lo, hi: n.hi }
   }
@@ -233,6 +322,9 @@ everywhere fn written-in(n: Node, b: {Int:Int}, known: {Int:Node}, spaces: {Int:
       some(v) => v with { lo: init.lo, hi: init.hi }
       none => init
     }) with { lo: n.lo, hi: n.hi }
+  # A declaration at the start of a list that is not written in where it is read: its initializer
+  # folded where it is declared (`const third = 1 / 3`).
+  Declarator(BindName(_) as name, init) if n.lo in refolded => Declarator(name, refolded[n.lo] ?? init) with { lo: n.lo, hi: n.hi }
 }
 
 fn space-value(o: Node, p: Text, b: {Int:Int}, spaces: {Int:{Text:Node}}) -> Node? =
@@ -242,17 +334,4 @@ fn value-at(n: Node, b: {Int:Int}, known: {Int:Node}) -> Node? = first s in [b[n
 
 everywhere fn names-in(n: Node, b: {Int:Int}) -> [Int] = match n {
   Ident(_) => [s for s in [b[n.lo] ?? -1] if s >= 0]
-}
-
-# A string's length in UTF-16 code units, as JavaScript counts it: each character one, and two for
-# one outside the Basic Multilingual Plane; a line continuation none.
-fn units(raw: Text) -> Int = sum p in host.pieces(unquote(raw)): match p {
-  lit.Plain(t) => sum c in [c for c in t]: match c {
-    _ if c >= 128 and c < 192 => 0
-    _ if c >= 240 => 2
-    _ => 1
-  }
-  lit.EscBrace(t) if (digits-number(t[3..len(t) - 1], 16, 1114112) ?? 0) > 65535 => 2
-  lit.EscOther(t) if t[1] == '\n' or t[1] == '\r' => 0
-  _ => 1
 }

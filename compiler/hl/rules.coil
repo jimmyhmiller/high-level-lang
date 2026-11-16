@@ -290,7 +290,7 @@
   (subslice t (+ (top-level-at t 3 #\)) 3) (len t)))
 
 (defn builtin-type? [(t (slice u8))] (-> bool)
-  (or (= t "Int") (= t "Bool") (= t "Text") (= t "Void") (= t "Never")))
+  (or (= t "Int") (= t "Float") (= t "Bool") (= t "Text") (= t "Void") (= t "Never")))
 
 ;;; The dot before a named type's own name.
 (defn last-dot [(t (slice u8))] (-> i64)
@@ -315,6 +315,7 @@
 
 (defn coil-type [(k (mut Comp)) (t (slice u8))] (-> Code)
   (cond (= t "Int") `i64
+        (= t "Float") `f64
         (= t "Bool") `bool
         (= t "Text") `(slice u8)
         (= t "Void") `void
@@ -5324,9 +5325,22 @@
       (push! (mut out) n)))
 
 (defn binary-int [(k (mut Comp)) (n g/Node) (op Code)] (-> TE)
-  (let [a (expect (mut k) (kid n 0) (expr (mut k) (kid n 0) "Int") "Int")
-        b (expect (mut k) (kid n 1) (expr (mut k) (kid n 1) "Int") "Int")]
-    (te `(~op ~(.code a) ~(.code b)) "Int")))
+  (binary-num (mut k) n op op))
+
+;;; Arithmetic on two Ints or two Floats; `float-op` is what a Float pair uses (`%` is C's fmod).
+(defn binary-num [(k (mut Comp)) (n g/Node) (op Code) (float-op Code)] (-> TE)
+  (let [a0 (expr (mut k) (kid n 0) "Int")
+        b0 (expr (mut k) (kid n 1) (if (= (.ty a0) "Float") "Float" "Int"))
+        ;; `2 * x` with `x` a Float: the literal is a Float too.
+        a (if (and (= (.ty a0) "Int") (= (.ty b0) "Float") (= (.kind (kid n 0)) (g/KInt)))
+              (expr (mut k) (kid n 0) "Float")
+              a0)]
+    (if (= (.ty a) "Float")
+        (let [b (expect (mut k) (kid n 1) b0 "Float")]
+          (te `(~float-op ~(.code a) ~(.code b)) "Float"))
+        (let [a (expect (mut k) (kid n 0) a "Int")
+              b (expect (mut k) (kid n 1) b0 "Int")]
+          (te `(~op ~(.code a) ~(.code b)) "Int")))))
 
 (defn compare [(k (mut Comp)) (n g/Node) (op Code)] (-> TE)
   (let [a (expr (mut k) (kid n 0) "")
@@ -5336,7 +5350,7 @@
     (if (= (.ty a) "Text")
         (te `(~op (str/cmp ~(.code a) ~(.code b)) 0) "Bool")
         (do
-          (unless (= (.ty a) "Int")
+          (unless (or (= (.ty a) "Int") (= (.ty a) "Float"))
             (die (mut k) n (cat "cannot order " (.ty a))))
           (te `(~op ~(.code a) ~(.code b)) "Bool")))))
 
@@ -6925,7 +6939,10 @@
 
 (defn plain-expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
   (match (.kind n)
-    (g/KInt [] (te `~(rt/parse-int (.text n)) "Int"))
+    ;; A whole-number literal is a Float where one is wanted: `x * 2`, `float-mod(x, 4294967296)`.
+    (g/KInt [] (if (= want "Float")
+                   (te `(cast f64 ~(rt/parse-int (.text n))) "Float")
+                   (te `~(rt/parse-int (.text n)) "Int")))
     (g/KStr [] (te `~(str-literal n) "Text"))
     (g/KChar [] (te `~(char-value n) "Int"))
     (g/KTrue [] (te `true "Bool"))
@@ -7283,12 +7300,12 @@
                             "Bool")]
               (te `(not ~(.code x)) "Bool")))
     (g/KNeg []
-            (let [x
-                    (expect (mut k)
-                            (kid n 0)
-                            (expr (mut k) (kid n 0) "Int")
-                            "Int")]
-              (te `(- 0 ~(.code x)) "Int")))
+            (let [x0 (expr (mut k) (kid n 0) (if (= want "Float") "Float" "Int"))]
+              (if (= (.ty x0) "Float")
+                  ;; Times -1, so that the negation of 0 is -0, as a double's is.
+                  (te `(* (: -1.0 f64) ~(.code x0)) "Float")
+                  (let [x (expect (mut k) (kid n 0) x0 "Int")]
+                    (te `(- 0 ~(.code x)) "Int")))))
     (g/KOr []
            (let [a
                    (expect (mut k)
@@ -7313,7 +7330,7 @@
     (g/KSub [] (binary-int (mut k) n `-))
     (g/KMul [] (binary-int (mut k) n `*))
     (g/KDiv [] (binary-int (mut k) n `/))
-    (g/KMod [] (binary-int (mut k) n `%))
+    (g/KMod [] (binary-num (mut k) n `% `rt/float-mod))
     (g/KConcat []
                (let [first-ty (.ty (expr (mut k) (kid n 0) want))]
                  (if (map? first-ty)
@@ -10127,7 +10144,7 @@
 ;;; a list whose buffer is the other's is the same without a look inside. Functions, and a foreign
 ;;; module's opaque types, cannot be looked into: two of them are never the same.
 (defn same-code [(k (mut Comp)) (t (slice u8)) (a Code) (b Code)] (-> Code)
-  (cond (or (= t "Int") (= t "Bool") (= t "Text")) `(= ~a ~b)
+  (cond (or (= t "Int") (= t "Float") (= t "Bool") (= t "Text")) `(= ~a ~b)
         (fn? t) `(~(identity-helper (mut k) t) ~a ~b)
         (opt? t)
           (let [x (fresh (mut k) "x")

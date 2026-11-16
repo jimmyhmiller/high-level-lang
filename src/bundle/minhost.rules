@@ -2,6 +2,7 @@
 rules bundle.minhost over bundle.js
 use bundle.js as js
 use bundle.literal as lit
+use bundle.jsvalue as jv
 
 fn opaque(n: Node) -> Bool = js.opaque-spine?(n)
 fn present(n: Node) -> Bool = not (n is None())
@@ -99,11 +100,10 @@ fn name-text?(s: Text) -> Bool =
 
 fn plain-key(raw: Text) -> Bool = name-text?(unquote(raw))
 fn dot(o: Node, raw: Text) -> Node = Member(o, PropName(unquote(raw)))
-fn plain-prop(raw: Text, v: Node) -> Node = Prop(PropName(unquote(raw)), v)
+fn plain-prop(raw: Text, v: Node) -> Node = Prop(PropName(unquote(raw)), v)# ---------------------------------------------------------------- numbers
 
-# ---------------------------------------------------------------- numbers
-
-# JavaScript numbers are doubles, so folding is exact only below 2^53. Outside that nothing folds.
+# Integers below 2^53 are exact doubles: a literal is spelt again in fewer characters
+# (`best-number`) only when it is one of them. Folding is bundle.jsvalue's.
 const safe-limit: Int = 9007199254740992
 
 # A leading zero is a legacy octal literal in sloppy JavaScript, so `010` is 8 there. Those answer
@@ -112,40 +112,6 @@ fn safe-int(s: Text) -> Int? = match s {
   "0" ++ more if more != "" => none
   _ => digits-number(s, 10, safe-limit - 1)
 }
-
-fn safe(v: Int) -> Int? = first x in [v] if x >= 0 and x < safe-limit: x
-
-fn added(a: Text, b: Text) -> Int? = match safe-int(a), safe-int(b) {
-  some(x), some(y) => safe(x + y)
-  _, _ => none
-}
-
-fn subtracted(a: Text, b: Text) -> Int? = match safe-int(a), safe-int(b) {
-  some(x), some(y) => safe(x - y)
-  _, _ => none
-}
-
-fn multiplied(a: Text, b: Text) -> Int? = match safe-int(a), safe-int(b) {
-  some(x), some(y) if x > 0 and y > (safe-limit - 1) / x => none
-  some(x), some(y) => safe(x * y)
-  _, _ => none
-}
-
-fn add-fits(a: Text, b: Text) -> Bool = is-some(added(a, b))
-fn sub-fits(a: Text, b: Text) -> Bool = is-some(subtracted(a, b))
-fn mul-fits(a: Text, b: Text) -> Bool = is-some(multiplied(a, b))
-fn add-num(a: Text, b: Text) -> Node = Num(int-text(added(a, b) ?? 0))
-fn sub-num(a: Text, b: Text) -> Node = Num(int-text(subtracted(a, b) ?? 0))
-fn mul-num(a: Text, b: Text) -> Node = Num(int-text(multiplied(a, b) ?? 0))
-
-# Nonnegative safe integers have the same remainder in JavaScript and the host.
-# Zero divisors, signed zero, legacy octal, fractions and unsafe integers stay unfolded.
-fn remainder(a: Text, b: Text) -> Int? = match safe-int(a), safe-int(b) {
-  some(x), some(y) if y > 0 => some(x % y)
-  _, _ => none
-}
-fn mod-fits(a: Text, b: Text) -> Bool = is-some(remainder(a, b))
-fn mod-num(a: Text, b: Text) -> Node = Num(int-text(remainder(a, b) ?? 0))
 
 fn hex-value(s: Text) -> Int? = match s {
   "0x" ++ digits | "0X" ++ digits if digits != "" and len(s) < 16 => digits-number(digits, 16, safe-limit)
@@ -203,85 +169,80 @@ fn num-short(n: Node) -> Node = Num(best-number(n.text)) with { lo: n.lo, hi: n.
 # ---------------------------------------------------------------- strings
 
 # String content as text and escapes. Most strings have no escape to look at.
-fn pieces(s: Text) -> [lit.Node] = match s {
-  _ if not has-byte?(s, '\\') => [lit.Plain(s)]
-  _ => match lit.parse(s, "<string>") { lit.Content(List(ps...)) => ps }
+# ---------------------------------------------------------------- folding
+
+# What esbuild makes a literal of as it parses (bundle.jsvalue), always, or with `--minify-syntax`,
+# written where it was. A node already spelt as its value's literal (`1 / 0` is how Infinity is
+# written) folds to nothing new, and a negative number keeps its literal's spelling.
+fn folds-always(n: Node) -> Bool = folds(n, jv.always())
+fn folded-always(n: Node) -> Node = folded(n, jv.always())
+fn folds-minified(n: Node) -> Bool = folds(n, minified())
+fn folded-minified(n: Node) -> Node = folded(n, minified())
+
+fn minified() -> jv.Folding = jv.Folding(minify: true, all: false)
+
+# A template with no tag, whose parts are not folded yet (bundle.emit writes it before minifying):
+# what esbuild makes of it as it parses, its parts folded first.
+fn template-inlines(n: Node) -> Bool = is-some(jv.value-of(n, minified()))
+fn template-inlined(n: Node) -> Node = folded(n, minified())
+
+fn folds(n: Node, f: jv.Folding) -> Bool = match n {
+  Neg(Num(_)) | Void(Num("0")) => false
+  _ if not jv.operands-literal?(n) => false
+  _ => any v in jv.value-of(n, f): spelling(jv.literal(v)) != spelling(n)
 }
 
-# The character an escape names, for one that stands for itself.
-fn escaped(p: lit.Node) -> Int = p.text[1]
-
-# A string literal's value: what it says, every escape resolved, legacy octal escapes and line
-# continuations too. What an import names, or one of its attributes, is the value, not the spelling.
-fn string-value(raw: Text) -> Text = escaped-value(unquote(raw))
-
-# The same of text with escapes, a string's content or a name's (whose `\u` escapes mean the same).
-fn escaped-value(content: Text) -> Text {
-  let cps = code-points-of(content)
-  var out: [Int] = []
-  var i = 0
-  while i < len(cps) {
-    let c = cps[i]
-    if c != '\\' {
-      out ++= [c]
-      i = i + 1
-    } else {
-      let e = cps[i + 1]
-      if e == 'x' {
-        out ++= [hex-points(cps, i + 2, i + 4)]
-        i = i + 4
-      } else if e == 'u' and cps[i + 2] == '{' {
-        let close = first j in (i + 3)..len(cps) if cps[j] == '}': j
-        let end = close ?? panic "{}: a brace escape that does not close", content
-        out ++= [hex-points(cps, i + 3, end)]
-        i = end + 1
-      } else if e == 'u' {
-        out ++= [hex-points(cps, i + 2, i + 6)]
-        i = i + 6
-      } else if e >= '0' and e <= '7' {
-        # Up to three digits from `\0`-`\3`, two from `\4`-`\7`: `\101` is `A`, `\400` is `\40` and `0`.
-        let most = if e <= '3' then 3 else 2
-        let digits = len([j for j in (i + 1)..min(i + 1 + most, len(cps)) while cps[j] >= '0' and cps[j] <= '7'])
-        out ++= [fold v = 0 for j in (i + 1)..(i + 1 + digits): v * 8 + cps[j] - '0']
-        i = i + 1 + digits
-      } else if e == 13 and i + 2 < len(cps) and cps[i + 2] == 10 {
-        i = i + 3
-      } else if e == 10 or e == 13 or e == 8232 or e == 8233 {
-        i = i + 2
-      } else {
-        out ++= [match e {
-          'b' => 8
-          'f' => 12
-          'n' => 10
-          'r' => 13
-          't' => 9
-          'v' => 11
-          _ => e
-        }]
-        i = i + 2
-      }
-    }
-  }
-  text-of-points(out)
+# How a literal reads, to tell one from another; anything else reads as nothing a literal does.
+fn spelling(n: Node) -> Text = match n {
+  Num(t) | Str(t) => t
+  Neg(Num(t)) => "-" ++ t
+  Neg(x) => "-(" ++ spelling(x) ++ ")"
+  Div(a, b) => spelling(a) ++ "/" ++ spelling(b)
+  Void(x) => "void " ++ spelling(x)
+  True() => "true"
+  False() => "false"
+  Null() => "null"
+  _ => "(not a literal)"
 }
 
-fn hex-points(cps: [Int], from: Int, to: Int) -> Int =
-  digits-number(text-of-points(cps[from..to]), 16, 1114111) ?? panic "{}: not a hex escape", text-of-points(cps[from..to])
-
-# Content rewritten for double quotes: a `\'` loses its slash, a bare `"` gains one.
-fn to-double-quoted(raw: Text) -> Text = match raw {
-  "'" ++ _ => join([double-quoted(p) for p in pieces(unquote(raw))], "")
-  _ => unquote(raw)
+fn folded(n: Node, f: jv.Folding) -> Node = match jv.value-of(n, f) {
+  some(v) => placed(jv.literal(v), n)
+  none => n
 }
 
-fn double-quoted(p: lit.Node) -> Text = match p {
-  lit.Plain(t) => replace-all(t, "\"", "\\\"")
-  _ if escaped(p) == '\'' => "'"
-  _ => p.text
+# A literal made for a node, every part of it at the node's place.
+fn placed(x: Node, at: Node) -> Node = match x {
+  Neg(y) => Neg(placed(y, at)) with { lo: at.lo, hi: at.hi }
+  Void(y) => Void(placed(y, at)) with { lo: at.lo, hi: at.hi }
+  Div(a, b) => Div(placed(a, at), placed(b, at)) with { lo: at.lo, hi: at.hi }
+  _ => x with { lo: at.lo, hi: at.hi }
 }
 
-# Two string tokens as one.
-fn concat(a: Text, b: Text) -> Node = Str("\"" ++ to-double-quoted(a) ++ to-double-quoted(b) ++ "\"")
+# `x + "a" + 1` as `x + "a1"` (FoldStringAddition of a nested left): the last two joined, when
+# the first of them is a string.
+fn joins-nested(n: Node) -> Bool = is-some(nested-join(n))
+fn joined-nested(n: Node) -> Node = nested-join(n) ?? n
+
+fn nested-join(n: Node) -> Node? = match n {
+  Add(Add(x, a), b) if jv.literal-form?(a) and jv.literal-form?(b) => first l in jv.value-of(a, jv.always()) if l.kind == jv.String
+                         for r in jv.value-of(b, jv.always()) for t in joined-text(l, r):
+                         Add(x, placed(Str(t), b)) with { lo: n.lo, hi: n.hi }
+  _ => none
+}
+
+fn joined-text(l: jv.Value, r: jv.Value) -> Text? = match r.kind {
+  jv.String => some(jv.concat(l.raw, r.raw).text)
+  _ => first t in jv.to-string(r): jv.concat(l.raw, "\"" ++ t ++ "\"").text
+}
+
+# String literals' values and spellings are JavaScript's primitive values' (bundle.jsvalue).
+fn pieces(s: Text) -> [lit.Node] = jv.pieces(s)
+fn escaped(p: lit.Node) -> Int = jv.escaped(p)
+fn string-value(raw: Text) -> Text = jv.string-value(raw)
+fn escaped-value(content: Text) -> Text = jv.escaped-value(content)
+fn to-double-quoted(raw: Text) -> Text = jv.to-double-quoted(raw)
+fn double-quoted(p: lit.Node) -> Text = jv.double-quoted(p)
+fn concat(a: Text, b: Text) -> Node = jv.concat(a, b)
 
 fn quote-byte?(c: Int) -> Bool = c == '"' or c == '\''
 
@@ -351,8 +312,7 @@ fn templated(n: Node) -> Node? = match n {
 # ---------------------------------------------------------------- text as a literal
 
 # Any text as a double-quoted string.
-fn js-string(s: Text) -> Text =
-  "\"" ++ replace-many(s, ["\"", "\\", "\n", "\r", "\t"], ["\\\"", "\\\\", "\\n", "\\r", "\\t"]) ++ "\""
+fn js-string(s: Text) -> Text = jv.js-string(s)
 
 const base64-digits: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 

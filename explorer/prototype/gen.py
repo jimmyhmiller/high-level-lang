@@ -705,6 +705,8 @@ LF = "src/bundle/link.facts"
 AA = "src/bundle/analysis.attrs"
 MR = "src/bundle/minify.rewrite"
 EA = "src/bundle/emit.attrs"
+CR = "src/bundle/constants.rules"
+JV = "src/bundle/jsvalue.rules"
 
 # Each output statement and why it is there, traced by hand through the real rules.
 included_main = {"fact": "included(main.js)", "rule": R(LF, "included(M) :- entry(M) ;"),
@@ -742,8 +744,6 @@ def decl_live(name, mod, what):
                       "rule": R(AA, "link.fact-declares(")}]}
 
 
-pure_line = R(AA, "fn pure?(n: Node) -> Bool = match n {")
-pure_default = R(AA, "  _ => false", pure_line["line"])
 trace = {
     "command": "esb main.js --bundle --minify-syntax --sourcemap",
     "output": out_js.split("\n//# sourceMappingURL")[0],
@@ -766,24 +766,7 @@ trace = {
          "question": "Why is clamp kept?",
          "summary": "This works the same way as greet: the kept console.log call uses clamp through its import.",
          "why": decl_live("clamp", "math.js", "const clamp"),
-         "rewrites": [
-             {"before": "export const clamp = …; export const unused = …;", "after": "var clamp=…,unused=…", "rule": R(MR, "rule merge-var"), "note": "two declarations in a row become one, once top-level const is var"}]},
-        {"id": "unused", "label": "unused=3", "out": span("out.js", "unused=3"), "bug": True,
-         "src": {"file": "math.js", "span": span("math.js", "export const unused = 1 + 2;")},
-         "question": "Why is unused=3 here?",
-         "summary": "Nothing imports unused, and esbuild drops it. We keep it because the analysis decides 1 + 2 might have an effect: pure? has no case for arithmetic, so Add falls through to `_ => false`. The 3 appears only later, when fold-add runs during minification, after tree shaking has already decided.",
-         "why": {"fact": "live(const unused)", "rule": R(LF, "live(P) :- included(M), part-of(P, M), effect(P) ;"),
-                 "from": [{"fact": "included(math.js)", "rule": R(LF, "included(M) :- live(P), part-of(P, M) ;"),
-                           "from": [{"fact": "live(const clamp)", "see": "clamp"},
-                                    {"fact": "part-of(const clamp, math.js)", "given": "a statement of math.js"}]},
-                          {"fact": "part-of(const unused, math.js)", "given": "a statement of math.js",
-                           "rule": R(AA, "link.fact-part-of(")},
-                          {"fact": "effect(const unused)", "bug": True,
-                           "rule": R(AA, "link.fact-effect(part) for p in [part] if directive or not sm.pure"),
-                           "from": [{"fact": "summary.pure = false", "rule": R(AA, "pure: declares and linking.tree-shaking and pure-stmt?(n)"),
-                                     "from": [{"fact": "pure?(Add(Num 1, Num 2)) = false", "bug": True, "rule": pure_default,
-                                               "given": "no arm of pure? names Add, so it reaches the last arm"}]}]}]},
-         "rewrites": [{"before": "1 + 2", "after": "3", "rule": R(MR, "rule fold-add"), "note": "Add(Num(a), Num(b)) when @add-fits(a, b): too late to matter for tree shaking"}]},
+         "rewrites": []},
         {"id": "log", "label": "console.log(…)", "out": span("out.js", 'console.log(greet("world"),clamp(12,0,10))'),
          "src": {"file": "main.js", "span": span("main.js", 'console.log(greet("world"), clamp(12, 0, 10));')},
          "question": "Why is the call kept?",
@@ -795,6 +778,20 @@ trace = {
          "why": None, "rewrites": []},
     ],
     "dropped": [
+        {"id": "unused", "label": "const unused", "src": {"file": "math.js", "span": span("math.js", "export const unused = 1 + 2;")},
+         "question": "Where did unused go?", "compare": True,
+         "summary": "Before tree shaking, the constants at the start of math.js are folded as esbuild folds them while parsing. clamp holds an arrow, which nothing can read too soon, so that start goes on to unused. There every operator folds, and 1 + 2 becomes 3. A literal has no effect, so no rule keeps the statement. While this prototype was being built, the statement was still in the output, because the start stopped at clamp and nothing folded 1 + 2 in time. Following esbuild's rules fixed it.",
+         "why_title": "Folded before tree shaking",
+         "why": {"fact": "const unused = 3", "rule": R(CR, "some(s), some(v) if constant and jv.const-value?(v) =>"),
+                 "from": [{"fact": "the start of math.js reaches unused", "rule": R(JV, "Regex(_) | FuncExpr(...) | GenExpr(...)"),
+                           "given": "clamp holds an arrow, which cannot be read too soon"},
+                          {"fact": "1 + 2 folds to 3", "rule": R(JV, "Add(l, r) => first a in value-of(l, f)"),
+                           "given": "at the start of a list, every operator folds"},
+                          {"fact": "3 is a constant esbuild writes in", "rule": R(JV, "fn const-value?(v: Value) -> Bool"),
+                           "given": "an integer"}]},
+         "candidates": [
+             {"rule": R(LF, "live(P) :- included(M), part-of(P, M), effect(P) ;"), "missing": "effect(const unused): 3 has no effect"},
+             {"rule": R(LF, "live(P) :- live(Q), uses(Q, S), declares(P, S) ;"), "missing": "uses(Q, unused@math.js) for a live Q: nothing imports unused"}]},
         {"id": "shout", "label": "function shout", "src": {"file": "greet.js", "span": span("greet.js", "export function shout(name) { return greet(name).toUpperCase(); }")},
          "question": "Where did shout go?",
          "summary": "No rule derives live(function shout). It has no effect (declaring a function runs nothing), and no live statement uses it. Each rule that could keep it is missing a premise:",

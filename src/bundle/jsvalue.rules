@@ -1,0 +1,586 @@
+# JavaScript's primitive values, as esbuild 0.28 folds them while it parses, before tree shaking:
+# js_ast's FoldBinaryOperator, ShouldFoldBinaryOperatorWhenMinifying and FoldStringAddition, and the
+# unary folds of js_parser's visitExprInOut. What a literal is worth, what an operator makes of
+# literals, and the literal printed for a value (js_printer's printNumber). Numbers are doubles.
+#
+# A tree is folded from its leaves up, so an operator sees what its operands became: `-(1)` is the
+# number -1, `1 + 2 + 3` is 6. Some folds are always made: a string joined with a primitive, `+` and
+# `-` of a primitive, `!` of one, `void` of one. The rest only with `--minify-syntax`, and then only
+# where esbuild expects the result to print no longer (`gated`), except in the initializer of a
+# `const` at the start of a statement list, where every operator folds (`all`), as esbuild folds
+# TypeScript's constant expressions.
+#
+# esbuild's other folds that make no literal (`x + "a" + "b"` as `x + "ab"`, a template with only
+# some of its parts written in) are the minifier's (bundle.minify).
+rules bundle.jsvalue over bundle.js
+use bundle.literal as lit
+
+enum Kind { Number, String, Boolean, Null, Undefined, BigInt }
+
+# `number`, a Number's; `raw`, a String's literal as written (quotes, escapes), or a BigInt's;
+# `truth`, a Boolean's.
+record Value { kind: Kind, number: Float, raw: Text, truth: Bool }
+
+# How much folds: `minify`, `--minify-syntax`; `all`, every operator, as in a leading `const`.
+record Folding { minify: Bool, all: Bool }
+
+fn always() -> Folding = Folding(minify: false, all: false)
+
+fn number(v: Float) -> Value = Value(kind: Number, number: v, raw: "", truth: false)
+fn string(raw: Text) -> Value = Value(kind: String, number: float(0), raw: raw, truth: false)
+fn boolean(b: Bool) -> Value = Value(kind: Boolean, number: float(0), raw: "", truth: b)
+fn null-value() -> Value = Value(kind: Null, number: float(0), raw: "", truth: false)
+fn undefined-value() -> Value = Value(kind: Undefined, number: float(0), raw: "", truth: false)
+fn bigint(raw: Text) -> Value = Value(kind: BigInt, number: float(0), raw: raw, truth: false)
+
+# ---------------------------------------------------------------- what a node is worth
+
+# The literal esbuild has where this expression was, once it has visited it, if that is one.
+fn value-of(n: Node, f: Folding) -> Value? = match n {
+  Num(t) if ends-with(t, "n") => some(bigint(t))
+  # What a NaN was folded to (`literal`).
+  Num("NaN") => some(number(nan()))
+  Num(t) => first v in literal-number(t): number(v)
+  Str(raw) => some(string(raw))
+  # With minifying, a template with nothing in it is a string.
+  TemplateFull(raw) if f.minify or f.all => some(string(js-string(cooked(raw[1..len(raw) - 1]))))
+  # With minifying, primitives are written into a template (InlinePrimitivesIntoTemplate); when all
+  # of its parts are, it is a string.
+  Template(TemplateHead(h), e, List(ps...), TemplateTail(t)) if f.minify or f.all =>
+    first text in template-text(h, [e] ++ [p.expr for p in ps], [p.middle.text for p in ps], t, f): string(js-string(text))
+  True() => some(boolean(true))
+  False() => some(boolean(false))
+  Null() => some(null-value())
+  Void(x) if is-some(value-of(x, f)) => some(undefined-value())
+  Paren(x) => value-of(x, f)
+  Neg(x) => first k in number-of-node(x, f): number(-k)
+  Pos(x) => first k in number-of-node(x, f): number(k)
+  Not(x) => first v in value-of(x, f) for b in truth-of(v): boolean(not b)
+  # `typeof` of a primitive, a function or an arrow (TypeofWithoutSideEffects).
+  TypeOf(x) => first t in type-of(x, f): string(quoted(t))
+  BitNot(x) if f.minify or f.all => first k in number-of-node(x, f): number(float(-1 - int32(k)))
+  # `(1, x)` is `x` when minifying: what has no effect before a comma goes.
+  Seq(a, b) if f.minify and is-some(value-of(a, f)) => value-of(b, f)
+  Add(l, r) => first a in value-of(l, f) for b in value-of(r, f) for v in added(a, b, f): v
+  Sub(l, r) => arithmetic(l, r, f, n)
+  Mul(l, r) => arithmetic(l, r, f, n)
+  Div(l, r) => arithmetic(l, r, f, n)
+  Mod(l, r) => arithmetic(l, r, f, n)
+  Pow(l, r) => arithmetic(l, r, f, n)
+  Shl(l, r) => arithmetic(l, r, f, n)
+  Shr(l, r) => arithmetic(l, r, f, n)
+  Ushr(l, r) => arithmetic(l, r, f, n)
+  BitAnd(l, r) => arithmetic(l, r, f, n)
+  BitOr(l, r) => arithmetic(l, r, f, n)
+  BitXor(l, r) => arithmetic(l, r, f, n)
+  Lt(l, r) | Gt(l, r) | Le(l, r) | Ge(l, r) => compared(l, r, f, n)
+  Eq(l, r) | StrictEq(l, r) | Ne(l, r) | StrictNe(l, r) => compared(l, r, f, n)
+  # A literal on the left decides `&&`, `||` and `??`: it is the answer, or what is on the right.
+  And(l, r) if f.minify or f.all => first a in value-of(l, f) for v in (match truth-of(a) {
+    some(false) => some(a)
+    some(true) => value-of(r, f)
+    none => none
+  }): v
+  Or(l, r) if f.minify or f.all => first a in value-of(l, f) for v in (match truth-of(a) {
+    some(true) => some(a)
+    some(false) => value-of(r, f)
+    none => none
+  }): v
+  Coalesce(l, r) if f.minify or f.all => first a in value-of(l, f) for v in (match a.kind {
+    Null | Undefined => value-of(r, f)
+    _ => some(a)
+  }): v
+  _ => none
+}
+
+fn type-of(x: Node, f: Folding) -> Text? = match value-of(x, f) {
+  some(v) => some(match v.kind {
+    Number => "number"
+    String => "string"
+    Boolean => "boolean"
+    Null => "object"
+    Undefined => "undefined"
+    BigInt => "bigint"
+  })
+  none => match x {
+    Paren(y) => type-of(y, f)
+    FuncExpr(...) | GenExpr(...) | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) => some("function")
+    _ => none
+  }
+}
+
+# Whether an operator's operands are what a rewrite from the leaves up has already folded them to
+# when it can fold at all: literals (and, for `typeof` and `+`/`-`, what those read). Asked before
+# `value-of`, so that an operator of anything else costs a look at its children, not a walk.
+fn operands-literal?(n: Node) -> Bool = match n {
+  And(l, r) | Or(l, r) | Coalesce(l, r) => literal-form?(l) and (literal-form?(r) or decides?(n, l))
+  Template(_, e, List(ps...), _) => literal-form?(e) and (all p in ps: literal-form?(p.expr))
+  _ => all k in n.kids: literal-form?(k)
+}
+
+# `a && b`, `a || b`, `a ?? b` whose left is its answer, whatever the right is.
+fn decides?(n: Node, l: Node) -> Bool = any v in value-of(l, always()): (match n, truth-of(v) {
+  And(...), some(false) => true
+  Or(...), some(true) => true
+  And(...), _ => false
+  Or(...), _ => false
+  _, _ => not (v.kind == Null or v.kind == Undefined)
+})
+
+fn literal-form?(n: Node) -> Bool = match n {
+  Num(_) | Str(_) | TemplateFull(_) | True() | False() | Null() | Regex(_) => true
+  Neg(Num(_)) | Void(Num(_)) | Div(Num(_), Num(_)) | Div(Neg(Num(_)), Num(_)) => true
+  ArrayLit(List()) | ObjectLit(List()) => true
+  FuncExpr(...) | GenExpr(...) | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) => true
+  Paren(x) => literal-form?(x)
+  _ => false
+}
+
+# What `+x` and `-x` read `x` as (ToNumberWithoutSideEffects): `[]` is 0, `{}` and a regular
+# expression NaN, and a primitive its number.
+fn number-of-node(x: Node, f: Folding) -> Float? = match x {
+  ArrayLit(List()) => some(float(0))
+  ObjectLit(List()) | Regex(_) => some(nan())
+  Paren(y) => number-of-node(y, f)
+  _ => first v in value-of(x, f) for k in to-number(v): k
+}
+
+fn to-number(v: Value) -> Float? = match v.kind {
+  Number => some(v.number)
+  Null => some(float(0))
+  Undefined => some(nan())
+  Boolean => some(match v.truth { true => float(1) false => float(0) })
+  String => string-number(string-value(v.raw))
+  BigInt => none
+}
+
+# A string reads as a number here only when it is empty or exactly how a 32-bit integer prints
+# (StringToEquivalentNumberValue): `"1"` and `"-5"` are numbers; `"01"`, `"-0"`, `"1.5"` are not.
+fn string-number(s: Text) -> Float? = match s {
+  "" => some(float(0))
+  "-" ++ digits => first v in printed-digits(digits) if v > 0 and v <= two-31: float(0 - v)
+  digits => first v in printed-digits(digits) if v < two-31: float(v)
+}
+
+# Decimal digits as an integer prints them: no sign, no leading zero but `0` itself.
+fn printed-digits(s: Text) -> Int? = match s {
+  _ if s == "" or not (all c in s: digit-byte?(c)) or (len(s) > 1 and s[0] == '0') => none
+  _ => digits-number(s, 10, two-31)
+}
+
+# Whether a value is truthy, when that can be told without running anything.
+fn truth-of(v: Value) -> Bool? = match v.kind {
+  Boolean => some(v.truth)
+  Number => some(not (v.number == 0 or float-nan?(v.number)))
+  String => some(string-value(v.raw) != "")
+  Null | Undefined => some(false)
+  # esbuild compares a BigInt's digits to "0".
+  BigInt => some(v.raw != "0n")
+}
+
+# What `"…" + v` reads `v` as (ToStringWithoutSideEffects): only a 32-bit integer of the numbers,
+# NaN and the infinities; a BigInt with no radix prefix.
+fn to-string(v: Value) -> Text? = match v.kind {
+  String => some(string-value(v.raw))
+  Null => some("null")
+  Undefined => some("undefined")
+  Boolean => some(match v.truth { true => "true" false => "false" })
+  Number if float-nan?(v.number) => some("NaN")
+  Number if infinite?(v.number) and v.number > 0 => some("Infinity")
+  Number if infinite?(v.number) => some("-Infinity")
+  Number if v.number == float(int32(v.number)) => some(int-text(int32(v.number)))
+  Number => none
+  BigInt if len(v.raw) < 3 or v.raw[0] != '0' => some(v.raw[0..len(v.raw) - 1])
+  BigInt => none
+}
+
+# ---------------------------------------------------------------- operators
+
+# `a + b`: strings joined, a primitive beside a string read as one (FoldStringAddition), always;
+# numbers added when the folding says so.
+fn added(a: Value, b: Value, f: Folding) -> Value? = match joined(a, b) {
+  some(v) => some(v)
+  none => folded-number(a, b, f, a.kind == Number and b.kind == Number and small-ints?(a, b, 4294967295), a.number + b.number)
+}
+
+fn joined(a: Value, b: Value) -> Value? = match a.kind, b.kind {
+  String, String => some(string(concat(a.raw, b.raw).text))
+  String, _ => first t in to-string(b): string(concat(a.raw, quoted(t)).text)
+  _, String => first t in to-string(a): string(concat(quoted(t), b.raw).text)
+  _, _ => none
+}
+
+fn quoted(t: Text) -> Text = "\"" ++ t ++ "\""
+
+# Numbers only, folded when every operator folds, or when minifying and `gate` holds.
+fn folded-number(a: Value, b: Value, f: Folding, gate: Bool, result: Float) -> Value? = match a.kind, b.kind {
+  Number, Number if f.all or (f.minify and gate) => some(number(result))
+  _, _ => none
+}
+
+fn arithmetic(l: Node, r: Node, f: Folding, n: Node) -> Value? = first a in value-of(l, f) for b in value-of(r, f)
+  for v in folded-number(a, b, f, gated(n, a.number, b.number), result(n, a.number, b.number)): v
+
+# What each operator makes of two numbers.
+fn result(n: Node, a: Float, b: Float) -> Float = match n {
+  Sub(...) => a - b
+  Mul(...) => a * b
+  Div(...) => a / b
+  Mod(...) => float-mod(a, b)
+  Pow(...) => float-pow(a, b)
+  Shl(...) => float(int32-wrap(int32(a) * power-of-two(uint32(b) % 32)))
+  Shr(...) => float(shifted-right(int32(a), uint32(b) % 32))
+  Ushr(...) => float(uint32(a) / power-of-two(uint32(b) % 32))
+  BitAnd(...) => float(int32-wrap(bit-and(uint32(a), uint32(b))))
+  BitOr(...) => float(int32-wrap(bit-or(uint32(a), uint32(b))))
+  BitXor(...) => float(int32-wrap(bit-xor(uint32(a), uint32(b))))
+  _ => panic "jsvalue.result: not an arithmetic operator"
+}
+
+# Whether minifying folds this operator of these numbers (ShouldFoldBinaryOperatorWhenMinifying):
+# where the answer is unlikely to print longer than the question.
+fn gated(n: Node, a: Float, b: Float) -> Bool = match n {
+  Sub(...) => small-int?(a, 4294967295) and small-int?(b, 4294967295)
+  Mul(...) => small-int?(a, 255) and small-int?(b, 255)
+  # `0/0` is NaN and `1/0` Infinity; nothing else.
+  Div(...) => b == 0
+  Shl(...) => printed-int-length(result(n, a, b)) <= printed-int-length(a) + 2 + printed-int-length(b)
+  Ushr(...) => printed-int-length(result(n, a, b)) <= printed-int-length(a) + 3 + printed-int-length(b)
+  Shr(...) | BitAnd(...) | BitOr(...) | BitXor(...) => true
+  _ => false
+}
+
+fn small-ints?(a: Value, b: Value, limit: Int) -> Bool = small-int?(a.number, limit) and small-int?(b.number, limit)
+fn small-int?(x: Float, limit: Int) -> Bool = x == float-trunc(x) and magnitude(x) <= float(limit)
+
+# `a < b`, `a == b` and the rest, of two numbers or two strings (strings by UTF-16 code units).
+# Minifying always folds them; esbuild never folds `==` of a number and a string here.
+fn compared(l: Node, r: Node, f: Folding, n: Node) -> Value? = match f.all or f.minify {
+  false => none
+  true => first a in value-of(l, f) for b in value-of(r, f) for v in compared-values(n, a, b): v
+}
+
+fn compared-values(n: Node, a: Value, b: Value) -> Value? = match a.kind, b.kind {
+  Number, Number => some(boolean(match n {
+    Lt(...) => a.number < b.number
+    Gt(...) => a.number > b.number
+    Le(...) => a.number <= b.number
+    Ge(...) => a.number >= b.number
+    Eq(...) | StrictEq(...) => a.number == b.number
+    _ => a.number != b.number
+  }))
+  String, String => some(boolean(match n {
+    Lt(...) => order < 0
+    Gt(...) => order > 0
+    Le(...) => order <= 0
+    Ge(...) => order >= 0
+    Eq(...) | StrictEq(...) => order == 0
+    _ => order != 0
+  })) where order = utf16-order(string-value(a.raw), string-value(b.raw))
+  _, _ => none
+}
+
+# How two strings order as JavaScript orders them, by UTF-16 code units: below zero, zero, above.
+fn utf16-order(a: Text, b: Text) -> Int = match first i in 0..min(len(x), len(y)) if x[i] != y[i]: x[i] - y[i] {
+  some(d) => d
+  none => len(x) - len(y)
+} where x = utf16-units(a), y = utf16-units(b)
+
+fn utf16-units(s: Text) -> [Int] = [u for c in code-points-of(s) for u in (match c {
+  _ if c >= 65536 => [55296 + (c - 65536) / 1024, 56320 + (c - 65536) % 1024]
+  _ => [c]
+})]
+
+# ---------------------------------------------------------------- 32-bit integers
+
+const two-32: Int = 4294967296
+const two-31: Int = 2147483648
+
+# JavaScript's ToInt32, as esbuild has it: NaN and the infinities are 0; otherwise the integer
+# part, wrapped into 32 bits, with the sign of the number.
+fn int32(x: Float) -> Int = match x {
+  _ if float-nan?(x) or infinite?(x) => 0
+  _ => signed-int32(x, float-int(float-trunc(float-mod(magnitude(x), 4294967296))))
+}
+
+fn signed-int32(x: Float, m: Int) -> Int = match float-negative?(x) {
+  true => int32-wrap(0 - m)
+  false => int32-wrap(m)
+}
+
+fn uint32(x: Float) -> Int = (int32(x) + two-32) % two-32
+fn int32-wrap(v: Int) -> Int = match ((v % two-32) + two-32) % two-32 {
+  u if u >= two-31 => u - two-32
+  u => u
+}
+
+fn power-of-two(k: Int) -> Int = fold out = 1 for i in 0..k: out * 2
+
+# A signed shift right: the floor of the quotient.
+fn shifted-right(v: Int, k: Int) -> Int = match v {
+  _ if v >= 0 => v / d
+  _ => (v - d + 1) / d
+} where d = power-of-two(k)
+
+# ---------------------------------------------------------------- numbers
+
+fn nan() -> Float = float(0) / float(0)
+fn infinite?(x: Float) -> Bool = not float-nan?(x) and x - x != 0
+fn magnitude(x: Float) -> Float = match x {
+  _ if x < 0 => 0 - x
+  _ => x
+}
+
+# About how many characters an integer prints in (approximatePrintedIntCharCount): its digits,
+# and one for a minus sign. esbuild takes the floor of a logarithm and converts it to an integer:
+# NaN converts to 0 there (one digit), an infinity to the largest (always long enough to fold).
+fn printed-int-length(x: Float) -> Int = match x {
+  _ if float-nan?(x) => 1
+  _ if infinite?(x) => 4611686018427387903
+  _ => digit-count(magnitude(x)) + (match x < 0 { true => 1 false => 0 })
+}
+fn digit-count(x: Float) -> Int = match x {
+  _ if x < 10 => 1
+  _ => 1 + digit-count(x / 10)
+}
+
+# A numeric literal's value, as esbuild's lexer reads it: `_` separators ignored; `0x`, `0o`, `0b`
+# and legacy octal (`017`) digit by digit in doubles; a decimal, `08` and `09` too, to the nearest
+# double. A BigInt is not a number.
+fn literal-number(text: Text) -> Float? = match ascii-lower(t) {
+  "0x" ++ d if d != "" => digits-value(d, 16)
+  "0o" ++ d if d != "" => digits-value(d, 8)
+  "0b" ++ d if d != "" => digits-value(d, 2)
+  "0" ++ d if d != "" and (all c in d: c >= '0' and c <= '7') => digits-value(d, 8)
+  _ => float-parse(t)
+} where t = replace-all(text, "_", "")
+
+fn digits-value(d: Text, base: Int) -> Float? = match all c in d: is-some(digit-value(c, base)) {
+  false => none
+  true => some(fold v = float(0) for c in d: v * float(base) + float(digit-value(c, base) ?? 0))
+}
+
+# What esbuild writes in where a constant is read (ExprToConstValue): null, undefined, a boolean,
+# a number that is an integer or whose shortest `%g` has at most 8 characters, a string of at most
+# 3 UTF-16 code units. Not a BigInt, nor anything longer.
+fn const-value?(v: Value) -> Bool = match v.kind {
+  Null | Undefined | Boolean => true
+  Number => (x == float-trunc(x) and magnitude(x) < float(9007199254740992) * 1024) or len(go-g(x)) <= 8
+    where x = v.number
+  String => len(utf16-units(string-value(v.raw))) <= 3
+  BigInt => false
+}
+
+# Go's FormatFloat(x, 'g', -1, 64), sign and all.
+fn go-g(x: Float) -> Text = match x {
+  _ if float-nan?(x) => "NaN"
+  _ if infinite?(x) and x > 0 => "+Inf"
+  _ if infinite?(x) => "-Inf"
+  _ if x == 0 => match float-negative?(x) { true => "-0" false => "0" }
+  _ if x < 0 => "-" ++ go-shortest-g(float-digits(0 - x))
+  _ => go-shortest-g(float-digits(x))
+}
+
+# What may come before a constant at the start of a statement list without ending that start
+# (isSafeForConstLocalPrefix): what a value folded to, if it is a string or a BigInt; or a string,
+# regular expression, function or arrow, `{}`, or an array of these.
+fn prefix-safe?(n: Node, f: Folding) -> Bool = match value-of(n, f) {
+  some(v) => v.kind == String or v.kind == BigInt
+  none => match n {
+    Paren(x) => prefix-safe?(x, f)
+    Regex(_) | FuncExpr(...) | GenExpr(...) | AsyncFuncExpr(...) | AsyncGenExpr(...) | Arrow(...) | AsyncArrow(...) => true
+    ObjectLit(List()) => true
+    ArrayLit(List(xs...)) => all x in xs: x is Hole() or prefix-safe?(x, f)
+    _ => false
+  }
+}
+
+# ---------------------------------------------------------------- printing a value
+
+# The literal esbuild prints for a value: a negative number as `-` and its magnitude, NaN as
+# `NaN`, an infinity as `1 / 0` (esbuild's spelling when minifying, the only time one is folded).
+fn literal(v: Value) -> Node = match v.kind {
+  Number => number-node(v.number)
+  String => Str(v.raw)
+  Boolean => match v.truth { true => True() false => False() }
+  Null => Null()
+  Undefined => Void(Num("0"))
+  BigInt => Num(v.raw)
+}
+
+fn number-node(x: Float) -> Node = match x {
+  _ if float-nan?(x) => Num("NaN")
+  _ if infinite?(x) and x > 0 => Div(Num("1"), Num("0"))
+  _ if infinite?(x) => Div(Neg(Num("1")), Num("0"))
+  _ if float-negative?(x) => Neg(Num(magnitude-text(0 - x)))
+  _ => Num(magnitude-text(x))
+}
+
+# A nonnegative finite number as esbuild prints it without minified whitespace
+# (printNonNegativeFloat): an integer below 1000 as its digits; anything else as Go's shortest
+# `%g`, then made shorter: `e+06` as `e6`, `0.001` as `1e-3`, `1.2e1` as `12`, `1000` as `1e3`.
+fn magnitude-text(x: Float) -> Text = match x {
+  _ if x == 0 => "0"
+  _ if x < 1000 and x == float-trunc(x) => int-text(float-int(x))
+  _ => simplified(go-shortest-g(float-digits(x)))
+}
+
+# Go's strconv.FormatFloat(x, 'g', -1, 64): an exponent when the decimal exponent is below -4 or
+# at least 6 (the shortest form's precision for that choice), at least two of its digits.
+fn go-shortest-g(d: rt.Decimal) -> Text = match exponent < -4 or exponent >= 6 {
+  true => mantissa ++ "e" ++ (match exponent < 0 { true => "-" false => "+" }) ++ two-digits(abs(exponent))
+    where mantissa = match len(d.digits) {
+      1 => d.digits
+      _ => d.digits[0..1] ++ "." ++ d.digits[1..len(d.digits)]
+    }
+  false => match d.point {
+    p if p <= 0 => "0." ++ repeated("0", 0 - p) ++ d.digits
+    p if p >= len(d.digits) => d.digits ++ repeated("0", p - len(d.digits))
+    p => d.digits[0..p] ++ "." ++ d.digits[p..len(d.digits)]
+  }
+} where exponent = d.point - 1
+
+fn abs(v: Int) -> Int = match v < 0 { true => 0 - v false => v }
+fn two-digits(v: Int) -> Text = match v < 10 { true => "0" ++ int-text(v) false => int-text(v) }
+
+# esbuild's own shortening of Go's text, in its order.
+fn simplified(g: Text) -> Text = shortened(match g {
+  m ++ "e+" ++ x => m ++ "e" ++ int-text(parse-int(x))
+  m ++ "e-" ++ x => m ++ "e-" ++ int-text(parse-int(x))
+  _ => g
+})
+
+fn shortened(s: Text) -> Text = match s {
+  # "0.001" is 1e-3, when that is shorter.
+  "0.0" ++ _ => shorter-of(s, rest ++ "e" ++ int-text(2 - i - len(rest)))
+    where i = 2 + span-of(s, 2, "0"), rest = s[i..len(s)]
+  "0." ++ _ => s
+  # "1.2e1" is 12; "1.2e4" is 12e3.
+  w ++ "." ++ after => match after {
+    f ++ "e" ++ x => match parse-exponent(x) - len(f) {
+      e if e >= 0 and e <= 2 => match len(s) >= len(w) + len(f) + e {
+        true => w ++ f ++ repeated("0", e)
+        false => s
+      }
+      e => match len(s) >= len(w) + len(f) + 1 + len(int-text(e)) {
+        true => w ++ f ++ "e" ++ int-text(e)
+        false => s
+      }
+    }
+    _ => s
+  }
+  # "1000" is 1e3, when that is shorter.
+  _ if ends-with(s, "0") => shorter-of(s, s[0..len(s) - zeros] ++ "e" ++ int-text(zeros))
+    where zeros = span-back-of(s, "0")
+  _ => s
+}
+
+fn parse-exponent(x: Text) -> Int = match x {
+  "-" ++ digits => 0 - parse-int(digits)
+  digits => parse-int(digits)
+}
+
+# The second, only when it is strictly shorter.
+fn shorter-of(a: Text, b: Text) -> Text = match len(a) > len(b) {
+  true => b
+  false => a
+}
+
+# A template's text (between its backquotes) as a string literal: what it says, in double quotes.
+# A template's text and its parts' values, as one text, when every part is a primitive text can be
+# made of. `h`, the head (`` `…${ ``); `middles`, each `}…${`; `t`, the tail (`` }…` ``).
+fn template-text(h: Text, exprs: [Node], middles: [Text], t: Text, f: Folding) -> Text? = match all x in subs: is-some(x) {
+  false => none
+  true => some(cooked(h[1..len(h) - 2]) ++ join([(subs[i] ?? "") ++ cooked(rests[i]) for i in 0..len(subs)], ""))
+} where subs = [first v in value-of(x, f) for s in to-string(v): s for x in exprs],
+        rests = [m[1..len(m) - 2] for m in middles] ++ [t[1..len(t) - 1]]
+
+# What a template's characters say: escapes resolved, and a line break a newline whatever the file
+# used (`\r\n` and `\r` read as `\n`).
+fn cooked(chars: Text) -> Text = escaped-value(replace-all(replace-all(chars, "\r\n", "\n"), "\r", "\n"))
+
+# ---------------------------------------------------------------- string literals
+
+fn pieces(s: Text) -> [lit.Node] = match s {
+  _ if not has-byte?(s, '\\') => [lit.Plain(s)]
+  _ => match lit.parse(s, "<string>") { lit.Content(List(ps...)) => ps }
+}
+
+# The character an escape names, for one that stands for itself.
+fn escaped(p: lit.Node) -> Int = p.text[1]
+
+# A string literal's value: what it says, every escape resolved, legacy octal escapes and line
+# continuations too. What an import names, or one of its attributes, is the value, not the spelling.
+fn string-value(raw: Text) -> Text = escaped-value(unquote(raw))
+
+# The same of text with escapes, a string's content or a name's (whose `\u` escapes mean the same).
+fn escaped-value(content: Text) -> Text {
+  let cps = code-points-of(content)
+  var out: [Int] = []
+  var i = 0
+  while i < len(cps) {
+    let c = cps[i]
+    if c != '\\' {
+      out ++= [c]
+      i = i + 1
+    } else {
+      let e = cps[i + 1]
+      if e == 'x' {
+        out ++= [hex-points(cps, i + 2, i + 4)]
+        i = i + 4
+      } else if e == 'u' and cps[i + 2] == '{' {
+        let close = first j in (i + 3)..len(cps) if cps[j] == '}': j
+        let end = close ?? panic "{}: a brace escape that does not close", content
+        out ++= [hex-points(cps, i + 3, end)]
+        i = end + 1
+      } else if e == 'u' {
+        out ++= [hex-points(cps, i + 2, i + 6)]
+        i = i + 6
+      } else if e >= '0' and e <= '7' {
+        # Up to three digits from `\0`-`\3`, two from `\4`-`\7`: `\101` is `A`, `\400` is `\40` and `0`.
+        let most = if e <= '3' then 3 else 2
+        let digits = len([j for j in (i + 1)..min(i + 1 + most, len(cps)) while cps[j] >= '0' and cps[j] <= '7'])
+        out ++= [fold v = 0 for j in (i + 1)..(i + 1 + digits): v * 8 + cps[j] - '0']
+        i = i + 1 + digits
+      } else if e == 13 and i + 2 < len(cps) and cps[i + 2] == 10 {
+        i = i + 3
+      } else if e == 10 or e == 13 or e == 8232 or e == 8233 {
+        i = i + 2
+      } else {
+        out ++= [match e {
+          'b' => 8
+          'f' => 12
+          'n' => 10
+          'r' => 13
+          't' => 9
+          'v' => 11
+          _ => e
+        }]
+        i = i + 2
+      }
+    }
+  }
+  text-of-points(out)
+}
+
+fn hex-points(cps: [Int], from: Int, to: Int) -> Int =
+  digits-number(text-of-points(cps[from..to]), 16, 1114111) ?? panic "{}: not a hex escape", text-of-points(cps[from..to])
+
+# Content rewritten for double quotes: a `\'` loses its slash, a bare `"` gains one.
+fn to-double-quoted(raw: Text) -> Text = match raw {
+  "'" ++ _ => join([double-quoted(p) for p in pieces(unquote(raw))], "")
+  _ => unquote(raw)
+}
+
+fn double-quoted(p: lit.Node) -> Text = match p {
+  lit.Plain(t) => replace-all(t, "\"", "\\\"")
+  _ if escaped(p) == '\'' => "'"
+  _ => p.text
+}
+
+# Two string tokens as one.
+fn concat(a: Text, b: Text) -> Node = Str("\"" ++ to-double-quoted(a) ++ to-double-quoted(b) ++ "\"")
+
+# Any text as a double-quoted string.
+fn js-string(s: Text) -> Text =
+  "\"" ++ replace-many(s, ["\"", "\\", "\n", "\r", "\t"], ["\\\"", "\\\\", "\\n", "\\r", "\\t"]) ++ "\""

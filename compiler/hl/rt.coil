@@ -17,6 +17,7 @@
 (import "coil.str" :as str)
 (import "coil.fs" :as fs)
 (import "coil.io" :as io)
+(import "coil.fmt" :as fmt)
 (import "coil.os" :as os)
 (import "coil.path" :as cpath)
 (import "coil.primitive" :as primitive)
@@ -5517,6 +5518,122 @@
 
 (defn bit-xor [(a i64) (b i64)] (-> i64)
   (^ a b))
+
+;; ---------------------------------------------------------------- doubles
+
+;;; A language whose numbers are doubles (IEEE 754 binary64) computes with these: conversions,
+;;; a plain decimal read, the shortest decimal digits that read back as the same double, and what
+;;; C's libm answers. How a language spells a number is the language's own concern.
+(extern strtod :cc (cc/C) [(ptr i8) (ptr (ptr i8))] (-> f64))
+(extern fmod :cc (cc/C) [f64 f64] (-> f64))
+(extern pow :cc (cc/C) [f64 f64] (-> f64))
+(extern trunc :cc (cc/C) [f64] (-> f64))
+(extern floor :cc (cc/C) [f64] (-> f64))
+
+(defn float-of [(v i64)] (-> f64) (cast f64 v))
+(defn float-mod [(a f64) (b f64)] (-> f64) (fmod a b))
+(defn float-pow [(a f64) (b f64)] (-> f64) (pow a b))
+(defn float-trunc [(x f64)] (-> f64) (trunc x))
+(defn float-floor [(x f64)] (-> f64) (floor x))
+(defn float-nan? [(x f64)] (-> bool) (!= x x))
+
+;;; Whether the sign bit is set: true for -0 and every negative number, as `x < 0` is not for -0.
+(defn float-negative? [(x f64)] (-> bool)
+  (let [(mut v) x]
+    (!= (>> (load (cast (ptr u64) (mut v))) 63) (: 0 u64))))
+
+;;; An integral double as an integer. Anything else is a caller's mistake.
+(defn float-int [(x f64)] (-> i64)
+  (when (or (!= x (trunc x)) (not (< (if (< x (: 0.0 f64)) (- (: 0.0 f64) x) x) (: 9.2e18 f64))))
+    (panic "float-int: not an integer that fits in 64 bits"))
+  (cast i64 x))
+
+;;; Digits, an optional `.` and more digits (at least one digit in all), and an optional exponent
+;;; (`e` or `E`, a sign, digits), read as the nearest double. Anything else is none.
+(defn float-parse [(s (slice u8))] (-> (Option f64))
+  (let [n (len s)
+        (mut i) 0
+        (mut digits) 0]
+    (while (and (< i n) (digit? (get s i))) (set! i (+ i 1)) (set! digits (+ digits 1)))
+    (when (and (< i n) (= (get s i) (: 46 u8)))
+      (set! i (+ i 1))
+      (while (and (< i n) (digit? (get s i))) (set! i (+ i 1)) (set! digits (+ digits 1))))
+    (let [(mut ok) (> digits 0)]
+      (when (and ok (< i n) (or (= (get s i) (: 101 u8)) (= (get s i) (: 69 u8))))
+        (set! i (+ i 1))
+        (when (and (< i n) (or (= (get s i) (: 43 u8)) (= (get s i) (: 45 u8)))) (set! i (+ i 1)))
+        (let [start i]
+          (while (and (< i n) (digit? (get s i))) (set! i (+ i 1)))
+          (when (= i start) (set! ok false))))
+      (if (and ok (= i n))
+          ;; strtod reads up to a NUL: the text, with one after it.
+          (let [(mut b) (str/StrBuf::new (value-allocator))]
+            (push-str! (mut b) s)
+            (push-str! (mut b) (text-of-byte 0))
+            (Some (strtod (cast (ptr i8) (data (finish! (mut b)))) (cast (ptr (ptr i8)) 0))))
+          (None [f64])))))
+
+;;; A finite, nonzero double's magnitude as decimal digits with no leading or trailing zero and
+;;; where the point goes: the value is 0.DIGITS times ten to the `point`. The digits are the
+;;; fewest that read back as exactly this double (coil.fmt's shortest form).
+(defstruct Decimal [(digits (slice u8)) (point i64)])
+
+(defstruct FloatText [(bytes (array u8 64)) (n i64)])
+
+(defn float-text-write [(ctx (ptr i8)) (buf (ptr i8)) (count i64)] (-> (Result i64 io/IoError))
+  (let [t (cast (ptr FloatText) ctx)]
+    (for i (range 0 count)
+      (when (< (load (field t n)) 64)
+        (store! (primitive/index (cast (ptr u8) (field t bytes)) (load (field t n)))
+                (load (primitive/index (cast (ptr u8) buf) i)))
+        (store! (field t n) (+ (load (field t n)) 1))))
+    (Ok count)))
+
+(defn float-digits [(x f64)] (-> Decimal)
+  (when (or (!= x x) (= x (: 0.0 f64)) (!= (- x x) (: 0.0 f64)))
+    (panic "float-digits: not a finite nonzero number"))
+  (let [t (primitive/alloc-stack FloatText)
+        w (primitive/alloc-stack io/Writer)
+        magnitude (if (< x (: 0.0 f64)) (- (: 0.0 f64) x) x)]
+    (store! (field t n) 0)
+    (store! (field w write-fn) (primitive/fnptr-of float-text-write))
+    (store! (field w ctx) (cast (ptr i8) t))
+    (fmt/write-f64-shortest w magnitude)
+    ;; What it wrote: digits with one `.`, then perhaps `e` and a signed exponent.
+    (let [text (cast (ptr u8) (field t bytes))
+          total (load (field t n))
+          (mut b) (str/StrBuf::new (value-allocator))
+          (mut i) 0
+          (mut before-point) 0
+          (mut seen-point) false
+          (mut leading) 0
+          (mut started) false]
+      (while (and (< i total) (!= (load (primitive/index text i)) (: 101 u8)))
+        (let [c (load (primitive/index text i))]
+          (cond (= c (: 46 u8)) (set! seen-point true)
+                (and (= c (: 48 u8)) (not started))
+                  (do (unless seen-point (set! before-point (+ before-point 1)))
+                      (set! leading (+ leading 1)))
+                :else
+                  (do (set! started true)
+                      (unless seen-point (set! before-point (+ before-point 1)))
+                      (push-str! (mut b) (text-of-byte (cast i64 c))))))
+        (set! i (+ i 1)))
+      (let [(mut exponent) 0
+            (mut negative) false]
+        (when (< i total)
+          (set! i (+ i 1))
+          (when (= (load (primitive/index text i)) (: 45 u8)) (set! negative true) (set! i (+ i 1)))
+          (when (= (load (primitive/index text i)) (: 43 u8)) (set! i (+ i 1)))
+          (while (< i total)
+            (set! exponent (+ (* exponent 10) (- (cast i64 (load (primitive/index text i))) 48)))
+            (set! i (+ i 1))))
+        (let [digits (finish! (mut b))
+              ;; Trailing zeros of the digits (`100.0` is 1 then zeros) move into the point.
+              (mut keep) (len digits)]
+          (while (and (> keep 1) (= (get digits (- keep 1)) (: 48 u8))) (set! keep (- keep 1)))
+          (Decimal :digits (subslice digits 0 keep)
+                   :point (- (+ before-point (if negative (- 0 exponent) exponent)) leading)))))))
 
 ;;; Every byte in order, made once, so a one-byte text is a slice of it and costs nothing. The
 ;;; ready word comes first, read and written atomically: whoever sees it set sees the bytes.
