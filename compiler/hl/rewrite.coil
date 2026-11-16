@@ -49,7 +49,9 @@
 
 ;;; A window rule rewrites a run in the middle of a list and leaves the rest alone:
 ;;; `List(xs..., P, ys...) => List(xs..., R, ys...)`. `width` is P's length, 0 otherwise.
-(defstruct Rule [(name (slice u8)) (head (slice u8)) (width i64)])
+;;; A rule: its name, its pattern's head node, its window's width (0: none), and its line, which
+;;; a recording names it by (`rt/record-rewrite!`).
+(defstruct Rule [(name (slice u8)) (head (slice u8)) (width i64) (line i64)])
 
 (defstruct Guard
   [(negated bool) (name (slice u8)) (args (ArrayList (slice u8)))])
@@ -64,6 +66,7 @@
    (vars (ArrayList Var))
    (guards (ArrayList Guard))
    (src (slice u8))
+   (path (slice u8))
    (next-subject i64)
    (next-scan i64)
    (window-prefix (slice u8))
@@ -561,7 +564,8 @@
                (Rule
                  :name (.text name)
                  :head head
-                 :width (if is-window (.window-width k) 0)))
+                 :width (if is-window (.window-width k) 0)
+                 :line (.line (tok-of (mut k) name))))
         (if is-window
             ;; The tail of `s0`'s children is the window: `scan` is where it starts.
             ;; The rest variables are bound to empty lists, so the result holds only the
@@ -584,13 +588,23 @@
           (try-rules (mut k) head (+ i 1))
         :else
           `(match (~(rule-sym (mut k) i) n pass)
-             (Some [r] (Some r))
+             (Some [r]
+                   ~(record-code (mut k) (get (.rules k) i) `n `r)
+                   (Some r))
              (None [] ~(try-rules (mut k) head (+ i 1))))))
+
+;;; With recording on, that `rule` turned `before` into `after` (see `rt/record-rewrite!`).
+(defn record-code [(k (mut Comp)) (rule Rule) (before Code) (after Code)] (-> Code)
+  `(when (rt/recording?)
+     (rt/record-rewrite! ~(.path k) ~(.line rule) ~(.name rule)
+                         (~(pfx-sym (mut k) "record-lo") ~before) (~(pfx-sym (mut k) "record-hi") ~before)
+                         (~(pfx-sym (mut k) "record-print") ~before) (~(pfx-sym (mut k) "record-print") ~after))))
 
 ;;; The rules' definitions, a step function dispatching on the head node, a driver,
 ;;; and the check against the grammar's table. The caller supplies `syn` and `host`.
 (defn compile-rules [(c (mut dsl/Cur))
                      (src (slice u8))
+                     (path (slice u8))
                      (rules (ArrayList g/Node))
                      (prefix (slice u8))
                      (has-host bool)
@@ -606,6 +620,7 @@
             :vars (ArrayList::new [Var] (rt/value-allocator))
             :guards (ArrayList::new [Guard] (rt/value-allocator))
             :src src
+            :path path
             :next-subject 1
             :next-scan 0
             :window-prefix ""
@@ -635,6 +650,7 @@
                     (let [probe (syn/mk (syn/KList) out 0 0)]
                       (match (~(rule-sym (mut k) i) probe pass)
                         (Some [repl]
+                              ~(record-code (mut k) r `probe `repl)
                               (for _ (range 0 ~(.width r)) (pop! (mut out)))
                               (set! fuel (- fuel 1))
                               (when (< fuel 0)
@@ -652,6 +668,32 @@
           check (pfx-sym (mut k) "check")]
       `(do
          ~@forms
+         ;;; Where a node came from, for a recording: its own place, or, for one a rule made (which has
+         ;;; none), the places of what it holds, from the first to the last that has one.
+         (defn ~(pfx-sym (mut k) "record-lo") [(n syn/Node)] (-> i64)
+           (if (or (!= (.lo n) 0) (!= (.hi n) 0))
+               (.lo n)
+               (let [(mut at) -1]
+                 (for each (.kids n)
+                   (when (< at 0)
+                     (let [x (~(pfx-sym (mut k) "record-lo") each)]
+                       (when (> x 0) (set! at x)))))
+                 at)))
+         (defn ~(pfx-sym (mut k) "record-hi") [(n syn/Node)] (-> i64)
+           (if (or (!= (.lo n) 0) (!= (.hi n) 0))
+               (.hi n)
+               (let [(mut at) -1]
+                 (for each (.kids n)
+                   (let [x (~(pfx-sym (mut k) "record-hi") each)]
+                     (when (> x at) (set! at x))))
+                 at)))
+         ;;; A node printed for a recording: a list (what a window rule rewrites), its items a line each.
+         (defn ~(pfx-sym (mut k) "record-print") [(n syn/Node)] (-> (slice u8))
+           (if (= (.kind n) (syn/KList))
+               (let [(mut parts) (ArrayList::new [(slice u8)] (rt/value-allocator))]
+                 (for each (.kids n) (push! (mut parts) (~(pfx-sym (mut k) "record-print") each)))
+                 (rt/joined parts "\n"))
+               (syn/render n false)))
          (defn ~step [(n syn/Node) (pass i64)] (-> (Option syn/Node))
            (match (.kind n) ~@arms (_ ~(no-match))))
          ;;; Window rules run as a peephole: normalise each element, push it, and try
@@ -770,6 +812,7 @@
                    ~(imports-for syntax host)
                    ~(compile-rules (mut c)
                                    src
+                                   path
                                    (.kids (get (.kids tree) 3))
                                    ""
                                    (> (len host) 0)

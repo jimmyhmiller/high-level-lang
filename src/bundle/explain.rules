@@ -1,0 +1,75 @@
+# What a build did, and why, for a reader exploring it (`--record=DIR` writes it to DIR/explain.json,
+# beside the analysis and the ledger): every module, every statement in each, where it is in its
+# source, whether the build keeps it, and when it does, the derivation that keeps it, from linking's
+# own rules (link.facts' `why-active-part`), each step its rule's line and its facts said by name
+# as the ledger says them (bundle.ledger: `m:` a module, `p:` a statement, `s:` a symbol, `n:` a
+# name, `i:` a place). What each rewrite rule did is recorded as it fires (`rt/record-rewrite!`),
+# beside this, in DIR/rewrites.jsonl.
+rules bundle.explain over bundle.js
+use bundle.js as js
+use bundle.modules as m
+use bundle.analysis as an
+use bundle.emit as e
+use bundle.link as link
+use bundle.ledger as led
+use bundle.sourcemap as map
+
+# A derivation's step: a fact, the rule that derived it (`line` in link.facts; -1 and 0 for a fact
+# given, not derived) and how deep below the kept statement it is.
+record Step { relation: Text, rule: Int, line: Int, depth: Int, args: [Text] }
+
+# A statement of a module: its key (as the ledger has it), its place in the module's source, whether
+# the build keeps it, and why.
+record Statement { key: Text, lo: Int, hi: Int, kept: Bool, why: [Step] }
+
+# A module: its number (what an emitted node's place holds above the low 32 bits, plus one), its
+# path as shown, its kind, its source, and its statements.
+record Module { id: Int, path: Text, kind: Text, source: Text, statements: [Statement] }
+
+record Explained { rules-file: Text, modules: [Module] }
+
+fn explained() -> Explained =
+  Explained(rules-file: "src/bundle/link.facts",
+            modules: [Module(id: id, path: led.module-key(id), kind: kind-name(m.modules[id].kind), source: led.source-of(id),
+                             statements: [statement(id, p, s, whys, lines, parts, symbols)
+                                          for p in e.parts-of(id) for s in [an.stmt-of(id, p)] if not (s is None() or s is Flag())])
+                      for id in m.order])
+  where parts = led.part-keys(),
+        lines = link.rule-lines(),
+        whys = {p: link.why-active-part(m.db, p) for id in m.order for p in e.parts-of(id) if m.db.active-part(p)},
+        symbols = led.symbol-keys([v for p in keys(whys) for w in whys[p] ?? [] for c in [columns-of(w.relation)]
+                                   for i in 0..len(c) if symbol-column?(c[i]) for v in [values(w)[i]] distinct v])
+
+fn statement(id: Int, p: Int, s: Node, whys: {Int:[link.Why]}, lines: [Int], parts: {Int:Text}, symbols: {Int:Text}) -> Statement =
+  Statement(key: parts[p] ?? "", lo: led.offset(s.lo), hi: led.offset(s.hi), kept: p in whys,
+            why: [step(w, lines, parts, symbols) for w in whys[p] ?? []])
+
+fn kind-name(k: m.ModuleKind) -> Text = match k {
+  m.Esm => "esm"
+  m.Cjs => "cjs"
+  m.Runtime => "runtime"
+  m.External => "external"
+}
+
+fn step(w: link.Why, lines: [Int], parts: {Int:Text}, symbols: {Int:Text}) -> Step =
+  Step(relation: w.relation, rule: w.rule, line: match w.rule { r if r >= 0 and r < len(lines) => lines[r]  _ => 0 },
+       depth: w.depth, args: [key(c[i], values(w)[i], parts, symbols) for c in [columns-of(w.relation)] for i in 0..len(c)])
+
+fn values(w: link.Why) -> [Int] = [w.a, w.b, w.c, w.d]
+
+fn columns-of(relation: Text) -> [Text] =
+  (first i in 0..len(link.relation-names()) if link.relation-names()[i] == relation: link.relation-columns(i))
+  ?? panic "explain: linking has no relation {}", relation
+
+# Columns that hold a symbol: a symbol, what an alias is of, an object literal's.
+fn symbol-column?(c: Text) -> Bool = c == "symbol" or c == "aliased" or c == "object" or c == "of"
+
+# A column's value, said as the ledger says it.
+fn key(column: Text, v: Int, parts: {Int:Text}, symbols: {Int:Text}) -> Text = match column {
+  "module" | "target" | "root" => "m:" ++ led.module-key(v)
+  "part" => "p:" ++ (parts[v] ?? ("#" ++ int-text(v)))
+  "name" | "target-name" => "n:" ++ name-of(m.names, v)
+  "at" => "i:" ++ int-text(v)
+  c if symbol-column?(c) => "s:" ++ (symbols[v] ?? ("#" ++ int-text(v)))
+  c => panic "explain: a column named {} holds nothing this can name", c
+}

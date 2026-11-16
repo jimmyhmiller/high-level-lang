@@ -4752,6 +4752,93 @@
 
 (defn json-done [(b (mut str/StrBuf))] (-> (slice u8)) (finish! (mut b)))
 
+;; ---------------------------------------------------------------- recording what a run does
+
+;;; With recording on (`record-start!`), a program built with these compilers says what its rules
+;;; did: each rewrite rule that fires, its file, line and name, the place of the node it fired on
+;;; (`lo` and `hi`; in a program a bundler emitted, a module's number is above the low 32 bits) and
+;;; the node before and after, printed. Each record is a line of JSON, copied in as it is made, so
+;;; nothing it holds outlives a region; `recorded` gives them all. Off, a record costs one load.
+(defstruct Recording [(on i64) (ready bool) (mutex Mutex) (lines (ArrayList u8)) (count i64) (where-key i64)])
+
+(defn recording :inline (Always) [] (-> (ptr Recording)) (primitive/alloc-static Recording))
+
+(defn recording? :inline (Always) [] (-> bool) (= (atomic/read (field (recording) on)) 1))
+
+(defn record-start! [] (-> void)
+  (let [r (recording)]
+    (unless (.ready r)
+      (match (Mutex::init (field r mutex))
+        (Ok [_] 0)
+        (Err [_] (panic "recording: cannot make its mutex")))
+      (set! (.lines r) (ArrayList::new [u8] (malloc-allocator)))
+      (set! (.where-key r) (key-new))
+      (set! (.ready r) true))
+    (atomic/store (field r on) 1)
+    0))
+
+;;; What this thread's rules work on from now (a module's number, say, for a bundler; -1 nothing
+;;; known), which each record it makes says as `where`. Answers `w`, to be used in an expression.
+(defn record-where! [(w i64)] (-> i64)
+  (when (recording?)
+    (key-set! (.where-key (recording)) (primitive/cast (ptr i8) (+ w 1))))
+  w)
+
+(defn record-where [] (-> i64)
+  (- (primitive/cast i64 (key-get (.where-key (recording)))) 1))
+
+;;; A printed node, cut at a length a reader can take in: an example, not the program.
+(defn record-cut [(s (slice u8))] (-> (slice u8))
+  (if (> (len s) 600) (subslice s 0 600) s))
+
+(defn record-line! [(text (slice u8))] (-> void)
+  (let [r (recording)]
+    (match (Mutex::lock! (field r mutex))
+      (Ok [_] 0)
+      (Err [_] (panic "recording: cannot lock")))
+    (extend! (mut (.lines r)) (data text) (len text))
+    (set! (.count r) (+ (.count r) 1))
+    (match (Mutex::unlock! (field r mutex))
+      (Ok [_] 0)
+      (Err [_] (panic "recording: cannot unlock")))
+    0))
+
+(defn record-rewrite! [(file (slice u8)) (line i64) (rule (slice u8)) (lo i64) (hi i64)
+                       (before (slice u8)) (after (slice u8))] (-> void)
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
+    (push-str! (mut b) "{\"kind\":\"rewrite\",\"file\":")
+    (json-text! (mut b) file)
+    (push-str! (mut b) ",\"line\":")
+    (push-i64! (mut b) line)
+    (push-str! (mut b) ",\"rule\":")
+    (json-text! (mut b) rule)
+    (push-str! (mut b) ",\"lo\":")
+    (push-i64! (mut b) lo)
+    (push-str! (mut b) ",\"hi\":")
+    (push-i64! (mut b) hi)
+    (push-str! (mut b) ",\"where\":")
+    (push-i64! (mut b) (record-where))
+    (push-str! (mut b) ",\"before\":")
+    (json-text! (mut b) (record-cut before))
+    (push-str! (mut b) ",\"after\":")
+    (json-text! (mut b) (record-cut after))
+    (push-str! (mut b) "}\n")
+    (record-line! (finish! (mut b)))))
+
+;;; Everything recorded so far, a JSON line each.
+(defn recorded [] (-> (slice u8))
+  (let [r (recording)
+        (mut b) (str/StrBuf::new (value-allocator))]
+    (when (.ready r)
+      (match (Mutex::lock! (field r mutex))
+        (Ok [_] 0)
+        (Err [_] (panic "recording: cannot lock")))
+      (push-str! (mut b) (slice (.lines r)))
+      (match (Mutex::unlock! (field r mutex))
+        (Ok [_] 0)
+        (Err [_] (panic "recording: cannot unlock"))))
+    (finish! (mut b))))
+
 ;;; JSON read back (`read-json`): a value, its kind 0 null, 1 false, 2 true, 3 a number, 4 a string,
 ;;; 5 an array (its items), 6 an object (its keys beside its items). Numbers are integers, as `json`
 ;;; writes them; anything else is an error, not a guess.
