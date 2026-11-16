@@ -22,6 +22,7 @@ BUILDS = os.path.join(ROOT, "out", "explorer", "builds")
 RUNS = os.path.join(ROOT, "out", "explorer", "example-runs")
 EXAMPLES = os.path.join(HERE, "examples")
 APP = os.path.join(HERE, "app")
+HLTREE = os.path.join(ROOT, "out", "bin", "hltree")
 PORT = 8770
 # Occurrences of one rule kept per build, at most: enough to read, not the whole build.
 PER_RULE = 300
@@ -335,6 +336,30 @@ def run_example(eid):
 
 # ---------------------------------------------------------------- the server
 
+# A file of the tower as its own grammar reads it (out/bin/hltree), kept until the file changes.
+_trees = {}
+TREE_LANG = {".rules": "rules", ".attrs": "attrs", ".facts": "facts", ".rewrite": "rewrite", ".scopes": "scopes", ".pipeline": "pipeline"}
+
+
+def tree_of(path):
+    lang = TREE_LANG.get(os.path.splitext(path)[1])
+    if not lang:
+        raise ValueError("no grammar reads %s here" % path)
+    full = os.path.abspath(os.path.join(ROOT, path))
+    if not full.startswith(os.path.join(ROOT, "src") + os.sep):
+        raise ValueError("not a file under src/")
+    if not os.path.exists(HLTREE):
+        raise RuntimeError("out/bin/hltree is missing: build it with tools/build-tools.sh")
+    stamp = (os.path.getmtime(full), os.path.getmtime(HLTREE))
+    hit = _trees.get(path)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    r = subprocess.run([HLTREE, lang, full], capture_output=True, text=True, timeout=60)
+    tree = json.loads(r.stdout) if r.stdout.strip() else {"error": r.stderr[-2000:]}
+    _trees[path] = (stamp, tree)
+    return tree
+
+
 def repo_file(path):
     full = os.path.abspath(os.path.join(ROOT, path))
     if not full.startswith(ROOT + os.sep) or "/out/" in full or "/node_modules/" in full:
@@ -413,6 +438,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return {"bundler": bundler_stamp()}
         if path == "rule-counts":
             return rule_counts()
+        if path == "tree":
+            return tree_of(q["path"])
         if path == "file":
             return {"path": q["path"], "text": repo_file(q["path"])}
         if path == "examples" and method == "GET":

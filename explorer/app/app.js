@@ -150,7 +150,7 @@ async function route() {
   const [place, ...rest] = h.split("/").map(decodeURIComponent);
   const main = $("#main");
   try {
-    if (MORE[place]) { frame(place === "focus" ? "code" : place); return MORE[place](main, rest); }
+    if (MORE[place]) { frame(place === "focus" ? "code" : place); return await MORE[place](main, rest); }
     if (place === "builds") { frame("builds"); return pageBuilds(main); }
     if (place === "build") { frame("builds"); return pageBuild(main, rest); }
     if (place === "compare") { frame("builds"); return pageCompare(main, rest[0], rest[1]); }
@@ -391,14 +391,18 @@ async function pageRule(main, key) {
         ${o.items.slice(0, 60).map((it, i) => occurrence(o.build, it, i)).join("")}</details>`).join("")
         : `<p class="muted">It has not applied in any build yet.${r.kind === "rewrite" ? ` ${short(r.file).includes("minify") || short(r.file).includes("final") ? "Minify rules run with --minify-syntax." : ""} Run a build that would use it.` : r.kind === "facts rule" ? " Linking's rules are recorded for every build; run one." : " Only rewrite rules and linking's Datalog rules are recorded so far."}</p>`}
     </div></section></div>`;
-  main.querySelectorAll("[data-pin]").forEach(btn => btn.onclick = async () => {
-    const [bid, mod, lo] = btn.dataset.pin.split("|"); const b = BUILDS.find(x => x.id === bid); const m = await moduleOf(b, mod);
-    const st = m.statements.find(s => +lo >= s.lo && +lo < s.hi) || m.statements.find(s => s.lo === +lo);
-    draftExample(r.key, st ? m.source.slice(st.lo, st.hi) : "", b, `${mod}${st ? ", " + st.key.split("#").pop() : ""}`); });
+  wirePins(main, r.key);
   $("#newex").onclick = () => editor(r, { title: "", source: "", flags: ["--minify-syntax", "--tree-shaking=false"], note: "" });
   if ($("#runex")) $("#runex").onclick = () => runExamples(exs.map(e => e.id));
   main.querySelectorAll("[data-run]").forEach(x => x.onclick = () => runExamples([x.dataset.run]));
   if (pendingDraft && pendingDraft.key === r.key) { editor(r, pendingDraft.ex); pendingDraft = null; $("#editor").scrollIntoView({ block: "center" }); }
+}
+// "Make an example" on a place a rule applied: the statement there becomes a draft example of the rule.
+function wirePins(box, key) {
+  box.querySelectorAll("[data-pin]").forEach(btn => btn.onclick = async () => {
+    const [bid, mod, lo] = btn.dataset.pin.split("|"); const b = BUILDS.find(x => x.id === bid); const m = await moduleOf(b, mod);
+    const st = m.statements.find(s => +lo >= s.lo && +lo < s.hi) || m.statements.find(s => s.lo === +lo);
+    draftExample(key, st ? m.source.slice(st.lo, st.hi) : "", b, `${mod}${st ? ", " + st.key.split("#").pop() : ""}`); });
 }
 function occurrence(build, it, i) {
   const where = it.module ? `<a class="chip" href="#build/${enc(build.id)}/m/${enc(it.module)}${it.statement ? "/" + enc(it.statement) : ""}">${esc(it.module)}${it.line ? ":" + it.line : ""}</a>` : `<span class="faint">while loading</span>`;

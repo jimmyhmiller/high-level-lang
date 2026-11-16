@@ -15,7 +15,7 @@ case "${1:---release}" in
   -O2|-O3) build_flags=(--release --backend llvm "$1") ;;
   *) build_flags=("$1") ;;
 esac
-for pair in esb:compiler/boot/esb.coil jsparse:compiler/boot/jsparse.coil spec:compiler/boot/app.coil langtest:compiler/boot/langtest.coil runtime-check:compiler/boot/runtime-check.coil; do
+for pair in esb:compiler/boot/esb.coil jsparse:compiler/boot/jsparse.coil hltree:compiler/boot/hltree.coil spec:compiler/boot/app.coil langtest:compiler/boot/langtest.coil runtime-check:compiler/boot/runtime-check.coil; do
   name=${pair%%:*}
   file=${pair#*:}
   coil build "$file" "${build_flags[@]}" --meta-opt=2 --reader-artifact "$READERS" -o "$TOOLS_OUTPUT/$name" 2>&1 |

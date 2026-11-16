@@ -112,6 +112,28 @@ def build(root):
 
 
     NAME = r"[A-Za-z_][\w\-]*[?!]?"
+
+
+    def params_at(lines, i, col):
+        """A function's parameter names, from the `(` after its name to the `)` that closes it."""
+        text = "\n".join(lines[i:i + 12])[col:]
+        if not text.lstrip().startswith("("):
+            return []
+        depth, cur, out = 0, "", []
+        for ch in text[text.index("("):]:
+            if ch in "([{":
+                depth += 1
+                if depth == 1:
+                    continue
+            elif ch in ")]}":
+                depth -= 1
+                if depth == 0:
+                    out.append(cur); break
+            if ch == "," and depth == 1:
+                out.append(cur); cur = ""
+            else:
+                cur += ch
+        return [p.split(":")[0].strip() for p in out if p.strip()]
     for path, f in files.items():
         lang = f["lang"]
         for i, line in enumerate(f["lines"]):
@@ -119,7 +141,7 @@ def build(root):
             if lang in ("rules", "attrs"):
                 m = re.match(r"(?:pub\s+)?(?:everywhere\s+)?(fn|memo fn)\s+(" + NAME + r")", line)
                 if m:
-                    add(path, "fn", m.group(2), ln); continue
+                    add(path, "fn", m.group(2), ln, params=params_at(f["lines"], i, m.end())); continue
                 m = re.match(r"(?:boxed\s+)?(record|enum)\s+(" + NAME + r")", line)
                 if m:
                     add(path, m.group(1), m.group(2), ln); continue

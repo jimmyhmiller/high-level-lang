@@ -216,7 +216,9 @@ function wireCode(pane, file, onLine) {
   });
 }
 
-MORE.code = function (main, rest) {
+const STRUCTURED = new Set(["rules", "attrs", "facts", "rewrite", "syntax"]);
+MORE.code = async function (main, rest) {
+  const textMode = rest[rest.length - 1] === "text"; if (textMode) rest = rest.slice(0, -1);
   const spec = rest.join("/");
   if (!spec) {
     const last = sessionStorage.getItem("lastcode"); if (last) { location.hash = "code/" + enc(last); return; }
@@ -226,20 +228,45 @@ MORE.code = function (main, rest) {
   if (!CAT.files[file]) throw new Error("no file " + file + " under src/");
   sessionStorage.setItem("lastcode", file + ":" + line);
   const lang = langOf(file), lines = linesOf(file), decls = declsIn(file);
+  const structured = STRUCTURED.has(lang) && !textMode && (lang !== "syntax" || CAT.grammars[file]);
   const starts = new Map(decls.map(d => [d.line, d]));
   const lg = CAT.languages.find(l => l.key === lang);
+  let body;
+  if (structured) {
+    if (lang === "rewrite") body = rewriteStructure(file);
+    else if (lang === "syntax") body = grammarStructure(file);
+    else body = Projector(file).file(await api("tree?path=" + enc(file)));
+  } else {
+    body = lines.map((l, k) => { const d = starts.get(k + 1); return `<div class="cl${k + 1 === line ? " at" : ""}${d ? " dl" : ""}" data-l="${k + 1}" id="L${k + 1}"><span class="n">${k + 1}</span>${d ? `<button class="focusbtn" data-d="${d.id}" title="see ${esc(d.name)} in the middle of what uses it">◎</button>` : `<span class="nofocus"></span>`}<span class="t">${codeLine(l, file) || " "}</span></div>`; }).join("");
+  }
+  const here = enc(file + ":" + line);
   main.innerHTML = `<div class="page wide">
     <div class="crumbs"><a href="#map">The tower</a> / <span>${esc(dirOf(file))}</span> /</div>
     <div class="row"><h1><code>${esc(baseOf(file))}</code></h1><span class="tag lc-${lang}">${esc(LANG_NAME[lang])}</span><span class="muted">${fileLines(file)} lines · ${decls.length} declarations</span>
       ${lg ? `<span class="faint">written in a language defined by</span>${lg.grammar ? `<a class="chip lc-syntax" href="#code/${enc(lg.grammar + ":1")}">${esc(baseOf(lg.grammar))}</a>` : ""}<a class="chip lc-coil" href="#file/${enc(lg.compiler)}:1">${esc(baseOf(lg.compiler))}</a>` : ""}</div>
-    <div class="codegrid"><section class="panel code-pane"><header>Code <span class="sub">hover a name for what it is · click to go to it · ⌥-click to see it in the middle of what uses it</span></header>
-        <div class="codebody" id="code">${lines.map((l, k) => { const d = starts.get(k + 1); return `<div class="cl${k + 1 === line ? " at" : ""}${d ? " dl" : ""}" data-l="${k + 1}" id="L${k + 1}"><span class="n">${k + 1}</span>${d ? `<button class="focusbtn" data-d="${d.id}" title="see ${esc(d.name)} in the middle of what uses it">◎</button>` : `<span class="nofocus"></span>`}<span class="t">${codeLine(l, file) || " "}</span></div>`; }).join("")}</div></section>
+    <div class="codegrid${structured ? " wide-code" : ""}"><section class="panel code-pane"><header>${STRUCTURED.has(lang) ? `<span class="seg"><a href="#code/${here}" aria-pressed="${!!structured}">Structure</a><a href="#code/${here}/text" aria-pressed="${!structured}">Text</a></span>` : "Code"}<span class="sub">hover a name for what it is · click to go to it · ⌥-click to see it in the middle of what uses it</span></header>
+        <div class="codebody${structured ? " structure" : ""}" id="code">${body}</div></section>
       <section class="panel pic-pane"><header id="pichead">Picture</header><div class="pic" id="pic"></div></section></div></div>`;
   const pic = picture(file, lang, $("#pic"), $("#pichead"), l => { goLine(l); });
-  const goLine = l => { const el = $(`#L${l}`); if (!el) return; main.querySelectorAll(".cl.at").forEach(x => x.classList.remove("at")); el.classList.add("at"); const box = $("#code"); box.scrollTop = el.offsetTop - box.offsetTop - 80; history.replaceState(null, "", "#code/" + enc(file + ":" + l)); };
-  wireCode($("#code"), file, l => { let d = null; for (const x of decls) if (x.line <= l) d = x; if (d && pic && pic.select) pic.select(d, l); });
-  goLine(line);
-  let d0 = null; for (const x of decls) if (x.line <= line) d0 = x; if (d0 && pic && pic.select) pic.select(d0, line);
+  const goLine = l => {
+    const box = $("#code");
+    if (structured) {
+      let best = null; box.querySelectorAll(".s-card").forEach(c => { if (+c.dataset.l <= l) best = c; });
+      box.querySelectorAll(".s-card.at").forEach(x => x.classList.remove("at"));
+      if (best) { best.classList.add("at"); box.scrollTop = best.offsetTop - box.offsetTop - 12; }
+    } else {
+      const el = $(`#L${l}`); if (!el) return; main.querySelectorAll(".cl.at").forEach(x => x.classList.remove("at")); el.classList.add("at"); box.scrollTop = el.offsetTop - box.offsetTop - 80;
+    }
+    history.replaceState(null, "", "#code/" + enc(file + ":" + l) + (textMode ? "/text" : ""));
+  };
+  const select = l => { let d = null; for (const x of decls) if (x.line <= l) d = x; if (d && pic && pic.select) pic.select(d, l); };
+  wireCode($("#code"), file, l => select(l));
+  $("#code").addEventListener("click", e => {
+    const c = e.target.closest(".s-card"); if (!c || e.target.closest("a, button, .s-applied")) return;
+    select(+c.dataset.l); $("#code").querySelectorAll(".s-card.at").forEach(x => x.classList.remove("at")); c.classList.add("at");
+    if (lang === "rewrite" || lang === "facts" && c.classList.contains("f-rule")) appliedUnder(c, file);
+  });
+  goLine(line); select(line);
 };
 
 // ------------------------------------------------------------ a module's picture, in its language's terms

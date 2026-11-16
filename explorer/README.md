@@ -3,7 +3,7 @@
 A local tool for working on the bundler: what a rule is, where it applies in real bundles, what a
 build holds and why, and examples kept for each rule.
 
-    tools/build-tools.sh                 # out/bin/esb, which records when asked
+    tools/build-tools.sh                 # out/bin/esb, which records when asked, and out/bin/hltree
     python3 explorer/server.py           # http://127.0.0.1:8770
     python3 explorer/server.py --check   # run every rule example; exits 1 if one fails
 
@@ -12,6 +12,22 @@ build holds and why, and examples kept for each rule.
 - **The map** is the tower: every module under `src/`, colored by its language, in columns by how
   far it builds on others (grammars and facts on the left, the bundler's top on the right). Hover
   one for what it builds on and what builds on it; click to open its code.
+- **Structure** is how a module opens: each declaration drawn from the tree its own grammar reads
+  (`out/bin/hltree LANG FILE`, which prints a file's parse tree as JSON from the compilers' own
+  parsers), so a rule is read by its shape:
+  - a function: its signature, then its body;
+  - a `match`: a table of the patterns and what each gives;
+  - patterns: the nodes they match;
+  - `where`: equations;
+  - a comprehension or quantifier: the clauses it goes through, then what it yields;
+  - a record made, or a call: its fields or arguments, each argument labelled with the parameter
+    it is passed as, read from the callee's signature;
+  - an attribute equation: grouped by the child it gives to;
+  - a Datalog rule: its atoms joined by colored variables, with how often it derived facts;
+  - a rewrite rule: its pattern and result as trees, with how often it applied.
+
+  Click a recorded rule (rewrite or Datalog) to see, under it, the real code it applied to in your
+  builds; one click more keeps a place as an example. "Text" shows the source as written.
 - **Code** is a module's source with every name a link (an alias's `js.render`, the file's own
   declarations, a grammar's node kinds): hover for what it is, click to go to it, ⌥-click to put it
   in the middle of what uses it. Beside the code is a picture of the module in its language's terms,

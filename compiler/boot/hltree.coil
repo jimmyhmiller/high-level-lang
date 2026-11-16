@@ -1,0 +1,86 @@
+;;; `hltree LANG FILE`: a file of one of the tower's languages as its grammar reads it, printed as
+;;; JSON: each node its kind (`k`), its place (`lo`, `hi`), its text when it has one (`t`) and its
+;;; children (`c`). LANG is rules (and attrs, which the rules grammar reads), facts, rewrite, scopes
+;;; or pipeline: the parsers the compilers themselves use, from src/languages/*.syntax. Knows
+;;; nothing of any one language: one dumper is made for each grammar from the same template.
+(module boot.hltree)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :as str)
+(import "hl.rt" :as rt)
+(import "hl.dsl" :as dsl)
+(import "hl.grammars.rules" :as g-rules)
+(import "hl.grammars.facts" :as g-facts)
+(import "hl.grammars.rewrite" :as g-rewrite)
+(import "hl.grammars.scopes" :as g-scopes)
+(import "hl.grammars.pipeline" :as g-pipeline)
+
+(defn dumper-of [(lang (slice u8)) (node Code) (kind-name Code) (parse-result Code)] (-> Code)
+  (let [dump (primitive/code-symbol (dsl/join2 "dump-" lang))
+        run (primitive/code-symbol (dsl/join2 "run-" lang))]
+    `(do
+       (defn ~dump [(n ~node) (b (mut str/StrBuf))] (-> void)
+         (push-str! (mut b) "{\"k\":")
+         (rt/json-text! (mut b) (~kind-name (.kind n)))
+         (push-str! (mut b) ",\"lo\":")
+         (push-i64! (mut b) (.lo n))
+         (push-str! (mut b) ",\"hi\":")
+         (push-i64! (mut b) (.hi n))
+         (when (> (len (.text n)) 0)
+           (push-str! (mut b) ",\"t\":")
+           (rt/json-text! (mut b) (.text n)))
+         (when (> (len (.kids n)) 0)
+           (push-str! (mut b) ",\"c\":[")
+           (for i (range 0 (len (.kids n)))
+             (when (> i 0) (push-str! (mut b) ","))
+             (~dump (get (.kids n) i) (mut b)))
+           (push-str! (mut b) "]"))
+         (push-str! (mut b) "}")
+         0)
+       (defn ~run [(src (slice u8)) (path (slice u8))] (-> i64)
+         (match (~parse-result src path 0)
+           (Ok [tree]
+               (let [(mut b) (str/StrBuf::new (rt/value-allocator))]
+                 (~dump tree (mut b))
+                 (push-str! (mut b) "\n")
+                 (rt/write-standard-output! (finish! (mut b)))
+                 0))
+           (Err [e]
+                (let [(mut b) (str/StrBuf::new (rt/value-allocator))]
+                  (push-str! (mut b) "{\"error\":")
+                  (rt/json-text! (mut b) (dsl/join2 "expected " (.want e)))
+                  (push-str! (mut b) ",\"line\":")
+                  (push-i64! (mut b) (.line e))
+                  (push-str! (mut b) ",\"col\":")
+                  (push-i64! (mut b) (.col e))
+                  (push-str! (mut b) "}\n")
+                  (rt/write-standard-output! (finish! (mut b)))
+                  1)))))))
+
+;;; The dumpers, and `main` choosing one: made in one expansion, so `main` names what it made.
+(defn dumpers [] (-> Code)
+  ;; Rendered and read back, as the compilers' own generated code is, so that a name made here
+  ;; (`dump-rules`) is the same name where it is defined and where it is called.
+  (primitive/code-read (dsl/render (dumpers-code)) `(reader-config)))
+
+(defn dumpers-code [] (-> Code)
+  `(do ~(dumper-of "rules" `g-rules/Node `g-rules/kind-name `g-rules/parse-result)
+       ~(dumper-of "facts" `g-facts/Node `g-facts/kind-name `g-facts/parse-result)
+       ~(dumper-of "rewrite" `g-rewrite/Node `g-rewrite/kind-name `g-rewrite/parse-result)
+       ~(dumper-of "scopes" `g-scopes/Node `g-scopes/kind-name `g-scopes/parse-result)
+       ~(dumper-of "pipeline" `g-pipeline/Node `g-pipeline/kind-name `g-pipeline/parse-result)
+       (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+         (rt/args-init! argc argv)
+         (when (< (rt/arg-count) 3)
+           (panic "usage: hltree rules|attrs|facts|rewrite|scopes|pipeline FILE"))
+         (let [lang (rt/arg-at 1)
+               path (rt/arg-at 2)
+               src (rt/read-all path)]
+           (cond (or (= lang "rules") (= lang "attrs")) (~(primitive/code-symbol "run-rules") src path)
+                 (= lang "facts") (~(primitive/code-symbol "run-facts") src path)
+                 (= lang "rewrite") (~(primitive/code-symbol "run-rewrite") src path)
+                 (= lang "scopes") (~(primitive/code-symbol "run-scopes") src path)
+                 (= lang "pipeline") (~(primitive/code-symbol "run-pipeline") src path)
+                 :else (panic "hltree: no grammar for {}" lang))))))
+
+(dumpers)
