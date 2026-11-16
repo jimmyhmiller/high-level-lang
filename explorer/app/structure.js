@@ -318,7 +318,10 @@ MORE.map = function (main) {
     const f = sec.dataset.f, grid = sec.querySelector(".atlas-grid");
     try { grid.innerHTML = await cardsOf(f); } catch (e) { grid.innerHTML = `<p class="empty">${esc(String(e.message || e))}</p>`; }
     sec.dataset.done = 1; sec.style.removeProperty("--n");
-    requestAnimationFrame(() => grid.querySelectorAll(".s-card").forEach(c => { if (c.scrollHeight > c.clientHeight + 2) c.classList.add("clipped"); }));
+    requestAnimationFrame(() => grid.querySelectorAll(".s-card").forEach(c => {
+      if (c.scrollHeight > c.clientHeight + 2) c.classList.add("clipped");
+      const b = c.querySelector(".s-body"); if (b && b.scrollWidth > b.clientWidth + 2) c.classList.add("clipped-x");
+    }));
     filterSection(sec);
   };
   const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) draw(e.target); }), { root: null, rootMargin: "1600px 0px" });
