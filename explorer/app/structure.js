@@ -11,7 +11,10 @@ function slicer(text) {
   const bytes = new TextEncoder().encode(text);
   if (bytes.length === text.length) return (lo, hi) => text.slice(lo, hi);
   const at = new Int32Array(bytes.length + 1); let ci = 0, bi = 0;
-  for (const ch of text) { const n = new TextEncoder().encode(ch).length; for (let k = 0; k < n; k++) at[bi + k] = ci; bi += n; ci += ch.length; }
+  for (const ch of text) {
+    const c = ch.codePointAt(0), n = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    for (let k = 0; k < n; k++) at[bi + k] = ci; bi += n; ci += ch.length;
+  }
   at[bytes.length] = text.length;
   return (lo, hi) => text.slice(at[lo], at[hi]);
 }
@@ -221,9 +224,11 @@ function Projector(file) {
   const render = n => { const lang = langOf(file); return lang === "facts" ? factsItem(n) : lang === "scopes" || lang === "pipeline" ? tableItem(n) : decl(n); };
   return {
     // One card per declaration, each with the line it starts on.
-    cards(tree) {
-      if (tree.error) return [{ line: 1, html: `<p class="empty">The grammar does not read this file: ${esc(tree.error)} (line ${tree.line}, column ${tree.col}).</p>` }];
-      return items(tree).filter(d => d.k !== "Use").map(n => ({ line: lineOf(n), html: render(n) })).filter(c => c.html);
+    cards(tree) { return this.makers(tree).map(m => ({ html: m() })).filter(c => c.html); },
+    // Each card as a function that makes it, so a page can make a few at a time.
+    makers(tree) {
+      if (tree.error) return [() => `<p class="empty">The grammar does not read this file: ${esc(tree.error)} (line ${tree.line}, column ${tree.col}).</p>`];
+      return items(tree).filter(d => d.k !== "Use").map(n => () => render(n));
     },
     file(tree) {
       if (tree.error) return this.cards(tree)[0].html;
@@ -237,21 +242,26 @@ function Projector(file) {
 
 // ------------------------------------------------------------ files of the other languages, by shape
 
-function rewriteStructure(file) {
-  const rs = CAT.rewrites[file] || []; let sec = null, html = "";
+function rewriteStructure(file) { return rewriteCards(file).join(""); }
+function rewriteCards(file) {
+  const rs = CAT.rewrites[file] || []; let sec = null; const html = [];
   for (const r of rs) {
-    if (r.section !== sec) { sec = r.section; html += `<h2 class="s-sect">${esc(sec || "rules")}</h2>`; }
+    if (r.section !== sec) { sec = r.section; html.push(`<h2 class="s-sect">${esc(sec || "rules")}</h2>`); }
     const n = COUNTS[file + ":" + r.line];
-    html += `<section class="s-card" id="D${r.line}" data-l="${r.line}"><header><span class="tag lc-rewrite">rule</span><span class="s-dname">${esc(r.name)}</span>${n ? `<a class="chip lc-rewrite" href="#rule/${enc(file + ":" + r.line)}">applied ${n.toLocaleString()}×</a>` : ""}<span class="s-tools"><a class="s-line" href="#code/${enc(file + ":" + r.line)}/text">${r.line}</a></span></header>
-      <div class="s-body"><div class="row trees">${termTree(r.lhs)}<span class="faint" style="font-size:18px">⇒</span>${termTree(r.rhs)}</div>${r.guards.length ? `<div class="s-guard"><span class="s-kw">when</span>${r.guards.map(g => `<code class="k-host">${esc(g)}</code>`).join(" ")}</div>` : ""}</div></section>`;
+    html.push(`<section class="s-card" id="D${r.line}" data-l="${r.line}"><header><span class="tag lc-rewrite">rule</span><span class="s-dname">${esc(r.name)}</span>${n ? `<a class="chip lc-rewrite" href="#rule/${enc(file + ":" + r.line)}">applied ${n.toLocaleString()}×</a>` : ""}<span class="s-tools"><a class="s-line" href="#code/${enc(file + ":" + r.line)}/text">${r.line}</a></span></header>
+      <div class="s-body"><div class="row trees">${termTree(r.lhs)}<span class="faint" style="font-size:18px">⇒</span>${termTree(r.rhs)}</div>${r.guards.length ? `<div class="s-guard"><span class="s-kw">when</span>${r.guards.map(g => `<code class="k-host">${esc(g)}</code>`).join(" ")}</div>` : ""}</div></section>`);
   }
   return html;
 }
-function grammarStructure(file) {
+function grammarStructure(file) { const cs = grammarCards(file); return cs && cs.join(""); }
+function grammarCards(file) {
   const prods = CAT.grammars[file];
   if (!prods) return null;
-  return prods.map(p => `<section class="s-card" id="D${p.line}" data-l="${p.line}"><header><span class="tag lc-syntax">${esc([...p.mods, p.kind].join(" "))}</span><span class="s-dname">${esc(p.name)}</span><span class="s-tools"><a class="s-line" href="#code/${enc(file + ":" + p.line)}/text">${p.line}</a></span></header>
-    <div class="s-body rr">${p.body ? railroad(p.body) : p.levels ? p.levels.map(l => `<div class="s-row"><span class="faint">${l.assoc}</span>${l.ops.map(o => `<code class="k-str">${esc(o.op)}</code><span class="p-node"><span class="p-kind">${esc(o.kind)}</span></span>`).join(" ")}</div>`).join("") : ""}</div></section>`).join("");
+  return prods.map(p => grammarCard(file, p));
+}
+function grammarCard(file, p) {
+  return `<section class="s-card" id="D${p.line}" data-l="${p.line}"><header><span class="tag lc-syntax">${esc([...p.mods, p.kind].join(" "))}</span><span class="s-dname">${esc(p.name)}</span><span class="s-tools"><a class="s-line" href="#code/${enc(file + ":" + p.line)}/text">${p.line}</a></span></header>
+    <div class="s-body rr">${p.body ? railroad(p.body) : p.levels ? p.levels.map(l => `<div class="s-row"><span class="faint">${l.assoc}</span>${l.ops.map(o => `<code class="k-str">${esc(o.op)}</code><span class="p-node"><span class="p-kind">${esc(o.kind)}</span></span>`).join(" ")}</div>`).join("") : ""}</div></section>`;
 }
 
 // Under a recorded rule's card, the places it applied in the builds made so far: real code, each one
@@ -274,17 +284,17 @@ async function appliedUnder(card, file) {
 const TREE_LANGS = new Set(["rules", "attrs", "facts", "scopes", "pipeline"]);
 // Every declaration of a file as a card: drawn from its tree, its rewrite trees, its railroads; a
 // file no grammar here reads (a .bundler target) as its text.
-async function cardsOf(file) {
-  const lang = langOf(file);
-  if (lang === "rewrite") return rewriteStructure(file);
-  if (lang === "syntax") return grammarStructure(file) || textCards(file);
-  if (TREE_LANGS.has(lang)) return Projector(file).cards(await api("tree?path=" + enc(file))).map(c => c.html).join("");
-  return textCards(file);
+async function makersOf(file) {
+  const lang = langOf(file), now = cs => cs.map(c => () => c);
+  if (lang === "rewrite") return now(rewriteCards(file));
+  if (lang === "syntax") { const g = CAT.grammars[file]; return g ? g.map(p => () => grammarCard(file, p)) : now(textCards(file)); }
+  if (TREE_LANGS.has(lang)) return Projector(file).makers(await api("tree?path=" + enc(file)));
+  return now(textCards(file));
 }
 function textCards(file) {
   const lines = linesOf(file);
   return declsIn(file).map(d => `<section class="s-card" data-l="${d.line}"><header><span class="tag lc-${langOf(file)}">${esc(d.kind)}</span><span class="s-dname">${esc(d.name)}</span><span class="s-tools"><a class="s-line" href="#code/${enc(file + ":" + d.line)}/text">${d.line}</a></span></header>
-    <div class="s-raw">${lines.slice(d.line - 1, Math.min(d.end || d.line, d.line + 14)).map(l => codeLine(l, file)).join("<br>")}</div></section>`).join("");
+    <div class="s-raw">${lines.slice(d.line - 1, Math.min(d.end || d.line, d.line + 14)).map(l => codeLine(l, file)).join("<br>")}</div></section>`);
 }
 
 const ATLAS_DIRS = ["languages", "bundle", "app", "react", "tanstack", "vite", "tools"];
@@ -311,28 +321,94 @@ MORE.map = function (main) {
     sec.hidden = !hit;
     if (sec.dataset.done) { const names = new Map(declsIn(f).map(d => [d.line, d])); sec.querySelectorAll(".s-card").forEach(c => { const d = names.get(+c.dataset.l); c.hidden = !!q() && !(d ? matches(d) : false); }); }
   };
-  const filter = () => { box.querySelectorAll(".atlas-file").forEach(filterSection); const shown = [...box.querySelectorAll(".atlas-file:not([hidden])")].map(x => x.dataset.f); $("#acount").textContent = q() || off.size ? `${shown.reduce((a, f) => a + declsIn(f).filter(matches).length, 0).toLocaleString()} shown` : ""; };
-  // Drawn when near the screen: thousands of cards, a few hundred at a time.
-  const draw = async sec => {
-    if (sec.dataset.done || sec.dataset.busy) return; sec.dataset.busy = 1;
+  const filter = () => { box.querySelectorAll(".atlas-file").forEach(filterSection); later(); const shown = [...box.querySelectorAll(".atlas-file:not([hidden])")].map(x => x.dataset.f); $("#acount").textContent = q() || off.size ? `${shown.reduce((a, f) => a + declsIn(f).filter(matches).length, 0).toLocaleString()} shown` : ""; };
+  // Only what is near the screen is in the page: a section is drawn as it comes within a screen or
+  // two, one per frame, and emptied again when it is far away (its cards kept, to put back at once),
+  // so the page holds a few thousand elements, not hundreds of thousands. Off the screen, the
+  // browser neither lays out nor paints a section (content-visibility).
+  const makers = new Map(), html = new Map(), heights = new Map(), queue = [];
+  const estimate = f => Math.max(80, Math.round(fileLines(f) * (langOf(f) === "syntax" ? 9 : 5.2)));
+  box.querySelectorAll(".atlas-file").forEach(sec => sec.style.setProperty("--h", estimate(sec.dataset.f) + "px"));
+  // A section's cards are made and put in a few at a time, each frame stopping after a few
+  // milliseconds, so scrolling never waits on a big file.
+  const BUDGET = 6;
+  const frame = () => new Promise(r => requestAnimationFrame(r));
+  const finish = sec => {
     const f = sec.dataset.f, grid = sec.querySelector(".atlas-grid");
-    try { grid.innerHTML = await cardsOf(f); } catch (e) { grid.innerHTML = `<p class="empty">${esc(String(e.message || e))}</p>`; }
-    sec.dataset.done = 1; sec.style.removeProperty("--n");
-    requestAnimationFrame(() => grid.querySelectorAll(".s-card").forEach(c => {
-      if (c.scrollHeight > c.clientHeight + 2) c.classList.add("clipped");
-      const b = c.querySelector(".s-body"); if (b && b.scrollWidth > b.clientWidth + 2) c.classList.add("clipped-x");
-    }));
+    sec.dataset.done = 1; delete sec.dataset.filling;
+    requestAnimationFrame(() => {
+      // every size read first, then every mark made: one layout, not one per card
+      const cards = [...grid.querySelectorAll(".s-card")];
+      const cut = cards.map(c => { const b = c.querySelector(".s-body"); return [c.scrollHeight > c.clientHeight + 2, !!b && b.scrollWidth > b.clientWidth + 2]; });
+      const h = sec.offsetHeight;
+      cards.forEach((c, i) => { if (cut[i][0]) c.classList.add("clipped"); if (cut[i][1]) c.classList.add("clipped-x"); });
+      heights.set(f, h); sec.style.setProperty("--h", h + "px");
+    });
     filterSection(sec);
   };
-  const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) draw(e.target); }), { root: null, rootMargin: "1600px 0px" });
-  box.querySelectorAll(".atlas-file").forEach(sec => io.observe(sec));
+  // How far a section is from the screen, measured now: what is drawn or emptied is decided by where
+  // things are, not by notices of what changed, which arrive after heights have moved.
+  const scroller = $("#main");
+  const distance = (sec, v = scroller.getBoundingClientRect()) => {
+    const r = sec.getBoundingClientRect();
+    return r.bottom < v.top ? v.top - r.bottom : r.top > v.bottom ? r.top - v.bottom : 0;
+  };
+  const NEAR = 1200, FAR = 5000;
+  let pumping = false;
+  const pump = async () => {
+    if (pumping) return; pumping = true;
+    while (queue.length) {
+      // nearest first: what is on the screen draws before what is a screen away
+      { const v = scroller.getBoundingClientRect(), d = new Map(queue.map(x => [x, distance(x, v)])); queue.sort((x, y) => d.get(x) - d.get(y)); }
+      const sec = queue.shift(); if (sec.dataset.done || sec.hidden || distance(sec) > NEAR * 2) continue;
+      const f = sec.dataset.f, grid = sec.querySelector(".atlas-grid");
+      if (!makers.has(f)) { try { makers.set(f, await makersOf(f)); } catch (e) { makers.set(f, [() => `<p class="empty">${esc(String(e.message || e))}</p>`]); } }
+      const ms = makers.get(f), made = html.get(f) || []; html.set(f, made);
+      grid.innerHTML = ""; sec.classList.remove("ph"); sec.dataset.filling = 1;
+      let i = 0, t = performance.now();
+      while (i < ms.length) {
+        if (made[i] === undefined) made[i] = ms[i]();
+        // cards already made go in many at a time; making them is what costs
+        let k = i + 1; while (k < ms.length && made[k] !== undefined && k - i < 60) k++;
+        grid.insertAdjacentHTML("beforeend", made.slice(i, k).join("")); i = k;
+        if (performance.now() - t > BUDGET) {
+          await frame(); t = performance.now();
+          if (distance(sec) > FAR) break;  // scrolled away while it was being drawn
+        }
+      }
+      if (i < ms.length) { grid.innerHTML = ""; sec.classList.add("ph"); delete sec.dataset.filling; continue; }
+      finish(sec);
+      await frame(); settle();
+    }
+    pumping = false;
+  };
+  const draw = sec => { if (!sec.dataset.done && !queue.includes(sec)) { queue.push(sec); pump(); } };
+  const drop = sec => {
+    if (sec.dataset.filling) return;
+    sec.style.setProperty("--h", (heights.get(sec.dataset.f) || sec.offsetHeight) + "px");
+    sec.querySelector(".atlas-grid").innerHTML = ""; delete sec.dataset.done; sec.classList.add("ph");
+  };
+  // Every section measured first, then drawn or emptied: one layout per frame.
+  const settle = () => {
+    const v = scroller.getBoundingClientRect();
+    const ds = [...box.querySelectorAll(".atlas-file:not([hidden])")].map(sec => [sec, distance(sec, v)]);
+    for (const [sec, d] of ds) { if (d <= NEAR) draw(sec); else if (d > FAR && sec.dataset.done) drop(sec); }
+  };
+  let pending = false;
+  const later = () => { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; settle(); }); } };
+  scroller.addEventListener("scroll", later, { passive: true });
+  addEventListener("resize", later);
+  box.querySelectorAll(".atlas-file").forEach(sec => sec.classList.add("ph"));
+  // The page is left for another: stop listening to its scroll.
+  const gone = new MutationObserver(() => { if (!box.isConnected) { scroller.removeEventListener("scroll", later); removeEventListener("resize", later); gone.disconnect(); } });
+  gone.observe(main, { childList: true });
   wireCode(box, null, null);
   box.addEventListener("click", e => {
     if (e.target.closest("a, button, .s-applied")) return;
     const c = e.target.closest(".s-card"), sec = e.target.closest(".atlas-file");
     if (c && sec) location.hash = "code/" + enc(sec.dataset.f + ":" + c.dataset.l);
   });
-  main.querySelector(".atlas-toc").addEventListener("click", e => { const a = e.target.closest("a[data-f]"); if (!a) return; e.preventDefault(); const sec = box.querySelector(`.atlas-file[data-f="${CSS.escape(a.dataset.f)}"]`); if (sec) { draw(sec); sec.scrollIntoView({ block: "start" }); } });
+  main.querySelector(".atlas-toc").addEventListener("click", e => { const a = e.target.closest("a[data-f]"); if (!a) return; e.preventDefault(); const sec = box.querySelector(`.atlas-file[data-f="${CSS.escape(a.dataset.f)}"]`); if (sec) { sec.scrollIntoView({ block: "start" }); later(); } });
   $("#aq").oninput = filter;
   $("#alangs").onclick = e => { const b = e.target.closest("button[data-l]"); if (!b) return; off.has(b.dataset.l) ? off.delete(b.dataset.l) : off.add(b.dataset.l); b.setAttribute("aria-pressed", !off.has(b.dataset.l)); try { localStorage.setItem("atlasoff", JSON.stringify([...off])); } catch (e) {} filter(); };
   filter();

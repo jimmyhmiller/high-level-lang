@@ -159,12 +159,15 @@ function tooltip(el, d) {
   const r = el.getBoundingClientRect(); tip.style.left = Math.min(r.left, innerWidth - 470) + "px"; tip.style.top = (r.bottom + 6) + "px";
 }
 function wireCode(pane, file, onLine) {
+  // The names lit up are remembered, not searched for again on every move of the mouse.
+  let hot = [], hotId = null;
   pane.addEventListener("mouseover", e => {
-    const a = e.target.closest("a.sym");
-    pane.querySelectorAll(".sym.hot").forEach(x => x.classList.remove("hot"));
+    const a = e.target.closest("a.sym"), id = a ? a.dataset.d : null;
+    if (id === hotId) return;
+    hot.forEach(x => x.classList.remove("hot")); hot = []; hotId = id;
     if (!a) { tooltip(null); return; }
-    pane.querySelectorAll(`a.sym[data-d="${a.dataset.d}"]`).forEach(x => x.classList.add("hot"));
-    tooltip(a, CAT.decls[+a.dataset.d]);
+    hot = [...(a.closest(".atlas-grid .s-card") || pane).querySelectorAll(`a.sym[data-d="${id}"]`)]; hot.forEach(x => x.classList.add("hot"));
+    tooltip(a, CAT.decls[+id]);
   });
   pane.addEventListener("mouseleave", () => tooltip(null));
   pane.addEventListener("click", e => {
