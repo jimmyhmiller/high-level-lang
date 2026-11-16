@@ -37,7 +37,7 @@ function ruleAt(key) {
   return { key, file, line, kind: "line", name: short(file) + ":" + line };
 }
 const ruleLink = (file, line, label) => `<a class="chip lc-${langOf(file)}" href="#rule/${enc(file + ":" + line)}" title="${esc(short(file))}:${line}">${esc(label || ruleAt(file + ":" + line).name)}</a>`;
-const fileLink = (file, line, label) => `<a class="chip lc-${langOf(file)}" href="#file/${enc(file)}:${line || 1}">${esc(label || short(file) + (line ? ":" + line : ""))}</a>`;
+const fileLink = (file, line, label) => `<a class="chip lc-${langOf(file)}" href="#${CAT.files[file] ? "code" : "file"}/${enc(file + ":" + (line || 1))}">${esc(label || short(file) + (line ? ":" + line : ""))}</a>`;
 
 // ------------------------------------------------------------ highlighting
 
@@ -130,10 +130,12 @@ function termTree(t) {
 
 // ------------------------------------------------------------ the frame
 
-const PLACES = [["builds", "Builds"], ["rules", "Rules"], ["examples", "Examples"], ["languages", "Languages"]];
+const PLACES = [["map", "Map"], ["code", "Code"], ["builds", "Builds"], ["rules", "Rules"], ["examples", "Examples"], ["languages", "Languages"]];
+// Places another script adds (visual.js): name → function(main, rest).
+const MORE = {};
 function frame(active) {
   const nrules = Object.values(CAT.rewrites).reduce((a, r) => a + r.length, 0) + Object.values(CAT.facts).reduce((a, r) => a + r.length, 0);
-  const counts = { builds: BUILDS.length, rules: nrules, examples: EXAMPLES.length, languages: CAT.languages.length };
+  const counts = { map: Object.keys(CAT.files).length, builds: BUILDS.length, rules: nrules, examples: EXAMPLES.length, languages: CAT.languages.length };
   $("#nav").innerHTML = PLACES.map(([id, name]) => `<a href="#${id}" aria-current="${id === active ? "page" : "false"}">${name}<small>${counts[id] ?? ""}</small></a>`).join("");
   $("#recent").innerHTML = BUILDS.slice(0, 8).map(b => `<a href="#build/${enc(b.id)}" title="${esc(b.entry + " " + b.flags.join(" "))}">${esc(b.entry.replace(/^apps\//, ""))} <small>${esc(b.flags.join(" ") || "plain")}</small></a>`).join("") || `<span class="faint" style="padding:0 8px;font-size:12px">none yet</span>`;
 }
@@ -144,10 +146,11 @@ const sameKind = (x, y) => x.entry === y.entry && x.flags.join(" ") === y.flags.
 
 async function route() {
   // Each part of the address is encoded on its own (a module's path holds slashes).
-  const h = location.hash.slice(1) || "builds";
+  const h = location.hash.slice(1) || "map";
   const [place, ...rest] = h.split("/").map(decodeURIComponent);
   const main = $("#main");
   try {
+    if (MORE[place]) { frame(place === "focus" ? "code" : place); return MORE[place](main, rest); }
     if (place === "builds") { frame("builds"); return pageBuilds(main); }
     if (place === "build") { frame("builds"); return pageBuild(main, rest); }
     if (place === "compare") { frame("builds"); return pageCompare(main, rest[0], rest[1]); }

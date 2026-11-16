@@ -725,7 +725,46 @@ def build(root):
                           "lines": sum(1 for p in lang_files for l in files[p]["lines"] if l.strip() and not l.lstrip().startswith("#")),
                           "productions": productions})
 
+
+    # ---------------------------------------------------------------- the code's structure
+
+    # What each file names its imports (`use bundle.js as js`), and the files they are.
+    file_of_module = {}
+    for p, f in files.items():
+        file_of_module.setdefault(f["module"], p)
+    aliases = {}
+    deps = []
+    for p, f in files.items():
+        al = {}
+        for i, line in enumerate(f["lines"]):
+            m = re.match(r"\s*use\s+([\w.]+)(?:\s+as\s+(\w+))?", line)
+            if m:
+                al[m.group(2) or m.group(1).split(".")[-1]] = m.group(1)
+                target = file_of_module.get(m.group(1))
+                if target and target != p:
+                    deps.append({"from": p, "to": target, "line": i + 1})
+            m = re.match(r"\s*(?:attrs|rules|rewrite|scopes)\s+[\w.]+\s+over\s+([\w.]+)", line)
+            if m and file_of_module.get(m.group(1)) and file_of_module[m.group(1)] != p:
+                deps.append({"from": p, "to": file_of_module[m.group(1)], "line": i + 1, "over": True})
+            m = re.match(r"\s*host\s+([\w.]+)", line)
+            if m and f["lang"] == "rewrite" and file_of_module.get(m.group(1)):
+                deps.append({"from": p, "to": file_of_module[m.group(1)], "line": i + 1})
+        if f["lang"] == "rewrite":
+            m = re.search(r"^rewrite\s+([\w.]+)", f["text"], re.M)
+            if m and file_of_module.get(m.group(1)):
+                deps.append({"from": p, "to": file_of_module[m.group(1)], "line": f["text"][:m.start()].count("\n") + 1, "over": True})
+        aliases[p] = al
+    # Who uses whom, between declarations: a call, a fact asserted, a rule reading or deriving a
+    # relation, a kept function, a node kind matched.
+    edges = []
+    for target, groups in refs.items():
+        for label, lst in groups.items():
+            for r in lst:
+                if r["in"] is not None and r["in"] != target:
+                    edges.append([r["in"], target, label])
+
     return {"files": {p: {"lang": f["lang"], "module": f["module"], "text": f["text"]} for p, f in files.items()},
             "decls": decls, "refs": {str(k): v for k, v in refs.items()},
             "facts": facts_rules, "grammars": grammars, "rewrites": rewrites, "pipeline": pipeline,
-            "kinds": sorted(kinds), "languages": languages}
+            "kinds": sorted(kinds), "languages": languages,
+            "modules": {p: f["module"] for p, f in files.items()}, "aliases": aliases, "deps": deps, "edges": edges}
