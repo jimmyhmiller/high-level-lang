@@ -28,11 +28,15 @@
 #              cold. Watch is `dev --eager-compile`: the first build is until every chunk its page
 #              names is served; a rebuild, from the edit until the served chunk has it, which
 #              includes noticing the edit and serving the chunk.
+#   vite       PATH is the vite package's directory (Vite 8: Rolldown bundles, Oxc minifies).
+#              One-shot is its build API in a fresh node process, timed from outside. Watch is
+#              `build.watch` in one process (tools/bench-vite.mjs): the first build, then from an
+#              edit's write until the bundle is written, noticing the edit included. No cache rows.
 #
 # Each cell is the median of the runs, with the least and most wall time beside it.
 #   usage: bench.py [--runs=N] [--apps=zod,three,...] [--out=FILE.md] NAME=[KIND:]PATH...
 #   apps: any of tests/apps (zod, three, datefns, rx, …), and manyzod: twelve copies of zod
-import gzip, json, os, re, shutil, signal, socket, statistics, subprocess, sys, time, urllib.request
+import gzip, json, os, re, shutil, signal, socket, statistics, subprocess, sys, threading, time, urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.join(REPO, "tests")
@@ -48,7 +52,7 @@ for a in sys.argv[1:]:
     elif a.startswith("--out="): out_md = a[6:]
     elif "=" in a:
         name, spec = a.split("=", 1)
-        kind, path = spec.split(":", 1) if spec.split(":", 1)[0] in ("esb", "esbuild", "turbopack") else ("esb", spec)
+        kind, path = spec.split(":", 1) if spec.split(":", 1)[0] in ("esb", "esbuild", "turbopack", "vite") else ("esb", spec)
         # esb:PATH:FLAG,FLAG: flags every one of its runs is given, such as --pipeline=full.
         path, _, flags = path.partition(":")
         tools.append((name, kind, os.path.abspath(path), [f for f in flags.split(",") if f]))
@@ -179,18 +183,32 @@ def esb_watch_edits(esb, root, entry, module, original, count, extra):
     p = subprocess.Popen([esb, entry, "--watch", "--timing", "--watch-interval=5", "--outfile=out/out.js"] + extra, cwd=root, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
     results, builds, said = [], 0, []
-    deadline = time.time() + 600
+    # A watcher that never builds again after an edit (a strategy that trusts the edited path never
+    # sees it) is stopped, not waited on: reading its output blocks, so the deadline is a thread's.
+    heard = [time.time()]
+    stop = threading.Event()
+    def watchdog():
+        while not stop.wait(0.5):
+            if time.time() - heard[0] > 60:
+                said.append("[bench] no build for 60 s after the last edit: stopped\n")
+                os.killpg(p.pid, signal.SIGKILL)
+                return
+    threading.Thread(target=watchdog, daemon=True).start()
     for line in p.stdout:
         said.append(line)
         m = BUILD.search(line)
         if m:
+            heard[0] = time.time()
             builds = int(m.group(1))
             if builds > 1: results.append({"ms": float(m.group(2)), "answers": int(m.group(3))})
         if any(s in line for s in SAVED) and builds >= 1:
             if len(results) >= count: break
             edit(root, module, original)
-        if time.time() > deadline: break
-    os.killpg(p.pid, signal.SIGKILL); p.wait()
+            heard[0] = time.time()
+    stop.set()
+    try: os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+    p.wait()
     if len(results) < count: raise RuntimeError(f"{esb}: {len(results)} of {count} rebuilds:\n" + "".join(said)[-2000:])
     return results
 
@@ -332,11 +350,28 @@ def bench_turbopack(r, name, tp, extra, root, entry, module, original):
 class Unserved(Exception):
     pass
 
+# ---------------------------------------------------------------- Vite
+
+def bench_vite(r, name, pkg, extra, root, entry, module, original):
+    script = os.path.join(REPO, "tools", "bench-vite.mjs")
+    once = lambda flags: timed(["node", script, pkg, root, entry, module, "once", "0"] + flags, root)
+    r["one-shot"][name] = [once([]) for _ in range(runs)]
+    r["one-shot --minify"][name] = [once(["--minify"]) for _ in range(runs)]
+    def watch(count):
+        p = subprocess.run(["node", script, pkg, root, entry, module, "watch", str(count)], capture_output=True, text=True)
+        if p.returncode != 0: raise RuntimeError(f"vite's watch: {p.stderr[-1500:]}")
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    got = watch(runs)
+    # First builds, each in a watcher of its own.
+    r["watch, first build"][name] = [{"ms": got["first"]}] + [{"ms": watch(0)["first"]} for _ in range(runs - 1)]
+    r["watch, rebuild, one edit"][name] = [{"ms": ms} for ms in got["rebuilds"]]
+    return "done" if not got["missing"] else f"done; {got['missing']} of {runs} rebuilds left the edit out (the package says it has no side effects)"
+
 # ---------------------------------------------------------------- the runs and the tables
 
 SCENARIOS = ["one-shot", "one-shot --minify", "--cache, cold", "--cache, warm, unchanged", "--cache, warm, one edit",
              "watch, first build", "watch, first, warm cache", "watch, rebuild, one edit"]
-BENCH = {"esb": bench_esb, "esbuild": bench_esbuild, "turbopack": bench_turbopack}
+BENCH = {"esb": bench_esb, "esbuild": bench_esbuild, "turbopack": bench_turbopack, "vite": bench_vite}
 
 results = {}  # app -> scenario -> tool -> [samples]
 os.makedirs(WORK, exist_ok=True)
