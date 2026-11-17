@@ -207,7 +207,8 @@ def esb_watch_edits(esb, root, entry, module, original, count, extra):
             heard[0] = time.time()
     stop.set()
     try: os.killpg(p.pid, signal.SIGKILL)
-    except ProcessLookupError: pass
+    # Gone already: no such group, or (macOS) a group whose leader has exited and is not yet waited for.
+    except (ProcessLookupError, PermissionError): pass
     p.wait()
     if len(results) < count: raise RuntimeError(f"{esb}: {len(results)} of {count} rebuilds:\n" + "".join(said)[-2000:])
     return results
@@ -385,7 +386,7 @@ for app in apps:
         try:
             said = BENCH[kind](results[app], name, path, extra, root, entry, module, original)
         except Exception as e:
-            said = f"FAILED: {str(e)[:400]}"
+            import traceback; said = f"FAILED: {str(e)[:400]}\n" + "".join(traceback.format_exception(e)[-4:])
         write(root, module, original)
         print(f"  {name}: {said}", flush=True)
 

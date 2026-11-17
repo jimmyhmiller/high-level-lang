@@ -46,7 +46,7 @@ def check(name, files, extra='', max_initializers=None):
         p = subprocess.run([str(ESB), 'a.js', 'b.js', '--splitting', '--strict-execution-order', '--format=esm', f'--outdir={output}',
                             f'--chunk-policy={policy}', f'--fragments={str(fragments).lower()}', *flags],
                            cwd=folder, capture_output=True, text=True, timeout=120)
-        assert p.returncode == 0, (name, policy, fragments, minify, p.stdout + p.stderr)
+        assert p.returncode == 0, (name, policy, fragments, minify, f"exit {p.returncode}", p.stdout + p.stderr)
         if max_initializers is not None:
             # These fixtures contain no user callback factories. Counting their initializer
             # allocations verifies that forwarding chains disappear, in addition to running
