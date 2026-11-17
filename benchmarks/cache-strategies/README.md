@@ -6,7 +6,10 @@ build of ours with `--pipeline=full`. Median of 7 runs. `results.md` is the full
 beside each median), `results.json` every sample.
 
 Wall times are from a machine that had other work on it: load average 5.5 when the run started and
-33 when it ended. Instructions (G) and answers computed do not move with load; read those first.
+33 when it ended. Answers computed do not move with load. Instructions (G) do only for builds on one
+thread: with `--pipeline=full` they include what waiting threads spin through, which moves with
+scheduling (three's tracking builds measured 1.3 G in one run and 1.9 G in another, at the same wall
+time and less CPU time), so compare wall time there, and instructions under `--pipeline=single`.
 
 ## Strategies compared
 
@@ -99,6 +102,14 @@ segfaulted in a minified `--pipeline=full` build, in `hl.rt.tok!`. Fixed in 16fe
 style, and every other value the runtime and generated code make once (memo stores among them),
 was published behind a plain flag, which another thread on arm64 could see set before the value.
 They are now read and set atomically: 0 crashes in 20,000 builds against 9 in 10,000 before.
+
+## Rerun at c208b79
+
+`rerun-c208b79/` is the same run on the code after the crash fix (16fe478). Our columns agree with
+the table above within noise (rebuild after one edit, incremental: zod 5.4 ms, three 18.2, date-fns
+7.6, rx 6.5, 12× zod 30.2; coarse 20.0 / 42.9 / 29.7 / 25.8 / 178). The machine's load went from 7
+to 67 while the other bundlers ran last, so their columns in that run are not measurements (Turbopack
+rebuilds of 1.5 s, Vite's zod watcher failing); the table above stands for them.
 
 ## Reproduce
 
