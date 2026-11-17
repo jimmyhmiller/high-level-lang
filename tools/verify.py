@@ -398,6 +398,18 @@ for path in sorted(glob.glob("../src/bundle/*.rules") + glob.glob("../src/bundle
         if re.search(r"parallel-(map|walk)|[\w-]*threads?\b|\bcores\b", code_part):
             threaded.append(f"{os.path.basename(path)}:{number}")
 check(not threaded, f"the bundler's rules say nothing of threads{': ' + ', '.join(threaded[:5]) if threaded else ''}")
+# Something the runtime or generated code makes once, on whichever thread asks first, says so
+# with a word read and set atomically (`once-mine?`, `once-ready?`, `once-made!` in hl.rt). A plain
+# flag can be seen set before what it guards on arm64: chunks printed on many threads once found a
+# grammar's print style ready with no table of word bytes in it, and crashed about one minified
+# build in a thousand.
+plain_once = []
+for path in sorted(glob.glob("../compiler/hl/*.coil")):
+    for number, line in enumerate(open(path), 1):
+        code_part = line.split(";", 1)[0]
+        if re.search(r"\((unless|when|if) \(\.ready |\(set! \(\.ready |\(when \(= \(\.(ready|known) \w+\) 0\)|\(ready bool\)", code_part):
+            plain_once.append(f"{os.path.basename(path)}:{number}")
+check(not plain_once, f"what is made once is published atomically{': ' + ', '.join(plain_once[:5]) if plain_once else ''}")
 
 # The pipeline claims pairs of functions give one answer, one dividing the work and one not
 # (`alone F is G`): each app built with the divided way forced and with the undivided way forced

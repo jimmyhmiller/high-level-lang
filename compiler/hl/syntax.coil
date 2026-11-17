@@ -3495,17 +3495,19 @@
        (defn kind-name [(k Kind)] (-> (slice u8))
          (match k ~@name-arms))
        ;; Each kind by its tag, made once: what a node read from the cache has.
-       (defstruct KindTable [(ready bool) (kinds (ArrayList Kind))])
+       ;; Made by whichever thread asks first (cache reads happen in parallel jobs), the rest
+       ;; waiting for it: a plain flag can be seen set before the table it guards.
+       (defstruct KindTable [(ready i64) (kinds (ArrayList Kind))])
        (defn kind-of-tag [(i i64)] (-> Kind)
          (let [t (primitive/alloc-static KindTable)]
-           (unless (.ready t)
+           (when (rt/once-mine? (field t ready))
              (let [(mut ks) (ArrayList::new [Kind] (malloc-allocator))]
                ~@kinds-made
                (push! (mut ks) (KList))
                (push! (mut ks) (KNone))
                (push! (mut ks) (KFlag))
                (set! (.kinds t) ks)
-               (set! (.ready t) true)))
+               (rt/once-made! (field t ready))))
            (when (or (< i 0) (>= i (len (.kinds t))))
              (panic "a node in the cache has kind {}, which this grammar has not"
                     i))
@@ -4071,12 +4073,14 @@
            (KFlag [] 0)))
 
        ;;; How this grammar prints: the same for the whole program, so made once, in the program's
-       ;;; own region (a style made per print, as it once was, was never let go).
-       (defstruct StyleCell [(ready bool) (style rt/PrintStyle)])
+       ;;; own region (a style made per print, as it once was, was never let go). Its ready word is
+       ;;; read and set atomically: chunks print on many threads, and one that found a plain flag
+       ;;; set before the style was there printed with no table of word bytes, and crashed.
+       (defstruct StyleCell [(ready i64) (style rt/PrintStyle)])
 
        (defn print-style [] (-> rt/PrintStyle)
          (let [c (primitive/alloc-static StyleCell)]
-           (unless (.ready c)
+           (unless (rt/once-ready? (field c ready))
              ;; Made outside the lock (making memory may take it), kept by the first to finish.
              (rt/state-region-enter!)
              (let [(mut breaks) (ArrayList::new [(slice u8)] (rt/value-allocator))]
@@ -4089,9 +4093,9 @@
                                           breaks)]
                  (rt/region-leave!)
                  (rt/init-lock!)
-                 (unless (.ready c)
+                 (unless (rt/once-ready? (field c ready))
                    (set! (.style c) made)
-                   (set! (.ready c) true))
+                   (rt/once-made! (field c ready)))
                  (rt/init-unlock!))))
            (.style c)))
 

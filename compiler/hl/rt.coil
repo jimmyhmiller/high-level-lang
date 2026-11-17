@@ -127,7 +127,7 @@
 
 ;;; `key`: a thread-specific value holding the slot plus one, so no value means slot 0.
 (defstruct Workers
-  [(ready bool)
+  [(ready i64)
    (ids (ArrayList i64))
    (count i64)
    (key i64)
@@ -137,7 +137,7 @@
 ;;; Called before any worker starts: from `main`, and from a reader at compile time.
 (defn workers [] (-> (ptr Workers))
   (let [w (primitive/alloc-static Workers)]
-    (unless (.ready w)
+    (when (once-mine? (field w ready))
       (set! (.ids w) (ArrayList::new [i64] (malloc-allocator)))
       (for _ (range 0 (max-workers)) (push! (mut (.ids w)) 0))
       (set! (.count w) 1)
@@ -148,7 +148,7 @@
                 (!= (pthread_key_create (field w pass-key) (cast (ptr i8) 0))
                     (: 0 i32)))
         (panic "cannot make a thread-specific key"))
-      (set! (.ready w) true))
+      (once-made! (field w ready)))
     w))
 
 ;;; A thread-specific value of a program's own, for something each thread keeps: here, a pointer.
@@ -269,6 +269,13 @@
 (defn once-made! [(word (ptr i64))] (-> void)
   (atomic/store word 1)
   0)
+
+;;; Whether what such a word guards is made, for a check made before taking a lock: read
+;;; atomically, so whoever sees it made sees what was made. A plain flag can be seen set before
+;;; what it guards on a processor that reorders stores (arm64): a printer once found its grammar's
+;;; style ready and its table of word bytes not yet there.
+(defn once-ready? :inline (Always) [(word (ptr i64))] (-> bool)
+  (= (atomic/read word) 1))
 
 ;; ---------------------------------------------------------------- regions
 
@@ -891,7 +898,7 @@
 ;;; One copy out, on one thread: a container reached twice is copied once, and the value still
 ;;; holds one container in two places. `seen` has each copied container's old memory, and where
 ;;; in `kept` its copy (the list's or map's own few words, or a boxed record's address) was put.
-(defstruct OwnCopies [(ready bool) (depth i64) (seen IntTable) (kept (ArrayList u8))])
+(defstruct OwnCopies [(depth i64) (seen IntTable) (kept (ArrayList u8))])
 
 (defn own-copies [] (-> (ptr OwnCopies))
   (let [slot (worker-slot)
@@ -906,8 +913,7 @@
       (let [(mut slots) (ArrayList::new [OwnCopies] (malloc-allocator))]
         (for _ (range 0 (max-workers))
           (push! (mut slots)
-                 (OwnCopies :ready true
-                            :depth 0
+                 (OwnCopies :depth 0
                             :seen (int-table 0)
                             :kept (ArrayList::new [u8] (malloc-allocator)))))
         (set! (.slots all) slots))
@@ -1105,9 +1111,10 @@
 
 (defn state-region [] (-> (ptr Region))
   (let [o (primitive/alloc-static StateRegion)]
-    (when (= (.region o) 0)
+    (when (= (atomic/read (field o region)) 0)
       (init-lock!)
-      (when (= (.region o) 0) (set! (.region o) (primitive/cast i64 (region-make true 4194304))))
+      (when (= (atomic/read (field o region)) 0)
+        (atomic/store (field o region) (primitive/cast i64 (region-make true 4194304))))
       (init-unlock!))
     (primitive/cast (ptr Region) (.region o))))
 
@@ -1151,16 +1158,16 @@
   (region-ref! (region-current) to))
 
 ;;; Regions waiting to be let go; and how many were made and let go, and their bytes, for the trace.
-(defstruct RegionQueue [(lock i64) (ready bool) (waiting (ArrayList i64)) (let-go i64) (bytes-let-go i64)
+(defstruct RegionQueue [(lock i64) (ready i64) (waiting (ArrayList i64)) (let-go i64) (bytes-let-go i64)
                         (made i64) (bytes-made i64)])
 
 (defn region-queue [] (-> (ptr RegionQueue))
   (let [q (primitive/alloc-static RegionQueue)]
-    (unless (.ready q)
+    (unless (once-ready? (field q ready))
       (init-lock!)
-      (unless (.ready q)
+      (unless (once-ready? (field q ready))
         (set! (.waiting q) (ArrayList::new [i64] (malloc-allocator)))
-        (set! (.ready q) true))
+        (once-made! (field q ready)))
       (init-unlock!))
     q))
 
@@ -1249,16 +1256,16 @@
 
 ;;; With HL_REGION_LABELS set, every region a label names is kept track of while it lives, and each
 ;;; safe point says which labels hold the most.
-(defstruct RegionLabels [(ready bool) (on bool) (lock i64) (live (HashMap i64 bool))])
+(defstruct RegionLabels [(ready i64) (on bool) (lock i64) (live (HashMap i64 bool))])
 
 (defn region-labels-state [] (-> (ptr RegionLabels))
   (let [l (primitive/alloc-static RegionLabels)]
-    (unless (.ready l)
+    (unless (once-ready? (field l ready))
       (init-lock!)
-      (unless (.ready l)
+      (unless (once-ready? (field l ready))
         (set! (.on l) (env-on? "HL_REGION_LABELS"))
         (set! (.live l) (HashMap::new [i64 bool] (malloc-allocator) (i64-keyops)))
-        (set! (.ready l) true))
+        (once-made! (field l ready)))
       (init-unlock!))
     l))
 
@@ -1734,13 +1741,13 @@
 ;;; Chunks come from malloc and go back to it; with HL_REGION_CHECK set they are pages of their
 ;;; own that are never used again once let go, and can be read by nobody, so a value read after
 ;;; its region was let go stops the program where it is read.
-(defstruct RegionCheck [(ready bool) (on bool)])
+(defstruct RegionCheck [(ready i64) (on bool)])
 
 (defn region-check? [] (-> bool)
   (let [c (primitive/alloc-static RegionCheck)]
-    (unless (.ready c)
+    (when (once-mine? (field c ready))
       (set! (.on c) (!= (primitive/cast i64 (os/getenv (str/to-cstr (malloc-allocator) "HL_REGION_CHECK"))) 0))
-      (set! (.ready c) true))
+      (once-made! (field c ready)))
     (.on c)))
 
 (extern malloc :cc (cc/C) [isize] (-> (ptr i8)))
@@ -1798,15 +1805,15 @@
 ;;; asked for since the last safe point, what one build or turn used: the rest goes back to the
 ;;; system there, as every chunk did before (see `chunk-pool-trim!`), so a build bigger than
 ;;; those after it does not leave its size behind.
-(defstruct ChunkPool [(lock i64) (ready bool) (free (ArrayList i64)) (asked i64)])
+(defstruct ChunkPool [(lock i64) (ready i64) (free (ArrayList i64)) (asked i64)])
 
 (defn chunk-pool [] (-> (ptr ChunkPool))
   (let [q (primitive/alloc-static ChunkPool)]
-    (unless (.ready q)
+    (unless (once-ready? (field q ready))
       (init-lock!)
-      (unless (.ready q)
+      (unless (once-ready? (field q ready))
         (set! (.free q) (ArrayList::new [i64] (malloc-allocator)))
-        (set! (.ready q) true))
+        (once-made! (field q ready)))
       (init-unlock!))
     q))
 
@@ -4409,12 +4416,12 @@
 
 (defn read-ahead-threads [] (-> i64)
   (let [w (primitive/alloc-static ReadAheadThreads)]
-    (when (= (.known w) 0)
+    (when (once-mine? (field w known))
       (let [name (str/to-cstr (malloc-allocator) "HL_READ_AHEAD")
             said (os/getenv name)]
         (set! (.n w) (if (!= (primitive/cast i64 said) 0) (parse-int (str/from-cstr said)) 4))
         (primitive/free (primitive/cast (ptr i8) name))
-        (set! (.known w) 1)))
+        (once-made! (field w known))))
     (.n w)))
 
 ;;; One file read into memory of its own: its place says so when it is done.
@@ -4776,7 +4783,7 @@
 ;;; (`lo` and `hi`; in a program a bundler emitted, a module's number is above the low 32 bits) and
 ;;; the node before and after, printed. Each record is a line of JSON, copied in as it is made, so
 ;;; nothing it holds outlives a region; `recorded` gives them all. Off, a record costs one load.
-(defstruct Recording [(on i64) (ready bool) (mutex Mutex) (lines (ArrayList u8)) (count i64) (where-key i64)])
+(defstruct Recording [(on i64) (ready i64) (mutex Mutex) (lines (ArrayList u8)) (count i64) (where-key i64)])
 
 (defn recording :inline (Always) [] (-> (ptr Recording)) (primitive/alloc-static Recording))
 
@@ -4784,13 +4791,13 @@
 
 (defn record-start! [] (-> void)
   (let [r (recording)]
-    (unless (.ready r)
+    (when (once-mine? (field r ready))
       (match (Mutex::init (field r mutex))
         (Ok [_] 0)
         (Err [_] (panic "recording: cannot make its mutex")))
       (set! (.lines r) (ArrayList::new [u8] (malloc-allocator)))
       (set! (.where-key r) (key-new))
-      (set! (.ready r) true))
+      (once-made! (field r ready)))
     (atomic/store (field r on) 1)
     0))
 
@@ -4846,7 +4853,7 @@
 (defn recorded [] (-> (slice u8))
   (let [r (recording)
         (mut b) (str/StrBuf::new (value-allocator))]
-    (when (.ready r)
+    (when (once-ready? (field r ready))
       (match (Mutex::lock! (field r mutex))
         (Ok [_] 0)
         (Err [_] (panic "recording: cannot lock")))
@@ -6081,7 +6088,7 @@
 ;;; runs, so a run costs a wake-up rather than a thread's start. Each has a slot, 1…; the thread
 ;;; that asks for a run is slot 0 and works too.
 (defstruct Pool
-  [(ready bool)
+  [(ready i64)
    (mutex Mutex)
    (wake Condition)  ; a new run
    (done Condition)  ; the last worker of a run finished
@@ -6122,7 +6129,7 @@
 
 (defn pool [] (-> (ptr Pool))
   (let [p (primitive/alloc-static Pool)]
-    (unless (.ready p)
+    (when (once-mine? (field p ready))
       (match (Mutex::init (field p mutex))
         (Ok [_] 0)
         (Err [_] (pool-fail "no mutex")))
@@ -6138,7 +6145,7 @@
       (set! (.read p) (ArrayList::new [i64] (malloc-allocator)))
       (for _ (range 0 (max-workers))
         (push! (mut (.threads p)) (Thread :handle (cast (ptr i8) 0))))
-      (set! (.ready p) true))
+      (once-made! (field p ready)))
     p))
 
 (defn pool-lock! [(p (ptr Pool))] (-> void)
@@ -6324,16 +6331,16 @@
 
 ;;; Arrivals: of the `total` callers that arrive with one key, the last is told so, and goes on
 ;;; with what needed all of them, while the others go do something else. Nobody waits.
-(defstruct Arrivals [(lock i64) (ready bool) (counts (HashMap (slice u8) i64))])
+(defstruct Arrivals [(lock i64) (ready i64) (counts (HashMap (slice u8) i64))])
 
 (defn arrivals [] (-> (ptr Arrivals))
   (let [a (primitive/alloc-static Arrivals)]
-    (unless (.ready a)
+    (unless (once-ready? (field a ready))
       (init-lock!)
-      (unless (.ready a)
+      (unless (once-ready? (field a ready))
         (set! (.counts a)
               (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
-        (set! (.ready a) true))
+        (once-made! (field a ready)))
       (init-unlock!))
     a))
 
@@ -6617,14 +6624,14 @@
 
 ;;; Where a solve's time went, rule by rule (see `rule-timed` in hl.facts): each label's
 ;;; nanoseconds and how often it ran, said after each solve, most first.
-(defstruct RuleTimes [(ready bool) (ns (HashMap (slice u8) i64)) (runs (HashMap (slice u8) i64))])
+(defstruct RuleTimes [(ready i64) (ns (HashMap (slice u8) i64)) (runs (HashMap (slice u8) i64))])
 
 (defn rule-times [] (-> (ptr RuleTimes))
   (let [t (primitive/alloc-static RuleTimes)]
-    (unless (.ready t)
+    (when (once-mine? (field t ready))
       (set! (.ns t) (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
       (set! (.runs t) (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
-      (set! (.ready t) true))
+      (once-made! (field t ready)))
     t))
 
 (defn rule-time! [(label (slice u8)) (ns i64)] (-> void)
@@ -6742,7 +6749,7 @@
   [(lock i64)
    (depth-key i64)
    (revision i64)
-   (ready bool)
+   (ready i64)
    (ids (HashMap (slice u8) i64))
    (texts (ArrayList (slice u8)))
    (changed (ArrayList i64))
@@ -6803,9 +6810,9 @@
 
 (defn deps [] (-> (ptr Deps))
   (let [d (primitive/alloc-static Deps)]
-    (unless (.ready d)
+    (unless (once-ready? (field d ready))
       (init-lock!)
-      (unless (.ready d)
+      (unless (once-ready? (field d ready))
         (set! (.ids d)
               (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
         (set! (.texts d) (ArrayList::new [(slice u8)] (malloc-allocator)))
@@ -6862,7 +6869,7 @@
         (set! (.depth-key d) (key-new))
         (atomic/store (field d revision) 1)
         (atomic/store (field d untracked) 0)
-        (set! (.ready d) true))
+        (once-made! (field d ready)))
       (init-unlock!))
     d))
 
@@ -7602,17 +7609,17 @@
   0)
 
 (defstruct AnyChange
-  [(lock i64) (ready bool) (ids (ArrayList i64)) (seen (HashMap i64 bool))])
+  [(lock i64) (ready i64) (ids (ArrayList i64)) (seen (HashMap i64 bool))])
 
 (defn any-change-nodes [] (-> (ptr AnyChange))
   (let [a (primitive/alloc-static AnyChange)]
-    (unless (.ready a)
+    (unless (once-ready? (field a ready))
       (init-lock!)
-      (unless (.ready a)
+      (unless (once-ready? (field a ready))
         (set! (.seen a)
               (HashMap::new [i64 bool] (malloc-allocator) (i64-keyops)))
         (set! (.ids a) (ArrayList::new [i64] (malloc-allocator)))
-        (set! (.ready a) true))
+        (once-made! (field a ready)))
       (init-unlock!))
     a))
 
@@ -7866,7 +7873,7 @@
 ;;; current, is printed, with how many reads it checked.
 (defn dep-tracing-checks? [] (-> bool)
   (let [t (primitive/alloc-static DepTrace)]
-    (when (= (.known t) 0)
+    (when (once-mine? (field t known))
       (set! (.on t)
             (if (= (primitive/cast i64
                                    (os/getenv (str/to-cstr (malloc-allocator)
@@ -7874,13 +7881,13 @@
                    0)
                 0
                 1))
-      (set! (.known t) 1))
+      (once-made! (field t known)))
     (= (.on t) 1)))
 
 ;;; Whether HL_TRACE_DEPS is set: each memo answer computed is printed, and whether it changed.
 (defn dep-tracing? [] (-> bool)
   (let [t (primitive/alloc-static DepTrace)]
-    (when (= (.known t) 0)
+    (when (once-mine? (field t known))
       (set! (.on t)
             (if (= (primitive/cast i64
                                    (os/getenv (str/to-cstr (malloc-allocator)
@@ -7888,7 +7895,7 @@
                    0)
                 0
                 1))
-      (set! (.known t) 1))
+      (once-made! (field t known)))
     (= (.on t) 1)))
 
 (defstruct DepTrace [(known i64) (on i64)])
@@ -8098,7 +8105,7 @@
 ;;; holds one.
 (defn watch-events? [] (-> bool)
   (let [w (watch-state)]
-    (when (= (.known w) 0)
+    (when (once-mine? (field w known))
       (set! (.kq w) (: -1 i32))
       (set! (.fds w)
             (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
@@ -8124,7 +8131,7 @@
                                           (: 526336 i32)))
                 (set! (.kind w) 2))
             :else 0)
-      (set! (.known w) 1))
+      (once-made! (field w known)))
     (>= (.kq w) (: 0 i32))))
 
 (defn inotify-init-fn [] (-> (ptr i8))
@@ -8361,7 +8368,7 @@
 ;;; client listening. One thread accepts and answers; a stream stays open until a write to it fails.
 (defstruct Server
   [(lock i64)
-   (ready bool)
+   (ready i64)
    (dir (slice u8))
    (page (slice u8))
    (events-path (slice u8))
@@ -8391,7 +8398,7 @@
 ;;; has no index.html, and server-sent events at `events-path`. Answers the port.
 (defn serve! [(port i64) (dir (slice u8)) (page (slice u8)) (events-path (slice u8))] (-> i64)
   (let [s (server)]
-    (when (.ready s) (panic "already serving on port {}" (.port s)))
+    (when (once-ready? (field s ready)) (panic "already serving on port {}" (.port s)))
     (set! (.dir s) dir)
     (set! (.page s) page)
     (set! (.events-path s) (own-text events-path))
@@ -8408,7 +8415,7 @@
           (match (TcpListener::port (field s listener))
             (Ok [p] p)
             (Err [_] (panic "cannot learn the port being served"))))
-    (set! (.ready s) true)
+    (once-made! (field s ready))
     (when (!= (Thread::spawn-configured (field s thread)
                                         (fnptr-of server-loop)
                                         (cast (ptr i8) 0)
@@ -8552,7 +8559,7 @@
 (defn broadcast! [(event (slice u8)) (text (slice u8))] (-> void)
   (let [s (server)]
     ;; Nothing is served (a watcher with no --serve): there is no one to send it to.
-    (when (.ready s)
+    (when (once-ready? (field s ready))
       (let [(mut b) (str/StrBuf::new (malloc-allocator))]
         (push-str! (mut b) "event: ")
         (push-str! (mut b) event)
@@ -8578,7 +8585,7 @@
 ;;; How many clients listen at the configured event path.
 (defn listeners [] (-> i64)
   (let [s (server)]
-    (if (.ready s)
+    (if (once-ready? (field s ready))
         (do
           (spin-lock! (cast (ptr i64) s))
           (let [n (len (.clients s))] (spin-unlock! (cast (ptr i64) s)) n))
@@ -9046,9 +9053,10 @@
 
 (defn objects-region [] (-> (ptr Region))
   (let [o (primitive/alloc-static ObjectsRegion)]
-    (when (= (.region o) 0)
+    (when (= (atomic/read (field o region)) 0)
       (init-lock!)
-      (when (= (.region o) 0) (set! (.region o) (primitive/cast i64 (region-make true 4194304))))
+      (when (= (atomic/read (field o region)) 0)
+        (atomic/store (field o region) (primitive/cast i64 (region-make true 4194304))))
       (init-unlock!))
     (primitive/cast (ptr Region) (.region o))))
 
@@ -9141,7 +9149,7 @@
 
 (defn size-notes [] (-> (ptr SizeNotes))
   (let [t (primitive/alloc-static SizeNotes)]
-    (when (= (.known t) 0)
+    (when (once-mine? (field t known))
       (set! (.on t)
             (if (= (primitive/cast i64
                                    (os/getenv (str/to-cstr (malloc-allocator)
@@ -9149,7 +9157,7 @@
                    0)
                 0
                 1))
-      (set! (.known t) 1))
+      (once-made! (field t known)))
     t))
 
 (defn put-part! [(w (ptr Writer)) (label (slice u8))] (-> void)
@@ -9467,14 +9475,14 @@
   (primitive/alloc-static CacheLock))
 
 ;;; The log's reader and the writer that appends to it: one of each, for the program.
-(defstruct Cells [(reader Reader) (writer Writer) (ready bool)])
+(defstruct Cells [(reader Reader) (writer Writer) (ready i64)])
 
 (defn cells [] (-> (ptr Cells))
   (let [c (primitive/alloc-static Cells)]
-    (unless (.ready c)
+    (when (once-mine? (field c ready))
       (set! (.reader c) (reader-new "" true))
       (set! (.writer c) (writer-new true))
-      (set! (.ready c) true))
+      (once-made! (field c ready)))
     c))
 
 (defn the-reader [] (-> (ptr Reader))
@@ -9574,17 +9582,17 @@
    (kept-revision i64)
    (kept-computed i64)
    (kept bool)
-   (ready bool)])
+   (ready i64)])
 
 (defn loading-state [] (-> (ptr Loading))
   (let [l (primitive/alloc-static Loading)]
-    (unless (.ready l)
+    (when (once-mine? (field l ready))
       (set! (.claimed l) (ArrayList::new [bool] (malloc-allocator)))
       (set! (.pending l)
             (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
       (set! (.by-argument l)
             (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
-      (set! (.ready l) true))
+      (once-made! (field l ready)))
     l))
 
 ;;; A memo whose key is its one argument, read from the cache: its answers' nodes are found by text,
@@ -9657,14 +9665,14 @@
     root))
 
 ;;; Each module's part, once in a pass that reads all that is unread.
-(defstruct ForceVisits [(seen (HashMap (slice u8) i64)) (ready bool)])
+(defstruct ForceVisits [(seen (HashMap (slice u8) i64)) (ready i64)])
 
 (defn force-module! [(name (slice u8))] (-> bool)
   (let [f (primitive/alloc-static ForceVisits)]
-    (unless (.ready f)
+    (when (once-mine? (field f ready))
       (set! (.seen f)
             (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
-      (set! (.ready f) true))
+      (once-made! (field f ready)))
     (match (get (.seen f) name)
       (Some [_] false)
       (None []
@@ -9673,7 +9681,7 @@
 
 (defn force-pass-start! [] (-> void)
   (let [f (primitive/alloc-static ForceVisits)]
-    (when (.ready f) (HashMap::clear! (mut (.seen f)))))
+    (when (once-ready? (field f ready)) (HashMap::clear! (mut (.seen f)))))
   (force-module! "")
   0)
 
@@ -10064,7 +10072,7 @@
    (slots (ArrayList i64))])
 
 (defstruct ContextsState
-  [(ready bool)
+  [(ready i64)
    (current i64)
    (names (ArrayList (slice u8)))
    (stack (ArrayList i64))
@@ -10072,14 +10080,14 @@
 
 (defn contexts [] (-> (ptr ContextsState))
   (let [c (primitive/alloc-static ContextsState)]
-    (unless (.ready c)
+    (unless (once-ready? (field c ready))
       (init-lock!)
-      (unless (.ready c)
+      (unless (once-ready? (field c ready))
         (set! (.names c) (ArrayList::new [(slice u8)] (malloc-allocator)))
         (push! (mut (.names c)) "")
         (set! (.stack c) (ArrayList::new [i64] (malloc-allocator)))
         (set! (.owns c) (ArrayList::new [ContextOwn] (malloc-allocator)))
-        (set! (.ready c) true))
+        (once-made! (field c ready)))
       (init-unlock!))
     c))
 
@@ -10158,19 +10166,19 @@
 ;;; worked out from the code), and how to forget.
 (defstruct Forgetting
   [(lock i64)
-   (ready bool)
+   (ready i64)
    (by (HashMap (slice u8) (ArrayList (fnptr (cc/C) [] void))))])
 
 (defn forgetting [] (-> (ptr Forgetting))
   (let [f (primitive/alloc-static Forgetting)]
-    (unless (.ready f)
+    (unless (once-ready? (field f ready))
       (init-lock!)
-      (unless (.ready f)
+      (unless (once-ready? (field f ready))
         (set! (.by f)
               (HashMap::new [(slice u8) (ArrayList (fnptr (cc/C) [] void))]
                             (malloc-allocator)
                             (text-keyops)))
-        (set! (.ready f) true))
+        (once-made! (field f ready)))
       (init-unlock!))
     f))
 
@@ -10422,16 +10430,16 @@
 ;;; A strategy's functions (`… by F` in the pipeline language), by `module/function`: each as the bits
 ;;; of its function value, registered by its module when a run picks its strategy, so the code it
 ;;; serves calls it without importing its module (which may read anything the program has).
-(defstruct Hooks [(lock i64) (ready bool) (by (HashMap (slice u8) i64))])
+(defstruct Hooks [(lock i64) (ready i64) (by (HashMap (slice u8) i64))])
 
 (defn hooks [] (-> (ptr Hooks))
   (let [h (primitive/alloc-static Hooks)]
-    (unless (.ready h)
+    (unless (once-ready? (field h ready))
       (init-lock!)
-      (unless (.ready h)
+      (unless (once-ready? (field h ready))
         (set! (.by h)
               (HashMap::new [(slice u8) i64] (malloc-allocator) (text-keyops)))
-        (set! (.ready h) true))
+        (once-made! (field h ready)))
       (init-unlock!))
     h))
 
@@ -10581,9 +10589,9 @@
 
 (defn audit-state [] (-> (ptr Audit))
   (let [a (primitive/alloc-static Audit)]
-    (when (= (.known a) 0)
+    (when (= (atomic/read (field a known)) 0)
       (init-lock!)
-      (when (= (.known a) 0)
+      (when (= (atomic/read (field a known)) 0)
         (set! (.on a)
               (if (= (primitive/cast i64
                                      (os/getenv (str/to-cstr (malloc-allocator)
@@ -10596,7 +10604,7 @@
               (HashMap::new [(slice u8) AuditRow]
                             (malloc-allocator)
                             (text-keyops)))
-        (set! (.known a) 1))
+        (atomic/store (field a known) 1))
       (init-unlock!))
     a))
 
@@ -10745,16 +10753,16 @@
 ;;; What a `check by` function gave for an answer when it was made, by the answer's node (see
 ;;; `check by` in the pipeline language): kept with the cache's index, so it is there to compare
 ;;; with before the answer itself is read.
-(defstruct Versions [(lock i64) (ready bool) (by (HashMap i64 (slice u8)))])
+(defstruct Versions [(lock i64) (ready i64) (by (HashMap i64 (slice u8)))])
 
 (defn versions [] (-> (ptr Versions))
   (let [v (primitive/alloc-static Versions)]
-    (unless (.ready v)
+    (unless (once-ready? (field v ready))
       (init-lock!)
-      (unless (.ready v)
+      (unless (once-ready? (field v ready))
         (set! (.by v)
               (HashMap::new [i64 (slice u8)] (malloc-allocator) (i64-keyops)))
-        (set! (.ready v) true))
+        (once-made! (field v ready)))
       (init-unlock!))
     v))
 
