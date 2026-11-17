@@ -7,7 +7,9 @@
 # and how many memo answers it computed, beside the fresh build's time. Then names across modules:
 # top-level names that come and go, which a nested scope in another module must step around.
 # Every write is whole when the watcher sees it: made beside the tree and moved into place.
-#   usage: watch-check.py ESB [APP...] [-- FLAG...]     (APP: datefns, rx, zod, … as in tests/apps)
+# With --warm, the watcher starts from a cache a run with --cache made, so its first build reads
+# answers back and each rebuild makes them again on many threads at once.
+#   usage: watch-check.py ESB [APP...] [--warm] [-- FLAG...]     (APP: datefns, rx, zod, … as in tests/apps)
 import json, os, queue, re, shutil, subprocess, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guard
@@ -15,6 +17,8 @@ import guard
 args = sys.argv[1:]
 flags = args[args.index("--") + 1:] if "--" in args else []
 args = args[:args.index("--")] if "--" in args else args
+WARM = "--warm" in args
+args = [a for a in args if a != "--warm"]
 ESB, = guard.in_tests(args[:1])
 APPS = args[1:] or ["datefns", "rx", "zod"]
 TESTS = os.getcwd()
@@ -77,6 +81,9 @@ for app in APPS:
         ("flip sideEffects in package.json", lambda: write(pkg, json.dumps(doc, indent=2)), True),
         ("put the entry back", lambda: write(entry, original), True),
     ]
+    if WARM:
+        p = subprocess.run([ESB, entry, "--cache", "--outfile=out.js"] + flags, cwd=WORK, capture_output=True, text=True, timeout=120)
+        if p.returncode != 0: sys.exit("the build that makes the cache failed: " + p.stderr[-2000:])
     lines = queue.Queue()
     proc = subprocess.Popen([ESB, entry, "--watch", "--outfile=out.js"] + flags, cwd=WORK, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -119,7 +126,9 @@ for app in APPS:
         failures += not same
         print(f"  {name:34} {got[0]:7.1f} ms  {got[1]:5} memo answers  {got[2]} inputs   fresh process {took:.0f} ms  "
               + ("identical" if same else "DIFFERENT  FAIL"))
-    os.killpg(proc.pid, 9)
+    # Gone already (it panicked, say): no such group, or on macOS one whose leader has exited.
+    try: os.killpg(proc.pid, 9)
+    except (ProcessLookupError, PermissionError): pass
     proc.wait()
 # Names across modules: a nested `y` in one module, and top-level names in another that take `y`,
 # then `y2`, then go, each making the nested names step around them, or come back.

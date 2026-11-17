@@ -541,6 +541,12 @@ print("== watching")
 code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch-check.py"), ESB, "datefns"],
                                       8000, 300, quiet=True)
 check(code == 0 and out.strip().endswith("all identical"), f"--watch: {out.strip().splitlines()[-1] if out.strip() else err[-200:]}")
+# The same on many threads with every answer made again on each edit (`coarse`: no cutoff), so
+# threads ask for answers another is making: a reader once took the answer being replaced. From a
+# warm cache, as that showed most often.
+code, out, err, _, reason = guard.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch-check.py"), ESB, "rx", "--warm",
+                                       "--", "--pipeline=full", "--strategy=coarse"], 8000, 300, quiet=True)
+check(code == 0 and out.strip().endswith("all identical"), f"--watch --pipeline=full --strategy=coarse, from a warm cache: {out.strip().splitlines()[-1] if out.strip() else err[-200:]}")
 code, out = sh(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve-check.py")], 300)
 check(code == 0, "HTTP runtime with a caller-chosen event path: " + out.strip().split("\n")[-1])
 
