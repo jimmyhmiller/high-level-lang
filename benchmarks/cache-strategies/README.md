@@ -94,10 +94,11 @@ taken:
 `mechanism-check.py` (now with `--pipeline=full` cache runs), `cache-check.py`, `strategy-check.py`
 and `watch-check.py` all pass on this binary (`checks/`).
 
-A third crash predates this work and is still open: about one run in three of
-`tools/evaluation-check.py` segfaults in a minified `--pipeline=full` build, in `hl.rt.tok!`
-printing a part of a chunk (`chunk-own--working`). The binary from before this work fails at the
-same rate.
+A third crash predated this work: about one run in three of `tools/evaluation-check.py`
+segfaulted in a minified `--pipeline=full` build, in `hl.rt.tok!`. Fixed in 16fe478: a grammar's print
+style, and every other value the runtime and generated code make once (memo stores among them),
+was published behind a plain flag, which another thread on arm64 could see set before the value.
+They are now read and set atomically: 0 crashes in 20,000 builds against 9 in 10,000 before.
 
 ## Reproduce
 
