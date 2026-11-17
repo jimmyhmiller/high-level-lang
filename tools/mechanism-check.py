@@ -8,6 +8,7 @@
 #   listing changes), after a package's package.json is edited to start it at another file, and after
 #   a name in the entry is made an export (ES module output, which lists them);
 #   a run with the cache after all of those edits, made while nothing ran, and after they are undone.
+# The cache's cold and warm builds are made with the pipeline's `full` plan too, on many threads.
 # Every output must be byte for byte what a fresh build with no cache makes of the files as they
 # are, but where the strategy trusts a path: an edit there is not seen, and the output is what it
 # was before it. With a big app (manyzod), what a bound on answers lets go is made again.
@@ -55,10 +56,10 @@ def fresh(root, entry):
     if p.returncode != 0: sys.exit("fresh build failed: " + p.stderr[-1500:])
     return open(os.path.join(root, "out", "fresh.js")).read()
 
-def cached(root, entry, strategy):
-    p = subprocess.run([ESB, entry, "--cache", f"--strategy={strategy}", "--format=esm", "--outfile=out/out.js"], cwd=root,
+def cached(root, entry, strategy, plan=()):
+    p = subprocess.run([ESB, entry, "--cache", f"--strategy={strategy}", "--format=esm", "--outfile=out/out.js", *plan], cwd=root,
                        capture_output=True, text=True, timeout=300)
-    if p.returncode != 0: sys.exit(f"--cache --strategy={strategy} failed: " + (p.stdout + p.stderr)[-1500:])
+    if p.returncode != 0: sys.exit(f"--cache --strategy={strategy} {' '.join(plan)} failed: " + (p.stdout + p.stderr)[-1500:])
     return open(os.path.join(root, "out", "out.js")).read()
 
 def watched(root, entry, strategy, edits):
@@ -157,6 +158,12 @@ for app in APPS:
         want = fresh(root, entry)
         check(cached(root, entry, strategy) == want, "--cache, cold")
         check(cached(root, entry, strategy) == want, "--cache, warm")
+        # The same on many threads, its own cache: a run from a warm cache makes again, inside a
+        # stage's parallel work, what the strategy did not save, reading back what that reads (a
+        # strategy that saves nothing once read the names table back inside a naming job).
+        full = ("--pipeline=full", "--cache-dir=node_modules/.cache/esb-full")
+        check(cached(root, entry, strategy, full) == want, "--cache --pipeline=full, cold")
+        check(cached(root, entry, strategy, full) == want, "--cache --pipeline=full, warm")
         # Each edit, as the files it writes; the files as each edit leaves them, and as the watcher
         # sees them (where a strategy trusts a path, it sees no edit there).
         files, seen, states = dict(start), dict(start), []
