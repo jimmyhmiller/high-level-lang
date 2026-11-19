@@ -1,0 +1,164 @@
+# Tailwind's stylesheet tree (tailwindcss/src/ast.ts): style rules, at-rules, declarations and
+# comments, and two kinds that print nothing: a context, which tells what is inside it (where it was
+# imported from, that it is the theme's or only for reference), and an at-root, whose children are
+# hoisted to the top of the output. What `tailwind.sheet` parses becomes this tree, as Tailwind's
+# parser makes it; `css` prints it as Tailwind's `toCss` does.
+rules tailwind.ast over tailwind.sheet
+use tailwind.sheet as sh
+use tailwind.text as tx
+
+enum Kind { StyleRule, AtRule, Decl, Comment, Context, AtRoot }
+
+# A node. A style rule's `head` is its selector, an at-rule's its name (`@media`), a declaration's
+# its property, a comment's its text; `params` are an at-rule's; `value` is a declaration's, none
+# when it was removed (`--x: initial` in a theme); a context's `context` says what it holds.
+boxed record Css {
+  kind: Kind,
+  head: Text,
+  params: Text,
+  value: Text?,
+  important: Bool,
+  nodes: [Css],
+  context: {Text:Text}
+}
+
+fn style-rule(selector: Text, nodes: [Css]) -> Css =
+  Css(kind: StyleRule, head: selector, params: "", value: none, important: false, nodes: nodes, context: {})
+fn at-rule(name: Text, params: Text, nodes: [Css]) -> Css =
+  Css(kind: AtRule, head: name, params: params, value: none, important: false, nodes: nodes, context: {})
+fn decl(property: Text, value: Text) -> Css =
+  Css(kind: Decl, head: property, params: "", value: some(value), important: false, nodes: [], context: {})
+# A declaration whose value may be missing (`undefined`), which Tailwind removes before printing.
+fn decl-opt(property: Text, value: Text?) -> Css =
+  Css(kind: Decl, head: property, params: "", value: value, important: false, nodes: [], context: {})
+fn important-decl(property: Text, value: Text, important: Bool) -> Css =
+  Css(kind: Decl, head: property, params: "", value: some(value), important: important, nodes: [], context: {})
+fn comment(text: Text) -> Css =
+  Css(kind: Comment, head: text, params: "", value: none, important: false, nodes: [], context: {})
+fn context(c: {Text:Text}, nodes: [Css]) -> Css =
+  Css(kind: Context, head: "", params: "", value: none, important: false, nodes: nodes, context: c)
+fn at-root(nodes: [Css]) -> Css =
+  Css(kind: AtRoot, head: "", params: "", value: none, important: false, nodes: nodes, context: {})
+
+# Tailwind's `rule`: a selector that starts with `@` is an at-rule's head.
+fn rule(selector: Text, nodes: [Css]) -> Css = match selector {
+  "@" ++ _ => parsed-at-rule(selector, nodes)
+  _ => style-rule(selector, nodes)
+}
+
+# Tailwind's `parseAtRule`: the name runs to the first space, tab or `(` after its fifth byte (the
+# length of `@page`), the rest are the parameters.
+fn parsed-at-rule(text: Text, nodes: [Css]) -> Css = match first i in 5..len(text) if text[i] == 32 or text[i] == 9 or text[i] == 40: i {
+  some(i) => at-rule(tx.js-trim(text[0..i]), tx.js-trim(text[i..len(text)]), nodes)
+  none => at-rule(tx.js-trim(text), "", nodes)
+}
+
+# ---------------------------------------------------------------- parsing
+
+# A stylesheet's nodes, as Tailwind's `parse` makes them: its license comments (`/*! … */`) first,
+# wherever they were.
+fn parse(text: Text, path: Text) -> [Css] = match sh.parse(text, path) {
+  Sheet(_, List(items...)) as sheet => [comment(c[2..len(c) - 2]) for c in licenses(sheet)] ++ [sheet-node(item, path)... for item in items]
+}
+
+everywhere fn licenses(n: Node) -> [Text] = match n {
+  Comment(t) if starts-with(t, "/*!") => [t]
+  Custom(...) => []
+}
+
+fn sheet-node(item: Node, path: Text) -> [Css] = match item {
+  Ws(_) | Comment(_) | Cdo() | Cdc() | Semi() => []
+  Tail(p) => match normalized(p) {
+    "@" ++ _ as t => [parsed-at-rule(t, [])]
+    t => [d for d in declaration(t)]
+  }
+  _ => block-node(item, path)
+}
+
+fn block-node(item: Node, path: Text) -> [Css] = match item {
+  Ws(_) | Comment(_) | Semi() => []
+  Statement(p) => match normalized(p) {
+    "@" ++ _ as t => [parsed-at-rule(t, [])]
+    t => [declaration(t) ?? invalid(path, item, t)]
+  }
+  Block(None(), List(items...)) => [rule("", [block-node(i, path)... for i in items])]
+  Block(p, List(items...)) => [rule(tx.js-trim(normalized(p)), [block-node(i, path)... for i in items])]
+  Tail(p) => match normalized(p) {
+    "@" ++ _ as t => [parsed-at-rule(t, [])]
+    t => [declaration(t) ?? invalid(path, item, t)]
+  }
+  Custom(head, value, _) => [custom(head.text, value.text) ?? fail-build(path ++ ": Invalid custom property, expected a value")]
+}
+
+fn invalid(path: Text, at: Node, t: Text) -> Never =
+  fail-build(path ++ ": Invalid declaration: `" ++ tx.js-trim(t) ++ "`")
+
+# Tailwind's `parseDeclaration`: the property before the first colon, the value after it, and
+# whether it ends in `!important`.
+fn declaration(t: Text) -> Css? = match index-of(t, ":") {
+  none => none
+  some(colon) => some(declared(tx.js-trim(t[0..colon]), t[colon + 1..len(t)], t[colon + 1..len(t)]))
+}
+
+fn declared(property: Text, value: Text, whole: Text) -> Css = match trim-value(value) {
+  v ++ "!important" if not escaped?(v ++ "!important", len(v)) => important-decl(property, trim-value(v), true)
+  _ => important-decl(property, trim-value(whole), false)
+}
+
+# A custom property: read raw, comments and all, to where its value's last non-space byte is.
+fn custom(head: Text, value: Text) -> Css? = some(declared(tx.js-trim(head), value[0..value-end(value)], value))
+
+fn value-end(value: Text) -> Int = len(value) - span-back-of(value, " \t\n\r")
+
+# Tailwind's `trimValue`: white space off both ends, but an escaped one at the end stays.
+fn trim-value(value: Text) -> Text = match tx.js-trim-start(value) {
+  v if len(tx.js-trim-end(v)) < len(v) and escaped?(v, len(tx.js-trim-end(v))) => v[0..len(tx.js-trim-end(v)) + 1]
+  v => tx.js-trim-end(v)
+}
+
+# Whether the byte at `at` follows an odd number of backslashes.
+fn escaped?(value: Text, at: Int) -> Bool = span-back-of(value[0..at], "\\") % 2 == 1
+
+# What a prelude's text is: its pieces as they were, but comments gone, a run of space the last of
+# its bytes (a line break a space, after something that is not space), and space at its start gone.
+fn normalized(prelude: Node) -> Text = fold out = "" for b in bits(prelude): stepped(out, b)
+
+record Bit { space: Bool, comment: Bool, text: Text }
+
+fn bits(n: Node) -> [Bit] = match n {
+  Prelude(lead, List(pieces...)) => bits(lead) ++ [bits(p)... for p in pieces]
+  Parens(List(inner...)) => [plain("(")] ++ [bits(p)... for p in inner] ++ [plain(")")]
+  Ws(t) => [Bit(space: true, comment: false, text: t)]
+  Comment(t) => [Bit(space: false, comment: true, text: t)]
+  Str(t) | Esc(t) | Char(t) | InnerChar(t) => [plain(t)]
+}
+
+fn plain(t: Text) -> Bit = Bit(space: false, comment: false, text: t)
+
+fn stepped(out: Text, b: Bit) -> Text = match b {
+  Bit(comment: true, ...) => out
+  Bit(space: true, text: t, ...) => match t[len(t) - 1] {
+    10 if out == "" or space-byte?(out[len(out) - 1]) => out
+    10 => out ++ " "
+    _ if out == "" => out
+    c => out ++ byte-text(c)
+  }
+  _ => out ++ b.text
+}
+
+fn space-byte?(c: Int) -> Bool = c == 32 or c == 10 or c == 9
+
+# ---------------------------------------------------------------- printing
+
+# Tailwind's `toCss`: two spaces of indent for each level, a declaration or a statement on its line.
+fn css(nodes: [Css]) -> Text = join([printed(n, 0) for n in nodes], "")
+
+fn printed(n: Css, depth: Int) -> Text = match n.kind {
+  Decl => indent ++ n.head ++ ": " ++ (n.value ?? "undefined") ++ (if n.important then " !important" else "") ++ ";\n"
+  StyleRule => indent ++ n.head ++ " {\n" ++ inside ++ indent ++ "}\n"
+  AtRule if len(n.nodes) == 0 => indent ++ n.head ++ " " ++ n.params ++ ";\n"
+  AtRule => indent ++ n.head ++ (if n.params == "" then " " else " " ++ n.params ++ " ") ++ "{\n" ++ inside ++ indent ++ "}\n"
+  Comment => indent ++ "/*" ++ n.head ++ "*/\n"
+  Context | AtRoot => ""
+} where indent = repeated("  ", depth),
+        inside = join([printed(c, depth + 1) for c in n.nodes], "")

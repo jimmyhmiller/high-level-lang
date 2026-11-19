@@ -2843,6 +2843,208 @@
     (push-i64! (mut b) v)
     (finish! (mut b))))
 
+;; ---------------------------------------------------------------- JavaScript's numbers
+
+;;; What a program written in JavaScript computes with numbers, for languages that port one: how
+;;; `Number(text)` reads text (a decimal literal, `0x`/`0o`/`0b` integers, `Infinity`, white space
+;;; around it, nothing as 0, anything else NaN), how `String(number)` writes a number (the fewest
+;;; digits that read back as it, in JavaScript's layout), and `parseFloat`. Doubles do the
+;;; arithmetic; libc's correctly rounded `strtod` and `snprintf` read and write the digits.
+
+(extern strtod :cc (cc/C) [(ptr i8) (ptr (ptr i8))] (-> f64))
+(extern snprintf :cc (cc/C) [(ptr i8) isize (ptr i8) ...] (-> i32))
+(extern c-free :cc (cc/C) :as "free" [(ptr i8)] (-> void))
+
+(defstruct JsNum [(ok bool) (v f64)])
+
+(defn js-space-byte? [(c u8)] (-> bool)
+  (or (= c 9) (= c 10) (= c 11) (= c 12) (= c 13) (= c 32)))
+
+;;; The length of a JavaScript white space or line terminator character at `i`, 0 for none.
+(defn js-space-at [(s (slice u8)) (i i64)] (-> i64)
+  (let [c (get s i)]
+    (cond (js-space-byte? c) 1
+          (and (= c 0xC2) (< (+ i 1) (len s)) (= (get s (+ i 1)) 0xA0)) 2
+          (and (= c 0xEF) (< (+ i 2) (len s)) (= (get s (+ i 1)) 0xBB) (= (get s (+ i 2)) 0xBF)) 3
+          (and (= c 0xE1) (< (+ i 2) (len s)) (= (get s (+ i 1)) 0x9A) (= (get s (+ i 2)) 0x80)) 3
+          (and (= c 0xE3) (< (+ i 2) (len s)) (= (get s (+ i 1)) 0x80) (= (get s (+ i 2)) 0x80)) 3
+          (and (= c 0xE2) (< (+ i 2) (len s)))
+            (let [b1 (get s (+ i 1)) b2 (get s (+ i 2))]
+              (cond (and (= b1 0x80) (or (<= b2 0x8A) (= b2 0xA8) (= b2 0xA9) (= b2 0xAF))) 3
+                    (and (= b1 0x81) (= b2 0x9F)) 3
+                    :else 0))
+          :else 0)))
+
+(defn js-trimmed [(s (slice u8))] (-> (slice u8))
+  (let [(mut from) 0
+        (mut to) (len s)
+        (mut going) true]
+    (while (and going (< from to))
+      (let [n (js-space-at s from)]
+        (if (= n 0) (set! going false) (set! from (+ from n)))))
+    (set! going true)
+    (while (and going (> to from))
+      ;; A wide space is found from its first byte: step back to the byte that starts a character.
+      (let [(mut start) (- to 1)]
+        (while (and (> start from) (= (& (cast i64 (get s start)) 0xC0) 0x80))
+          (set! start (- start 1)))
+        (let [n (js-space-at s start)]
+          (if (and (> n 0) (= (+ start n) to)) (set! to start) (set! going false)))))
+    (subslice s from to)))
+
+(defn digits-in [(s (slice u8)) (from i64) (base i64)] (-> i64)
+  (let [(mut i) from]
+    (while (and (< i (len s)) (match (digit-value (cast i64 (get s i)) base) (Some [_] true) (None [] false)))
+      (set! i (+ i 1)))
+    (- i from)))
+
+;;; How long the decimal literal starting at `from` is (`[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?`,
+;;; or `[+-]?Infinity`), 0 when there is none.
+(defn js-decimal-length [(s (slice u8)) (from i64)] (-> i64)
+  (let [(mut i) from]
+    (when (and (< i (len s)) (or (= (get s i) #\+) (= (get s i) #\-))) (set! i (+ i 1)))
+    (if (and (<= (+ i 8) (len s)) (= (subslice s i (+ i 8)) "Infinity"))
+        (- (+ i 8) from)
+        (let [whole (digits-in s i 10)]
+          (set! i (+ i whole))
+          (let [(mut fraction) 0]
+            (when (and (< i (len s)) (= (get s i) #\.))
+              (set! fraction (digits-in s (+ i 1) 10))
+              (when (or (> whole 0) (> fraction 0)) (set! i (+ i 1 fraction))))
+            (if (and (= whole 0) (= fraction 0))
+                0
+                (do
+                  (when (and (< i (len s)) (or (= (get s i) #\e) (= (get s i) #\E)))
+                    (let [(mut j) (+ i 1)]
+                      (when (and (< j (len s)) (or (= (get s j) #\+) (= (get s j) #\-))) (set! j (+ j 1)))
+                      (let [exp (digits-in s j 10)]
+                        (when (> exp 0) (set! i (+ j exp))))))
+                  (- i from))))))))
+
+(defn js-read-decimal [(s (slice u8))] (-> f64)
+  (let [c (str/to-cstr (malloc-allocator) s)
+        v (strtod c (cast (ptr (ptr i8)) 0))]
+    (c-free c)
+    v))
+
+;;; JavaScript's `Number(text)`.
+(defn js-number [(text (slice u8))] (-> JsNum)
+  (let [s (js-trimmed text)]
+    (cond (= (len s) 0) (JsNum :ok true :v 0.0)
+          (and (> (len s) 2) (= (get s 0) #\0)
+               (or (= (get s 1) #\x) (= (get s 1) #\X) (= (get s 1) #\o) (= (get s 1) #\O) (= (get s 1) #\b) (= (get s 1) #\B)))
+            (let [p (get s 1)
+                  base (cond (or (= p #\x) (= p #\X)) 16 (or (= p #\o) (= p #\O)) 8 :else 2)]
+              (if (= (digits-in s 2 base) (- (len s) 2))
+                  (let [(mut v) 0.0]
+                    (for i (range 2 (len s))
+                      (match (digit-value (cast i64 (get s i)) base)
+                        (Some [d] (set! v (+ (* v (cast f64 base)) (cast f64 d))))
+                        (None [] (set! v v))))
+                    (JsNum :ok true :v v))
+                  (JsNum :ok false :v 0.0)))
+          (= (js-decimal-length s 0) (len s))
+            (cond (= s "Infinity") (JsNum :ok true :v (/ 1.0 0.0))
+                  (= s "+Infinity") (JsNum :ok true :v (/ 1.0 0.0))
+                  (= s "-Infinity") (JsNum :ok true :v (/ -1.0 0.0))
+                  :else (JsNum :ok true :v (js-read-decimal s)))
+          :else (JsNum :ok false :v 0.0))))
+
+;;; The shortest digits of a finite positive double, and where its decimal point goes: the value is
+;;; 0.DIGITS × 10^point, as ECMAScript's Number::toString has it (`n`).
+(defstruct Shortest [(digits (slice u8)) (point i64)])
+
+(defn shortest-of [(v f64)] (-> Shortest)
+  (let [buf (cast (ptr i8) (malloc 64))
+        (mut found) (Shortest :digits "" :point 0)
+        (mut p) 1]
+    (while (<= p 17)
+      (snprintf buf 64 c"%.*e" (cast i32 (- p 1)) v)
+      (if (= (strtod buf (cast (ptr (ptr i8)) 0)) v)
+          (do (set! found (shortest-parts (str/from-cstr buf))) (set! p 18))
+          (set! p (+ p 1))))
+    (c-free buf)
+    found))
+
+;;; `D.DDDDe±XX` as digits without trailing zeros, and the point.
+(defn shortest-parts [(e-form (slice u8))] (-> Shortest)
+  (let [(mut digits) (ArrayList::new [u8] (value-allocator))
+        (mut i) 0]
+    (while (and (< i (len e-form)) (!= (get e-form i) #\e))
+      (when (!= (get e-form i) #\.) (push! (mut digits) (get e-form i)))
+      (set! i (+ i 1)))
+    (let [exp-text (subslice e-form (+ i 1) (len e-form))
+          negative (= (get exp-text 0) #\-)
+          magnitude (match (parse-num (subslice exp-text 1 (len exp-text))) (Some [n] n) (None [] 0))
+          exp (if negative (- 0 magnitude) magnitude)]
+      (while (and (> (len digits) 1) (= (get (slice digits) (- (len digits) 1)) #\0))
+        (pop! (mut digits)))
+      (Shortest :digits (slice digits) :point (+ exp 1)))))
+
+;;; JavaScript's `String(number)`.
+(defn js-number-string [(v f64)] (-> (slice u8))
+  (cond (!= v v) "NaN"
+        (= v 0.0) "0"
+        (= v (/ 1.0 0.0)) "Infinity"
+        (= v (/ -1.0 0.0)) "-Infinity"
+        (< v 0.0) (let [(mut b) (str/StrBuf::new (value-allocator))]
+                    (push-str! (mut b) "-")
+                    (push-str! (mut b) (js-number-string (- 0.0 v)))
+                    (finish! (mut b)))
+        :else
+          (let [s (shortest-of v)
+                k (len (.digits s))
+                n (.point s)
+                (mut b) (str/StrBuf::new (value-allocator))]
+            (cond (and (<= k n) (<= n 21))
+                    (do (push-str! (mut b) (.digits s))
+                        (for _ (range 0 (- n k)) (push-str! (mut b) "0")))
+                  (and (< 0 n) (<= n 21))
+                    (do (push-str! (mut b) (subslice (.digits s) 0 n))
+                        (push-str! (mut b) ".")
+                        (push-str! (mut b) (subslice (.digits s) n k)))
+                  (and (< -6 n) (<= n 0))
+                    (do (push-str! (mut b) "0.")
+                        (for _ (range 0 (- 0 n)) (push-str! (mut b) "0"))
+                        (push-str! (mut b) (.digits s)))
+                  :else
+                    (do (push-str! (mut b) (subslice (.digits s) 0 1))
+                        (when (> k 1)
+                          (push-str! (mut b) ".")
+                          (push-str! (mut b) (subslice (.digits s) 1 k)))
+                        (push-str! (mut b) (if (>= (- n 1) 0) "e+" "e-"))
+                        (push-i64! (mut b) (if (>= (- n 1) 0) (- n 1) (- 1 n)))))
+            (finish! (mut b)))))
+
+;;; `String(Number(text))`: "NaN" when the text is not a number.
+(defn js-number-text [(text (slice u8))] (-> (slice u8))
+  (let [n (js-number text)]
+    (if (.ok n) (js-number-string (.v n)) "NaN")))
+
+;;; `String(Number(text) * factor)`.
+(defn js-number-scaled [(text (slice u8)) (factor i64)] (-> (slice u8))
+  (let [n (js-number text)]
+    (if (.ok n) (js-number-string (* (.v n) (cast f64 factor))) "NaN")))
+
+;;; `String(parseFloat(text))`: the longest decimal literal after leading white space.
+(defn js-parse-float [(text (slice u8))] (-> (slice u8))
+  (let [(mut from) 0
+        (mut going) true]
+    (while (and going (< from (len text)))
+      (let [n (js-space-at text from)]
+        (if (= n 0) (set! going false) (set! from (+ from n)))))
+    (let [n (js-decimal-length text from)]
+      (if (= n 0) "NaN" (js-number-text (subslice text from (+ from n)))))))
+
+;;; How `Number(a)` and `Number(b)` compare: -1, 0 or 1, and 2 when either is NaN.
+(defn js-number-compare [(a (slice u8)) (b (slice u8))] (-> i64)
+  (let [x (js-number a) y (js-number b)]
+    (cond (or (not (.ok x)) (not (.ok y))) 2
+          (< (.v x) (.v y)) -1
+          (> (.v x) (.v y)) 1
+          (= (.v x) (.v y)) 0
+          :else 2)))
+
 ;; ---------------------------------------------------------------- relations
 
 ;;; A relation of up to four columns of ids, with its rows stored flat. Row

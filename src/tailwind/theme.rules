@@ -1,0 +1,130 @@
+# Tailwind's theme (tailwindcss/src/theme.ts): the custom properties of a stylesheet's `@theme`
+# blocks, in the order they were first given, each with what its block said of it (inline,
+# reference, default, static). A value of `initial` takes a key away; `--x-*: initial` a namespace.
+# How a utility's value names a key (`red-500` in `--color` is `--color-red-500`) and what it then
+# is: the key's `var(…)`, or its value when inline.
+rules tailwind.theme
+use tailwind.text as tx
+
+record Entry { key: Text, value: Text, inline: Bool, reference: Bool, default: Bool, static: Bool }
+
+record Theme { entries: [Entry], prefix: Text, by-key: {Text:Entry} }
+
+record Options { inline: Bool, reference: Bool, default: Bool, static: Bool }
+
+fn empty() -> Theme = Theme(entries: [], prefix: "", by-key: {})
+
+# The theme looked up by key, once it is built.
+fn indexed(t: Theme) -> Theme = t with { by-key: {e.key: e for e in t.entries} }
+
+# Keys a namespace does not hold though their names start with it: `--font-weight` is not a font.
+fn ignored-keys(namespace: Text) -> [Text] = match namespace {
+  "--font" => ["--font-weight", "--font-size"]
+  "--inset" => ["--inset-shadow", "--inset-ring"]
+  "--text" => ["--text-color", "--text-decoration-color", "--text-decoration-thickness", "--text-indent",
+               "--text-shadow", "--text-underline-offset"]
+  "--grid-column" => ["--grid-column-start", "--grid-column-end"]
+  "--grid-row" => ["--grid-row-start", "--grid-row-end"]
+  _ => []
+}
+
+fn ignored?(key: Text, namespace: Text) -> Bool =
+  any k in ignored-keys(namespace): key == k or starts-with(key, k ++ "-")
+
+# The theme with one more declaration of a `@theme` block.
+fn added(t: Theme, key: Text, value: Text, o: Options) -> Theme = match key {
+  _ if ends-with(key, "-*") and value != "initial" => fail-build("Invalid theme value `" ++ value ++ "` for namespace `" ++ key ++ "`")
+  "--*" => given(t with { entries: [] }, key, value, o)
+  _ if ends-with(key, "-*") => given(cleared(t, key[0..len(key) - 2]), key, value, o)
+  _ => given(t, key, value, o)
+}
+
+# `initial` takes the key away; any other value replaces the key's where it stands, or comes last.
+fn given(t: Theme, key: Text, value: Text, o: Options) -> Theme = match value {
+  _ if o.default and (any e in t.entries: e.key == key and not e.default) => t
+  "initial" => t with { entries: [e for e in t.entries if e.key != key] }
+  _ if any e in t.entries: e.key == key => t with { entries: [if e.key == key then entry else e for e in t.entries] }
+  _ => t with { entries: t.entries ++ [entry] }
+} where entry = Entry(key: key, value: value, inline: o.inline, reference: o.reference, default: o.default, static: o.static)
+
+fn cleared(t: Theme, namespace: Text) -> Theme =
+  t with { entries: [e for e in t.entries if not starts-with(e.key, namespace) or (any k in ignored-keys(namespace): starts-with(e.key, k))] }
+
+fn entry-of(t: Theme, key: Text) -> Entry? = t.by-key[key]
+
+fn has?(t: Theme, key: Text) -> Bool = key in t.by-key
+
+fn prefix-key(t: Theme, key: Text) -> Text = match t.prefix {
+  "" => key
+  p => "--" ++ p ++ "-" ++ key[2..len(key)]
+}
+
+fn unprefix-key(t: Theme, key: Text) -> Text = match t.prefix {
+  "" => key
+  p => "--" ++ key[3 + len(p)..len(key)]
+}
+
+fn options-of(t: Theme, key: Text) -> Entry? = entry-of(t, tx.unescape(unprefix-key(t, key)))
+
+# The keys under these namespaces, without them: what a utility's value may be.
+fn keys-in(t: Theme, namespaces: [Text]) -> [Text] =
+  [e.key[len(ns) + 1..len(e.key)] for ns in namespaces for e in t.entries
+   if starts-with(e.key, ns ++ "-") and not is-some(index-of(e.key[2..len(e.key)], "--")) and not ignored?(e.key, ns)]
+
+# The key a utility's value names in the first of these namespaces that has it (`1.5` may be
+# spelled `1_5`).
+fn key-for(t: Theme, value: Text?, namespaces: [Text]) -> Text? = first ns in namespaces
+  if let some(key) = named-key(t, value, ns) if not ignored?(key, ns): key
+
+fn named-key(t: Theme, value: Text?, ns: Text) -> Text? = match value {
+  none => if has?(t, ns) then some(ns) else none
+  some(v) if has?(t, ns ++ "-" ++ v) => some(ns ++ "-" ++ v)
+  some(v) if has-byte?(v, '.') and has?(t, ns ++ "-" ++ replace-all(v, ".", "_")) => some(ns ++ "-" ++ replace-all(v, ".", "_"))
+  _ => none
+}
+
+# A key as a utility reads it: `var(--key)`, with the value as a fallback for a reference.
+fn var-of(t: Theme, key: Text) -> Text? = match entry-of(t, key) {
+  some(e) if e.reference => some("var(" ++ tx.escape(prefix-key(t, key)) ++ ", " ++ e.value ++ ")")
+  some(e) => some("var(" ++ tx.escape(prefix-key(t, key)) ++ ")")
+  none => none
+}
+
+# Tailwind's `theme.resolve`: what a utility's value is in these namespaces, its value when inline.
+fn resolve(t: Theme, value: Text?, namespaces: [Text]) -> Text? = resolve-with(t, value, namespaces, false)
+
+fn resolve-inline(t: Theme, value: Text?, namespaces: [Text]) -> Text? = resolve-with(t, value, namespaces, true)
+
+fn resolve-with(t: Theme, value: Text?, namespaces: [Text], inline: Bool) -> Text? =
+  first key in key-for(t, value, namespaces) for e in entry-of(t, key):
+    (if inline or e.inline then some(e.value) else var-of(t, key)) ?? ""
+
+# Tailwind's `theme.resolveValue`: the key's value itself.
+# Tailwind's `theme.get`: the value of the first of these keys the theme has, as written.
+fn raw(t: Theme, keys: [Text]) -> Text? = first k in keys for e in entry-of(t, k): e.value
+
+fn resolve-value(t: Theme, value: Text?, namespaces: [Text]) -> Text? =
+  first key in key-for(t, value, namespaces) for e in entry-of(t, key): e.value
+
+# Tailwind's `theme.resolveWith`: the value, and what the nested keys (`--text-lg--line-height`)
+# say beside it.
+record With { value: Text, nested: {Text:Text} }
+
+fn resolve-nested(t: Theme, value: Text, namespaces: [Text], nested: [Text]) -> With? =
+  first key in key-for(t, some(value), namespaces) for e in entry-of(t, key):
+    With(value: (if e.inline then e.value else var-of(t, key) ?? ""),
+         nested: {n: (if ne.inline then ne.value else var-of(t, key ++ n) ?? "") for n in nested if let some(ne) = entry-of(t, key ++ n)})
+
+# Tailwind's `theme.namespace`: the values under a namespace by what follows it (none for the
+# namespace itself).
+record Named { name: Text?, value: Text }
+
+fn namespace(t: Theme, ns: Text) -> [Named] =
+  [Named(name: named-in(e.key, ns), value: e.value) for e in t.entries
+   if e.key == ns or starts-with(e.key, ns ++ "-")]
+
+fn named-in(key: Text, ns: Text) -> Text? = match key {
+  _ if key == ns => none
+  _ if starts-with(key, ns ++ "--") => some(key[len(ns)..len(key)])
+  _ => some(key[len(ns) + 1..len(key)])
+}

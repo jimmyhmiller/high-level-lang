@@ -1,0 +1,151 @@
+# Text as Tailwind's TypeScript handles it: JavaScript's trimming (Unicode white space, not only
+# ASCII), `segment` (split on a separator outside brackets and strings), and the escaping of class
+# names and custom properties (utils/escape.ts, CSS.escape's algorithm).
+rules tailwind.text
+
+# JavaScript's `String.prototype.trim` and its halves: white space and line terminators, Unicode's
+# as well as ASCII's.
+fn js-trim(s: Text) -> Text = js-trim-end(js-trim-start(s))
+
+fn js-trim-start(s: Text) -> Text = s[leading-space(s)..len(s)]
+
+fn js-trim-end(s: Text) -> Text = s[0..len(s) - trailing-space(s)]
+
+fn leading-space(s: Text) -> Int = match len(s) - span-of(s, 0, ascii-space) {
+  0 => len(s)
+  _ if s[span-of(s, 0, ascii-space)] < 128 => span-of(s, 0, ascii-space)
+  _ => span-of(s, 0, ascii-space) + wide-space-at(s, span-of(s, 0, ascii-space))
+}
+
+# The bytes of white space at `at` and after it, where the first is a wide character.
+fn wide-space-at(s: Text, at: Int) -> Int = match space-point-length(s, at) {
+  0 => 0
+  n => n + leading-space(s[at + n..len(s)])
+}
+
+fn trailing-space(s: Text) -> Int = match span-back-of(s, ascii-space) {
+  n if n == len(s) => n
+  n if s[len(s) - n - 1] < 128 => n
+  n => n + wide-space-before(s, len(s) - n)
+}
+
+fn wide-space-before(s: Text, end: Int) -> Int = match space-point-before(s, end) {
+  0 => 0
+  n => n + trailing-space(s[0..end - n])
+}
+
+# ASCII's white space as JavaScript has it: tab, line feed, vertical tab, form feed, carriage
+# return and space.
+const ascii-space: Text = "\t\n" ++ byte-text(11) ++ byte-text(12) ++ "\r "
+
+# JavaScript's other white space: no-break space, ogham space mark, the en quad to the hair space,
+# the line and paragraph separators, the narrow no-break space, the medium mathematical space, the
+# ideographic space and the byte order mark.
+fn js-space-point?(cp: Int) -> Bool =
+  cp == 160 or cp == 5760 or (cp >= 8192 and cp <= 8202) or cp == 8232 or cp == 8233 or cp == 8239
+  or cp == 8287 or cp == 12288 or cp == 65279
+
+# The length of a wide white space character at `at`, or 0.
+fn space-point-length(s: Text, at: Int) -> Int = match code-points-of(s[at..min(len(s), at + 4)]) {
+  [cp, ...] if js-space-point?(cp) => utf8-length(cp)
+  _ => 0
+}
+
+# The length of a wide white space character ending at `end`, or 0.
+fn space-point-before(s: Text, end: Int) -> Int = match code-points-of(s[start..end]) {
+  [..., cp] if js-space-point?(cp) and end - utf8-length(cp) >= start => utf8-length(cp)
+  _ => 0
+} where start = utf8-start(s, max(0, end - 3), end)
+
+# The start of the character that holds the byte before `end`, no earlier than `low`.
+fn utf8-start(s: Text, low: Int, end: Int) -> Int = match [i for i in low..end if s[i] < 128 or s[i] >= 192] {
+  [] => low
+  starts => last(starts)
+}
+
+fn utf8-length(cp: Int) -> Int = match cp {
+  _ if cp < 128 => 1
+  _ if cp < 2048 => 2
+  _ if cp < 65536 => 3
+  _ => 4
+}
+
+# Tailwind's `segment`: the parts of `input` between `separator` bytes outside brackets (`()`, `[]`,
+# `{}`); a string is read to its closing quote, and a backslash escapes the byte after it.
+fn segment(input: Text, separator: Int) -> [Text] =
+  [input[bounds[i] + 1..bounds[i + 1]] for i in 0..len(bounds) - 1]
+  where bounds = [-1] ++ cuts-from(input, separator, 0, []) ++ [len(input)]
+
+# Where the separators are, from `i` on, with these brackets open (their closers, innermost last).
+fn cuts-from(input: Text, separator: Int, i: Int, closers: [Int]) -> [Int] = match i {
+  _ if i >= len(input) => []
+  _ if len(closers) == 0 and input[i] == separator => [i] ++ cuts-from(input, separator, i + 1, closers)
+  _ => match input[i] {
+    92 => cuts-from(input, separator, i + 2, closers)
+    34 | 39 => cuts-from(input, separator, string-end(input, i + 1, input[i]) + 1, closers)
+    40 => cuts-from(input, separator, i + 1, closers ++ [41])
+    91 => cuts-from(input, separator, i + 1, closers ++ [93])
+    123 => cuts-from(input, separator, i + 1, closers ++ [125])
+    c if len(closers) > 0 and c == last(closers) => cuts-from(input, separator, i + 1, closers[0..len(closers) - 1])
+    _ => cuts-from(input, separator, i + 1, closers)
+  }
+}
+
+# Where the string whose body starts at `i` ends: its closing quote, or the end of the text.
+fn string-end(input: Text, i: Int, quote: Int) -> Int = match i {
+  _ if i >= len(input) => len(input)
+  _ if input[i] == 92 => string-end(input, i + 2, quote)
+  _ if input[i] == quote => i
+  _ => string-end(input, i + 1, quote)
+}
+
+# Tailwind's `escape` (CSS.escape): how a class name or a custom property's name is written in CSS.
+fn escape(value: Text) -> Text = match value {
+  "-" => "\\-"
+  _ => join([escaped-byte(value, i) for i in 0..len(value)], "")
+}
+
+fn escaped-byte(value: Text, i: Int) -> Text = match value[i] {
+  0 => "�"
+  c if (c >= 1 and c <= 31) or c == 127 or (i == 0 and digit-byte?(c)) or (i == 1 and digit-byte?(c) and value[0] == 45) =>
+    "\\" ++ hex-text(c) ++ " "
+  c if c >= 128 or c == 45 or c == 95 or digit-byte?(c) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) => byte-text(c)
+  c => "\\" ++ byte-text(c)
+}
+
+fn hex-text(n: Int) -> Text = match n {
+  _ if n < 16 => byte-text(hex-digit(n))
+  _ => hex-text(n / 16) ++ byte-text(hex-digit(n % 16))
+}
+
+fn hex-digit(d: Int) -> Int = if d < 10 then 48 + d else 87 + d
+
+# Tailwind's `unescape`: a backslash and one to six hex digits (and one white space byte after them)
+# are the character they number; a backslash and any other character, that character.
+fn unescape(escaped: Text) -> Text = match index-of(escaped, "\\") {
+  none => escaped
+  some(at) => escaped[0..at] ++ unescaped-at(escaped, at + 1)
+}
+
+fn unescaped-at(s: Text, i: Int) -> Text = match hex-run(s, i) {
+  _ if i >= len(s) => ""
+  0 => s[i..i + char-length(s, i)] ++ unescape(s[i + char-length(s, i)..len(s)])
+  n => point-text(digits-number(s[i..i + n], 16, 8) ?? 0) ++ unescape(s[after..len(s)])
+    where after = if i + n < len(s) and (s[i + n] == 9 or s[i + n] == 10 or s[i + n] == 12 or s[i + n] == 13 or s[i + n] == 32)
+                  then i + n + 1 else i + n
+}
+
+fn hex-run(s: Text, i: Int) -> Int = len([j for j in i..min(len(s), i + 6) while is-some(digit-value(s[j], 16))])
+
+fn char-length(s: Text, i: Int) -> Int = match s[i] {
+  c if c < 192 => 1
+  c if c < 224 => 2
+  c if c < 240 => 3
+  _ => 4
+}
+
+fn point-text(cp: Int) -> Text = match cp {
+  _ if cp == 0 or cp > 1114111 or (cp >= 55296 and cp <= 57343) => "�"
+  _ => text-of-points([cp])
+}
+

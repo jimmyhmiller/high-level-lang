@@ -1,0 +1,87 @@
+# Tailwind's value parser (tailwindcss/src/value-parser.ts): a declaration's value or an at-rule's
+# parameters as words, functions and the separators between them. A separator is a run of `:`, `,`,
+# `=`, `<`, `>` and white space; `/` is a word of its own; a word followed by `(` is a function's
+# name. As Tailwind's: an unclosed function ends the text, what was left unread after it is a word at
+# the top, and a word before a `)` that closes nothing is dropped.
+rules tailwind.values
+
+enum Kind { Word, Function, Separator }
+
+boxed record Value { kind: Kind, value: Text, nodes: [Value] }
+
+fn word(value: Text) -> Value = Value(kind: Word, value: value, nodes: [])
+fn function(name: Text, nodes: [Value]) -> Value = Value(kind: Function, value: name, nodes: nodes)
+fn separator(value: Text) -> Value = Value(kind: Separator, value: value, nodes: [])
+
+fn css(nodes: [Value]) -> Text = join([printed(n) for n in nodes], "")
+
+fn printed(n: Value) -> Text = match n.kind {
+  Function => n.value ++ "(" ++ css(n.nodes) ++ ")"
+  _ => n.value
+}
+
+# What one level of the text holds: its nodes, where reading it stopped, and the word being read
+# when the text ended inside it (it goes at the top).
+record Level { nodes: [Value], next: Int, rest: Text }
+
+fn parse(input: Text) -> [Value] = match level(text, 0, "", [], false) {
+  Level(nodes: nodes, rest: "", ...) => nodes
+  Level(nodes: nodes, rest: rest, ...) => nodes ++ [word(rest)]
+} where text = replace-all(input, "\r\n", "\n")
+
+const separator-bytes: Text = ":,=<>\n \t"
+
+fn flushed(nodes: [Value], buffer: Text) -> [Value] = match buffer {
+  "" => nodes
+  _ => nodes ++ [word(buffer)]
+}
+
+# Reading from `i`, with `buffer` the word so far and `nodes` what this level holds; `inner` when the
+# level is a function's arguments, which a `)` ends.
+fn level(s: Text, i: Int, buffer: Text, nodes: [Value], inner: Bool) -> Level = match i {
+  _ if i >= len(s) => Level(nodes: nodes, next: len(s), rest: buffer)
+  _ => match s[i] {
+    92 => level(s, i + 2, buffer ++ s[i..min(len(s), i + 2)], nodes, inner)
+    47 => level(s, i + 1, "", flushed(nodes, buffer) ++ [word("/")], inner)
+    c if has-byte?(separator-bytes, c) =>
+      level(s, end, "", flushed(nodes, buffer) ++ [separator(s[i..end])], inner)
+      where end = i + span-of(s, i, separator-bytes)
+    34 | 39 => match quote-end(s, i + 1, s[i]) {
+      some(j) => level(s, j + 1, buffer ++ s[i..j + 1], nodes, inner)
+      none => level(s, i + 1, buffer ++ s[i..i + 1], nodes, inner)
+    }
+    40 => match level(s, i + 1, "", [], true) {
+      args if args.next >= len(s) => Level(nodes: nodes ++ [function(buffer, args.nodes)], next: len(s), rest: args.rest)
+      args => level(s, args.next, "", nodes ++ [function(buffer, args.nodes)], inner)
+    }
+    41 if inner => Level(nodes: flushed(nodes, buffer), next: i + 1, rest: "")
+    41 => level(s, i + 1, "", nodes, inner)
+    _ => level(s, i + 1, buffer ++ s[i..i + 1], nodes, inner)
+  }
+}
+
+# Where the string whose body starts at `i` is closed, if it is.
+fn quote-end(s: Text, i: Int, quote: Int) -> Int? = match i {
+  _ if i >= len(s) => none
+  _ if s[i] == 92 => quote-end(s, i + 2, quote)
+  _ if s[i] == quote => some(i)
+  _ => quote-end(s, i + 1, quote)
+}
+
+# Tailwind's `extractUsedVariables`: the custom properties `var(…)` reads, its fallbacks' too.
+fn used-variables(raw: Text) -> [Text] = match index-of(raw, "var(") {
+  none => []
+  _ => [v for n in parse(raw) for v in vars-in(n)]
+}
+
+fn vars-in(n: Value) -> [Text] = match n {
+  Value(kind: Function, value: "var", nodes: inner) => [w for c in inner for w in dashed-words(c)]
+  Value(kind: Function, nodes: inner, ...) => [v for c in inner for v in vars-in(c)]
+  _ => []
+}
+
+fn dashed-words(n: Value) -> [Text] = match n {
+  Value(kind: Word, value: "--" ++ _ as w, ...) => [w]
+  Value(kind: Function, nodes: inner, ...) => [w for c in inner for w in dashed-words(c)]
+  _ => []
+}

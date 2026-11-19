@@ -1,0 +1,1048 @@
+# Tailwind's compiler (tailwindcss/src/index.ts, compile.ts, design-system.ts, apply.ts,
+# css-functions.ts, at-import.ts, v4.3.5): a stylesheet's `@import`s inlined (each file read through
+# the bundler's reading, so a watcher sees it), its directives read in order (`@theme`, `@source`,
+# `@utility`, `@custom-variant`, `@tailwind utilities`, `@media source(…)`/`theme(…)`/`reference`),
+# the design system they make (the theme, the utilities and variants), and then for a set of
+# candidates: each compiled, sorted as Tailwind sorts them, put where `@tailwind utilities` was,
+# `@apply`, `@variant` and the theme functions substituted, and the whole made into the output
+# (`tailwind.output`).
+rules tailwind.compile
+use tailwind.ast as ast
+use tailwind.candidate as cand
+use tailwind.theme as th
+use tailwind.text as tx
+use tailwind.values as vp
+use tailwind.numbers as num
+use tailwind.utilities as ut
+use tailwind.variants as vr
+use tailwind.property-order as po
+use vite.stylesheets as sheets
+use tailwind.output as out
+
+# Tailwind's `Features`: what a stylesheet uses, as bits.
+const at-apply: Int = 1
+const at-import: Int = 2
+const js-plugin-compat: Int = 4
+const theme-function: Int = 8
+const utilities-feature: Int = 16
+const variants-feature: Int = 32
+const at-theme: Int = 64
+
+# Whether the Vite plugin treats a stylesheet as Tailwind's: anything but imports and themes.
+fn root-features?(features: Int) -> Bool = bit-and(features, at-apply + js-plugin-compat + theme-function + utilities-feature + variants-feature) != 0
+
+# ---------------------------------------------------------------- @import
+
+record Imported { nodes: [ast.Css], features: Int, files: [Text] }
+
+# Tailwind's `substituteAtImports`: each `@import "x" layer(…) supports(…) media` (and `@reference`)
+# the file it names, inside a context saying where it is, wrapped in what the import said. `files`
+# are the stylesheets read.
+fn imported(nodes: [ast.Css], base: Text, depth: Int) -> Imported = match [import-of(n, base, depth) for n in nodes] {
+  results => Imported(nodes: [x for r in results for x in r.nodes], features: fold f = 0 for r in results: bit-or(f, r.features),
+                      files: [x for r in results for x in r.files])
+}
+
+fn import-of(n: ast.Css, base: Text, depth: Int) -> Imported = match n.kind {
+  ast.AtRule if n.head == "@import" or n.head == "@reference" => match import-params(vp.parse(n.params)) {
+    none => Imported(nodes: [n], features: 0, files: [])
+    some(p) if starts-with(p.uri, "data:") or starts-with(p.uri, "http://") or starts-with(p.uri, "https://") =>
+      Imported(nodes: [n], features: at-import, files: [])
+    some(p) => loaded(n, p with { media: if n.head == "@reference" then some("reference") else p.media }, base, depth)
+  }
+  ast.Decl | ast.Comment => Imported(nodes: [n], features: 0, files: [])
+  _ => match imported(n.nodes, base, depth) {
+    inner => Imported(nodes: [n with { nodes: inner.nodes }], features: inner.features, files: inner.files)
+  }
+}
+
+record Import { uri: Text, layer: Text?, media: Text?, supports: Text? }
+
+fn loaded(n: ast.Css, p: Import, base: Text, depth: Int) -> Imported = match depth > 100 {
+  true => fail-build("Exceeded maximum recursion depth while resolving `" ++ p.uri ++ "` in `" ++ base ++ "`)")
+  false => match sheets.resolved(p.uri, base ++ "/__placeholder__.css") {
+    none => fail-build("Could not resolve '" ++ p.uri ++ "' from '" ++ base ++ "'")
+    some(path) => match imported(ast.parse(read-file(path), path), dir-of(path), depth + 1) {
+      inner => Imported(nodes: [ast.context({}, wrapped-import([ast.context({"base": dir-of(path)}, inner.nodes)], p))],
+                        features: bit-or(at-import, inner.features), files: [path] ++ inner.files)
+    }
+  }
+}
+
+fn wrapped-import(nodes: [ast.Css], p: Import) -> [ast.Css] = with-supports(with-media(with-layer(nodes, p.layer), p.media), p.supports)
+
+fn with-layer(nodes: [ast.Css], layer: Text?) -> [ast.Css] = match layer {
+  some(l) => [ast.at-rule("@layer", l, nodes)]
+  none => nodes
+}
+
+fn with-media(nodes: [ast.Css], media: Text?) -> [ast.Css] = match media {
+  some(m) => [ast.at-rule("@media", m, nodes)]
+  none => nodes
+}
+
+fn with-supports(nodes: [ast.Css], supports: Text?) -> [ast.Css] = match supports {
+  some(s) => [ast.at-rule("@supports", if starts-with(s, "(") then s else "(" ++ s ++ ")", nodes)]
+  none => nodes
+}
+
+# Tailwind's `parseImportParams`: the quoted name, then `layer`/`layer(…)`, `supports(…)`, and the
+# rest the media query. A `url(…)` import is not Tailwind's.
+fn import-params(params: [vp.Value]) -> Import? = import-from(params, 0, none)
+
+fn import-from(params: [vp.Value], i: Int, found: Import?) -> Import? = match i {
+  _ if i >= len(params) => found
+  _ => match params[i] {
+    n if n.kind == vp.Separator => import-from(params, i + 1, found)
+    n if n.kind == vp.Word and is-none(found) => match n.value {
+      "" => none
+      v if v[0] == '"' or v[0] == '\'' => import-from(params, i + 1, some(Import(uri: v[1..len(v) - 1], layer: none, media: none, supports: none)))
+      _ => none
+    }
+    n if n.kind == vp.Function and ascii-lower(n.value) == "url" => none
+    _ if is-none(found) => none
+    n if (n.kind == vp.Word or n.kind == vp.Function) and ascii-lower(n.value) == "layer" => match found {
+      some(f) if is-some(f.layer) => none
+      some(f) if is-some(f.supports) => fail-build("`layer(…)` in an `@import` should come before any other functions or conditions")
+      some(f) => import-from(params, i + 1, some(f with { layer: some(if n.kind == vp.Function then vp.css(n.nodes) else "") }))
+      none => none
+    }
+    n if n.kind == vp.Function and ascii-lower(n.value) == "supports" => match found {
+      some(f) if is-some(f.supports) => none
+      some(f) => import-from(params, i + 1, some(f with { supports: some(vp.css(n.nodes)) }))
+      none => none
+    }
+    _ => first f in found: f with { media: some(vp.css(params[i..len(params)])) }
+  }
+}
+
+# ---------------------------------------------------------------- reading the directives
+
+# What a context says, and its parent; the base of the file a node is in.
+fn base-of(c: {Text:Text}) -> Text = c["base"] ?? ""
+
+# `@media source(…)`, `theme(…)`, `prefix(…)`, `important` and `reference`: what they say is moved
+# onto what they hold, and the `@media` goes when nothing else is left of it.
+fn media-handled(nodes: [ast.Css], c: {Text:Text}) -> [ast.Css] = [y for n in nodes for y in media-one(n, c)]
+
+fn media-one(n: ast.Css, c: {Text:Text}) -> [ast.Css] = match n.kind {
+  ast.AtRule if n.head == "@media" => match tx.segment(n.params, ' ') {
+    params => match [p for p in params if not special-media?(p)] {
+      unknown if len(unknown) > 0 => [n with { params: join(unknown, " "), nodes: media-handled(media-applied(n.nodes, params, c), c) }]
+      _ => media-handled(media-applied(n.nodes, params, c), c)
+    }
+  }
+  ast.Context => [n with { nodes: media-handled(n.nodes, c ++ n.context) }]
+  ast.Decl | ast.Comment => [n]
+  _ => [n with { nodes: media-handled(n.nodes, c) }]
+}
+
+fn special-media?(p: Text) -> Bool = starts-with(p, "source(") or starts-with(p, "theme(") or starts-with(p, "prefix(") or p == "important" or p == "reference"
+
+fn media-applied(nodes: [ast.Css], params: [Text], c: {Text:Text}) -> [ast.Css] = fold out = nodes for p in params: media-param(out, p, c)
+
+fn media-param(nodes: [ast.Css], p: Text, c: {Text:Text}) -> [ast.Css] = match p {
+  "source(" ++ rest => sourced-utilities(nodes, rest[0..len(rest) - 1], base-of(c))
+  "theme(" ++ rest => themed-params(nodes, rest[0..len(rest) - 1], contains-text?(rest, "reference"))
+  "prefix(" ++ rest => [n for x in nodes for n in [prefixed-theme(x, rest[0..len(rest) - 1])]]
+  "reference" => [ast.context({"reference": "true"}, nodes)]
+  _ => nodes
+}
+
+# The first `@tailwind utilities` gets the source, in a context saying where it was given.
+fn sourced-utilities(nodes: [ast.Css], path: Text, base: Text) -> [ast.Css] = match first-utilities(nodes) {
+  none => nodes
+  some(_) => sourced-first(nodes, path, base)
+}
+
+fn first-utilities(nodes: [ast.Css]) -> Int? = first i in 0..len(nodes) if holds-utilities?(nodes[i]): i
+
+fn holds-utilities?(n: ast.Css) -> Bool = match n.kind {
+  ast.AtRule if n.head == "@tailwind" and n.params == "utilities" => true
+  ast.Decl | ast.Comment => false
+  _ => any c in n.nodes: holds-utilities?(c)
+}
+
+fn sourced-first(nodes: [ast.Css], path: Text, base: Text) -> [ast.Css] = match first-utilities(nodes) {
+  some(i) => nodes[0..i] ++ [sourced-in(nodes[i], path, base)] ++ nodes[i + 1..len(nodes)]
+  none => nodes
+}
+
+fn sourced-in(n: ast.Css, path: Text, base: Text) -> ast.Css = match n.kind {
+  ast.AtRule if n.head == "@tailwind" and n.params == "utilities" =>
+    ast.context({"sourceBase": base}, [n with { params: n.params ++ " source(" ++ path ++ ")" }])
+  _ => n with { nodes: sourced-first(n.nodes, path, base) }
+}
+
+fn themed-params(nodes: [ast.Css], params: Text, reference: Bool) -> [ast.Css] = [themed-param(n, params, reference) for n in nodes]
+
+fn themed-param(n: ast.Css, params: Text, reference: Bool) -> ast.Css = match n.kind {
+  ast.Context => n with { nodes: themed-params(n.nodes, params, reference) }
+  ast.AtRule if n.head == "@theme" => n with { params: n.params ++ " " ++ params }
+  ast.AtRule => n with { nodes: themed-params(n.nodes, params, reference) }
+  _ if reference => fail-build("Files imported with `@import \"…\" theme(reference)` must only contain `@theme` blocks.\nUse `@reference \"…\";` instead.")
+  _ => n
+}
+
+fn prefixed-theme(n: ast.Css, prefix: Text) -> ast.Css = match n.kind {
+  ast.AtRule if n.head == "@theme" => n with { params: n.params ++ " prefix(" ++ prefix ++ ")" }
+  ast.Decl | ast.Comment => n
+  _ => n with { nodes: [prefixed-theme(c, prefix) for c in n.nodes] }
+}
+
+fn important-media?(nodes: [ast.Css]) -> Bool = any n in nodes: match n.kind {
+  ast.AtRule if n.head == "@media" => any p in tx.segment(n.params, ' '): p == "important"
+  ast.Decl | ast.Comment => false
+  _ => important-media?(n.nodes)
+}
+
+# What reading a stylesheet's directives found, in the order they came.
+record Found {
+  theme: th.Theme,
+  # `@source` patterns, and the candidates `@source inline(…)` adds or takes away.
+  sources: [Source],
+  inline: [Text],
+  ignored: [Text],
+  # `source(…)` of the first `@tailwind utilities`: "" none given, "none", or the pattern.
+  root: Text,
+  root-base: Text,
+  utilities: Bool,
+  # A stylesheet's own utilities and variants.
+  custom-utilities: [ast.Css],
+  custom-variants: [ast.Css],
+  # A `@theme` was found, so the first is the theme's rule.
+  themed: Bool,
+  # The theme's `@keyframes`, in order.
+  keyframes: [ast.Css],
+  features: Int
+}
+
+record Source { base: Text, pattern: Text, negated: Bool }
+
+fn nothing-found() -> Found = Found(theme: th.empty(), sources: [], inline: [], ignored: [], root: "", root-base: "", utilities: false,
+  custom-utilities: [], custom-variants: [], themed: false, keyframes: [], features: 0)
+
+# The tree with the directives read out of it, and what they said.
+record Read { nodes: [ast.Css], found: Found }
+
+fn read-all(nodes: [ast.Css], c: {Text:Text}, top: Bool, f: Found) -> Read =
+  fold r = Read(nodes: [], found: f) for n in nodes: read-more(r, n, c, top)
+
+fn read-more(r: Read, n: ast.Css, c: {Text:Text}, top: Bool) -> Read = match read-one(n, c, top, r.found) {
+  one => Read(nodes: r.nodes ++ one.nodes, found: one.found)
+}
+
+fn read-one(n: ast.Css, c: {Text:Text}, top: Bool, f: Found) -> Read = match n.kind {
+  ast.Context => match read-all(n.nodes, c ++ n.context, top, f) {
+    inner => Read(nodes: [n with { nodes: inner.nodes }], found: inner.found)
+  }
+  ast.AtRule => directive(n, c, top, f)
+  ast.Decl | ast.Comment => Read(nodes: [n], found: f)
+  _ => match read-all(n.nodes, c, false, f) {
+    inner => Read(nodes: [n with { nodes: inner.nodes }], found: inner.found)
+  }
+}
+
+fn kept(n: ast.Css, f: Found) -> Read = Read(nodes: [n], found: f)
+fn dropped(f: Found) -> Read = Read(nodes: [], found: f)
+
+fn directive(n: ast.Css, c: {Text:Text}, top: Bool, f: Found) -> Read = match n.head {
+  "@tailwind" if n.params == "utilities" or starts-with(n.params, "utilities") => match f.utilities or "reference" in c {
+    true => dropped(f)
+    false => kept(n, utilities-root(n, c, f) with { utilities: true, features: bit-or(f.features, utilities-feature) })
+  }
+  "@utility" if not top => fail-build("`@utility` cannot be nested.")
+  "@utility" if len(n.nodes) == 0 => fail-build("`@utility " ++ n.params ++ "` is empty. Utilities should include at least one property.")
+  "@utility" => kept(n, f with { custom-utilities: f.custom-utilities ++ [n] })
+  "@source" if len(n.nodes) > 0 => fail-build("`@source` cannot have a body.")
+  "@source" if not top => fail-build("`@source` cannot be nested.")
+  "@source" => dropped(sourced(n.params, base-of(c), f))
+  "@variant" if top and (len(n.nodes) == 0 or has-slot?(n.nodes)) => custom-variant(n with { head: "@custom-variant" }, top, f)
+  "@custom-variant" => custom-variant(n, top, f)
+  "@theme" => match theme-read(n, c, f) {
+    t => match f.themed {
+      false => Read(nodes: [ast.context({"theme-rule": "true"}, [])],
+                    found: f with { theme: t, themed: true, keyframes: f.keyframes ++ theme-keyframes([n]), features: bit-or(f.features, at-theme) })
+      true => dropped(f with { theme: t, keyframes: f.keyframes ++ theme-keyframes([n]), features: bit-or(f.features, at-theme) })
+    }
+  }
+  "@plugin" | "@config" => fail-build("`" ++ n.head ++ " " ++ n.params ++ "`: Tailwind's JavaScript plugins and configuration files are not implemented")
+  _ => match read-all(n.nodes, c, false, f) {
+    inner => Read(nodes: [n with { nodes: inner.nodes }], found: inner.found)
+  }
+}
+
+fn has-slot?(nodes: [ast.Css]) -> Bool = any n in nodes: match n.kind {
+  ast.AtRule if n.head == "@slot" => true
+  ast.Decl | ast.Comment => false
+  _ => has-slot?(n.nodes)
+}
+
+fn utilities-root(n: ast.Css, c: {Text:Text}, f: Found) -> Found = fold out = f for param in tx.segment(n.params, ' '): match param {
+  "source(none)" => out with { root: "none" }
+  "source(" ++ rest => match rest[0..len(rest) - 1] {
+    path if (path != "" and path[0] == '"' and path[len(path) - 1] != '"') or (path != "" and path[0] == '\'' and path[len(path) - 1] != '\'')
+            or path == "" or (path[0] != '\'' and path[0] != '"') => fail-build("`source(…)` paths must be quoted.")
+    path => out with { root: path[1..len(path) - 1], root-base: c["sourceBase"] ?? base-of(c) }
+  }
+  _ => out
+}
+
+# `@source "glob"`, `@source not "glob"`, `@source inline("…")`, `@source not inline("…")`.
+fn sourced(params: Text, base: Text, f: Found) -> Found = match source-of(params) {
+  s if s.inline and s.negated => f with { ignored: f.ignored ++ expanded-candidates(s.path) }
+  s if s.inline => f with { inline: f.inline ++ expanded-candidates(s.path) }
+  s => f with { sources: f.sources ++ [Source(base: base, pattern: s.path, negated: s.negated)] }
+}
+
+record SourceParam { path: Text, negated: Bool, inline: Bool }
+
+fn source-of(params: Text) -> SourceParam = match (match params { "not " ++ rest => rest _ => params }) {
+  "inline(" ++ rest => checked-source(tx.js-trim(rest[0..len(rest) - 1]), starts-with(params, "not "), true)
+  path => checked-source(path, starts-with(params, "not "), false)
+}
+
+fn checked-source(path: Text, negated: Bool, inline: Bool) -> SourceParam = match path {
+  _ if path == "" or (path[0] != '"' and path[0] != '\'') or path[len(path) - 1] != path[0] or len(path) < 2 =>
+    fail-build("`@source` paths must be quoted.")
+  _ => SourceParam(path: path[1..len(path) - 1], negated: negated, inline: inline)
+}
+
+fn expanded-candidates(source: Text) -> [Text] = [c for s in tx.segment(source, ' ') for c in brace-expanded(s)]
+
+# Tailwind's `expand`: `a-{b,c}` and `p-{1..3}` as every name they stand for.
+fn brace-expanded(pattern: Text) -> [Text] = match index-of(pattern, "{") {
+  none => [pattern]
+  some(at) => match brace-end(pattern, at, 0) {
+    none => fail-build("The pattern `" ++ pattern ++ "` is not balanced.")
+    some(end) => [pre ++ part ++ tail for tail in brace-expanded(pattern[end + 1..len(pattern)]) for part in parts]
+      where pre = pattern[0..at],
+            inside = pattern[at + 1..end],
+            parts = [x for p in (if sequence?(inside) then sequence-of(inside) else tx.segment(inside, ',')) for x in brace-expanded(p)]
+  }
+}
+
+fn brace-end(s: Text, i: Int, depth: Int) -> Int? = match i {
+  _ if i >= len(s) => (if depth > 0 then last-index-of(s, "}") else none)
+  _ if s[i] == '{' => brace-end(s, i + 1, depth + 1)
+  _ if s[i] == '}' and depth == 1 => some(i)
+  _ if s[i] == '}' => brace-end(s, i + 1, depth - 1)
+  _ => brace-end(s, i + 1, depth)
+}
+
+# `a..b` and `a..b..step`, of integers.
+fn sequence?(s: Text) -> Bool = match split(s, "..") {
+  [a, b] => integer?(a) and integer?(b)
+  [a, b, c] => integer?(a) and integer?(b) and integer?(c)
+  _ => false
+}
+
+fn integer?(s: Text) -> Bool = match s {
+  "-" ++ rest => rest != "" and span-of(rest, 0, "0123456789") == len(rest)
+  _ => s != "" and span-of(s, 0, "0123456789") == len(s)
+}
+
+fn int-of(s: Text) -> Int = match s {
+  "-" ++ rest => 0 - parse-int(rest)
+  _ => parse-int(s)
+}
+
+fn sequence-of(s: Text) -> [Text] = match split(s, "..") {
+  [a, b] => stepped(int-of(a), int-of(b), if int-of(a) <= int-of(b) then 1 else -1)
+  [a, b, c] if int-of(c) == 0 => fail-build("Step cannot be zero in sequence expansion.")
+  [a, b, c] => stepped(int-of(a), int-of(b), if int-of(a) < int-of(b) then abs(int-of(c)) else -abs(int-of(c)))
+  _ => [s]
+}
+
+fn abs(n: Int) -> Int = if n < 0 then 0 - n else n
+
+fn stepped(from: Int, to: Int, step: Int) -> [Text] = match (if step > 0 then from <= to else from >= to) {
+  false => []
+  true => [int-text(from)] ++ stepped(from + step, to, step)
+}
+
+fn custom-variant(n: ast.Css, top: Bool, f: Found) -> Read = match top {
+  false => fail-build("`@custom-variant` cannot be nested.")
+  true => dropped(f with { custom-variants: f.custom-variants ++ [n] })
+}
+
+# ---------------------------------------------------------------- the theme
+
+record ThemeParams { options: th.Options, prefix: Text }
+
+fn theme-params(params: Text) -> ThemeParams = fold out = ThemeParams(options: th.Options(inline: false, reference: false, default: false, static: false), prefix: "")
+  for option in tx.segment(params, ' '): match option {
+    "reference" => out with { options: out.options with { reference: true } }
+    "inline" => out with { options: out.options with { inline: true } }
+    "default" => out with { options: out.options with { default: true } }
+    "static" => out with { options: out.options with { static: true } }
+    "prefix(" ++ p => out with { prefix: p[0..len(p) - 1] }
+    _ => out
+  }
+
+fn theme-read(n: ast.Css, c: {Text:Text}, f: Found) -> th.Theme = match theme-params(n.params) {
+  tp => fold t = (if tp.prefix == "" then f.theme else f.theme with { prefix: valid-prefix(tp.prefix) })
+         for d in theme-children(n, n.nodes):
+           th.added(t, tx.unescape(d.head), d.value ?? "", if "reference" in c then tp.options with { reference: true } else tp.options)
+}
+
+fn valid-prefix(p: Text) -> Text = match p != "" and span-of(p, 0, "abcdefghijklmnopqrstuvwxyz") == len(p) {
+  true => p
+  false => fail-build("The prefix \"" ++ p ++ "\" is invalid. Prefixes must be lowercase ASCII letters (a-z) only.")
+}
+
+# A theme's custom properties; its `@keyframes` are kept apart; anything else is an error.
+fn theme-children(theme: ast.Css, nodes: [ast.Css]) -> [ast.Css] = [d for n in nodes for d in theme-child(theme, n)]
+
+fn theme-child(theme: ast.Css, n: ast.Css) -> [ast.Css] = match n.kind {
+  ast.AtRule if n.head == "@keyframes" => []
+  ast.Comment => []
+  ast.Decl if starts-with(n.head, "--") => [n]
+  ast.Context | ast.AtRoot => theme-children(theme, n.nodes)
+  _ => fail-build("`@theme` blocks must only contain custom properties or `@keyframes`.\n\n" ++ ast.css([theme with { nodes: [n] }]))
+}
+
+fn theme-keyframes(nodes: [ast.Css]) -> [ast.Css] = [k for n in nodes for k in keyframes-in-theme(n, false)]
+
+fn keyframes-in-theme(n: ast.Css, inside: Bool) -> [ast.Css] = match n.kind {
+  ast.AtRule if inside and n.head == "@keyframes" => [n]
+  ast.AtRule if n.head == "@theme" => [k for c in n.nodes for k in keyframes-in-theme(c, true)]
+  ast.Decl | ast.Comment => []
+  _ => [k for c in n.nodes for k in keyframes-in-theme(c, inside)]
+}
+
+# ---------------------------------------------------------------- the design system
+
+record Design {
+  theme: th.Theme,
+  names: cand.Names,
+  utilities: {Text:[ut.U]},
+  # A stylesheet's own static utilities, by name: what `@utility name { … }` holds.
+  own-utilities: {Text:[ast.Css]},
+  variants: vr.Table,
+  important: Bool,
+  invalid: {Text:Bool}
+}
+
+fn design(t: th.Theme, f: Found, important: Bool) -> Design = Design(theme: t, names: names, utilities: by-root, own-utilities: owned,
+    variants: table, important: important, invalid: {c: true for c in f.ignored})
+  where registry = ut.registry(),
+        owned = {own-utility-name(u): u.nodes for u in f.custom-utilities},
+        by-root = {r: [u for u in registry if u.name == r] for r in [u.name for u in registry distinct u.name]},
+        defs = vr.registry(t, own-variants(f.custom-variants)),
+        table = vr.table(defs),
+        names = cand.Names(static-utilities: {u.name: true for u in registry if u.static} ++ {k: true for k in keys(owned)},
+                           functional-utilities: {u.name: true for u in registry if not u.static},
+                           variant-kinds: {d.name: d.kind for d in defs}, variant-names: {d.name: true for d in defs},
+                           compounds-with: {d.name: d.compounds-with for d in defs}, compounds: {d.name: d.compounds for d in defs},
+                           prefix: t.prefix)
+
+fn own-utility-name(u: ast.Css) -> Text = match tx.unescape(u.params) {
+  name if ends-with(name, "-*") => fail-build("`@utility " ++ u.params ++ "`: functional utilities of a stylesheet's own (`--value(…)`) are not implemented")
+  name if static-utility-name?(name) => name
+  name => fail-build("`@utility " ++ u.params ++ "` defines an invalid utility name. Utilities should be alphanumeric and start with a lowercase letter.")
+}
+
+# Tailwind's `isValidStaticUtilityName`.
+fn static-utility-name?(name: Text) -> Bool = match root-length(name) {
+  0 => false
+  n if n == len(name) => not ends-with(name, "-")
+  n => static-rest?(name, n)
+}
+
+fn root-length(name: Text) -> Int = match name {
+  "-" ++ rest if rest != "" and rest[0] >= 'a' and rest[0] <= 'z' => 1 + span-of(rest, 0, root-bytes)
+  _ if name != "" and name[0] >= 'a' and name[0] <= 'z' => span-of(name, 0, root-bytes)
+  _ => 0
+}
+
+const root-bytes: Text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+
+fn static-rest?(name: Text, from: Int) -> Bool = all i in from..len(name): static-byte-ok?(name, from, i)
+  and len([i for i in from..len(name) if name[i] == '/']) <= 1 and name[len(name) - 1] != '/'
+
+fn static-byte-ok?(name: Text, from: Int, i: Int) -> Bool = match name[i] {
+  '%' => i == len(name) - 1 and digit-byte?(name[i - 1])
+  '/' => true
+  '.' => digit-byte?(name[i - 1]) and i + 1 < len(name) and digit-byte?(name[i + 1])
+  c => c == '_' or c == '-' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or digit-byte?(c)
+}
+
+# A stylesheet's variants: `@custom-variant name (selectors);` or with a body.
+fn own-variants(nodes: [ast.Css]) -> [vr.Def] = [own-variant(n) for n in nodes]
+
+fn own-variant(n: ast.Css) -> vr.Def = match tx.segment(n.params, ' ') {
+  [name, ...] if not variant-name?(name) => fail-build("`@custom-variant " ++ name ++ "` defines an invalid variant name. Variants should only contain alphanumeric, dashes, or underscore characters and start with a lowercase letter or number.")
+  [name, selector, ...] if len(n.nodes) > 0 => fail-build("`@custom-variant " ++ name ++ "` cannot have both a selector and a body.")
+  [name] if len(n.nodes) == 0 => fail-build("`@custom-variant " ++ name ++ "` has no selector or body.")
+  [name, selector, ...] => match [tx.js-trim(s) for s in tx.segment(selector[1..len(selector) - 1], ',')] {
+    sels if len(sels) == 0 or (any s in sels: s == "") => fail-build("`@custom-variant " ++ name ++ " (" ++ join(sels, ",") ++ ")` selector is invalid.")
+    sels if any s in sels: starts-with(s, "@scope") => fail-build("`@custom-variant " ++ name ++ "`: variants with `@scope` are not implemented")
+    sels => vr.custom-of-selectors(name, sels)
+  }
+  [name, ...] if any-variant-rule?(n.nodes) => fail-build("`@custom-variant " ++ name ++ "`: `@variant` inside a custom variant's body is not implemented")
+  [name, ...] => vr.custom-of-body(name, n.nodes)
+}
+
+fn any-variant-rule?(nodes: [ast.Css]) -> Bool = any n in nodes: match n.kind {
+  ast.AtRule if n.head == "@variant" or n.head == "@scope" => true
+  ast.Decl | ast.Comment => false
+  _ => any-variant-rule?(n.nodes)
+}
+
+# Tailwind's `IS_VALID_VARIANT_NAME`: `^@?[a-z0-9][a-zA-Z0-9_-]*(?<![_-])$`.
+fn variant-name?(name: Text) -> Bool = match (if starts-with(name, "@") then name[1..len(name)] else name) {
+  "" => false
+  v => (digit-byte?(v[0]) or (v[0] >= 'a' and v[0] <= 'z')) and span-of(v, 0, root-bytes) == len(v)
+       and v[len(v) - 1] != '_' and v[len(v) - 1] != '-'
+}
+
+fn parse-candidate(raw: Text, ds: Design) -> [cand.Candidate] = cand.parse(raw, ds.names)
+
+# ---------------------------------------------------------------- compiling candidates
+
+# One rule a candidate made, and what it is sorted by.
+record Made { node: ast.Css, order: [Int], count: Int, variants: [cand.Variant], raw: Text }
+
+# Tailwind's `compileCandidates`: each candidate's rules, sorted by their variants, then by the
+# properties they set, then by how many, then by the candidate. `respect-important`: whether the
+# stylesheet's `important` applies (not under `@apply`).
+fn compiled-candidates(raws: [Text], ds: Design, respect-important: Bool) -> [Made] =
+  sort-made([m for raw in raws if not (raw in ds.invalid) for m in candidate-made(raw, ds, respect-important)], ds)
+
+# What a class name makes: the rules of the first of its readings that makes any... of each that
+# does, as Tailwind takes every reading that compiles.
+fn candidate-made(raw: Text, ds: Design, respect-important: Bool) -> [Made] =
+  [m for c in parse-candidate(raw, ds) for m in ast-nodes(c, ds, respect-important)]
+
+fn ast-nodes(c: cand.Candidate, ds: Design, respect-important: Bool) -> [Made] = match base-utility(c, ds) {
+  asts => match [made-rule(c, nodes, ds, respect-important) for nodes in asts] {
+    made if any m in made: is-none(m) => []
+    made => match [m for o in made for m in o] {
+      rules => match substituted-candidate([m.node for m in rules], ds) {
+        some(nodes) => [rules[i] with { node: nodes[i] } for i in 0..len(rules)]
+        none => []
+      }
+    }
+  }
+}
+
+# Tailwind runs the theme functions and `@variant` over what a candidate made, and an error there
+# makes the candidate invalid.
+fn substituted-candidate(nodes: [ast.Css], ds: Design) -> [ast.Css]? = match functions-in(nodes, ds) {
+  r if r.error != "" => none
+  r => match at-variants(r.nodes, ds) {
+    v if v.error != "" => none
+    v => some(v.nodes)
+  }
+}
+
+fn made-rule(c: cand.Candidate, nodes: [ast.Css], ds: Design, respect-important: Bool) -> Made? =
+  first rule in variants-applied(ast.style-rule("." ++ tx.escape(c.raw), if c.important or (ds.important and respect-important) then importanted(nodes) else nodes),
+                                 c.variants, ds):
+    Made(node: rule, order: sort-info.order, count: sort-info.count, variants: c.variants, raw: c.raw)
+  where sort-info = property-sort(nodes)
+
+fn variants-applied(rule: ast.Css, variants: [cand.Variant], ds: Design) -> ast.Css? = match variants {
+  [] => some(rule)
+  [v, rest...] => first r in vr.applied(rule, v, ds.variants, ds.theme, 0) for out in variants-applied(r, rest, ds): out
+}
+
+fn importanted(nodes: [ast.Css]) -> [ast.Css] = [important-one(n) for n in nodes]
+
+fn important-one(n: ast.Css) -> ast.Css = match n.kind {
+  ast.Decl => n with { important: true }
+  ast.StyleRule | ast.AtRule => n with { nodes: importanted(n.nodes) }
+  _ => n
+}
+
+# Tailwind's `compileBaseUtility`: what each of the candidate's root's utilities makes of it.
+fn base-utility(c: cand.Candidate, ds: Design) -> [[ast.Css]] = match c.kind {
+  cand.ArbitraryUtility => [[ast.decl(c.property, v)] for v in (match c.modifier {
+    none => some(c.arbitrary-value)
+    some(_) => ut.as-color(c.arbitrary-value, c.modifier, ds.theme)
+  })]
+  cand.StaticUtility => [out for u in ds.utilities[c.root] ?? [] if u.static for out in ut.compiled(u, c, ds.theme)]
+    ++ [nodes for nodes in ds.own-utilities[c.root]]
+  cand.FunctionalUtility => [out for u in ds.utilities[c.root] ?? [] if not u.static for out in ut.compiled(u, c, ds.theme)]
+}
+
+record Sorting { order: [Int], count: Int }
+
+# Tailwind's `getPropertySort`: the places in the property order of the declarations, breadth
+# first, a `--tw-sort` standing for everything after it; and how many declarations there are.
+fn property-sort(nodes: [ast.Css]) -> Sorting = match breadth-decls(nodes) {
+  decls => Sorting(order: sorted-ints(orders-of(decls)), count: len(decls))
+}
+
+fn breadth-decls(nodes: [ast.Css]) -> [ast.Css] = match nodes {
+  [] => []
+  _ => [n for n in nodes if n.kind == ast.Decl and is-some(n.value)]
+       ++ breadth-decls([c for n in nodes if n.kind == ast.StyleRule or n.kind == ast.AtRule for c in n.nodes])
+}
+
+fn orders-of(decls: [ast.Css]) -> [Int] = match decls {
+  [] => []
+  [d, rest...] if d.head == "--tw-sort" and is-some(po.index[d.value ?? ""]) => [po.index[d.value ?? ""] ?? 0]
+  [d, rest...] => ((first i in po.index[d.head]: [i]) ?? []) ++ orders-of(rest)
+}
+
+fn sorted-ints(xs: [Int]) -> [Int] = [x for x in sort x in xs by x distinct x]
+
+# A stable merge sort by Tailwind's comparison (Array.prototype.sort is stable).
+fn sort-made(made: [Made], ds: Design) -> [Made] = match len(made) {
+  n if n <= 1 => made
+  n => merged-made(sort-made(made[0..n / 2], ds), sort-made(made[n / 2..n], ds), ds)
+}
+
+# Two sorted halves merged: each item's place is its own index plus how many of the other half go
+# before it (found by halving), the left half first among equals.
+record Placed { at: Int, made: Made }
+
+fn merged-made(a: [Made], z: [Made], ds: Design) -> [Made] = [p.made for p in sort p in placed by p.at]
+  where placed = [Placed(at: i + first-not-before(z, a[i], 0, len(z), ds, true), made: a[i]) for i in 0..len(a)]
+                 ++ [Placed(at: j + first-not-before(a, z[j], 0, len(a), ds, false), made: z[j]) for j in 0..len(z)]
+
+# The first index in `xs[lo..hi]` whose item does not go before `m`: when `m` is from the left half,
+# an equal item goes after it; from the right, before it.
+fn first-not-before(xs: [Made], m: Made, lo: Int, hi: Int, ds: Design, left: Bool) -> Int = match lo >= hi {
+  true => lo
+  false => match goes-before?(xs[mid], m, ds, left) {
+    true => first-not-before(xs, m, mid + 1, hi, ds, left)
+    false => first-not-before(xs, m, lo, mid, ds, left)
+  } where mid = (lo + hi) / 2
+}
+
+fn goes-before?(x: Made, m: Made, ds: Design, m-left: Bool) -> Bool = match made-compare(x, m, ds) {
+  d if m-left => d < 0
+  d => d <= 0
+}
+
+# Tailwind's comparison of two compiled rules.
+fn made-compare(a: Made, z: Made, ds: Design) -> Int = match variant-mask-compare(a.variants, z.variants, ds) {
+  0 => match order-compare(a.order, z.order) {
+    0 => match z.count - a.count {
+      0 => num.compare(a.raw, z.raw)
+      d => d
+    }
+    d => d
+  }
+  d => d
+}
+
+# The first place where the orders differ; a list that ran out is after one that did not.
+fn order-compare(a: [Int], z: [Int]) -> Int = match first i in 0..min(len(a), len(z)) if a[i] != z[i]: i {
+  some(i) => a[i] - z[i]
+  none if len(a) == len(z) => 0
+  none => if len(a) < len(z) then 1 else -1
+}
+
+# Tailwind sorts by a bit for each variant (in the variants' order): which set has the highest
+# variant the other lacks.
+fn variant-mask-compare(a: [cand.Variant], z: [cand.Variant], ds: Design) -> Int = mask-compare(highest-first(a, ds), highest-first(z, ds), ds)
+
+fn highest-first(vs: [cand.Variant], ds: Design) -> [cand.Variant] =
+  fold out = [] for v in vs: if any o in out: vr.compare(o, v, ds.variants, ds.theme) == 0 then out else inserted-variant(out, v, ds)
+
+fn inserted-variant(sorted: [cand.Variant], v: cand.Variant, ds: Design) -> [cand.Variant] =
+  sorted[0..at] ++ [v] ++ sorted[at..len(sorted)]
+  where at = len([s for s in sorted while vr.compare(s, v, ds.variants, ds.theme) > 0])
+
+fn mask-compare(a: [cand.Variant], z: [cand.Variant], ds: Design) -> Int = match a, z {
+  [], [] => 0
+  [], _ => -1
+  _, [] => 1
+  [x, xs...], [y, ys...] => match vr.compare(x, y, ds.variants, ds.theme) {
+    0 => mask-compare(xs, ys, ds)
+    d => d
+  }
+}
+
+# ---------------------------------------------------------------- @variant
+
+record Substituted { nodes: [ast.Css], error: Text, features: Int }
+
+fn ok(nodes: [ast.Css], features: Int) -> Substituted = Substituted(nodes: nodes, error: "", features: features)
+
+fn joined-results(rs: [Substituted]) -> Substituted = match first r in rs if r.error != "": r {
+  some(bad) => bad
+  none => Substituted(nodes: [n for r in rs for n in r.nodes], error: "", features: fold f = 0 for r in rs: bit-or(f, r.features))
+}
+
+# Tailwind's `substituteAtVariant`: `@variant a:b, c { … }` the rules those variants make around it.
+fn at-variants(nodes: [ast.Css], ds: Design) -> Substituted = joined-results([at-variant-one(n, ds) for n in nodes])
+
+fn at-variant-one(n: ast.Css, ds: Design) -> Substituted = match n.kind {
+  ast.AtRule if n.head == "@variant" => match joined-results([variant-group(g, n.nodes, ds) for g in tx.segment(n.params, ',')]) {
+    r if r.error != "" => r
+    r => match at-variants(r.nodes, ds) {
+      inner => inner with { features: bit-or(inner.features, variants-feature) }
+    }
+  }
+  ast.Decl | ast.Comment => ok([n], 0)
+  _ => match at-variants(n.nodes, ds) {
+    inner if inner.error != "" => inner
+    inner => ok([n with { nodes: inner.nodes }], inner.features)
+  }
+}
+
+fn variant-group(group: Text, body: [ast.Css], ds: Design) -> Substituted =
+  match fold r = Stacked(rule: some(ast.style-rule("&", body)), error: "") for v in reversed(tx.segment(group, ':')): stacked-variant(r, tx.js-trim(v), ds) {
+    r if r.error != "" => Substituted(nodes: [], error: r.error, features: 0)
+    Stacked(rule: some(rule), ...) if rule.head == "&" and rule.kind == ast.StyleRule => ok(rule.nodes, 0)
+    Stacked(rule: some(rule), ...) => ok([rule], 0)
+    _ => Substituted(nodes: [], error: "Cannot use `@variant` with variant: " ++ group, features: 0)
+  }
+
+record Stacked { rule: ast.Css?, error: Text }
+
+fn stacked-variant(r: Stacked, v: Text, ds: Design) -> Stacked = match r.rule {
+  none => r
+  some(rule) => match v {
+    "" => Stacked(rule: none, error: "Cannot use `@variant` with empty variant")
+    _ => match cand.parse-variant(v, ds.names) {
+      none => Stacked(rule: none, error: "Cannot use `@variant` with unknown variant: " ++ v)
+      some(parsed) => match vr.applied(rule, parsed, ds.variants, ds.theme, 0) {
+        some(out) => Stacked(rule: some(out), error: "")
+        none => Stacked(rule: none, error: "Cannot use `@variant` with variant: " ++ v)
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------- theme functions
+
+# Tailwind's `substituteFunctions`: `--theme(…)`, `theme(…)`, `--spacing(…)` and `--alpha(…)` in
+# declarations' values and in `@media`, `@custom-media`, `@container` and `@supports` parameters.
+fn functions-in(nodes: [ast.Css], ds: Design) -> Substituted = joined-results([functions-one(n, ds) for n in nodes])
+
+fn functions-one(n: ast.Css, ds: Design) -> Substituted = match n.kind {
+  ast.Decl if invokes-function?(n.value ?? "") => match substituted-value(n.value ?? "", false, ds) {
+    v if v.error != "" => Substituted(nodes: [], error: v.error, features: 0)
+    v => ok([n with { value: some(v.text) }], theme-function)
+  }
+  ast.Decl | ast.Comment => ok([n], 0)
+  ast.AtRule if (n.head == "@media" or n.head == "@custom-media" or n.head == "@container" or n.head == "@supports") and invokes-function?(n.params) =>
+    match substituted-value(n.params, true, ds) {
+      v if v.error != "" => Substituted(nodes: [], error: v.error, features: 0)
+      v => match functions-in(n.nodes, ds) {
+        inner if inner.error != "" => inner
+        inner => ok([n with { params: v.text, nodes: inner.nodes }], bit-or(theme-function, inner.features))
+      }
+    }
+  _ => match functions-in(n.nodes, ds) {
+    inner if inner.error != "" => inner
+    inner => ok([n with { nodes: inner.nodes }], inner.features)
+  }
+}
+
+fn invokes-function?(v: Text) -> Bool = contains-text?(v, "theme(") or contains-text?(v, "--spacing(") or contains-text?(v, "--alpha(")
+
+record Value { text: Text, error: Text }
+
+fn substituted-value(value: Text, at-rule: Bool, ds: Design) -> Value = match value-nodes(vp.parse(value), at-rule, ds) {
+  r if r.error != "" => Value(text: "", error: r.error)
+  r => Value(text: vp.css(r.nodes), error: "")
+}
+
+record ValueNodes { nodes: [vp.Value], error: Text }
+
+fn value-nodes(nodes: [vp.Value], at-rule: Bool, ds: Design) -> ValueNodes = match [value-node(n, at-rule, ds) for n in nodes] {
+  rs => match first r in rs if r.error != "": r {
+    some(bad) => bad
+    none => ValueNodes(nodes: [x for r in rs for x in r.nodes], error: "")
+  }
+}
+
+fn value-node(n: vp.Value, at-rule: Bool, ds: Design) -> ValueNodes = match n.kind {
+  vp.Function if n.value == "--alpha" or n.value == "--spacing" or n.value == "--theme" or n.value == "theme" =>
+    match css-function(n.value, [tx.js-trim(a) for a in tx.segment(tx.js-trim(vp.css(n.nodes)), ',')], at-rule, ds) {
+      r if r.error != "" => ValueNodes(nodes: [], error: r.error)
+      r => value-nodes(vp.parse(r.text), at-rule, ds)
+    }
+  vp.Function => match value-nodes(n.nodes, at-rule, ds) {
+    inner if inner.error != "" => inner
+    inner => ValueNodes(nodes: [n with { nodes: inner.nodes }], error: "")
+  }
+  _ => ValueNodes(nodes: [n], error: "")
+}
+
+fn css-function(name: Text, args: [Text], at-rule: Bool, ds: Design) -> Value = match name {
+  "--alpha" => match args {
+    [value] => match [tx.js-trim(x) for x in tx.segment(value, '/')] {
+      [color, alpha] if color != "" and alpha != "" => Value(text: ut.with-alpha(color, alpha), error: "")
+      parts => Value(text: "", error: "The --alpha(…) function requires a color and an alpha value, e.g.: `--alpha(" ++ (if len(parts) > 0 and parts[0] != "" then parts[0] else "var(--my-color)") ++ " / " ++ (if len(parts) > 1 and parts[1] != "" then parts[1] else "50%") ++ ")`")
+    }
+    _ => Value(text: "", error: "The --alpha(…) function only accepts one argument")
+  }
+  "--spacing" => match args {
+    [""] | [] => Value(text: "", error: "The --spacing(…) function requires an argument, but received none.")
+    [value] => match th.resolve(ds.theme, none, ["--spacing"]) {
+      none => Value(text: "", error: "The --spacing(…) function requires that the `--spacing` theme variable exists, but it was not found.")
+      some(multiplier) => match num.dimension(value) {
+        some(d) if num.zero?(d.number) => Value(text: "0px", error: "")
+        some(d) if num.one?(d.number) => Value(text: multiplier, error: "")
+        _ => Value(text: "calc(" ++ multiplier ++ " * " ++ value ++ ")", error: "")
+      }
+    }
+    _ => Value(text: "", error: "The --spacing(…) function only accepts a single argument, but received " ++ int-text(len(args)) ++ ".")
+  }
+  "--theme" => match args {
+    [path, fallback...] if not starts-with(path, "--") => Value(text: "", error: "The --theme(…) function can only be used with CSS variables from your theme.")
+    [path, fallback...] => themed-value(if ends-with(path, " inline") then path[0..len(path) - 7] else path,
+                                        ends-with(path, " inline") or at-rule, fallback, ds)
+    _ => Value(text: "", error: "The --theme(…) function can only be used with CSS variables from your theme.")
+  }
+  _ => match args {
+    [path, fallback...] => legacy-theme(unquoted(path), fallback, ds)
+    _ => Value(text: "", error: "Could not resolve value for theme function: `theme()`.")
+  }
+}
+
+# Tailwind's `designSystem.resolveThemeValue`: a theme key, `/alpha` after it for an alpha.
+fn theme-value(path: Text, inline: Bool, ds: Design) -> Text? = match last-index-of(path, "/") {
+  some(at) => first v in resolved-key(tx.js-trim(path[0..at]), inline, ds) if tx.js-trim(path[at + 1..len(path)]) != "":
+    ut.with-alpha(v, tx.js-trim(path[at + 1..len(path)]))
+  none => resolved-key(path, inline, ds)
+}
+
+fn resolved-key(key: Text, inline: Bool, ds: Design) -> Text? =
+  if inline then th.resolve-inline(ds.theme, none, [key]) else th.resolve(ds.theme, none, [key])
+
+fn themed-value(path: Text, inline: Bool, fallback: [Text], ds: Design) -> Value = match theme-value(path, inline, ds) {
+  none if len(fallback) > 0 => Value(text: join(fallback, ", "), error: "")
+  none => Value(text: "", error: "Could not resolve value for theme function: `theme(" ++ path ++ ")`. Consider checking if the variable name is correct or provide a fallback value to silence this error.")
+  some(v) if len(fallback) == 0 => Value(text: v, error: "")
+  some(v) if join(fallback, ", ") == "initial" => Value(text: v, error: "")
+  some("initial") => Value(text: join(fallback, ", "), error: "")
+  some(v) if starts-with(v, "var(") or starts-with(v, "theme(") or starts-with(v, "--theme(") =>
+    Value(text: vp.css(with-fallback(vp.parse(v), join(fallback, ", "))), error: "")
+  some(v) => Value(text: v, error: "")
+}
+
+# Tailwind's `injectFallbackForInitialFallback`.
+fn with-fallback(nodes: [vp.Value], fallback: Text) -> [vp.Value] = [fallback-in(n, fallback) for n in nodes]
+
+fn fallback-in(n: vp.Value, fallback: Text) -> vp.Value = match n.kind {
+  vp.Function if n.value == "var" or n.value == "theme" or n.value == "--theme" => match n.nodes {
+    [only] => n with { nodes: [fallback-in(only, fallback), vp.word(", " ++ fallback)] }
+    [init..., last-node] if last-node.kind == vp.Word and last-node.value == "initial" =>
+      n with { nodes: [fallback-in(x, fallback) for x in init] ++ [last-node with { value: fallback }] }
+    _ => n with { nodes: with-fallback(n.nodes, fallback) }
+  }
+  vp.Function => n with { nodes: with-fallback(n.nodes, fallback) }
+  _ => n
+}
+
+fn legacy-theme(path: Text, fallback: [Text], ds: Design) -> Value = match starts-with(path, "--") {
+  false => fail-build("`theme(" ++ path ++ ")`: theme values by the JavaScript configuration's paths are not implemented (use `--theme(--…)`)")
+  true => match theme-value(path, true, ds) {
+    some(v) => Value(text: v, error: "")
+    none if len(fallback) > 0 => Value(text: join(fallback, ", "), error: "")
+    none => Value(text: "", error: "Could not resolve value for theme function: `theme(" ++ path ++ ")`. Consider checking if the path is correct or provide a fallback value to silence this error.")
+  }
+}
+
+# Tailwind's `eventuallyUnquote`.
+fn unquoted(v: Text) -> Text = match v {
+  _ if v == "" or (v[0] != '"' and v[0] != '\'') => v
+  _ => unquote-from(v, 1, v[0])
+}
+
+fn unquote-from(v: Text, i: Int, q: Int) -> Text = match i {
+  _ if i >= len(v) - 1 => ""
+  _ if v[i] == 92 and (v[i + 1] == q or v[i + 1] == 92) => v[i + 1..i + 2] ++ unquote-from(v, i + 2, q)
+  _ => v[i..i + 1] ++ unquote-from(v, i + 1, q)
+}
+
+# ---------------------------------------------------------------- @apply
+
+# Tailwind's `substituteAtApply`: each `@apply` in a rule the declarations of its candidates, in
+# their sorted order, a candidate's own rule unwrapped.
+fn applied(nodes: [ast.Css], ds: Design, top: Bool) -> Substituted = joined-results([apply-one(n, ds, top) for n in nodes])
+
+fn apply-one(n: ast.Css, ds: Design, top: Bool) -> Substituted = match n.kind {
+  ast.AtRule if n.head == "@keyframes" and contains-apply?(n.nodes) => fail-build("You cannot use `@apply` inside `@keyframes`.")
+  ast.AtRule if n.head == "@keyframes" => ok([n], 0)
+  ast.AtRule if n.head == "@utility" and contains-apply?(n.nodes) => fail-build("`@utility " ++ n.params ++ "`: `@apply` inside a stylesheet's own utility is not implemented")
+  ast.AtRule if n.head == "@apply" and top => ok([n], 0)
+  ast.AtRule if n.head == "@apply" => apply-candidates(n, ds)
+  ast.Decl | ast.Comment => ok([n], 0)
+  ast.Context => match applied(n.nodes, ds, top) {
+    inner if inner.error != "" => inner
+    inner => ok([n with { nodes: inner.nodes }], inner.features)
+  }
+  _ => match applied(n.nodes, ds, false) {
+    inner if inner.error != "" => inner
+    inner => ok([n with { nodes: inner.nodes }], inner.features)
+  }
+}
+
+fn contains-apply?(nodes: [ast.Css]) -> Bool = any n in nodes: match n.kind {
+  ast.AtRule if n.head == "@apply" => true
+  ast.Decl | ast.Comment => false
+  _ => contains-apply?(n.nodes)
+}
+
+fn apply-candidates(n: ast.Css, ds: Design) -> Substituted = match [p for p in split-space(n.params)] {
+  parts => match [p for p in parts if starts-with(p, "--")], [p for p in parts if not starts-with(p, "--")] {
+    dashed, normal if len(dashed) > 0 and len(normal) == 0 => ok([n], 0)
+    dashed, normal if len(dashed) > 0 => fail-build("You cannot use `@apply` with both mixins and utilities. Please move `@apply " ++ join(dashed, " ") ++ "` into a separate rule.")
+    _, normal if len(n.nodes) > 0 and len(normal) > 0 => fail-build("The rule `@apply " ++ join(normal, " ") ++ "` must not have a body.")
+    _, normal => ok([x for m in compiled-candidates(checked-apply(unique(normal), ds), ds, false)
+                     for x in (if m.node.kind == ast.StyleRule then m.node.nodes else [m.node])], at-apply)
+  }
+}
+
+# `params.split(/(\s+)/)`'s words: what is between the runs of white space (one empty at either end
+# when the text starts or ends with space).
+fn split-space(s: Text) -> [Text] = space-words(s, 0, 0)
+
+fn space-words(s: Text, start: Int, i: Int) -> [Text] = match i {
+  _ if i >= len(s) => [s[start..len(s)]]
+  _ if is-space-byte?(s[i]) => [s[start..i]] ++ space-words(s, i + span-of(s, i, " \t\n\r" ++ byte-text(11) ++ byte-text(12)), i + span-of(s, i, " \t\n\r" ++ byte-text(11) ++ byte-text(12)))
+  _ => space-words(s, start, i + 1)
+}
+
+fn is-space-byte?(c: Int) -> Bool = c == 32 or c == 9 or c == 10 or c == 13 or c == 11 or c == 12
+
+fn unique(xs: [Text]) -> [Text] = [x for x in xs distinct x]
+
+# Every candidate of an `@apply` must make something; Tailwind says why one does not.
+fn checked-apply(candidates: [Text], ds: Design) -> [Text] = [c for c in candidates for ok in [apply-check(c, ds)] if ok]
+
+fn apply-check(c: Text, ds: Design) -> Bool = match len(candidate-made(c, ds, false)) > 0 and not (c in ds.invalid) {
+  true => true
+  false => match c {
+    _ if ds.theme.prefix != "" and not starts-with(c, ds.theme.prefix) =>
+      fail-build("Cannot apply unprefixed utility class `" ++ c ++ "`. Did you mean `" ++ ds.theme.prefix ++ ":" ++ c ++ "`?")
+    _ if c in ds.invalid => fail-build("Cannot apply utility class `" ++ c ++ "` because it has been explicitly disabled: https://tailwindcss.com/docs/detecting-classes-in-source-files#explicitly-excluding-classes")
+    _ => match tx.segment(c, ':') {
+      parts if len(parts) > 1 and len(candidate-made(last(parts), ds, true)) > 0 => match [v for v in parts[0..len(parts) - 1]
+                                                                                           if len(candidate-made(v ++ ":[--tw-variant-check:1]", ds, true)) == 0] {
+        [v] => fail-build("Cannot apply utility class `" ++ c ++ "` because the `" ++ v ++ "` variant does not exist.")
+        vs if len(vs) > 1 => fail-build("Cannot apply utility class `" ++ c ++ "` because the " ++ listed(["`" ++ v ++ "`" for v in vs]) ++ " variants do not exist.")
+        _ => unknown-apply(c, ds)
+      }
+      _ => unknown-apply(c, ds)
+    }
+  }
+}
+
+fn unknown-apply(c: Text, ds: Design) -> Bool = match len(ds.theme.entries) {
+  0 => fail-build("Cannot apply unknown utility class `" ++ c ++ "`. Are you using CSS modules or similar and missing `@reference`? https://tailwindcss.com/docs/functions-and-directives#reference-directive")
+  _ => fail-build("Cannot apply unknown utility class `" ++ c ++ "`")
+}
+
+# `Intl.ListFormat('en', { type: 'conjunction' })`: `a and b`, `a, b, and c`.
+fn listed(xs: [Text]) -> Text = match xs {
+  [a, b] => a ++ " and " ++ b
+  _ => join(xs[0..len(xs) - 1], ", ") ++ ", and " ++ last(xs)
+}
+
+# ---------------------------------------------------------------- the compiler
+
+# A stylesheet read by Tailwind: the tree with its directives read (where `@tailwind utilities`
+# was, a context to fill), the design system, what the stylesheet said, and every file it read.
+record Compiler { nodes: [ast.Css], ds: Design, found: Found, features: Int, files: [Text], input: Text }
+
+# Tailwind's `compile(css, { base })`.
+fn compiler(text: Text, path: Text) -> Compiler = match imported([ast.context({"base": dir-of(path)}, ast.parse(text, path))], dir-of(path), 0) {
+  imports => match read-all(media-handled(imports.nodes, {}), {}, true, nothing-found()) {
+    r => compiled-sheet(r, path, imports, text, important-media?(imports.nodes))
+  }
+}
+
+fn compiled-sheet(r: Read, path: Text, imports: Imported, text: Text, important: Bool) -> Compiler =
+  match finished(themed-rule(r.nodes, theme, r.found) ++ keyframe-roots(r.nodes, r.found), ds) {
+    s if s.error != "" => fail-build(path ++ ": " ++ s.error)
+    s => Compiler(nodes: utilities-context(without-utility-rules(s.nodes)), ds: ds, found: r.found,
+                  features: bit-or(bit-or(imports.features, r.found.features), s.features), files: imports.files, input: text)
+  }
+  where theme = th.indexed(r.found.theme),
+        ds = design(theme, r.found with { theme: theme }, important)
+
+# `@variant`, the theme functions and `@apply`, in that order.
+fn finished(nodes: [ast.Css], ds: Design) -> Substituted = match at-variants(nodes, ds) {
+  v if v.error != "" => v
+  v => match functions-in(v.nodes, ds) {
+    f if f.error != "" => f
+    f => match applied(f.nodes, ds, true) {
+      a if a.error != "" => a
+      a => a with { features: bit-or(bit-or(v.features, f.features), a.features) }
+    }
+  }
+}
+
+# The first `@theme`'s rule holds the theme's variables (but those for reference only).
+fn themed-rule(nodes: [ast.Css], t: th.Theme, f: Found) -> [ast.Css] = match f.themed {
+  false => nodes
+  true => theme-filled(nodes, t)
+}
+
+fn theme-filled(nodes: [ast.Css], t: th.Theme) -> [ast.Css] = [theme-fill(n, t) for n in nodes]
+
+fn theme-fill(n: ast.Css, t: th.Theme) -> ast.Css = match n.kind {
+  ast.Context if "theme-rule" in n.context =>
+    ast.style-rule(":root, :host", [ast.context({"theme": "true"}, [ast.decl(tx.escape(th.prefix-key(t, e.key)), e.value) for e in t.entries if not e.reference])])
+  ast.Decl | ast.Comment => n
+  _ => n with { nodes: theme-filled(n.nodes, t) }
+}
+
+# The theme's `@keyframes`, at the end, each hoisted to the root.
+fn keyframe-roots(nodes: [ast.Css], f: Found) -> [ast.Css] = match f.themed {
+  false => []
+  true => [ast.context({"theme": "true"}, [ast.at-root([k])]) for k in f.keyframes]
+}
+
+fn without-utility-rules(nodes: [ast.Css]) -> [ast.Css] = [y for n in nodes for y in without-utility(n)]
+
+fn without-utility(n: ast.Css) -> [ast.Css] = match n.kind {
+  ast.AtRule if n.head == "@utility" => []
+  ast.AtRule | ast.Decl | ast.Comment => [n]
+  _ => [n with { nodes: without-utility-rules(n.nodes) }]
+}
+
+# Where `@tailwind utilities` was: a context that the build fills.
+fn utilities-context(nodes: [ast.Css]) -> [ast.Css] = [utilities-one(n) for n in nodes]
+
+fn utilities-one(n: ast.Css) -> ast.Css = match n.kind {
+  ast.AtRule if n.head == "@tailwind" and (n.params == "utilities" or starts-with(n.params, "utilities")) => ast.context({"utilities": "true"}, [])
+  ast.Decl | ast.Comment => n
+  _ => n with { nodes: utilities-context(n.nodes) }
+}
+
+# The sources to scan, as the Vite plugin makes them: the root (`source(…)`, or the project's root
+# with `**/*`, or none), then `@source`s.
+fn scan-sources(c: Compiler, project-root: Text) -> [Source] = (match c.found.root {
+  "none" => []
+  "" => [Source(base: project-root, pattern: "**/*", negated: false)]
+  pattern => [Source(base: c.found.root-base, pattern: pattern, negated: false)]
+}) ++ c.found.sources
+
+# ---------------------------------------------------------------- building
+
+# Tailwind's `compiler.build(candidates)`: the stylesheet with the candidates' utilities where
+# `@tailwind utilities` was, written as Tailwind writes it, after its license comment. A candidate
+# that is a variable (`--x`) marks that theme variable used.
+fn build(c: Compiler, candidates: [Text], version: Text) -> Text = match c.features {
+  0 => c.input
+  _ => ast.css([ast.comment("! tailwindcss v" ++ version ++ " | MIT License | https://tailwindcss.com ")]
+               ++ out.optimized(filled-utilities(c.nodes, [m.node for m in compiled-candidates(utility-candidates(c, candidates), c.ds, true)]),
+                                c.ds.theme, [x for x in candidates if starts-with(x, "--") and not (x in c.ds.invalid)]))
+}
+
+# The candidates compiled: `@source inline(…)`'s first, then the scanned ones, each once, the
+# disabled ones and variables left out.
+fn utility-candidates(c: Compiler, candidates: [Text]) -> [Text] = match c.found.utilities {
+  false => []
+  true => [x for x in c.found.inline ++ candidates if not (x in c.ds.invalid) and not starts-with(x, "--") distinct x]
+}
+
+fn filled-utilities(nodes: [ast.Css], made: [ast.Css]) -> [ast.Css] = [filled-one(n, made) for n in nodes]
+
+fn filled-one(n: ast.Css, made: [ast.Css]) -> ast.Css = match n.kind {
+  ast.Context if "utilities" in n.context => n with { nodes: made }
+  ast.Decl | ast.Comment => n
+  _ => n with { nodes: filled-utilities(n.nodes, made) }
+}
