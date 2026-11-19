@@ -1,0 +1,75 @@
+# mini's driver: every language in the tower used on a language that is not JavaScript.
+rules mini.main over mini.lang
+use mini.lang as syn
+use mini.scope as sc
+use mini.check as check
+use mini.reach as reach
+use mini.fold as fold
+
+main run on big stack
+
+# Name resolution with ML's rules, written directly: which Bind each Var means, by offset.
+fn resolved(n: Node, env: {Text:Int}) -> [Text] = match n {
+  Var(x) => [x ++ "@" ++ int-text(n.lo) ++ " -> " ++ int-text(env[x] ?? -1)]
+  Def(name, params, body) => resolved(body, {p.text: p.lo for p in params.names.kids})
+  Let(name, init, body) => resolved(init, env) ++ resolved(body, env ++ {name.text: name.lo})
+  Call(callee, args) => [r for a in args.kids for r in resolved(a, env)]
+  _ => [r for k in n.kids for r in resolved(k, env)]
+}
+
+# What the generated scope analysis says, in the same form.
+fn scoped(n: Node, a: sym.Analysis, binds: {Int:Int}) -> [Text] = match n {
+  Var(x) => [x ++ "@" ++ int-text(n.lo) ++ " -> " ++ int-text(binds[a.bindings[n.lo] ?? -1] ?? -1)]
+  _ => [r for k in n.kids for r in scoped(k, a, binds)]
+}
+
+fn bind-leaves(n: Node) -> [Node] = match n {
+  Bind(_) => [n]
+  _ => [b for k in n.kids for b in bind-leaves(k)]
+}
+
+fn eval(n: Node, env: {Text:Int}, defs: {Text:Node}) -> Int = match n {
+  Num(t) => parse-int(t)
+  Var(x) => env[x] ?? 0
+  Paren(x) => eval(x, env, defs)
+  Add(a, b) => eval(a, env, defs) + eval(b, env, defs)
+  Sub(a, b) => eval(a, env, defs) - eval(b, env, defs)
+  Mul(a, b) => eval(a, env, defs) * eval(b, env, defs)
+  Let(name, init, body) => eval(body, env ++ {name.text: eval(init, env, defs)}, defs)
+  If(t, y, e) => if eval(t, env, defs) != 0 then eval(y, env, defs) else eval(e, env, defs)
+  Call(callee, args) => match defs[callee.text] {
+    some(Def(_, params, body)) => eval(body, {params.names.kids[i].text: eval(args.kids[i], env, defs) for i in 0..len(args.kids)}, defs)
+    _ => 0
+  }
+  _ => 0
+}
+
+fn run() -> Void {
+  let path = arg-at(1)
+  let tree = syn.parse(read-file(path), path)
+  let defs = tree.defs.kids
+  let names = [d.name.text for d in defs]
+  let table = {d.name.text: d for d in defs}
+
+  print "-- folded:\n{}", syn.render(fold.run(tree), true)
+
+  let a = sc.analysis(tree, [])
+  let binds = {a.bindings[b.lo] ?? -1: b.lo for b in bind-leaves(tree)}
+  let want = resolved(tree, {})
+  let got = scoped(tree, a, binds)
+  print "-- name resolution: ML rules (written in .rules) vs the generated .scopes resolver"
+  for i in 0..len(want) {
+    print "{}  {}  {}", (if want[i] == got[i] then "same" else "DIFF"), want[i], got[i]
+  }
+
+  var interned = names-new()
+  let ids = {n: intern!(interned, n) for n in names}
+  let facts = [reach.fact-root(ids["main"] ?? 0)] ++
+              [reach.fact-calls(ids[d.name.text] ?? 0, ids[c] ?? 0)
+               for d in defs for c in check.run(d, names).calls if c in names]
+  var db = reach.solved(facts)
+  let live = [name-of(interned, f) for db.reach(?f)]
+  print "-- unbound: {}", join(check.run(tree, names).unbound, ", ")
+  print "-- dead functions: {}", join([n for n in names if not (n in live)], ", ")
+  print "-- main() = {}", eval(Call(FnRef("main"), List()), {}, table)
+}
