@@ -3045,6 +3045,366 @@
           (= (.v x) (.v y)) 0
           :else 2)))
 
+;; ---------------------------------------------------------------- 32-bit floats, as CSS engines have them
+
+;;; `F32` in the rules language is Coil's `f32`. What a program ported from a CSS engine computes
+;;; with: Rust's `f32` operations (libm's single-precision functions, as Rust's standard library
+;;; calls them), cssparser's reading of a number token (in doubles, then rounded to a float), and
+;;; dtoa-short's writing of one (Grisu2's digits of the float, as the dtoa crate formats them, cut
+;;; to six significant digits).
+
+(extern strtof :cc (cc/C) [(ptr i8) (ptr (ptr i8))] (-> f32))
+(extern cbrtf :cc (cc/C) [f32] (-> f32))
+(extern powf :cc (cc/C) [f32 f32] (-> f32))
+(extern sinf :cc (cc/C) [f32] (-> f32))
+(extern cosf :cc (cc/C) [f32] (-> f32))
+(extern atan2f :cc (cc/C) [f32 f32] (-> f32))
+(extern sqrtf :cc (cc/C) [f32] (-> f32))
+(extern roundf :cc (cc/C) [f32] (-> f32))
+(extern floorf :cc (cc/C) [f32] (-> f32))
+(extern ceilf :cc (cc/C) [f32] (-> f32))
+(extern truncf :cc (cc/C) [f32] (-> f32))
+(extern fabsf :cc (cc/C) [f32] (-> f32))
+(extern fmodf :cc (cc/C) [f32 f32] (-> f32))
+(extern c-pow :cc (cc/C) :as "pow" [f64 f64] (-> f64))
+
+;;; A float's bits, as an unsigned 32-bit number.
+(defn f32-bits [(v f32)] (-> i64)
+  (let [(mut x) v]
+    (cast i64 (load (cast (ptr u32) (mut x))))))
+
+(defn f32-of-bits [(b i64)] (-> f32)
+  (let [(mut x) (cast u32 (& b 0xFFFFFFFF))]
+    (load (cast (ptr f32) (mut x)))))
+
+;;; The double that is exactly the float nearest `text`, written so Coil reads it as a float
+;;; literal: what the rules compiler writes for an `F32` literal.
+(defn f32-exact-literal [(text (slice u8))] (-> (slice u8))
+  (let [c (str/to-cstr (malloc-allocator) text)
+        v (strtof c (cast (ptr (ptr i8)) 0))
+        buf (cast (ptr i8) (malloc 64))]
+    (c-free c)
+    (snprintf buf 64 c"%.17g" (cast f64 v))
+    (let [s (str/from-cstr buf)
+          (mut b) (str/StrBuf::new (value-allocator))]
+      (push-str! (mut b) s)
+      (when (not (or (contains-byte? s #\.) (contains-byte? s #\e) (contains-byte? s #\n) (contains-byte? s #\i)))
+        (push-str! (mut b) ".0"))
+      (c-free buf)
+      (finish! (mut b)))))
+
+(defn contains-byte? [(s (slice u8)) (c u8)] (-> bool)
+  (let [(mut hit) false]
+    (for x s (when (= x c) (set! hit true)))
+    hit))
+
+(defn f32-of [(i i64)] (-> f32) (cast f32 i))
+(defn f32-of-double [(v f64)] (-> f32) (cast f32 v))
+
+;;; Rust's `x as i32`: toward zero, NaN as 0, saturating at i32's bounds.
+(defn f32-to-i32 [(x f32)] (-> i64)
+  (cond (!= x x) 0
+        (>= x (: 2147483647.0 f32)) 2147483647
+        (<= x (: -2147483648.0 f32)) -2147483648
+        :else (cast i64 (cast i32 x))))
+
+;;; Rust's `x as u8`: toward zero, NaN as 0, saturating at 0 and 255.
+(defn f32-to-u8 [(x f32)] (-> i64)
+  (cond (!= x x) 0
+        (>= x (: 255.0 f32)) 255
+        (<= x (: 0.0 f32)) 0
+        :else (cast i64 (cast i32 x))))
+
+(defn f32-round [(x f32)] (-> f32) (roundf x))
+(defn f32-floor [(x f32)] (-> f32) (floorf x))
+(defn f32-ceil [(x f32)] (-> f32) (ceilf x))
+(defn f32-trunc [(x f32)] (-> f32) (truncf x))
+(defn f32-abs [(x f32)] (-> f32) (fabsf x))
+;;; Rust's `%` on floats: C's `fmodf`.
+(defn f32-rem [(x f32) (y f32)] (-> f32) (fmodf x y))
+(defn f32-sqrt [(x f32)] (-> f32) (sqrtf x))
+(defn f32-cbrt [(x f32)] (-> f32) (cbrtf x))
+(defn f32-pow [(x f32) (y f32)] (-> f32) (powf x y))
+(defn f32-sin [(x f32)] (-> f32) (sinf x))
+(defn f32-cos [(x f32)] (-> f32) (cosf x))
+(defn f32-atan2 [(y f32) (x f32)] (-> f32) (atan2f y x))
+(defn f32-nan? [(x f32)] (-> bool) (!= x x))
+(defn f32-infinite? [(x f32)] (-> bool) (and (= x x) (!= (- x x) (- x x))))
+;;; Whether the sign bit is set: true of -0 and of negative numbers.
+(defn f32-sign-negative? [(x f32)] (-> bool) (>= (f32-bits x) 0x80000000))
+
+;;; cssparser's reading of a number (`[+-]?\d*(\.\d+)?([eE][+-]?\d+)?`, the whole text): digits
+;;; summed in doubles, the fraction digit by digit times a factor that is divided by ten each time,
+;;; the exponent through `pow`. The double, before it is made a float.
+(defn css-number-double [(s (slice u8))] (-> f64)
+  (let [(mut i) 0
+        (mut sign) 1.0
+        (mut integral) 0.0
+        (mut fractional) 0.0]
+    (when (and (< i (len s)) (or (= (get s i) #\-) (= (get s i) #\+)))
+      (when (= (get s i) #\-) (set! sign -1.0))
+      (set! i (+ i 1)))
+    (while (and (< i (len s)) (digit? (get s i)))
+      (set! integral (+ (* integral 10.0) (cast f64 (- (cast i64 (get s i)) 48))))
+      (set! i (+ i 1)))
+    (when (and (< (+ i 1) (len s)) (= (get s i) #\.) (digit? (get s (+ i 1))))
+      (set! i (+ i 1))
+      (let [(mut factor) 0.1]
+        (while (and (< i (len s)) (digit? (get s i)))
+          (set! fractional (+ fractional (* (cast f64 (- (cast i64 (get s i)) 48)) factor)))
+          (set! factor (* factor 0.1))
+          (set! i (+ i 1)))))
+    (let [(mut value) (* sign (+ integral fractional))]
+      (when (and (< i (len s)) (or (= (get s i) #\e) (= (get s i) #\E)))
+        (set! i (+ i 1))
+        (let [(mut esign) 1.0
+              (mut exponent) 0.0]
+          (when (and (< i (len s)) (or (= (get s i) #\-) (= (get s i) #\+)))
+            (when (= (get s i) #\-) (set! esign -1.0))
+            (set! i (+ i 1)))
+          (while (and (< i (len s)) (digit? (get s i)))
+            (set! exponent (+ (* exponent 10.0) (cast f64 (- (cast i64 (get s i)) 48))))
+            (set! i (+ i 1)))
+          (set! value (* value (c-pow 10.0 (* esign exponent))))))
+      value)))
+
+;;; A number token's value.
+(defn css-number-of [(s (slice u8))] (-> f32) (cast f32 (css-number-double s)))
+
+;;; A percentage token's value: the number divided by a hundred, in doubles, then made a float.
+(defn css-percent-of [(s (slice u8))] (-> f32) (cast f32 (/ (css-number-double s) 100.0)))
+
+;;; An integer token's `int_value`: the double saturated to i32's bounds, toward zero.
+(defn css-int-of [(s (slice u8))] (-> i64)
+  (let [v (css-number-double s)]
+    (cond (>= v 2147483647.0) 2147483647
+          (<= v -2147483648.0) -2147483648
+          :else (cast i64 (cast i32 v)))))
+
+;;; Grisu2 over 32-bit significands, as the dtoa crate has it for f32: a significand and its
+;;; binary exponent. Arithmetic on significands is u32's, wrapping.
+(defstruct Diy [(f i64) (e i64)])
+
+(defn u32-wrap [(x i64)] (-> i64) (& x 0xFFFFFFFF))
+
+(defn diy-mul [(a Diy) (b Diy)] (-> Diy)
+  (let [tmp (+ (* (cast u64 (.f a)) (cast u64 (.f b))) (: 0x80000000 u64))]
+    (Diy :f (cast i64 (>> tmp (: 32 u64))) :e (+ (.e a) (.e b) 32))))
+
+(defn diy-normalize [(d Diy)] (-> Diy)
+  (let [(mut f) (.f d) (mut e) (.e d)]
+    (while (= (& f 0x80000000) 0)
+      (set! f (u32-wrap (<< f 1)))
+      (set! e (- e 1)))
+    (Diy :f f :e e)))
+
+(defn diy-normalize-boundary [(d Diy)] (-> Diy)
+  (let [(mut f) (.f d) (mut e) (.e d)]
+    (while (= (& f (<< 0x00800000 1)) 0)
+      (set! f (u32-wrap (<< f 1)))
+      (set! e (- e 1)))
+    (Diy :f (u32-wrap (<< f 7)) :e (- e 7))))
+
+(defn f32-cached-power-f [(i i64)] (-> i64)
+  (cond (= i 0) 0xaa242499 (= i 1) 0xfd87b5f3 (= i 2) 0xbce50865 (= i 3) 0x8cbccc09 (= i 4) 0xd1b71759 (= i 5) 0x9c400000 (= i 6) 0xe8d4a510 (= i 7) 0xad78ebc6 (= i 8) 0x813f3979 (= i 9) 0xc097ce7c (= i 10) 0x8f7e32ce :else 0xd5d238a5))
+(defn f32-cached-power-e [(i i64)] (-> i64)
+  (cond (= i 0) -151 (= i 1) -125 (= i 2) -98 (= i 3) -71 (= i 4) -45 (= i 5) -18 (= i 6) 8 (= i 7) 35 (= i 8) 62 (= i 9) 88 (= i 10) 115 :else 141))
+(defn pow10-u32 [(i i64)] (-> i64)
+  (cond (= i 0) 1 (= i 1) 10 (= i 2) 100 (= i 3) 1000 (= i 4) 10000 (= i 5) 100000 (= i 6) 1000000 (= i 7) 10000000 (= i 8) 100000000 :else 1000000000))
+
+(defn count-decimal-digit32 [(n i64)] (-> i64)
+  (cond (< n 10) 1 (< n 100) 2 (< n 1000) 3 (< n 10000) 4 (< n 100000) 5
+        (< n 1000000) 6 (< n 10000000) 7 (< n 100000000) 8 :else 9))
+
+(defn grisu-round! [(buffer (mut (ArrayList u8))) (delta i64) (rest0 i64) (ten-kappa i64) (wp-w i64)] (-> void)
+  (let [(mut rest) rest0
+        n (len buffer)]
+    (while (and (< rest wp-w)
+                (>= (u32-wrap (- delta rest)) ten-kappa)
+                (or (< (u32-wrap (+ rest ten-kappa)) wp-w)
+                    (> (u32-wrap (- wp-w rest)) (u32-wrap (- (u32-wrap (+ rest ten-kappa)) wp-w)))))
+      (set! (mut buffer) (- n 1) (- (get (slice buffer) (- n 1)) 1))
+      (set! rest (u32-wrap (+ rest ten-kappa))))))
+
+;;; The digits of a positive finite float, and K: the value is DIGITS × 10^K.
+(defstruct Grisu [(digits (slice u8)) (k i64)])
+
+(defn grisu2-f32 [(value f32)] (-> Grisu)
+  (let [u (f32-bits value)
+        biased-e (>> (& u 0x7F800000) 23)
+        significand (& u 0x007FFFFF)
+        v (if (!= biased-e 0)
+              (Diy :f (+ significand 0x00800000) :e (- biased-e 127 23))
+              (Diy :f significand :e (- 1 127 23)))
+        pl (diy-normalize-boundary (Diy :f (+ (<< (.f v) 1) 1) :e (- (.e v) 1)))
+        mi0 (if (= (.f v) 0x00800000)
+                (Diy :f (- (<< (.f v) 2) 1) :e (- (.e v) 2))
+                (Diy :f (- (<< (.f v) 1) 1) :e (- (.e v) 1)))
+        mi (Diy :f (u32-wrap (<< (.f mi0) (- (.e mi0) (.e pl)))) :e (.e pl))
+        dk (- (* (cast f64 (- 3 32 (.e pl))) 0.30102999566398114) (cast f64 (+ -36 1)))
+        k0 (cast i64 dk)
+        k1 (if (> (- dk (cast f64 k0)) 0.0) (+ k0 1) k0)
+        index (+ (>> k1 3) 1)
+        k (- 0 (+ -36 (<< index 3)))
+        c-mk (Diy :f (f32-cached-power-f index) :e (f32-cached-power-e index))
+        w (diy-mul (diy-normalize v) c-mk)
+        wp0 (diy-mul pl c-mk)
+        wm0 (diy-mul mi c-mk)
+        wp (Diy :f (u32-wrap (- (.f wp0) 1)) :e (.e wp0))
+        wm (Diy :f (u32-wrap (+ (.f wm0) 1)) :e (.e wm0))]
+    (digit-gen-f32 w wp (u32-wrap (- (.f wp) (.f wm))) k)))
+
+(defn digit-gen-f32 [(w Diy) (mp Diy) (delta0 i64) (k0 i64)] (-> Grisu)
+  (let [one-e (.e mp)
+        shift (- 0 one-e)
+        one-f (<< 1 shift)
+        wp-w (u32-wrap (- (.f mp) (.f w)))
+        (mut p1) (>> (.f mp) shift)
+        (mut p2) (& (.f mp) (- one-f 1))
+        (mut kappa) (count-decimal-digit32 p1)
+        (mut delta) delta0
+        (mut k) k0
+        (mut buffer) (ArrayList::new [u8] (value-allocator))
+        (mut done) false]
+    (while (and (not done) (> kappa 0))
+      (let [div (pow10-u32 (- kappa 1))
+            d (/ p1 div)]
+        (set! p1 (% p1 div))
+        (when (or (!= d 0) (> (len buffer) 0))
+          (push! (mut buffer) (cast u8 (+ 48 d))))
+        (set! kappa (- kappa 1))
+        (let [tmp (u32-wrap (+ (u32-wrap (<< p1 shift)) p2))]
+          (when (<= tmp delta)
+            (set! k (+ k kappa))
+            (grisu-round! (mut buffer) delta tmp (u32-wrap (<< (pow10-u32 kappa) shift)) wp-w)
+            (set! done true)))))
+    (while (not done)
+      (set! p2 (u32-wrap (* p2 10)))
+      (set! delta (u32-wrap (* delta 10)))
+      (let [d (>> p2 shift)]
+        (when (or (!= d 0) (> (len buffer) 0))
+          (push! (mut buffer) (cast u8 (+ 48 d))))
+        (set! p2 (& p2 (- one-f 1)))
+        (set! kappa (- kappa 1))
+        (when (< p2 delta)
+          (set! k (+ k kappa))
+          (let [index (- 0 kappa)]
+            (grisu-round! (mut buffer) delta p2 one-f
+                          (u32-wrap (* wp-w (if (< index 9) (pow10-u32 index) 0)))))
+          (set! done true))))
+    (Grisu :digits (slice buffer) :k k)))
+
+;;; The dtoa crate's text of a finite float (`Buffer::format_finite`): `0.0`, `1.0`, `0.25`,
+;;; `1e30`, `1.234e33`, as RapidJSON's Prettify lays out Grisu2's digits.
+(defn f32-dtoa-text [(value f32)] (-> (slice u8))
+  (let [(mut b) (str/StrBuf::new (value-allocator))]
+    (if (= value (: 0.0 f32))
+        (push-str! (mut b) (if (f32-sign-negative? value) "-0.0" "0.0"))
+        (let [g (grisu2-f32 (if (< value (: 0.0 f32)) (- (: 0.0 f32) value) value))
+              digits (.digits g)
+              length (len digits)
+              k (.k g)
+              kk (+ length k)]
+          (when (< value (: 0.0 f32)) (push-str! (mut b) "-"))
+          (cond (and (<= 0 k) (<= kk 21))
+                  (do (push-str! (mut b) digits)
+                      (for _ (range length kk) (push-str! (mut b) "0"))
+                      (push-str! (mut b) ".0"))
+                (and (< 0 kk) (<= kk 21))
+                  (do (push-str! (mut b) (subslice digits 0 kk))
+                      (push-str! (mut b) ".")
+                      (push-str! (mut b) (subslice digits kk length)))
+                (and (< -6 kk) (<= kk 0))
+                  (do (push-str! (mut b) "0.")
+                      (for _ (range 0 (- 0 kk)) (push-str! (mut b) "0"))
+                      (push-str! (mut b) digits))
+                (< kk -324)
+                  (push-str! (mut b) "0.0")
+                (= length 1)
+                  (do (push-str! (mut b) digits)
+                      (push-str! (mut b) "e")
+                      (push-i64! (mut b) (- kk 1)))
+                :else
+                  (do (push-str! (mut b) (subslice digits 0 1))
+                      (push-str! (mut b) ".")
+                      (push-str! (mut b) (subslice digits 1 length))
+                      (push-str! (mut b) "e")
+                      (push-i64! (mut b) (- kk 1))))))
+    (finish! (mut b))))
+
+;;; dtoa-short's `write` of a float: the dtoa crate's text rounded to six significant digits, the
+;;; trailing zeros of its fraction gone (`100.0` is `100`, `0.25` is `0.25`, `1e30` stays).
+(defn f32-short-text [(value f32)] (-> (slice u8))
+  (restrict-prec (f32-dtoa-text value) 6))
+
+(defn restrict-prec [(text (slice u8)) (prec i64)] (-> (slice u8))
+  (let [(mut buf) (ArrayList::new [u8] (value-allocator))]
+    (push! (mut buf) #\0)
+    (for c text (push! (mut buf) c))
+    (let [n (len buf)
+          sign (if (or (= (get (slice buf) 1) #\+) (= (get (slice buf) 1) #\-)) (get (slice buf) 1) 0)
+          (mut pos-dot) -1
+          (mut pos-exp) -1
+          (mut prec-start) -1
+          (mut i) 1]
+      (when (!= sign 0) (set! (mut buf) 1 #\0))
+      (while (< i n)
+        (let [c (get (slice buf) i)]
+          (cond (= c #\.) (set! pos-dot i)
+                (= c #\e) (do (set! pos-exp i) (set! i n))
+                (and (< prec-start 0) (!= c #\0)) (set! prec-start i)
+                :else 0))
+        (set! i (+ i 1)))
+      (if (< prec-start 0)
+          "0"
+          (let [coeff-end (if (>= pos-exp 0) pos-exp n)
+                dot (if (>= pos-dot 0) pos-dot coeff-end)
+                prec-end (let [end (+ prec-start prec)]
+                           (if (and (> dot prec-start) (<= dot end)) (+ end 1) end))
+                (mut new-end) coeff-end]
+            (when (< prec-end coeff-end)
+              (let [next (get (slice buf) prec-end)]
+                (set! new-end prec-end)
+                (when (>= next #\5)
+                  (let [(mut j) (- prec-end 1)
+                        (mut going) true]
+                    (while (and going (>= j 0))
+                      (let [c (get (slice buf) j)]
+                        (cond (= c #\.) 0
+                              (!= c #\9) (do (set! (mut buf) j (+ c 1)) (set! new-end (+ j 1)) (set! going false))
+                              :else (set! (mut buf) j #\0)))
+                      (set! j (- j 1)))))))
+            (if (< new-end dot)
+                (do (for j (range new-end dot) (set! (mut buf) j #\0))
+                    (set! new-end dot))
+                (let [(mut j) (- new-end 1)
+                      (mut going) true]
+                  (while (and going (>= j 0))
+                    (let [c (get (slice buf) j)]
+                      (if (!= c #\0)
+                          (do (when (= c #\.) (set! new-end j)) (set! going false))
+                          (set! new-end j)))
+                    (set! j (- j 1)))))
+            (let [(mut out) (str/StrBuf::new (value-allocator))
+                  whole (slice buf)
+                  coefficient (subslice whole 0 new-end)
+                  exponent (if (>= pos-exp 0) (subslice whole pos-exp n) "")]
+              ;; The leading zero that caught a carry goes unless it is all there is before the dot.
+              (if (!= sign 0)
+                  (if (and (= (get coefficient 1) #\0) (!= (get-or coefficient 2 0) #\.))
+                      (do (push! (mut (.bytes out)) sign)
+                          (push-str! (mut out) (subslice coefficient 2 (len coefficient))))
+                      (do (push! (mut (.bytes out)) sign)
+                          (push-str! (mut out) (subslice coefficient 1 (len coefficient)))))
+                  (if (and (= (get coefficient 0) #\0) (!= (get-or coefficient 1 0) #\.))
+                      (push-str! (mut out) (subslice coefficient 1 (len coefficient)))
+                      (push-str! (mut out) coefficient)))
+              (push-str! (mut out) exponent)
+              (finish! (mut out))))))))
+
+(defn get-or [(s (slice u8)) (i i64) (d u8)] (-> u8)
+  (if (< i (len s)) (get s i) d))
+
 ;; ---------------------------------------------------------------- relations
 
 ;;; A relation of up to four columns of ids, with its rows stored flat. Row

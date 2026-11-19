@@ -290,7 +290,7 @@
   (subslice t (+ (top-level-at t 3 #\)) 3) (len t)))
 
 (defn builtin-type? [(t (slice u8))] (-> bool)
-  (or (= t "Int") (= t "Float") (= t "Bool") (= t "Text") (= t "Void") (= t "Never")))
+  (or (= t "Int") (= t "Float") (= t "F32") (= t "Bool") (= t "Text") (= t "Void") (= t "Never")))
 
 ;;; The dot before a named type's own name.
 (defn last-dot [(t (slice u8))] (-> i64)
@@ -316,6 +316,7 @@
 (defn coil-type [(k (mut Comp)) (t (slice u8))] (-> Code)
   (cond (= t "Int") `i64
         (= t "Float") `f64
+        (= t "F32") `f32
         (= t "Bool") `bool
         (= t "Text") `(slice u8)
         (= t "Void") `void
@@ -3965,6 +3966,7 @@
 
 (defn plain-text-code [(t (slice u8)) (v Code)] (-> Code)
   (cond (= t "Int") `(rt/num-text ~v)
+        (= t "F32") `(rt/f32-short-text ~v)
         (= t "Bool") `(if ~v "1" "0")
         :else v))
 
@@ -5325,23 +5327,28 @@
         (concat-operands! (kid n 1) (mut out)))
       (push! (mut out) n)))
 
-(defn binary-int [(k (mut Comp)) (n g/Node) (op Code)] (-> TE)
-  (binary-num (mut k) n op op))
+;;; Arithmetic keeps the operands' numerical type and promotes integer literals only.
+(defn binary-num [(k (mut Comp)) (n g/Node) (op Code) (float-op Code) (want (slice u8))] (-> TE)
+  (let [left (kid n 0)
+        right (kid n 1)
+        a0 (expr (mut k) left (if (= want "F32") "F32" "Int"))
+        b0 (expr (mut k) right (.ty a0))
+        a (if (and (= (.ty a0) "Int") (or (= (.ty b0) "Float") (= (.ty b0) "F32")) (= (.kind left) (g/KInt)))
+              (expr (mut k) left (.ty b0))
+              a0)
+        ty (.ty a)
+        b (expect (mut k) right b0 ty)]
+    (unless (or (= ty "Int") (= ty "Float") (= ty "F32"))
+      (die (mut k) n (cat "cannot do arithmetic on " ty)))
+    (when (and (= ty "F32") (= (.kind n) (g/KMod)))
+      (die (mut k) n "`%` takes integers or Float, not F32"))
+    (let [operator (if (= ty "Float") float-op op)]
+      (te `(~operator ~(.code a) ~(.code b)) ty))))
 
-;;; Arithmetic on two Ints or two Floats; `float-op` is what a Float pair uses (`%` is C's fmod).
-(defn binary-num [(k (mut Comp)) (n g/Node) (op Code) (float-op Code)] (-> TE)
-  (let [a0 (expr (mut k) (kid n 0) "Int")
-        b0 (expr (mut k) (kid n 1) (if (= (.ty a0) "Float") "Float" "Int"))
-        ;; `2 * x` with `x` a Float: the literal is a Float too.
-        a (if (and (= (.ty a0) "Int") (= (.ty b0) "Float") (= (.kind (kid n 0)) (g/KInt)))
-              (expr (mut k) (kid n 0) "Float")
-              a0)]
-    (if (= (.ty a) "Float")
-        (let [b (expect (mut k) (kid n 1) b0 "Float")]
-          (te `(~float-op ~(.code a) ~(.code b)) "Float"))
-        (let [a (expect (mut k) (kid n 0) a "Int")
-              b (expect (mut k) (kid n 1) b0 "Int")]
-          (te `(~op ~(.code a) ~(.code b)) "Int")))))
+;;; A float literal: the 32-bit float nearest the decimal, written as the double that is exactly it,
+;;; so Coil's reading of the literal rounds nothing a second time.
+(defn f32-literal [(text (slice u8))] (-> Code)
+  `(: ~(sym (rt/f32-exact-literal text)) f32))
 
 (defn compare [(k (mut Comp)) (n g/Node) (op Code)] (-> TE)
   (let [a (expr (mut k) (kid n 0) "")
@@ -5351,7 +5358,7 @@
     (if (= (.ty a) "Text")
         (te `(~op (str/cmp ~(.code a) ~(.code b)) 0) "Bool")
         (do
-          (unless (or (= (.ty a) "Int") (= (.ty a) "Float"))
+          (unless (or (= (.ty a) "Int") (= (.ty a) "Float") (= (.ty a) "F32"))
             (die (mut k) n (cat "cannot order " (.ty a))))
           (te `(~op ~(.code a) ~(.code b)) "Bool")))))
 
@@ -6940,10 +6947,10 @@
 
 (defn plain-expr [(k (mut Comp)) (n g/Node) (want (slice u8))] (-> TE)
   (match (.kind n)
-    ;; A whole-number literal is a Float where one is wanted: `x * 2`, `float-mod(x, 4294967296)`.
-    (g/KInt [] (if (= want "Float")
-                   (te `(cast f64 ~(rt/parse-int (.text n))) "Float")
-                   (te `~(rt/parse-int (.text n)) "Int")))
+    (g/KInt [] (cond (= want "Float") (te `(cast f64 ~(rt/parse-int (.text n))) "Float")
+                     (= want "F32") (te (f32-literal (.text n)) "F32")
+                     else (te `~(rt/parse-int (.text n)) "Int")))
+    (g/KFloat [] (te (f32-literal (.text n)) "F32"))
     (g/KStr [] (te `~(str-literal n) "Text"))
     (g/KChar [] (te `~(char-value n) "Int"))
     (g/KTrue [] (te `true "Bool"))
@@ -7301,12 +7308,10 @@
                             "Bool")]
               (te `(not ~(.code x)) "Bool")))
     (g/KNeg []
-            (let [x0 (expr (mut k) (kid n 0) (if (= want "Float") "Float" "Int"))]
-              (if (= (.ty x0) "Float")
-                  ;; Times -1, so that the negation of 0 is -0, as a double's is.
-                  (te `(* (: -1.0 f64) ~(.code x0)) "Float")
-                  (let [x (expect (mut k) (kid n 0) x0 "Int")]
-                    (te `(- 0 ~(.code x)) "Int")))))
+            (let [x (expr (mut k) (kid n 0) want)]
+              (cond (= (.ty x) "Float") (te `(* (: -1.0 f64) ~(.code x)) "Float")
+                    (= (.ty x) "F32") (te `(* (: -1.0 f32) ~(.code x)) "F32")
+                    else (te `(- 0 ~(.code (expect (mut k) (kid n 0) x "Int"))) "Int"))))
     (g/KOr []
            (let [a
                    (expect (mut k)
@@ -7327,11 +7332,11 @@
     (g/KGt [] (compare (mut k) n `>))
     (g/KGe [] (compare (mut k) n `>=))
     (g/KIn [] (in-test (mut k) n))
-    (g/KAdd [] (binary-int (mut k) n `+))
-    (g/KSub [] (binary-int (mut k) n `-))
-    (g/KMul [] (binary-int (mut k) n `*))
-    (g/KDiv [] (binary-int (mut k) n `/))
-    (g/KMod [] (binary-num (mut k) n `% `rt/float-mod))
+    (g/KAdd [] (binary-num (mut k) n `+ `+ want))
+    (g/KSub [] (binary-num (mut k) n `- `- want))
+    (g/KMul [] (binary-num (mut k) n `* `* want))
+    (g/KDiv [] (binary-num (mut k) n `/ `/ want))
+    (g/KMod [] (binary-num (mut k) n `% `rt/float-mod want))
     (g/KConcat []
                (let [first-ty (.ty (expr (mut k) (kid n 0) want))]
                  (if (map? first-ty)
@@ -7934,7 +7939,7 @@
     (_ true)))
 
 (defn scalar-type? [(t (slice u8))] (-> bool)
-  (or (= t "Int") (= t "Bool") (= t "Float") (= t "Char")))
+  (or (= t "Int") (= t "Bool") (= t "F32") (= t "Char")))
 
 ;;; A loop being compiled: whether it has regions of its own, and its mark's name.
 (defstruct LoopInfo [(scoped bool) (mark (slice u8))])
@@ -8871,6 +8876,7 @@
         (opt? ty) `(None [~(coil-type (mut k) (opt-of ty))])
         (map? ty) (new-map (mut k) ty)
         (= ty "Int") `0
+        (= ty "F32") `(: 0.0 f32)
         (= ty "Bool") `false
         (= ty "Text") `""
         ;; A record's is its fields' empty values, and an enum's its first value.
@@ -8925,6 +8931,7 @@
             (opt? ty)
             (map? ty)
             (= ty "Int")
+            (= ty "F32")
             (= ty "Bool")
             (= ty "Text"))
           true
@@ -10146,6 +10153,8 @@
 ;;; module's opaque types, cannot be looked into: two of them are never the same.
 (defn same-code [(k (mut Comp)) (t (slice u8)) (a Code) (b Code)] (-> Code)
   (cond (or (= t "Int") (= t "Float") (= t "Bool") (= t "Text")) `(= ~a ~b)
+        ;; A float is the same when its bits are: NaN is the NaN it was, and 0 is not -0.
+        (= t "F32") `(= (rt/f32-bits ~a) (rt/f32-bits ~b))
         (fn? t) `(~(identity-helper (mut k) t) ~a ~b)
         (opt? t)
           (let [x (fresh (mut k) "x")
@@ -10298,6 +10307,7 @@
 ;;; Code writing `v`, of type `t`.
 (defn enc-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
   (cond (= t "Int") `(rt/put-int! w ~v)
+        (= t "F32") `(rt/put-int! w (rt/f32-bits ~v))
         (= t "Bool") `(rt/put-bool! w ~v)
         (= t "Text") `(rt/put-text! w ~v)
         ;; A function value's bits, read as an integer.
@@ -10319,6 +10329,7 @@
 ;;; Code reading a value of type `t`.
 (defn dec-code [(k (mut Comp)) (t (slice u8))] (-> Code)
   (cond (= t "Int") `(rt/take-int r)
+        (= t "F32") `(rt/f32-of-bits (rt/take-int r))
         (= t "Bool") `(rt/take-bool r)
         (= t "Text") `(rt/take-text r)
         (fn? t)
@@ -10379,7 +10390,7 @@
 ;;; Whether a value of the type holds a tree, whose identity is where its parts are: a memo whose
 ;;; key does makes its keys again when the cache is read.
 (defn tree-type? [(k (mut Comp)) (t (slice u8))] (-> bool)
-  (cond (or (= t "Int") (= t "Bool") (= t "Text")) false
+  (cond (or (= t "Int") (= t "F32") (= t "Bool") (= t "Text")) false
         (list? t) (tree-type? (mut k) (elem-of t))
         (opt? t) (tree-type? (mut k) (opt-of t))
         (map? t)
@@ -11191,7 +11202,7 @@
 ;;; bytes copied, anything else written and read back (the cache's own code for it), so the copy
 ;;; points at nothing the original does.
 (defn own-code [(k (mut Comp)) (t (slice u8)) (v Code)] (-> Code)
-  (cond (or (= t "Int") (= t "Bool") (= t "Float")) v
+  (cond (or (= t "Int") (= t "Bool") (= t "F32")) v
         (= t "Text") `(rt/text-copy ~v)
         :else
           `(let [w (rt/copy-writer-new)]
@@ -11205,7 +11216,7 @@
 ;;; where values go now, of whatever part of it lies in scratch region `from` (in any, for
 ;;; `(rt/any-scratch)`), sharing the rest. Numbers, truths and functions are as they are.
 (defn own-in-code [(k (mut Comp)) (t (slice u8)) (v Code) (from Code)] (-> Code)
-  (cond (or (= t "Int") (= t "Bool") (= t "Float") (fn? t)) v
+  (cond (or (= t "Int") (= t "Bool") (= t "F32") (fn? t)) v
         (= t "Text") `(rt/text-own-in ~from ~v)
         (opt? t)
           (let [x (fresh (mut k) "x")]
@@ -11216,7 +11227,7 @@
 
 ;;; Whether a value of type `t` can hold anything in scratch storage at all.
 (defn own-in-plain? [(t (slice u8))] (-> bool)
-  (or (= t "Int") (= t "Bool") (= t "Float") (fn? t)))
+  (or (= t "Int") (= t "Bool") (= t "F32") (fn? t)))
 
 (defn own-in-helper [(k (mut Comp)) (t (slice u8))] (-> Code)
   (let [name (persist-name "ownin--" t)

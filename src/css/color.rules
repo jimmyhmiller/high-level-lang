@@ -1,0 +1,789 @@
+# Colors as lightningcss (values/color.rs) reads, converts, mixes and writes them, in 32-bit floats
+# as it computes. A color is a `V`:
+#
+#   currentcolor
+#   rgba                       items: red, green, blue, alpha, each 0-255 (`n` values)
+#   lab, lch, oklab, oklch     items: the three components and alpha (`n`; NaN for `none`)
+#   light-dark                 items: the light color and the dark one
+#
+# Conversions go as lightningcss's `From` impls chain them (oklch → oklab → xyz-d65 → linear sRGB
+# → sRGB), with its matrices; `color-mix()` interpolates as `CssColor::interpolate` does, mapping
+# a color that is out of the space's gamut by CSS Color 4's binary search on chroma.
+rules css.color
+use css.values as cv
+
+# ---------------------------------------------------------------- making
+
+fn rgba(r: F32, g: F32, b: F32, alpha: F32) -> cv.V = cv.holder("rgba", [cv.n(r), cv.n(g), cv.n(b), cv.n(alpha)])
+fn polar(kind: Text, a: F32, b: F32, c: F32, alpha: F32) -> cv.V = cv.holder(kind, [cv.n(a), cv.n(b), cv.n(c), cv.n(alpha)])
+
+fn current-color() -> cv.V = cv.word("currentcolor", "")
+fn transparent() -> cv.V = rgba(0.0, 0.0, 0.0, 0.0)
+
+fn part(c: cv.V, i: Int) -> F32 = c.items[i].num
+
+# lightningcss's `RGBA::new`: the alpha, a float, kept as a byte.
+fn rgba-new(r: Int, g: Int, b: Int, alpha: F32) -> cv.V = rgba(f32-of(r), f32-of(g), f32-of(b), f32-of(clamp-unit(alpha)))
+
+# `clamp_unit_f32`: a unit float as a byte, rounded.
+fn clamp-unit(v: F32) -> Int = clamp-floor-256(v * 255.0)
+fn clamp-floor-256(v: F32) -> Int = f32-to-u8(f32-min(f32-max(f32-round(v), 0.0), 255.0))
+
+# Rust's `f32::max` and `min`: NaN gives the other.
+fn f32-max(a: F32, b: F32) -> F32 = if f32-nan?(a) then b else if f32-nan?(b) then a else if a > b then a else b
+fn f32-min(a: F32, b: F32) -> F32 = if f32-nan?(a) then b else if f32-nan?(b) then a else if a < b then a else b
+
+# Rust's `f32::clamp`: NaN stays NaN.
+fn f32-clamp(v: F32, low: F32, high: F32) -> F32 = if v < low then low else if v > high then high else v
+
+# ---------------------------------------------------------------- reading
+
+# lightningcss's `CssColor::parse`, from the next token: a hash, a name, or a color function.
+fn color-of(ts: [cv.V]) -> cv.Got? = match cv.next-of(ts) {
+  none => none
+  some(g) => match g.value {
+    cv.V(kind: "hash" | "idhash", text: h, ...) => match hash-color(h) {
+      some(c) => cv.got(c, g.rest)
+      none => none
+    }
+    cv.V(kind: "ident", text: name, ...) => match cv.lower(name) {
+      "currentcolor" => cv.got(current-color(), g.rest)
+      "transparent" => cv.got(transparent(), g.rest)
+      lowered => match named-colors[lowered] {
+        some([r, gr, b]) => cv.got(rgba(f32-of(r), f32-of(gr), f32-of(b), 255.0), g.rest)
+        _ if lowered in system-colors => fail-build("lightningcss: the system color `" ++ name ++ "` is not implemented")
+        _ => none
+      }
+    }
+    cv.V(kind: "function", text: f, items: args, ...) => match color-function(cv.lower(f), args) {
+      some(c) => cv.got(c, g.rest)
+      none => none
+    }
+    _ => none
+  }
+}
+
+# A whole token list that is one color.
+fn color-only(ts: [cv.V]) -> cv.V? = match color-of(ts) {
+  some(g) if cv.exhausted?(g.rest) => some(g.value)
+  _ => none
+}
+
+# cssparser's `parse_hash_color`.
+fn hash-color(h: Text) -> cv.V? = match len(h) {
+  8 if hex?(h) => some(rgba-new(hex2(h, 0), hex2(h, 2), hex2(h, 4), f32-of(hex2(h, 6)) / 255.0))
+  6 if hex?(h) => some(rgba(f32-of(hex2(h, 0)), f32-of(hex2(h, 2)), f32-of(hex2(h, 4)), 255.0))
+  4 if hex?(h) => some(rgba-new(hex1(h, 0) * 17, hex1(h, 1) * 17, hex1(h, 2) * 17, f32-of(hex1(h, 3) * 17) / 255.0))
+  3 if hex?(h) => some(rgba(f32-of(hex1(h, 0) * 17), f32-of(hex1(h, 1) * 17), f32-of(hex1(h, 2) * 17), 255.0))
+  _ => none
+}
+
+fn hex?(h: Text) -> Bool = span-of(h, 0, "0123456789abcdefABCDEF") == len(h)
+fn hex1(h: Text, i: Int) -> Int = digit-value(h[i], 16) ?? 0
+fn hex2(h: Text, i: Int) -> Int = hex1(h, i) * 16 + hex1(h, i + 1)
+
+fn color-function(f: Text, args: [cv.V]) -> cv.V? = match f {
+  "rgb" | "rgba" => rgb-function(args)
+  "oklch" => lch-function("oklch", args, 1.0, 0.4)
+  "lch" => lch-function("lch", args, 100.0, 150.0)
+  "oklab" => lab-function("oklab", args, 1.0, 0.4)
+  "lab" => lab-function("lab", args, 100.0, 125.0)
+  "color-mix" => color-mix(args)
+  "hsl" | "hsla" | "hwb" | "color" | "alpha" | "light-dark" =>
+    if any a in args: cv.has-var?(a) then none else fail-build("lightningcss: the `" ++ f ++ "()` color function is not implemented")
+  _ => none
+}
+
+# A relative color (`rgb(from red r g b)`).
+fn relative?(args: [cv.V]) -> Bool = is-some(cv.ident-matching(args, "from"))
+
+# lightningcss's `parse_lab` (lab, oklab): lightness clamped to be positive, `/ alpha`.
+fn lab-function(kind: Text, args: [cv.V], l-basis: F32, ab-basis: F32) -> cv.V? = match relative?(args) {
+  true => relative-unsupported(kind, args)
+  false => match number-or-percentage(args, l-basis) {
+    some(l) => match number-or-percentage(l.rest, ab-basis) {
+      some(a) => match number-or-percentage(a.rest, ab-basis) {
+        some(b) => match alpha-of(b.rest) {
+          some(alpha) if cv.exhausted?(alpha.rest) =>
+            some(polar(kind, f32-clamp(l.value.num, 0.0, 3.4028235e38), a.value.num, b.value.num, alpha.value.num))
+          _ => none
+        }
+        none => none
+      }
+      none => none
+    }
+    none => none
+  }
+}
+
+# lightningcss's `parse_lch` (lch, oklch): lightness and chroma clamped to be positive, the hue an
+# angle (in degrees) or a number.
+fn lch-function(kind: Text, args: [cv.V], l-basis: F32, c-basis: F32) -> cv.V? = match relative?(args) {
+  true => relative-unsupported(kind, args)
+  false => match number-or-percentage(args, l-basis) {
+    some(l) => match number-or-percentage(l.rest, c-basis) {
+      some(c) => match angle-or-number(c.rest) {
+        some(h) => match alpha-of(h.rest) {
+          some(alpha) if cv.exhausted?(alpha.rest) =>
+            some(polar(kind, f32-clamp(l.value.num, 0.0, 3.4028235e38), f32-clamp(c.value.num, 0.0, 3.4028235e38), h.value.num,
+                       alpha.value.num))
+          _ => none
+        }
+        none => none
+      }
+      none => none
+    }
+    none => none
+  }
+}
+
+fn relative-unsupported(kind: Text, args: [cv.V]) -> cv.V? =
+  if any a in args: cv.has-var?(a) then none else fail-build("lightningcss: relative colors (`" ++ kind ++ "(from …)`) are not implemented")
+
+# lightningcss's `parse_rgb`: the legacy comma syntax, and the modern one.
+fn rgb-function(args: [cv.V]) -> cv.V? = match relative?(args) {
+  true => relative-unsupported("rgb", args)
+  false => match number-or-percentage-kind(args) {
+    none => none
+    some(red) => match cv.kind-matching(red.rest, "comma") {
+      some(after) if not f32-nan?(red.value.num) => legacy-rgb(red.value, after)
+      _ => modern-rgb(red)
+    }
+  }
+}
+
+# The legacy syntax: all numbers or all percentages, commas between, an optional alpha.
+fn legacy-rgb(red: cv.V, after: [cv.V]) -> cv.V? = match red.kind {
+  "number" => match legacy-parts(after, number-of) {
+    some(gb) if f32-nan?(gb.value.items[0].num) or f32-nan?(gb.value.items[1].num) => none
+    some(gb) => legacy-alpha(rgb-byte(red.num), rgb-byte(gb.value.items[0].num), rgb-byte(gb.value.items[1].num), gb.rest)
+    none => none
+  }
+  _ => match legacy-parts(after, percentage-of) {
+    some(gb) if f32-nan?(gb.value.items[0].num) or f32-nan?(gb.value.items[1].num) => none
+    some(gb) => legacy-alpha(rgb-byte(red.num * 255.0), rgb-byte(gb.value.items[0].num * 255.0), rgb-byte(gb.value.items[1].num * 255.0), gb.rest)
+    none => none
+  }
+}
+
+fn legacy-parts(ts: [cv.V], part-of: Fn([cv.V]) -> cv.Got?) -> cv.Got? = match part-of(ts) {
+  some(g) => match cv.kind-matching(g.rest, "comma") {
+    some(after) => match part-of(after) {
+      some(b) => cv.got(cv.holder("parts", [g.value, b.value]), b.rest)
+      none => none
+    }
+    none => none
+  }
+  none => none
+}
+
+fn legacy-alpha(r: F32, g: F32, b: F32, ts: [cv.V]) -> cv.V? = match cv.exhausted?(ts) {
+  true => some(rgba-new(f32-to-u8(r), f32-to-u8(g), f32-to-u8(b), 1.0))
+  false => match cv.kind-matching(ts, "comma") {
+    some(after) => match number-or-percentage(after, 1.0) {
+      some(a) if cv.exhausted?(a.rest) => some(rgba-new(f32-to-u8(r), f32-to-u8(g), f32-to-u8(b), f32-clamp(a.value.num, 0.0, 1.0)))
+      _ => none
+    }
+    none => none
+  }
+}
+
+fn rgb-byte(v: F32) -> F32 = f32-clamp(f32-round(v), 0.0, 255.0)
+
+fn modern-component(v: cv.V) -> F32 = match v.kind {
+  "percentage" => rgb-byte(v.num * 255.0)
+  _ if f32-nan?(v.num) => v.num
+  _ => rgb-byte(v.num)
+}
+
+fn modern-rgb(red: cv.Got) -> cv.V? = match number-or-percentage-kind(red.rest) {
+  some(g) => match number-or-percentage-kind(g.rest) {
+    some(b) => match alpha-of(b.rest) {
+      some(alpha) if cv.exhausted?(alpha.rest) => modern-rgb-of(modern-component(red.value), modern-component(g.value), modern-component(b.value), alpha.value.num)
+      _ => none
+    }
+    none => none
+  }
+  none => none
+}
+
+fn modern-rgb-of(r: F32, g: F32, b: F32, alpha: F32) -> cv.V? = match f32-nan?(r) or f32-nan?(g) or f32-nan?(b) or f32-nan?(alpha) {
+  true => fail-build("lightningcss: `none` in an rgb() color is not implemented")
+  false => some(rgba-new(clamp-unit(r / 255.0), clamp-unit(g / 255.0), clamp-unit(b / 255.0), alpha))
+}
+
+# ---------------------------------------------------------------- components
+
+# A number (`ComponentParser::parse_number`): a number token, or `none` (NaN).
+fn number-of(ts: [cv.V]) -> cv.Got? = match cv.next-of(ts) {
+  some(g) if g.value.kind == "number" => cv.got(cv.n(g.value.num), g.rest)
+  some(g) if g.value.kind == "ident" and cv.lower(g.value.text) == "none" => cv.got(cv.n(0.0 / 0.0), g.rest)
+  some(g) if cv.math-function?(g.value) => math-unsupported(g.value)
+  _ => none
+}
+
+fn percentage-of(ts: [cv.V]) -> cv.Got? = match cv.next-of(ts) {
+  some(g) if g.value.kind == "percentage" => cv.got(cv.n(g.value.num), g.rest)
+  some(g) if g.value.kind == "ident" and cv.lower(g.value.text) == "none" => cv.got(cv.n(0.0 / 0.0), g.rest)
+  some(g) if cv.math-function?(g.value) => math-unsupported(g.value)
+  _ => none
+}
+
+# A number or a percentage, saying which (`kind` "number" or "percentage"; a percentage's num is
+# its unit value), `none` as a NaN number.
+fn number-or-percentage-kind(ts: [cv.V]) -> cv.Got? = match cv.next-of(ts) {
+  some(g) if g.value.kind == "number" => cv.got(cv.number("number", g.value.num), g.rest)
+  some(g) if g.value.kind == "percentage" => cv.got(cv.number("percentage", g.value.num), g.rest)
+  some(g) if g.value.kind == "ident" and cv.lower(g.value.text) == "none" => cv.got(cv.number("number", 0.0 / 0.0), g.rest)
+  some(g) if cv.math-function?(g.value) => math-unsupported(g.value)
+  _ => none
+}
+
+# lightningcss's `parse_number_or_percentage`: a percentage scaled by its basis.
+fn number-or-percentage(ts: [cv.V], basis: F32) -> cv.Got? = match number-or-percentage-kind(ts) {
+  some(g) if g.value.kind == "percentage" => cv.got(cv.n(g.value.num * basis), g.rest)
+  some(g) => cv.got(cv.n(g.value.num), g.rest)
+  none => none
+}
+
+# An angle in degrees, a number, or `none`.
+fn angle-or-number(ts: [cv.V]) -> cv.Got? = match cv.next-of(ts) {
+  some(g) if g.value.kind == "dimension" => match degrees(g.value.num, g.value.text) {
+    some(d) => cv.got(cv.n(d), g.rest)
+    none => none
+  }
+  _ => number-of(ts)
+}
+
+# lightningcss's `Angle::to_degrees`.
+fn degrees(value: F32, unit: Text) -> F32? = match cv.lower(unit) {
+  "deg" => some(value)
+  "rad" => some(value * (180.0 / pi))
+  "grad" => some(value * 180.0 / 200.0)
+  "turn" => some(value * 360.0)
+  _ => none
+}
+
+const pi: F32 = 3.14159265358979323846
+
+# `/ alpha`, clamped to 0-1; 1 when there is none.
+fn alpha-of(ts: [cv.V]) -> cv.Got? = match cv.delim-matching(ts, "/") {
+  some(after) => match number-or-percentage(after, 1.0) {
+    some(a) => cv.got(cv.n(f32-clamp(a.value.num, 0.0, 1.0)), a.rest)
+    none => none
+  }
+  none => cv.got(cv.n(1.0), ts)
+}
+
+fn math-unsupported(t: cv.V) -> cv.Got? =
+  if cv.has-var?(t) then none else fail-build("lightningcss: `" ++ t.text ++ "()` in a color is not implemented")
+
+# ---------------------------------------------------------------- color-mix()
+
+# lightningcss's `parse_color_mix`: `in <space> [hue method]`, two colors each with an optional
+# percentage, mixed now.
+fn color-mix(args: [cv.V]) -> cv.V? = match cv.ident-matching(args, "in") {
+  none => none
+  some(after-in) => match cv.next-of(after-in) {
+    some(space) if space.value.kind == "ident" and cv.lower(space.value.text) in mix-spaces =>
+      mix-after-space(cv.lower(space.value.text), hue-method(cv.lower(space.value.text), space.rest))
+    _ => none
+  }
+}
+
+const mix-spaces: [Text] = ["srgb", "srgb-linear", "lab", "oklab", "xyz", "xyz-d50", "xyz-d65", "hsl", "hwb", "lch", "oklch"]
+
+# The hue interpolation method of a polar space, and the tokens after it.
+fn hue-method(space: Text, ts: [cv.V]) -> cv.Got = match cv.next-of(ts) {
+  some(g) if space in ["hsl", "hwb", "lch", "oklch"] and g.value.kind == "ident"
+             and cv.lower(g.value.text) in ["shorter", "longer", "increasing", "decreasing", "specified"] =>
+    match cv.ident-matching(g.rest, "hue") {
+      some(rest) => cv.Got(value: cv.word("hue", cv.lower(g.value.text)), rest: rest)
+      none => cv.Got(value: cv.word("hue", "invalid"), rest: g.rest)
+    }
+  _ => cv.Got(value: cv.word("hue", "shorter"), rest: ts)
+}
+
+fn mix-after-space(space: Text, method: cv.Got) -> cv.V? = match method.value.text {
+  "invalid" => none
+  hue => match cv.kind-matching(method.rest, "comma") {
+    none => none
+    some(after) => match mix-part(after) {
+      none => none
+      some(first) => match cv.kind-matching(first.rest, "comma") {
+        none => none
+        some(after2) => match mix-part(after2) {
+          some(second) if cv.exhausted?(second.rest) => mixed(space, hue, first.value, second.value)
+          _ => none
+        }
+      }
+    }
+  }
+}
+
+# A color and its percentage, before or after it: items [color, percentage] (NaN for none).
+fn mix-part(ts: [cv.V]) -> cv.Got? = match cv.next-of(ts) {
+  some(p) if p.value.kind == "percentage" => match color-of(p.rest) {
+    some(c) => cv.got(cv.holder("part", [c.value, cv.n(p.value.num)]), c.rest)
+    none => none
+  }
+  _ => match color-of(ts) {
+    some(c) => match cv.next-of(c.rest) {
+      some(p) if p.value.kind == "percentage" => cv.got(cv.holder("part", [c.value, cv.n(p.value.num)]), p.rest)
+      _ => cv.got(cv.holder("part", [c.value, cv.n(0.0 / 0.0)]), c.rest)
+    }
+    none => none
+  }
+}
+
+# The percentages normalized (css-color-5's color-mix percent normalization), then the mix.
+fn mixed(space: Text, hue: Text, first: cv.V, second: cv.V) -> cv.V? = match f32-nan?(p1), f32-nan?(p2) {
+  true, true => interpolated(space, hue, first.items[0], 0.5, second.items[0], 0.5)
+  false, true => checked-mix(space, hue, first.items[0], p1, second.items[0], 1.0 - p1)
+  true, false => checked-mix(space, hue, first.items[0], 1.0 - p2, second.items[0], p2)
+  false, false => checked-mix(space, hue, first.items[0], p1, second.items[0], p2)
+} where p1 = first.items[1].num, p2 = second.items[1].num
+
+fn checked-mix(space: Text, hue: Text, a: cv.V, p1: F32, b: cv.V, p2: F32) -> cv.V? =
+  if p1 + p2 == 0.0 then none else interpolated(space, hue, a, p1, b, p2)
+
+# lightningcss's `CssColor::interpolate`: currentColor cannot be mixed now; each color in the
+# space, gamut-mapped if it was converted, powerless components dropped, missing ones filled from
+# the other, hues adjusted, premultiplied, mixed, unpremultiplied.
+fn interpolated(space: Text, hue: Text, a: cv.V, p1: F32, b: cv.V, p2: F32) -> cv.V? = match a.kind, b.kind {
+  "currentcolor", _ => none
+  _, "currentcolor" => none
+  "light-dark", _ => fail-build("lightningcss: mixing light-dark() colors is not implemented")
+  _, "light-dark" => fail-build("lightningcss: mixing light-dark() colors is not implemented")
+  _, _ => some(mix-in(space, hue, a, p1, b, p2))
+}
+
+fn mix-in(space: Text, hue: Text, a: cv.V, p1: F32, b: cv.V, p2: F32) -> cv.V = match space {
+  "srgb" => srgb-color(mix-rect(space, prepared(space, a), p1, prepared(space, b), p2))
+  "oklab" => polar("oklab", m.a, m.b, m.c, m.alpha) where m = mix-rect(space, prepared(space, a), p1, prepared(space, b), p2)
+  "lab" => polar("lab", m.a, m.b, m.c, m.alpha) where m = mix-rect(space, prepared(space, a), p1, prepared(space, b), p2)
+  _ => fail-build("lightningcss: color-mix() in " ++ space ++ " is not implemented")
+}
+
+# A color in the space (`T::try_from`), gamut-mapped and with its powerless components dropped
+# when it was converted.
+fn prepared(space: Text, c: cv.V) -> C = match converted?(space, c) {
+  false => in-space(space, c)
+  true => powerless(space, gamut-mapped(space, in-space(space, c)))
+}
+
+fn converted?(space: Text, c: cv.V) -> Bool = match c.kind {
+  "rgba" => space != "srgb"
+  k => k != space
+}
+
+fn gamut-mapped(space: Text, c: C) -> C = match space {
+  "srgb" => if srgb-in-gamut?(c) then c else map-gamut-srgb(c)
+  _ => c
+}
+
+# Lab spaces: when lightness is 0, a and b are powerless.
+fn powerless(space: Text, c: C) -> C = match space {
+  "lab" | "oklab" if f32-abs(c.a) < epsilon => c with { b: 0.0 / 0.0, c: 0.0 / 0.0 }
+  _ => c
+}
+
+const epsilon: F32 = 1.1920929e-7
+
+fn mix-rect(space: Text, a0: C, p1-in: F32, b0: C, p2-in: F32) -> C =
+  unpremultiplied(interpolate(premultiplied(filled(a0, b0)), p1, premultiplied(filled(b0, filled(a0, b0))), p2), multiplier)
+  where total = p1-in + p2-in,
+        p1 = if total != 1.0 then p1-in / total else p1-in,
+        p2 = if total != 1.0 then p2-in / total else p2-in,
+        multiplier = if total != 1.0 and total > 1.0 then 1.0 else total
+
+fn filled(c: C, other: C) -> C = C(a: if f32-nan?(c.a) then other.a else c.a, b: if f32-nan?(c.b) then other.b else c.b,
+                                   c: if f32-nan?(c.c) then other.c else c.c, alpha: if f32-nan?(c.alpha) then other.alpha else c.alpha)
+
+fn premultiplied(c: C) -> C = if f32-nan?(c.alpha) then c else C(a: c.a * c.alpha, b: c.b * c.alpha, c: c.c * c.alpha, alpha: c.alpha)
+
+fn unpremultiplied(c: C, multiplier: F32) -> C =
+  if f32-nan?(c.alpha) or c.alpha == 0.0 then c else C(a: c.a / c.alpha, b: c.b / c.alpha, c: c.c / c.alpha, alpha: c.alpha * multiplier)
+
+fn interpolate(x: C, p1: F32, y: C, p2: F32) -> C =
+  C(a: x.a * p1 + y.a * p2, b: x.b * p1 + y.b * p2, c: x.c * p1 + y.c * p2, alpha: x.alpha * p1 + y.alpha * p2)
+
+# ---------------------------------------------------------------- spaces
+
+# Three components and alpha, in whatever space a function says.
+record C { a: F32, b: F32, c: F32, alpha: F32 }
+
+fn comps(c: cv.V) -> C = C(a: part(c, 0), b: part(c, 1), c: part(c, 2), alpha: part(c, 3))
+
+# Missing components (NaN) as zero.
+fn resolved-missing(c: C) -> C = C(a: zero-nan(c.a), b: zero-nan(c.b), c: zero-nan(c.c), alpha: zero-nan(c.alpha))
+fn zero-nan(x: F32) -> F32 = if f32-nan?(x) then 0.0 else x
+
+# A color in a space, as `T::try_from(&CssColor)` converts it.
+fn in-space(space: Text, c: cv.V) -> C = match space {
+  "srgb" => to-srgb(c)
+  "oklab" => to-oklab(c)
+  "lab" => to-lab(c)
+  _ => fail-build("lightningcss: converting colors to " ++ space ++ " is not implemented")
+}
+
+fn to-srgb(c: cv.V) -> C = match c.kind {
+  "rgba" => C(a: part(c, 0) / 255.0, b: part(c, 1) / 255.0, c: part(c, 2) / 255.0, alpha: part(c, 3) / 255.0)
+  "oklch" | "oklab" | "lab" | "lch" => srgb-of-xyz65(xyz65-of(c))
+  k => fail-build("lightningcss: converting " ++ k ++ " colors to sRGB is not implemented")
+}
+
+fn to-oklab(c: cv.V) -> C = match c.kind {
+  "oklab" => comps(c)
+  "oklch" => oklab-of-oklch(comps(c))
+  "rgba" | "lab" | "lch" => oklab-of-xyz65(xyz65-of(c))
+  k => fail-build("lightningcss: converting " ++ k ++ " colors to oklab is not implemented")
+}
+
+fn to-lab(c: cv.V) -> C = match c.kind {
+  "lab" => comps(c)
+  "lch" => rectangular(resolved-missing(comps(c)))
+  "rgba" | "oklab" | "oklch" => lab-of-xyz50(xyz50-of-xyz65(xyz65-of(c)))
+  k => fail-build("lightningcss: converting " ++ k ++ " colors to lab is not implemented")
+}
+
+# Any color in XYZ (D65), the hub of lightningcss's conversions.
+fn xyz65-of(c: cv.V) -> C = match c.kind {
+  "rgba" => xyz65-of-linear(linear-of-srgb(to-srgb(c)))
+  "oklab" => xyz65-of-oklab(comps(c))
+  "oklch" => xyz65-of-oklab(oklab-of-oklch(comps(c)))
+  "lab" => xyz65-of-xyz50(xyz50-of-lab(comps(c)))
+  "lch" => xyz65-of-xyz50(xyz50-of-lab(rectangular(resolved-missing(comps(c)))))
+  k => fail-build("lightningcss: converting " ++ k ++ " colors is not implemented")
+}
+
+fn oklab-of-oklch(c: C) -> C = rectangular(resolved-missing(c))
+
+# `polar_to_rectangular`.
+fn rectangular(c: C) -> C = C(a: c.a, b: c.b * f32-cos(c.c * pi / 180.0), c: c.b * f32-sin(c.c * pi / 180.0), alpha: c.alpha)
+
+# `rectangular_to_polar`.
+fn polar-of(c: C) -> C = C(a: c.a, b: f32-sqrt(c.b * c.b + c.c * c.c), c: f32-rem(h0 + (if h0 < 0.0 then 360.0 else 0.0), 360.0), alpha: c.alpha)
+  where h0 = f32-atan2(c.c, c.b) * 180.0 / pi
+
+fn matrix(m: [F32], c: C) -> C = C(a: m[0] * c.a + m[1] * c.b + m[2] * c.c, b: m[3] * c.a + m[4] * c.b + m[5] * c.c,
+                                   c: m[6] * c.a + m[7] * c.b + m[8] * c.c, alpha: c.alpha)
+
+fn cube(x: F32) -> F32 = x * x * x
+
+fn xyz65-of-oklab(lab: C) -> C = matrix(lms-to-xyz, C(a: cube(lms.a), b: cube(lms.b), c: cube(lms.c), alpha: lms.alpha))
+  where lms = matrix(oklab-to-lms, resolved-missing(lab))
+
+fn oklab-of-xyz65(xyz: C) -> C = matrix(lms-to-oklab, C(a: f32-cbrt(lms.a), b: f32-cbrt(lms.b), c: f32-cbrt(lms.c), alpha: lms.alpha))
+  where lms = matrix(xyz-to-lms, resolved-missing(xyz))
+
+fn linear-of-xyz65(xyz: C) -> C = matrix(xyz-to-srgb-linear, resolved-missing(xyz))
+fn xyz65-of-linear(rgb: C) -> C = matrix(srgb-linear-to-xyz, resolved-missing(rgb))
+fn srgb-of-xyz65(xyz: C) -> C = srgb-of-linear(linear-of-xyz65(xyz))
+
+fn srgb-of-linear(rgb: C) -> C = C(a: gamma(r.a), b: gamma(r.b), c: gamma(r.c), alpha: r.alpha) where r = resolved-missing(rgb)
+fn linear-of-srgb(rgb: C) -> C = C(a: linear(r.a), b: linear(r.b), c: linear(r.c), alpha: r.alpha) where r = resolved-missing(rgb)
+
+# `gam_srgb`, extended to negative values by reflection.
+fn gamma(c: F32) -> F32 = match f32-abs(c) {
+  a if a > 0.0031308 => (if c < 0.0 then -1.0 else 1.0) * (1.055 * f32-pow(a, 1.0 / 2.4) - 0.055)
+  _ => 12.92 * c
+}
+
+# `lin_srgb`.
+fn linear(c: F32) -> F32 = match f32-abs(c) {
+  a if a < 0.04045 => c / 12.92
+  a => (if c < 0.0 then -1.0 else 1.0) * f32-pow((a + 0.055) / 1.055, 2.4)
+}
+
+fn xyz50-of-lab(lab0: C) -> C = C(a: x * d50[0], b: y * d50[1], c: z * d50[2], alpha: lab.alpha)
+  where lab = resolved-missing(lab0),
+        f1 = (lab.a + 16.0) / 116.0,
+        f0 = lab.b / 500.0 + f1,
+        f2 = f1 - lab.c / 200.0,
+        x = if cube(f0) > lab-e then cube(f0) else (116.0 * f0 - 16.0) / lab-k,
+        y = if lab.a > lab-k * lab-e then cube((lab.a + 16.0) / 116.0) else lab.a / lab-k,
+        z = if cube(f2) > lab-e then cube(f2) else (116.0 * f2 - 16.0) / lab-k
+
+fn lab-of-xyz50(xyz0: C) -> C = C(a: 116.0 * f1 - 16.0, b: 500.0 * (f0 - f1), c: 200.0 * (f1 - f2), alpha: xyz.alpha)
+  where xyz = resolved-missing(xyz0),
+        x = xyz.a / d50[0], y = xyz.b / d50[1], z = xyz.c / d50[2],
+        f0 = if x > lab-e then f32-cbrt(x) else (lab-k * x + 16.0) / 116.0,
+        f1 = if y > lab-e then f32-cbrt(y) else (lab-k * y + 16.0) / 116.0,
+        f2 = if z > lab-e then f32-cbrt(z) else (lab-k * z + 16.0) / 116.0
+
+fn xyz65-of-xyz50(xyz: C) -> C = matrix(d50-to-d65, resolved-missing(xyz))
+fn xyz50-of-xyz65(xyz: C) -> C = matrix(d65-to-d50, resolved-missing(xyz))
+
+const lab-k: F32 = 24389.0 / 27.0
+const lab-e: F32 = 216.0 / 24389.0
+const d50: [F32] = [0.3457 / 0.3585, 1.0, (1.0 - 0.3457 - 0.3585) / 0.3585]
+
+const xyz-to-srgb-linear: [F32] = [3.2409699419045226, -1.537383177570094, -0.4986107602930034, -0.9692436362808796, 1.8759675015077202,
+                                   0.04155505740717559, 0.05563007969699366, -0.20397695888897652, 1.0569715142428786]
+const srgb-linear-to-xyz: [F32] = [0.41239079926595934, 0.357584339383878, 0.1804807884018343, 0.21263900587151027, 0.715168678767756,
+                                   0.07219231536073371, 0.01933081871559182, 0.11919477979462598, 0.9505321522496607]
+const lms-to-xyz: [F32] = [1.2268798733741557, -0.5578149965554813, 0.28139105017721583, -0.04057576262431372, 1.1122868293970594,
+                           -0.07171106666151701, -0.07637294974672142, -0.4214933239627914, 1.5869240244272418]
+const oklab-to-lms: [F32] = [0.99999999845051981432, 0.39633779217376785678, 0.21580375806075880339, 1.0000000088817607767,
+                             -0.1055613423236563494, -0.063854174771705903402, 1.0000000546724109177, -0.089484182094965759684,
+                             -1.2914855378640917399]
+const xyz-to-lms: [F32] = [0.8190224432164319, 0.3619062562801221, -0.12887378261216414, 0.0329836671980271, 0.9292868468965546,
+                           0.03614466816999844, 0.048177199566046255, 0.26423952494422764, 0.6335478258136937]
+const lms-to-oklab: [F32] = [0.2104542553, 0.7936177850, -0.0040720468, 1.9779984951, -2.4285922050, 0.4505937099, 0.0259040371,
+                             0.7827717662, -0.8086757660]
+const d50-to-d65: [F32] = [0.9554734527042182, -0.023098536874261423, 0.0632593086610217, -0.028369706963208136, 1.0099954580058226,
+                           0.021041398966943008, 0.012314001688319899, -0.020507696433477912, 1.3303659366080753]
+const d65-to-d50: [F32] = [1.0479298208405488, 0.022946793341019088, -0.05019222954313557, 0.029627815688159344, 0.990434484573249,
+                           -0.01707382502938514, -0.009243058152591178, 0.015055144896577895, 0.7518742899580008]
+
+# ---------------------------------------------------------------- gamut
+
+fn srgb-in-gamut?(c: C) -> Bool = c.a >= 0.0 and c.a <= 1.0 and c.b >= 0.0 and c.b <= 1.0 and c.c >= 0.0 and c.c <= 1.0
+
+fn srgb-clip(c: C) -> C = C(a: f32-clamp(c.a, 0.0, 1.0), b: f32-clamp(c.b, 0.0, 1.0), c: f32-clamp(c.c, 0.0, 1.0), alpha: f32-clamp(c.alpha, 0.0, 1.0))
+
+# `map_gamut` for sRGB: CSS Color 4's binary search on chroma in oklch, stopping where clipping
+# changes the color less than a just-noticeable difference.
+fn map-gamut-srgb(color: C) -> C = match current {
+  _ if f32-abs(current.a - 1.0) < 0.00001 or current.a > 1.0 => srgb-of-oklch(C(a: 1.0, b: 0.0, c: 0.0, alpha: current.alpha))
+  _ if current.a < 0.00001 => srgb-of-oklch(C(a: 0.0, b: 0.0, c: 0.0, alpha: current.alpha))
+  _ => chroma-search(current, 0.0, current.b)
+} where current = polar-of(oklab-of-xyz65(xyz65-of-linear(linear-of-srgb(color))))
+
+fn srgb-of-oklch(c: C) -> C = srgb-of-xyz65(xyz65-of-oklab(oklab-of-oklch(c)))
+
+fn chroma-search(current: C, low: F32, high: F32) -> C = match high - low > 0.00001 {
+  false => srgb-of-oklch(current)
+  true => match srgb-of-oklch(trial) {
+    converted if srgb-in-gamut?(converted) => chroma-search(trial, chroma, high)
+    converted if delta-eok(srgb-clip(converted), trial) < 0.02 => srgb-clip(converted)
+    _ => chroma-search(trial, low, chroma)
+  } where chroma = (low + high) / 2.0, trial = current with { b: chroma }
+}
+
+fn delta-eok(srgb: C, oklch: C) -> F32 = f32-sqrt(dl * dl + da * da + db * db)
+  where x = oklab-of-xyz65(xyz65-of-linear(linear-of-srgb(srgb))),
+        y = oklab-of-oklch(oklch),
+        dl = x.a - y.a, da = x.b - y.b, db = x.c - y.c
+
+# An sRGB color as lightningcss keeps it (`From<SRGB> for CssColor`): resolved (gamut-mapped when
+# out of gamut), as bytes.
+fn srgb-color(c: C) -> cv.V = rgba(f32-of(clamp-unit(r.a)), f32-of(clamp-unit(r.b)), f32-of(clamp-unit(r.c)), f32-of(clamp-unit(r.alpha)))
+  where r = srgb-resolved(c)
+
+fn srgb-resolved(c: C) -> C = match resolved-missing(c) {
+  m if srgb-in-gamut?(m) => m
+  m => map-gamut-srgb(m)
+}
+
+# ---------------------------------------------------------------- writing
+
+# lightningcss's `CssColor::to_css` when minifying. `hex-alpha` says whether the targets have
+# `#rrggbbaa` colors; without them an alpha is written with rgba().
+fn color-text(c: cv.V, hex-alpha: Bool) -> Text = match c.kind {
+  "currentcolor" => "currentColor"
+  "rgba" if part(c, 3) == 255.0 => opaque-text(f32-to-i32(part(c, 0)) * 65536 + f32-to-i32(part(c, 1)) * 256 + f32-to-i32(part(c, 2)))
+  "rgba" if not hex-alpha => fail-build("lightningcss: writing a color with alpha for targets without #rrggbbaa is not implemented")
+  "rgba" => alpha-hex-text(f32-to-i32(part(c, 0)), f32-to-i32(part(c, 1)), f32-to-i32(part(c, 2)), f32-to-i32(part(c, 3)))
+  "lab" => components-text("lab", part(c, 0) / 100.0, part(c, 1), part(c, 2), part(c, 3))
+  "lch" => components-text("lch", part(c, 0) / 100.0, part(c, 1), part(c, 2), part(c, 3))
+  "oklab" => components-text("oklab", part(c, 0), part(c, 1), part(c, 2), part(c, 3))
+  "oklch" => components-text("oklch", part(c, 0), part(c, 1), part(c, 2), part(c, 3))
+  k => fail-build("lightningcss: writing a " ++ k ++ " color is not implemented")
+}
+
+fn opaque-text(hex: Int) -> Text = match short-names[hex] {
+  some(name) => name
+  none => if hex == expand3(compact3(hex)) then "#" ++ hex-of(compact3(hex), 3) else "#" ++ hex-of(hex, 6)
+}
+
+fn alpha-hex-text(r: Int, g: Int, b: Int, a: Int) -> Text = match r % 17 == 0 and g % 17 == 0 and b % 17 == 0 and a % 17 == 0 {
+  true => "#" ++ hex-of(r / 17, 1) ++ hex-of(g / 17, 1) ++ hex-of(b / 17, 1) ++ hex-of(a / 17, 1)
+  false => "#" ++ hex-of(r, 2) ++ hex-of(g, 2) ++ hex-of(b, 2) ++ hex-of(a, 2)
+}
+
+# 0xAABBCC as 0xABC, and back (esbuild's `compact_hex` and `expand_hex`, for three digits).
+fn compact3(v: Int) -> Int = (v / 1048576 % 16) * 256 + (v / 4096 % 16) * 16 + (v / 16 % 16)
+fn expand3(v: Int) -> Int = (v / 256 % 16) * 1114112 + (v / 16 % 16) * 4352 + (v % 16) * 17
+
+# `n` as lowercase hex, `width` digits with leading zeros.
+fn hex-of(n: Int, width: Int) -> Text = join([byte-text(cv.hex-digit(n / power(16, width - 1 - i) % 16)) for i in 0..width], "")
+
+fn power(b: Int, e: Int) -> Int = fold p = 1 for i in 0..e: p * b
+
+# lightningcss's `write_components`: the first component as a percentage, `none` for NaN, an
+# alpha that is not 1 after a slash.
+fn components-text(name: Text, a: F32, b: F32, c: F32, alpha: F32) -> Text =
+  name ++ "(" ++ (if f32-nan?(a) then "none" else cv.percentage-text(a)) ++ " " ++ component-text(b) ++ " " ++ component-text(c)
+  ++ (if f32-nan?(alpha) or f32-abs(alpha - 1.0) > epsilon then "/" ++ component-text(alpha) else "") ++ ")"
+
+fn component-text(x: F32) -> Text = if f32-nan?(x) then "none" else cv.number-text(x)
+
+# Colors whose names are shorter than their hex.
+const short-names: {Int:Text} = {128: "navy", 32768: "green", 32896: "teal", 4915330: "indigo", 8388608: "maroon",
+  8388736: "purple", 8421376: "olive", 8421504: "gray", 10506797: "sienna", 10824234: "brown", 12632256: "silver",
+  13468991: "peru", 13808780: "tan", 14315734: "orchid", 14524637: "plum", 15631086: "violet", 15787660: "khaki",
+  15794175: "azure", 16113331: "wheat", 16119260: "beige", 16416882: "salmon", 16445670: "linen", 16711680: "red",
+  16737095: "tomato", 16744272: "coral", 16753920: "orange", 16761035: "pink", 16766720: "gold", 16770244: "bisque",
+  16775930: "snow", 16777200: "ivory"}
+
+# CSS's system colors, which lightningcss reads as keywords.
+const system-colors: [Text] = ["accentcolor", "accentcolortext", "activetext", "buttonborder", "buttonface", "buttontext", "canvas",
+  "canvastext", "field", "fieldtext", "graytext", "highlight", "highlighttext", "linktext", "mark", "marktext", "selecteditem",
+  "selecteditemtext", "visitedtext", "activeborder", "activecaption", "appworkspace", "background", "buttonhighlight",
+  "buttonshadow", "captiontext", "inactiveborder", "inactivecaption", "inactivecaptiontext", "infobackground", "infotext", "menu",
+  "menutext", "scrollbar", "threeddarkshadow", "threedface", "threedhighlight", "threedlightshadow", "threedshadow", "window",
+  "windowframe", "windowtext"]
+
+# cssparser's named colors.
+const named-colors: {Text:[Int]} = {
+  "black": [0, 0, 0],
+  "silver": [192, 192, 192],
+  "gray": [128, 128, 128],
+  "white": [255, 255, 255],
+  "maroon": [128, 0, 0],
+  "red": [255, 0, 0],
+  "purple": [128, 0, 128],
+  "fuchsia": [255, 0, 255],
+  "green": [0, 128, 0],
+  "lime": [0, 255, 0],
+  "olive": [128, 128, 0],
+  "yellow": [255, 255, 0],
+  "navy": [0, 0, 128],
+  "blue": [0, 0, 255],
+  "teal": [0, 128, 128],
+  "aqua": [0, 255, 255],
+  "aliceblue": [240, 248, 255],
+  "antiquewhite": [250, 235, 215],
+  "aquamarine": [127, 255, 212],
+  "azure": [240, 255, 255],
+  "beige": [245, 245, 220],
+  "bisque": [255, 228, 196],
+  "blanchedalmond": [255, 235, 205],
+  "blueviolet": [138, 43, 226],
+  "brown": [165, 42, 42],
+  "burlywood": [222, 184, 135],
+  "cadetblue": [95, 158, 160],
+  "chartreuse": [127, 255, 0],
+  "chocolate": [210, 105, 30],
+  "coral": [255, 127, 80],
+  "cornflowerblue": [100, 149, 237],
+  "cornsilk": [255, 248, 220],
+  "crimson": [220, 20, 60],
+  "cyan": [0, 255, 255],
+  "darkblue": [0, 0, 139],
+  "darkcyan": [0, 139, 139],
+  "darkgoldenrod": [184, 134, 11],
+  "darkgray": [169, 169, 169],
+  "darkgreen": [0, 100, 0],
+  "darkgrey": [169, 169, 169],
+  "darkkhaki": [189, 183, 107],
+  "darkmagenta": [139, 0, 139],
+  "darkolivegreen": [85, 107, 47],
+  "darkorange": [255, 140, 0],
+  "darkorchid": [153, 50, 204],
+  "darkred": [139, 0, 0],
+  "darksalmon": [233, 150, 122],
+  "darkseagreen": [143, 188, 143],
+  "darkslateblue": [72, 61, 139],
+  "darkslategray": [47, 79, 79],
+  "darkslategrey": [47, 79, 79],
+  "darkturquoise": [0, 206, 209],
+  "darkviolet": [148, 0, 211],
+  "deeppink": [255, 20, 147],
+  "deepskyblue": [0, 191, 255],
+  "dimgray": [105, 105, 105],
+  "dimgrey": [105, 105, 105],
+  "dodgerblue": [30, 144, 255],
+  "firebrick": [178, 34, 34],
+  "floralwhite": [255, 250, 240],
+  "forestgreen": [34, 139, 34],
+  "gainsboro": [220, 220, 220],
+  "ghostwhite": [248, 248, 255],
+  "gold": [255, 215, 0],
+  "goldenrod": [218, 165, 32],
+  "greenyellow": [173, 255, 47],
+  "grey": [128, 128, 128],
+  "honeydew": [240, 255, 240],
+  "hotpink": [255, 105, 180],
+  "indianred": [205, 92, 92],
+  "indigo": [75, 0, 130],
+  "ivory": [255, 255, 240],
+  "khaki": [240, 230, 140],
+  "lavender": [230, 230, 250],
+  "lavenderblush": [255, 240, 245],
+  "lawngreen": [124, 252, 0],
+  "lemonchiffon": [255, 250, 205],
+  "lightblue": [173, 216, 230],
+  "lightcoral": [240, 128, 128],
+  "lightcyan": [224, 255, 255],
+  "lightgoldenrodyellow": [250, 250, 210],
+  "lightgray": [211, 211, 211],
+  "lightgreen": [144, 238, 144],
+  "lightgrey": [211, 211, 211],
+  "lightpink": [255, 182, 193],
+  "lightsalmon": [255, 160, 122],
+  "lightseagreen": [32, 178, 170],
+  "lightskyblue": [135, 206, 250],
+  "lightslategray": [119, 136, 153],
+  "lightslategrey": [119, 136, 153],
+  "lightsteelblue": [176, 196, 222],
+  "lightyellow": [255, 255, 224],
+  "limegreen": [50, 205, 50],
+  "linen": [250, 240, 230],
+  "magenta": [255, 0, 255],
+  "mediumaquamarine": [102, 205, 170],
+  "mediumblue": [0, 0, 205],
+  "mediumorchid": [186, 85, 211],
+  "mediumpurple": [147, 112, 219],
+  "mediumseagreen": [60, 179, 113],
+  "mediumslateblue": [123, 104, 238],
+  "mediumspringgreen": [0, 250, 154],
+  "mediumturquoise": [72, 209, 204],
+  "mediumvioletred": [199, 21, 133],
+  "midnightblue": [25, 25, 112],
+  "mintcream": [245, 255, 250],
+  "mistyrose": [255, 228, 225],
+  "moccasin": [255, 228, 181],
+  "navajowhite": [255, 222, 173],
+  "oldlace": [253, 245, 230],
+  "olivedrab": [107, 142, 35],
+  "orange": [255, 165, 0],
+  "orangered": [255, 69, 0],
+  "orchid": [218, 112, 214],
+  "palegoldenrod": [238, 232, 170],
+  "palegreen": [152, 251, 152],
+  "paleturquoise": [175, 238, 238],
+  "palevioletred": [219, 112, 147],
+  "papayawhip": [255, 239, 213],
+  "peachpuff": [255, 218, 185],
+  "peru": [205, 133, 63],
+  "pink": [255, 192, 203],
+  "plum": [221, 160, 221],
+  "powderblue": [176, 224, 230],
+  "rebeccapurple": [102, 51, 153],
+  "rosybrown": [188, 143, 143],
+  "royalblue": [65, 105, 225],
+  "saddlebrown": [139, 69, 19],
+  "salmon": [250, 128, 114],
+  "sandybrown": [244, 164, 96],
+  "seagreen": [46, 139, 87],
+  "seashell": [255, 245, 238],
+  "sienna": [160, 82, 45],
+  "skyblue": [135, 206, 235],
+  "slateblue": [106, 90, 205],
+  "slategray": [112, 128, 144],
+  "slategrey": [112, 128, 144],
+  "snow": [255, 250, 250],
+  "springgreen": [0, 255, 127],
+  "steelblue": [70, 130, 180],
+  "tan": [210, 180, 140],
+  "thistle": [216, 191, 216],
+  "tomato": [255, 99, 71],
+  "turquoise": [64, 224, 208],
+  "violet": [238, 130, 238],
+  "wheat": [245, 222, 179],
+  "whitesmoke": [245, 245, 245],
+  "yellowgreen": [154, 205, 50]
+}
