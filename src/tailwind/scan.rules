@@ -1,0 +1,544 @@
+# Tailwind's scanner (oxide's `Scanner`, scanner/mod.rs and sources.rs): the files the sources a
+# stylesheet names reach, walked as oxide's walker (the `ignore` crate's) walks them, and the
+# candidates in them.
+#
+# A source is what @tailwindcss/vite gives the scanner: a base directory, a pattern, and whether
+# it is `@source not`. Sources become oxide's own entries: a directory to detect sources in (auto),
+# one whose files are all wanted (external, a gitignored or `node_modules`-like directory named
+# outright), a pattern for files, or a pattern to ignore. Those decide where the walk starts, what
+# it ignores beyond the gitignore files it meets, and which files it keeps.
+rules tailwind.scan
+use tailwind.extract as ex
+use tailwind.preprocess as pre
+use tailwind.globs as gl
+
+record Source { base: Text, pattern: Text, negated: Bool }
+
+# The candidates in the files the sources reach: distinct, sorted bytewise.
+fn candidates(sources: [Source]) -> [Text] = distinct-sorted([c for f in read-files(sources) for c in file-candidates(f)])
+
+# The files read for them, sorted bytewise (oxide's `scannedFiles` after a first scan, which names
+# only the files whose paths are UTF-8; it reads the others too).
+fn scanned-files(sources: [Source]) -> [Text] = sort f in [f for f in read-files(sources) if utf8?(f)] by f
+
+fn read-files(sources: [Source]) -> [Text] = kept-files(walked(walker(entries(sources))))
+
+# The candidates of a text with an extension, as oxide's `scanFiles` finds them in content given
+# to it: pre-processed for the extension, then each line extracted.
+fn content-candidates(content: Text, extension: Text) -> [Text] = distinct-sorted(blob-candidates(pre.processed(content, extension)))
+
+# ---------------------------------------------------------------- reading files
+
+# A file's candidates (oxide's `scan`): a stylesheet gives the CSS variables it uses; any other
+# file its candidates and variables, after its extension's pre-processor. A file that cannot be
+# read gives nothing.
+fn file-candidates(path: Text) -> [Text] = match readable-file?(path) {
+  false => []
+  true => match extension-of(path) {
+    "css" => [c for line in split(content, "\n") if line != "" for c in ex.used-variables(line) if utf8?(c)]
+    extension => blob-candidates(pre.processed(content, extension))
+  } where content = read-file(path)
+}
+
+fn blob-candidates(blob: Text) -> [Text] = [c for line in split(blob, "\n") if line != "" for c in ex.extracted(line) if utf8?(c)]
+
+fn distinct-sorted(xs: [Text]) -> [Text] = sort k in keys({x: true for x in xs}) by k
+
+# Rust's `Path::extension`: after the file name's last `.`, unless that is its first byte (none
+# when the file name has no `.` there); a missing one reads as empty, as oxide reads it.
+fn extension-of(path: Text) -> Text = match extension(path) {
+  some(x) if utf8?(x) => x
+  _ => ""
+}
+
+fn extension(path: Text) -> Text? = match last(components(path)) {
+  "/" | "." | ".." => none
+  name => match last-index-of(name, ".") {
+    some(k) if k > 0 => some(name[k + 1..len(name)])
+    _ => none
+  }
+}
+
+fn utf8?(s: Text) -> Bool = pre.utf8?(s)
+
+# ---------------------------------------------------------------- paths
+
+# Rust's `Path` on absolute paths of Unix: components, joining, parents, prefixes.
+fn joined(base: Text, name: Text) -> Text = match base {
+  "" => name
+  _ if ends-with(base, "/") => base ++ name
+  _ => base ++ "/" ++ name
+}
+
+# `PathBuf::join`: an absolute path replaces the base.
+fn path-join(base: Text, path: Text) -> Text = if starts-with(path, "/") then path else joined(base, path)
+
+# `PathBuf::pop`: the root stays the root.
+fn parent-of(p: Text) -> Text = match last-index-of(p, "/") {
+  some(0) => "/"
+  some(k) => p[0..k]
+  none => ""
+}
+
+# `Path::ancestors` of an absolute path: itself, then each directory it is in, to the root.
+fn ancestors-of(p: Text) -> [Text] = match p {
+  "/" => ["/"]
+  "" => [""]
+  _ => [p] ++ ancestors-of(parent-of(p))
+}
+
+# `Path::starts_with`: whole components.
+fn under?(p: Text, prefix: Text) -> Bool = match prefix {
+  "" => true
+  "/" => starts-with(p, "/")
+  _ => p == prefix or starts-with(p, prefix ++ "/")
+}
+
+# `Path::strip_prefix` of whole components, the remainder without its `/`.
+fn below(p: Text, prefix: Text) -> Text = match prefix {
+  "/" => p[1..len(p)]
+  _ if p == prefix => ""
+  _ => p[len(prefix) + 1..len(p)]
+}
+
+# `Path::components` of a pattern: `/` for the root, `.` only first, empty ones dropped.
+fn components(p: Text) -> [Text] =
+  (if starts-with(p, "/") then ["/"] else []) ++ [part for k in 0..len(parts) for part in [parts[k]] if part != "" and (part != "." or (k == 0 and not starts-with(p, "/")))]
+  where parts = split(p, "/")
+
+# What a directory holds, in the order the system lists it, and each name's kind (`f` a file,
+# `d` a directory, `l` anything else).
+fn listing-lines(dir: Text) -> [Text] = [line for line in split(dir-listing(if dir == "" then "/" else dir), "\n") if line != ""]
+
+fn kind-in(dir: Text, name: Text) -> Int? = first line in listing-lines(dir) if line[1..len(line)] == name: line[0]
+
+# What is at a path, links followed: `f`, `d`, or 0 (nothing, or neither).
+fn kind-at(p: Text) -> Int = match p {
+  "/" => 'd'
+  _ => match kind-in(parent-of(r), path-base(r)) {
+    some(k) if k == 'f' or k == 'd' => k
+    # A file system that does not say an entry's kind in its listing.
+    some(_) if readable-file?(r) => 'f'
+    some(_) if file-exists?(r) => 'd'
+    _ => 0
+  } where r = real-path(p)
+}
+
+fn dir?(p: Text) -> Bool = kind-at(p) == 'd'
+
+# `dunce::canonicalize`: the real path, or none when nothing is there.
+fn canonical(p: Text) -> Text? = if file-exists?(p) then some(real-path(p)) else none
+
+# ---------------------------------------------------------------- sources
+
+# oxide's private source entries (`public_source_entries_to_private_source_entries`): each source's
+# pattern brace-expanded, its static start moved into its base, auto sources in gitignored
+# directories made external, and restricted patterns expanded.
+enum EntryKind { Auto, Pattern, Ignored, External }
+
+record Entry { kind: EntryKind, base: Text, pattern: Text }
+
+fn entries(sources: [Source]) -> [Entry] =
+  restricted([promoted(entry-of(optimized(s with { pattern: p }))) for s in sources for p in gl.expanded(s.pattern)])
+
+# `PublicSourceEntry::optimize`: the base canonical, then the pattern's components that hold no `*`
+# moved onto it (`..` going up), the last only when it is a directory; the pattern pinned with a
+# leading `/`, `/**/*` when nothing is left. A base that is not there leaves the source as it is.
+fn optimized(s: Source) -> Source = match canonical(s.base) {
+  none => s
+  some(base) => pinned(moved(base, components(s.pattern))) with { negated: s.negated }
+}
+
+fn moved(base: Text, parts: [Text]) -> Source = match parts {
+  [] => Source(base: base, pattern: "", negated: false)
+  ["." , rest...] => moved(base, rest)
+  ["..", rest...] => moved(parent-of(base), rest)
+  ["/", rest...] => moved("/", rest)
+  [part, rest...] if has-byte?(part, '*') => Source(base: base, pattern: join(parts, "/"), negated: false)
+  [part] if dir?(joined(base, part)) => Source(base: joined(base, part), pattern: "", negated: false)
+  [part] => Source(base: base, pattern: part, negated: false)
+  [part, rest...] => moved(joined(base, part), rest)
+}
+
+fn pinned(s: Source) -> Source = match s.pattern {
+  "" => s with { pattern: "/**/*" }
+  p if starts-with(p, "/") => s
+  p => s with { pattern: "/" ++ p }
+}
+
+# `From<PublicSourceEntry>`: negated, ignored; `/**/*` (or a directory) auto, or external inside a
+# directory never detected in; anything else a pattern.
+fn entry-of(s: Source) -> Entry = match s {
+  _ if s.negated => Entry(kind: Ignored, base: s.base, pattern: s.pattern)
+  _ if not (s.pattern == "/**/*" or dir?(path-join(s.base, s.pattern))) => Entry(kind: Pattern, base: s.base, pattern: s.pattern)
+  _ if any d in ignored-content-dirs: contains-text?(s.base, "/" ++ d ++ "/") or ends-with(s.base, "/" ++ d) =>
+    Entry(kind: External, base: s.base, pattern: "")
+  _ => Entry(kind: Auto, base: s.base, pattern: "")
+}
+
+# An auto source a `.gitignore` in a directory above it ignores is external: the walk goes up from
+# the base to the repository's root (or, outside a repository, to the directory holding the
+# working directory), and a directory's `.gitignore` applies to the base relative to it.
+fn promoted(e: Entry) -> Entry = match e.kind {
+  Auto if ignored-from?(e.base, ancestors-of(e.base), any a in ancestors-of(e.base): file-exists?(joined(a, ".git"))) =>
+    e with { kind: External }
+  _ => e
+}
+
+fn ignored-from?(base: Text, dirs: [Text], in-repo: Bool) -> Bool = match dirs {
+  [] => false
+  [dir, rest...] if dir != base and gitignore-ignores?(dir, base) => true
+  [dir, rest...] if file-exists?(joined(dir, ".git")) => false
+  [dir, rest...] if not in-repo and under?(working-root, dir) => false
+  [_, rest...] => ignored-from?(base, rest, in-repo)
+}
+
+const working-root: Text = real-path(working-dir())
+
+fn gitignore-ignores?(dir: Text, base: Text) -> Bool = match kind-at(joined(dir, ".gitignore")) {
+  'f' => matched-up(m, stripped(m, base)) == 1 where m = ignore-file(dir, joined(dir, ".gitignore"))
+  _ => false
+}
+
+# `matched_path_or_any_parents`: the path, then each directory it is in (all directories), the
+# empty path last.
+fn matched-up(m: Matcher, rel: Text) -> Int = match matched-stripped(m, rel, true) {
+  0 if rel == "" => 0
+  0 => matched-up(m, match last-index-of(rel, "/") { some(k) => rel[0..k] none => "" })
+  r => r
+}
+
+# `expand_restricted_patterns`: a pattern whose base no wider source walks walks its base alone:
+# everything there is ignored (only its direct children when another source's base is inside it),
+# then the directories its pattern goes through are whitelisted.
+fn restricted(sources: [Entry]) -> [Entry] =
+  [x for k in 0..len(sources) for x in restricted-entry(sources[k], k, sources, unrestricted, pattern-roots)]
+  where unrestricted = [e.base for e in sources if e.kind == Auto or e.kind == External or (e.kind == Pattern and contains-text?(e.pattern, "**"))],
+        pattern-roots = [e.base for e in sources if e.kind == Pattern]
+
+fn restricted-entry(e: Entry, k: Int, sources: [Entry], unrestricted: [Text], pattern-roots: [Text]) -> [Entry] = match e.kind {
+  Pattern if not (any r in unrestricted: under?(e.base, r)) =>
+    (if first-restricted?(e, k, sources, unrestricted) then [Entry(kind: Ignored, base: e.base, pattern: if nested then "/*" else "*")] else [])
+    ++ [Entry(kind: Ignored, base: e.base, pattern: "!/" ++ trim-start-slashes(join(dirs[0..j + 1], "/")) ++ "/") for j in 0..len(dirs)]
+    ++ [e]
+    where nested = (any r in unrestricted: under?(r, e.base)) or (any r in pattern-roots: r != e.base and under?(r, e.base)),
+          dirs = pattern-dirs(components(e.pattern))
+  _ => [e]
+}
+
+# Whether no restricted pattern before this one had its base.
+fn first-restricted?(e: Entry, k: Int, sources: [Entry], unrestricted: [Text]) -> Bool =
+  not (any j in 0..k: sources[j].kind == Pattern and sources[j].base == e.base and not (any r in unrestricted: under?(sources[j].base, r)))
+
+# The directory components of a pattern (all but its last, the root and `.` dropped).
+fn pattern-dirs(parts: [Text]) -> [Text] = [p for p in parts[0..max(0, len(parts) - 1)] if p != "/" and p != "."]
+
+fn trim-start-slashes(s: Text) -> Text = s[span-of(s, 0, "/")..len(s)]
+
+# ---------------------------------------------------------------- the walker
+
+# What `create_walker` sets up: where the walk starts (the first source's base, then the others'),
+# the ignore files given outright (the auto detection's rules, then the sources' lines, each run of
+# lines with one base a file of its own), whether gitignore files need a repository (one is above
+# the first base), and which files are wanted: anything under an auto or external base, or what a
+# pattern matches.
+record Walker { roots: [Text], explicit: [Matcher], require-git: Bool, bases: [Text], patterns: [Entry] }
+
+record Emit { base: Text, line: Text }
+
+fn walker(sources: [Entry]) -> Walker? = match roots {
+  [] => none
+  [first-root, ...] => some(Walker(roots: roots, explicit: detection-rules ++ source-rules(emits),
+                                   require-git: any a in ancestors-of(first-root): file-exists?(joined(a, ".git")),
+                                   bases: [e.base for e in sources if e.kind == Auto or e.kind == External],
+                                   patterns: [e for e in sources if e.kind == Pattern]))
+} where roots = distinct-texts([e.base for e in sources if e.kind != Ignored]),
+        emits = [x for e in sources for x in emitted(e)]
+
+fn distinct-texts(xs: [Text]) -> [Text] = [xs[k] for k in 0..len(xs) if not (any j in 0..k: xs[j] == xs[k])]
+
+# The ignore lines a source adds: a pattern without `**` is wanted even where it is ignored; one
+# with `**` adds its extension to what auto detection keeps; an external base wants everything
+# but binary files.
+fn emitted(e: Entry) -> [Emit] = match e.kind {
+  Pattern if not contains-text?(e.pattern, "**") => [Emit(base: e.base, line: "!" ++ e.pattern)]
+  Pattern => [Emit(base: e.base, line: "!*." ++ x) for x in extension(e.pattern)]
+  Ignored => [Emit(base: e.base, line: e.pattern)]
+  External => [Emit(base: e.base, line: "!/**/*"), Emit(base: e.base, line: binary-glob)]
+  Auto => []
+}
+
+# Each run of lines with one base, as one ignore file there.
+fn source-rules(emits: [Emit]) -> [Matcher] =
+  [Matcher(root: emits[k].base, rules: [source-rule(emits[j].line) for j in k..run-end(emits, k)], only-files: false)
+   for k in 0..len(emits) if k == 0 or emits[k - 1].base != emits[k].base]
+
+fn run-end(emits: [Emit], k: Int) -> Int = (first j in k + 1..len(emits) if emits[j].base != emits[k].base: j) ?? len(emits)
+
+fn source-rule(line: Text) -> gl.Rule = match gl.rule-of(line) {
+  some(r) => r
+  none => fail-build("Tailwind's scanner cannot read this @source pattern as an ignore rule (oxide panics on it): " ++ line)
+}
+
+# Auto source detection's rules (auto_source_detection.rs): directories never detected in,
+# extensions and files never wanted, and binary files (files only, so a directory may be named
+# like one).
+const detection-rules: [Matcher] = [
+  Matcher(root: "", rules: [r for line in ["{" ++ join(ignored-content-dirs, ",") ++ "}/", "*.{" ++ join(ignored-extensions, ",") ++ "}",
+                                           "{" ++ join(ignored-files, ",") ++ "}"] for r in gl.rule-of(line)], only-files: false),
+  Matcher(root: "", rules: [r for r in gl.rule-of(binary-glob)], only-files: true)
+]
+
+const binary-glob: Text = "*.{" ++ join(binary-extensions, ",") ++ "}"
+
+const ignored-content-dirs: [Text] = [".git", ".hg", ".jj", ".next", ".parcel-cache", ".pnpm-store", ".svelte-kit", ".svn",
+  ".turbo", ".venv", ".vercel", ".yarn", "__pycache__", "node_modules", "venv"]
+
+const ignored-extensions: [Text] = ["less", "lock", "sass", "scss", "styl", "log"]
+
+const ignored-files: [Text] = ["package-lock.json", "pnpm-lock.yaml", "bun.lockb", ".gitignore", ".env", ".env.*"]
+
+const binary-extensions: [Text] = ["3dm", "3ds", "3g2", "3gp", "7z", "a", "aac", "adp", "ai", "aif", "aiff", "alz", "ape",
+  "apk", "appimage", "ar", "arj", "asf", "au", "avi", "avif", "bak", "baml", "bh", "bin", "bk", "bmp", "btif", "bz2", "bzip2",
+  "cab", "caf", "cgm", "class", "cmx", "cpio", "cr2", "cur", "dat", "db", "dcm", "deb", "dex", "djvu", "dll", "dmg", "dng",
+  "doc", "docm", "docx", "dot", "dotm", "dra", "DS_Store", "dsk", "dts", "dtshd", "dvb", "dwg", "dxf", "ecelp4800",
+  "ecelp7470", "ecelp9600", "egg", "eol", "eot", "epub", "exe", "exr", "f4v", "fbs", "fh", "fla", "flac", "flatpak", "fli",
+  "flv", "fpx", "fst", "fvt", "g3", "geojson", "gh", "gif", "graffle", "gz", "gzip", "h261", "h263", "h264", "hdr", "icns",
+  "ico", "ief", "img", "ipa", "iso", "jar", "jpeg", "jpg", "jpgv", "jpm", "jxr", "key", "ktx", "lha", "lib", "lockb", "lvp",
+  "lz", "lzh", "lzma", "lzo", "m3u", "m4a", "m4v", "mar", "mdi", "mht", "mid", "midi", "mj2", "mka", "mkv", "mmr", "mng",
+  "mobi", "mov", "movie", "mp3", "mp4", "mp4a", "mpeg", "mpg", "mpga", "mxu", "nef", "node", "npx", "numbers", "nupkg", "o",
+  "oa", "odp", "ods", "odt", "oga", "ogg", "ogv", "otf", "ott", "pages", "pbm", "pcx", "pdb", "pdf", "pea", "pgm", "pic",
+  "plist", "png", "pnm", "pot", "potm", "potx", "ppa", "ppam", "ppm", "pps", "ppsm", "ppsx", "ppt", "pptm", "pptx", "psd",
+  "pya", "pyc", "pyo", "pyv", "qt", "rar", "ras", "raw", "resources", "rgb", "rip", "rlc", "rmf", "rmvb", "rpm", "rtf", "rz",
+  "s3m", "s7z", "scpt", "sgi", "shar", "sil", "sketch", "slk", "smv", "snap", "snk", "so", "sqlite", "sqlite3", "stl",
+  "storedata", "sub", "suo", "swf", "symbolsarchive", "tar", "tbz", "tbz2", "tga", "tgz", "thmx", "tif", "tiff", "tlz", "ttc",
+  "ttf", "txz", "udf", "uvh", "uvi", "uvm", "uvp", "uvs", "uvu", "viv", "vob", "war", "wasm", "wav", "wax", "wbmp", "wdp",
+  "weba", "webm", "webp", "whl", "wim", "wm", "wma", "wmv", "wmx", "woff", "woff2", "wrm", "wvx", "xbm", "xif", "xla", "xlam",
+  "xls", "xlsb", "xlsm", "xlsx", "xlt", "xltm", "xltx", "xm", "xmind", "xpi", "xpm", "xwd", "xz", "z", "zip", "zipx"]
+
+# ---------------------------------------------------------------- ignore files
+
+# A gitignore file's rules (`Gitignore`): matched against paths relative to its root, the last
+# rule that matches deciding; `only-files` rules never match a directory.
+record Matcher { root: Text, rules: [gl.Rule], only-files: Bool }
+
+const no-rules: Matcher = Matcher(root: "", rules: [], only-files: false)
+
+# An ignore file read (`GitignoreBuilder::add`): its lines (a `\r` before a line end dropped, a
+# byte order mark off the first), up to the first that is not UTF-8.
+fn ignore-file(root: Text, path: Text) -> Matcher = match readable-file?(path) {
+  false => no-rules
+  true => Matcher(root: root, rules: [r for k in 0..len(good) for r in gl.rule-of(if k == 0 then without-bom(good[k]) else good[k])], only-files: false)
+    where good = [line for line in file-lines(read-file(path)) while utf8?(line)]
+}
+
+fn file-lines(text: Text) -> [Text] = [trim-cr(line) for line in (if ends-with(text, "\n") then split(text[0..len(text) - 1], "\n") else split(text, "\n"))
+                                       if text != ""]
+
+fn trim-cr(line: Text) -> Text = if ends-with(line, "\r") then line[0..len(line) - 1] else line
+
+fn without-bom(line: Text) -> Text = if starts-with(line, bom) then without-bom(line[len(bom)..len(line)]) else line
+
+const bom: Text = byte-text(239) ++ byte-text(187) ++ byte-text(191)
+
+# `Gitignore::strip`: a path relative to the matcher's root (byte prefixes, as the crate strips).
+fn stripped(m: Matcher, path: Text) -> Text = match path {
+  _ if not has-byte?(path, '/') => path
+  _ if starts-with(path, m.root) => without-slash(path[len(m.root)..len(path)])
+  _ => path
+}
+
+fn without-slash(p: Text) -> Text = if starts-with(p, "/") then p[1..len(p)] else p
+
+# 1: ignored, 2: whitelisted, 0: neither.
+fn matched-stripped(m: Matcher, rel: Text, is-dir: Bool) -> Int = match m.rules {
+  [] => 0
+  _ if m.only-files and is-dir => 0
+  rules => (last r in rules if (not r.only-dir or is-dir) and gl.rule-matches?(r, rel): if r.whitelist then 2 else 1) ?? 0
+}
+
+fn matched(m: Matcher, path: Text, is-dir: Bool) -> Int = if len(m.rules) == 0 then 0 else matched-stripped(m, stripped(m, path), is-dir)
+
+# A directory's ignore files (`Ignore::add_child_path`): `.gitignore`, `.ignore`, and
+# `.git/info/exclude` (a worktree's from its repository's common directory); and whether it holds
+# a repository, which only matters when gitignore files need one.
+record DirRules { dir: Text, gitignore: Matcher, ignore: Matcher, exclude: Matcher, has-git: Bool }
+
+fn dir-rules(dir: Text, require-git: Bool) -> DirRules = DirRules(
+  dir: dir,
+  gitignore: ignore-file(dir, joined(dir, ".gitignore")),
+  ignore: ignore-file(dir, joined(dir, ".ignore")),
+  exclude: match exclude-path(dir, require-git) { some(p) => ignore-file(dir, p) none => no-rules },
+  has-git: require-git and (file-exists?(joined(dir, ".git")) or file-exists?(joined(dir, ".jj"))))
+
+fn exclude-path(dir: Text, require-git: Bool) -> Text? = match require-git and kind-at(joined(dir, ".git")) == 'f' {
+  false => some(joined(dir, ".git/info/exclude"))
+  true => match first-line(joined(dir, ".git")) {
+    "gitdir: " ++ git-dir => match file-text(joined(git-dir, "commondir")) {
+      "" => none
+      text => some(joined(common-dir(git-dir, line-of-text(text)), "info/exclude"))
+    }
+    _ => none
+  }
+}
+
+# A worktree's `commondir` line: relative to its git directory when it starts with `.`.
+fn common-dir(git-dir: Text, line: Text) -> Text = if starts-with(line, ".") then joined(git-dir, line) else line
+
+# A file's first line (`BufRead::lines`), empty when it cannot be read or is empty.
+fn first-line(path: Text) -> Text = line-of-text(file-text(path))
+
+fn file-text(path: Text) -> Text = if readable-file?(path) then read-file(path) else ""
+
+fn line-of-text(text: Text) -> Text = trim-cr(text-before(text ++ "\n", "\n"))
+
+# The ignore files that count for a directory's entries: those of the directories above the
+# walk's root (matched against the path as it is under the root's real path) and those of the
+# directories walked, the root first.
+record Chain { root: Text, real-root: Text, above: [DirRules], walked: [DirRules] }
+
+# Whether the walk ignores a path (`Ignore::matched`): the rules given outright first, the last
+# given that has an answer; then `.ignore` files, the nearest directory's first; then `.gitignore`
+# and `exclude` files the same way, stopping at the repository's root.
+fn ignored?(w: Walker, c: Chain, path: Text, is-dir: Bool) -> Bool = match explicit-match(w.explicit, len(w.explicit) - 1, path, is-dir) {
+  1 => true
+  2 => false
+  _ => match nearest(levels, path, real, is-dir, ignore-of) {
+    1 => true
+    2 => false
+    _ => match nearest(git, path, real, is-dir, gitignore-of) {
+      1 => true
+      2 => false
+      _ => nearest(git, path, real, is-dir, exclude-of) == 1
+    }
+  }
+} where levels = [Level(rules: c.walked[len(c.walked) - 1 - k], above: false) for k in 0..len(c.walked)]
+                 ++ [Level(rules: c.above[len(c.above) - 1 - k], above: true) for k in 0..len(c.above)],
+        git = if not w.require-git or (any l in levels: l.rules.has-git) then git-scope(levels, 0) else [],
+        real = if path == c.root then c.real-root else joined(c.real-root, below(path, c.root))
+
+# A directory of the chain, nearest first, and whether it is above the root.
+record Level { rules: DirRules, above: Bool }
+
+fn ignore-of(d: DirRules) -> Matcher = d.ignore
+fn gitignore-of(d: DirRules) -> Matcher = d.gitignore
+fn exclude-of(d: DirRules) -> Matcher = d.exclude
+
+# The first answer of the nearest directory that has one.
+fn nearest(levels: [Level], path: Text, real: Text, is-dir: Bool, file: Fn(DirRules) -> Matcher) -> Int =
+  (first l in levels for r in [matched(file(l.rules), if l.above then real else path, is-dir)] if r != 0: r) ?? 0
+
+fn explicit-match(ms: [Matcher], k: Int, path: Text, is-dir: Bool) -> Int = match k {
+  _ if k < 0 => 0
+  _ if not under?(path, ms[k].root) => explicit-match(ms, k - 1, path, is-dir)
+  _ => match matched(ms[k], path, is-dir) {
+    0 => explicit-match(ms, k - 1, path, is-dir)
+    r => r
+  }
+}
+
+# The directories whose gitignore files count, nearest first: to the first that holds a repository.
+fn git-scope(levels: [Level], k: Int) -> [Level] = match k {
+  _ if k >= len(levels) => []
+  _ if levels[k].rules.has-git => [levels[k]]
+  _ => [levels[k]] ++ git-scope(levels, k + 1)
+}
+
+# ---------------------------------------------------------------- walking
+
+# A file the walk reached, and its real path: a link's target, or the file in its directory's
+# real path.
+record Reached { path: Text, real: Text }
+
+fn walked(w: Walker?) -> [Reached] = match w {
+  none => []
+  some(walker) => [f for root in walker.roots for f in walk-root(walker, root)]
+}
+
+# A walk from a root (`Walk`): the root's own directories above it count for its ignore files.
+fn walk-root(w: Walker, root: Text) -> [Reached] = match kind-at(root) {
+  'f' => [Reached(path: root, real: real-path(root))]
+  'd' => walk-dir(w, root, Chain(root: root, real-root: real, above: [dir-rules(a, w.require-git) for a in reversed(ancestors-of(real)[1..len(ancestors-of(real))])],
+                                walked: [dir-rules(root, w.require-git)]), [real])
+    where real = real-path(root)
+  _ => []
+}
+
+
+# A directory's entries in the order it lists them, each directory walked as it is met. `open` is
+# the real paths of the directories being walked, this one last.
+fn walk-dir(w: Walker, dir: Text, c: Chain, open: [Text]) -> [Reached] =
+  [f for line in listing-lines(dir) for f in walk-entry(w, dir, line[1..len(line)], line[0], c, open)]
+
+fn walk-entry(w: Walker, dir: Text, name: Text, kind: Int, c: Chain, open: [Text]) -> [Reached] = match kind {
+  'd' => walk-into(w, path, c, open, joined(last(open), name))
+  'f' => walk-file(w, path, c, joined(last(open), name))
+  _ => match real-path(path) {
+    # Not a link: what the listing could not say, looked at.
+    target if target == joined(last(open), name) => match kind-at(target) {
+      'd' => walk-into(w, path, c, open, target)
+      'f' => walk-file(w, path, c, target)
+      _ => []
+    }
+    # A link to a directory being walked is a loop, which the walk passes.
+    target => match kind-at(target) {
+      'd' if target in open => []
+      'd' => walk-into(w, path, c, open, target)
+      'f' => walk-file(w, path, c, target)
+      _ => []
+    }
+  }
+} where path = joined(dir, name)
+
+fn walk-into(w: Walker, path: Text, c: Chain, open: [Text], real: Text) -> [Reached] = match ignored?(w, c, path, true) {
+  true => []
+  false => walk-dir(w, path, c with { walked: c.walked ++ [dir-rules(path, w.require-git)] }, open ++ [real])
+}
+
+fn walk-file(w: Walker, path: Text, c: Chain, real: Text) -> [Reached] = match not ignored?(w, c, path, false) and wanted?(w, path) {
+  true => [Reached(path: path, real: real)]
+  false => []
+}
+
+# The walk's filter: a file under an auto or external base, or one a pattern matches, relative to
+# its base and with a leading `/`.
+fn wanted?(w: Walker, path: Text) -> Bool =
+  (any b in w.bases: under?(path, b))
+  or (any e in w.patterns: under?(path, e.base) and gl.glob-match?(e.pattern, "/" ++ below(path, e.base)))
+
+# The files of a walk as oxide keeps them (`discover_sources`): each path once, and a link's real
+# path (or a file's, when the directory it is in is reached through a link) counted as seen too.
+record Kept { seen: {Text:Bool}, files: [Text] }
+
+fn kept-files(reached: [Reached]) -> [Text] = (fold k = Kept(seen: {}, files: []) for r in reached:
+  (k with { seen: k.seen ++ more-seen, files: k.files ++ more-files }
+   where fresh = not (r.path in k.seen),
+         more-seen = if fresh then {r.path: true, r.real: true} else {},
+         more-files = if fresh then [r.path] else [])).files
+
+# ---------------------------------------------------------------- explaining
+
+# The private source entries, the walker's roots and the files walked, a line each
+# (`twc scan-entries`).
+fn entries-text(sources: [Source]) -> Text =
+  join([kind-name(e.kind) ++ " " ++ e.base ++ " " ++ e.pattern ++ "\n" for e in entries(sources)], "")
+  ++ join(["root " ++ r ++ "\n" for w in walker(entries(sources)) for r in w.roots], "")
+  ++ join(["walked " ++ r.path ++ "\n" for r in walked(walker(entries(sources)))], "")
+
+# A gitignore line against a path relative to its file (`twc ignore-rule LINE PATH…`): `ignore`,
+# `whitelist`, `none`, or `not a rule`; with a trailing `/` on the path, as a directory.
+fn rule-test(line: Text, path: Text) -> Text = match gl.rule-of(line) {
+  none => "not a rule"
+  some(r) => match matched(Matcher(root: "", rules: [r], only-files: false), trim-end, ends-with(path, "/")) {
+    1 => "ignore"
+    2 => "whitelist"
+    _ => "none"
+  }
+} where trim-end = if ends-with(path, "/") then path[0..len(path) - 1] else path
+
+fn kind-name(k: EntryKind) -> Text = match k {
+  Auto => "auto"
+  Pattern => "pattern"
+  Ignored => "ignored"
+  External => "external"
+}
