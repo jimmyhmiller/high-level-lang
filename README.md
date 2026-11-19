@@ -849,6 +849,15 @@ Each part of what TanStack's and Vite's plugins do is a language's here (`src/ta
   it is written again loading the entry chunk, preloading what that imports, linking its
   stylesheets. `--manifest` writes Vite's `.vite/manifest.json`. Vite's `import.meta.env` (`.env`
   files, `VITE_` variables), `?url`, `?raw`, assets and `import.meta.glob` come with it.
+- **Tailwind CSS.** Vite-style HTML, Router and Start builds recognize Tailwind CSS 4.3.5
+  projects with `@tailwindcss/vite` installed. The compiler reads the stylesheet and its imports,
+  and the scanner finds utility classes in the project's sources. Production lowers nested
+  selectors and grouping rules for Vite 8's default browser targets and adds the prefixes those
+  targets require for supported properties. Development watches the scanner's inputs and updates
+  the running page. `tools/tailwind-check.py` checks the compiler and scanner against Tailwind.
+  `node tools/tailwind-build-check.mjs` checks production styling against Vite in Chrome and
+  exercises development updates and stylesheet assets. Tailwind JavaScript plugins and config
+  files, functional `@utility` rules, and CSS Modules are outside the supported subset.
 - **Development.** React Fast Refresh (`react.refresh`): components registered with React's refresh
   runtime, hooks as signatures, a module of components accepting its updates. A route file gets
   TanStack's route update statement, so an edit updates the route in the running router. Stylesheets
@@ -880,7 +889,7 @@ the Router app is 275.7 KB, so most of the difference is the minifier. Start's b
 modules in the order native ES modules would (`--strict-execution-order`), which costs it the
 initializers of the modules that observe it. Not yet: Start's `<Hydrate>`,
 a Start factory re-exported through a project's own file (recognised only when imported from
-Start's packages), and in development a stylesheet's `url()` files (the build fails, saying so).
+Start's packages).
 
 ## Results
 
@@ -1510,7 +1519,7 @@ builds every way against esbuild's), source maps, output to standard output when
 
 Being explicit, because "everything esbuild does" is a lot:
 
-- **Not built:** CSS modules, CSS nesting and other CSS lowering, JavaScript
+- **Not built:** CSS Modules, additional CSS lowering in esbuild-compatible builds, JavaScript
   (stage 3) decorators, `accessor` fields, `--keep-names`, `--inject`, `--mangle-props`, `--metafile`,
   and inlining enum values across files. A `switch` on a constant is not folded.
 - **Hard errors for now:** `@import` with `layer()` or `supports()`, a media query on an import inside

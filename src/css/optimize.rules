@@ -1,0 +1,95 @@
+# Production stylesheet lowering. Selector lists carry their parent specificity through :is().
+# Declarations before and after a nested rule are emitted in cascade order.
+rules css.optimize over css.sheet
+use css.sheet as sheet
+use css.values as cv
+use css.tokens as tokens
+use css.selectors as sel
+use css.compat as compat
+
+const vite-targets: compat.Targets = compat.Targets(
+  browsers: {"chrome": 7274496, "edge": 7274496, "firefox": 7471104, "safari": 1049600, "ios_saf": 1049600},
+  include: 0, exclude: 0)
+
+record Context { source: Text, parents: [[cv.V]] }
+
+fn stylesheet(text: Text, path: Text) -> Text = match compat.should-compile?(vite-targets, "nesting", "nesting") {
+  false => text
+  true => match sheet.parse(text, path) {
+    Sheet(List(items...)) => top(items, Context(source: text, parents: []))
+  }
+}
+
+fn top(items: [Node], c: Context) -> Text = join([item(n, c) for n in items], "")
+
+fn item(n: Node, c: Context) -> Text = match n {
+  Ws(_) | Semi(_) | Cdo(_) | Cdc(_) => ""
+  Comment(t) => if starts-with(t, "/*!") then t ++ "\n" else ""
+  QualifiedRule(List(prelude...), Block(List(items...))) => match selectors(prelude, c) {
+    some(list) => inside(items, c with { parents: c.parents ++ [list] })
+    none => wrap(raw(n, c), c)
+  }
+  AtRule(AtKeyword(name), List(prelude...), Block(List(items...))) if grouped?(ascii-lower(name)) =>
+    header(name, prelude, c) ++ "{" ++ (if len(c.parents) == 0 then top(items, c) else inside(items, c)) ++ "}"
+  _ => wrap(raw(n, c), c)
+}
+
+fn selectors(prelude: [Node], c: Context) -> [cv.V]? =
+  if len(c.parents) == 0 then sel.selector-list(tokens.tokens-of(prelude), "none")
+  else sel.relative-list(tokens.tokens-of(prelude), "implicit")
+
+fn grouped?(name: Text) -> Bool = name in ["@media", "@supports", "@container", "@layer", "@starting-style"]
+
+fn header(name: Text, prelude: [Node], c: Context) -> Text = match prelude {
+  [] => name
+  [first, ...] => name ++ " " ++ trim(c.source[first.lo..last(prelude).hi])
+}
+
+fn raw(n: Node, c: Context) -> Text = c.source[n.lo..n.hi]
+
+record Run { output: Text, declarations: [Node] }
+
+fn inside(items: [Node], c: Context) -> Text = flush(done, c)
+  where done = fold run = Run(output: "", declarations: []) for n in items: step(run, n, c)
+
+fn step(run: Run, n: Node, c: Context) -> Run = match n {
+  Ws(_) | Semi(_) => run
+  Comment(t) if not starts-with(t, "/*!") => run
+  Declaration(...) | CustomDeclaration(...) => run with { declarations: run.declarations ++ [n] }
+  _ => Run(output: flush(run, c) ++ item(n, c), declarations: [])
+}
+
+fn flush(run: Run, c: Context) -> Text =
+  run.output ++ wrap(join([d for n in run.declarations for d in declarations(n, run.declarations, c)], ";"), c)
+
+# These properties use the same value grammar for their prefixed form. Keep an explicit prefixed
+# declaration in the author's control, and keep the generated declaration beside its original.
+const same-value-prefixes: [Text] = ["appearance", "backdrop-filter", "background-clip", "hyphens",
+  "text-size-adjust", "user-select"]
+
+fn declarations(n: Node, siblings: [Node], c: Context) -> [Text] = match property(n) {
+  p if p in same-value-prefixes =>
+    [prefix ++ text for bit in [2, 4, 8, 16] if compat.has-bits?(bits, bit)
+                    for prefix in [compat.prefix-text(bit)] if not (any s in siblings: property(s) == prefix ++ p)] ++ [text]
+    where bits = compat.target-prefixes(vite-targets, 1, p)
+  _ => [text]
+} where text = without-semi(raw(n, c))
+
+fn property(n: Node) -> Text = match n {
+  Declaration(name, ...) => ascii-lower(cv.unescaped(name.text))
+  _ => ""
+}
+
+fn without-semi(text: Text) -> Text = match text {
+  content ++ ";" => content
+  _ => text
+}
+
+fn wrap(text: Text, c: Context) -> Text = match text, c.parents {
+  "", _ => ""
+  _, [] => text
+  _, parents => selectors-text(last(parents), c with { parents: parents[0..len(parents) - 1] }) ++ "{" ++ text ++ "}"
+}
+
+fn selectors-text(selectors: [cv.V], c: Context) -> Text =
+  sel.list-text(selectors, sel.Ctx(prefix: 0, compile-nesting: true, parents: c.parents))

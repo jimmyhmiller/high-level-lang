@@ -17,6 +17,8 @@ use tailwind.utilities as ut
 use tailwind.variants as vr
 use tailwind.property-order as po
 use vite.stylesheets as sheets
+use bundle.resolve as res
+use css.values as cv
 use tailwind.output as out
 
 # Tailwind's `Features`: what a stylesheet uses, as bits.
@@ -31,6 +33,8 @@ const at-theme: Int = 64
 # Whether the Vite plugin treats a stylesheet as Tailwind's: anything but imports and themes.
 fn root-features?(features: Int) -> Bool = bit-and(features, at-apply + js-plugin-compat + theme-function + utilities-feature + variants-feature) != 0
 
+setting production: Bool = true
+
 # ---------------------------------------------------------------- @import
 
 record Imported { nodes: [ast.Css], features: Int, files: [Text] }
@@ -38,31 +42,60 @@ record Imported { nodes: [ast.Css], features: Int, files: [Text] }
 # Tailwind's `substituteAtImports`: each `@import "x" layer(…) supports(…) media` (and `@reference`)
 # the file it names, inside a context saying where it is, wrapped in what the import said. `files`
 # are the stylesheets read.
-fn imported(nodes: [ast.Css], base: Text, depth: Int) -> Imported = match [import-of(n, base, depth) for n in nodes] {
+fn imported(nodes: [ast.Css], base: Text, root: Text, depth: Int) -> Imported = match [import-of(n, base, root, depth) for n in nodes] {
   results => Imported(nodes: [x for r in results for x in r.nodes], features: fold f = 0 for r in results: bit-or(f, r.features),
                       files: [x for r in results for x in r.files])
 }
 
-fn import-of(n: ast.Css, base: Text, depth: Int) -> Imported = match n.kind {
+fn import-of(n: ast.Css, base: Text, root: Text, depth: Int) -> Imported = match n.kind {
   ast.AtRule if n.head == "@import" or n.head == "@reference" => match import-params(vp.parse(n.params)) {
     none => Imported(nodes: [n], features: 0, files: [])
     some(p) if starts-with(p.uri, "data:") or starts-with(p.uri, "http://") or starts-with(p.uri, "https://") =>
       Imported(nodes: [n], features: at-import, files: [])
-    some(p) => loaded(n, p with { media: if n.head == "@reference" then some("reference") else p.media }, base, depth)
+    some(p) => loaded(n, p with { media: if n.head == "@reference" then some("reference") else p.media }, base, root, depth)
   }
-  ast.Decl | ast.Comment => Imported(nodes: [n], features: 0, files: [])
-  _ => match imported(n.nodes, base, depth) {
+  ast.Decl => Imported(nodes: [rebased(n, base, root)], features: 0, files: [])
+  ast.Comment => Imported(nodes: [n], features: 0, files: [])
+  _ => match imported(n.nodes, base, root, depth) {
     inner => Imported(nodes: [n with { nodes: inner.nodes }], features: inner.features, files: inner.files)
   }
 }
 
+# When a stylesheet's declarations are inlined, relative URLs still name assets beside the
+# original sheet. Rebase them before the bundler collects and rewrites those assets.
+fn rebased(n: ast.Css, base: Text, root: Text) -> ast.Css = match n.value {
+  some(raw) if base != root and contains-text?(ascii-lower(raw), "url(") =>
+    n with { value: some(vp.css([rebase-url(v, base, root) for v in vp.parse(raw)])) }
+  _ => n
+}
+
+fn rebase-url(v: vp.Value, base: Text, root: Text) -> vp.Value = match v.kind {
+  vp.Function if ascii-lower(v.value) == "url" => match url-path(trim(vp.css(v.nodes))) {
+    some(p) => v with { nodes: [vp.word(cv.string-text(res.relative-path(root, base) ++ "/" ++ p))] }
+    none => v
+  }
+  vp.Function => v with { nodes: [rebase-url(w, base, root) for w in v.nodes] }
+  _ => v
+}
+
+fn url-path(raw: Text) -> Text? = match decoded-url(raw) {
+  "" | "/" ++ _ | "#" ++ _ => none
+  p if contains-text?(p, ":") or contains-text?(p, "(") => none
+  p => some(p)
+}
+
+fn decoded-url(raw: Text) -> Text = match raw {
+  "\"" ++ _ | "'" ++ _ => cv.string-value(raw)
+  _ => cv.unescaped(raw)
+}
+
 record Import { uri: Text, layer: Text?, media: Text?, supports: Text? }
 
-fn loaded(n: ast.Css, p: Import, base: Text, depth: Int) -> Imported = match depth > 100 {
+fn loaded(n: ast.Css, p: Import, base: Text, root: Text, depth: Int) -> Imported = match depth > 100 {
   true => fail-build("Exceeded maximum recursion depth while resolving `" ++ p.uri ++ "` in `" ++ base ++ "`)")
-  false => match sheets.resolved(p.uri, base ++ "/__placeholder__.css") {
+  false => match sheets.resolved-in(p.uri, base ++ "/__placeholder__.css", production) {
     none => fail-build("Could not resolve '" ++ p.uri ++ "' from '" ++ base ++ "'")
-    some(path) => match imported(ast.parse(read-file(path), path), dir-of(path), depth + 1) {
+    some(path) => match imported(ast.parse(read-file(path), path), dir-of(path), root, depth + 1) {
       inner => Imported(nodes: [ast.context({}, wrapped-import([ast.context({"base": dir-of(path)}, inner.nodes)], p))],
                         features: bit-or(at-import, inner.features), files: [path] ++ inner.files)
     }
@@ -947,7 +980,7 @@ fn listed(xs: [Text]) -> Text = match xs {
 record Compiler { nodes: [ast.Css], ds: Design, found: Found, features: Int, files: [Text], input: Text }
 
 # Tailwind's `compile(css, { base })`.
-fn compiler(text: Text, path: Text) -> Compiler = match imported([ast.context({"base": dir-of(path)}, ast.parse(text, path))], dir-of(path), 0) {
+fn compiler(text: Text, path: Text) -> Compiler = match imported([ast.context({"base": dir-of(path)}, ast.parse(text, path))], dir-of(path), dir-of(path), 0) {
   imports => match read-all(media-handled(imports.nodes, {}), {}, true, nothing-found()) {
     r => compiled-sheet(r, path, imports, text, important-media?(imports.nodes))
   }

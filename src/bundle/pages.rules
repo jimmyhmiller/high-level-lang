@@ -7,7 +7,7 @@ rules bundle.pages over bundle.markup
 use bundle.markup as mk
 
 # What a page loads that the build makes: where it is in the page, and the file it names.
-record Load { lo: Int, hi: Int, script: Bool, source: Text }
+record Load { lo: Int, hi: Int, script: Bool, source: Text, href-lo: Int, href-hi: Int }
 
 record Page { path: Text, text: Text, loads: [Load], head: Int }
 
@@ -27,21 +27,23 @@ fn entries(p: Page) -> [Text] = [l.source for l in p.loads]
 
 fn load-of(p: Node, root: Text, text: Text) -> [Load] = match p {
   Script(_, List(attrs...), ...) if attr(attrs, "type") is some(t) and t == "module" => match attr(attrs, "src") {
-    some(src) if local?(src) => [Load(lo: p.lo, hi: p.hi, script: true, source: resolved(src, root))]
+    some(src) if local?(src) => [Load(lo: p.lo, hi: p.hi, script: true, source: resolved(src, root), href-lo: 0, href-hi: 0)]
     some(_) => []
     none => fail-build(root ++ ": an inline module script in a page is not built; move it to a file the page's script loads")
   }
-  Open(tag, List(attrs...), _, _) if tag-name(tag.text) == "link" and lower(attr(attrs, "rel") ?? "") == "stylesheet" => match attr(attrs, "href") {
-    some(href) if local?(href) => [Load(lo: p.lo, hi: p.hi, script: false, source: resolved(href, root))]
-    _ => []
-  }
+  Open(tag, List(attrs...), ...) => stylesheet-load(p, tag, attrs, root)
   _ => []
 }
 
-fn lower(s: Text) -> Text = ascii-lower(s)
+fn stylesheet-load(p: Node, tag: Node, attrs: [Node], root: Text) -> [Load] =
+  match tag-name(tag.text), ascii-lower(attr(attrs, "rel") ?? ""), attr-node(attrs, "href") {
+    "link", "stylesheet", some(v) if local?(unquote-attr(v.text)) =>
+      [Load(lo: p.lo, hi: p.hi, script: false, source: resolved(unquote-attr(v.text), root), href-lo: v.lo, href-hi: v.hi)]
+    _, _, _ => []
+  }
 
 # A tag's name from its text (`<head`, `</head >`), in lower case.
-fn tag-name(t: Text) -> Text = ascii-lower(t[start..start + span-not-of(t, start, " \t\n\r\f/>")])
+fn tag-name(t: Text) -> Text = ascii-lower(t[start..start + span-not-of(t, start, " \t\n\r/>" ++ byte-text(12))])
   where start = match t {
     "</" ++ _ => 2
     _ => 1
@@ -51,6 +53,12 @@ fn attr(attrs: [Node], name: Text) -> Text? =
   first a in attrs if ascii-lower(a.name.text) == name: match a.value {
     Value(_, _, v) => unquote-attr(v.text)
     _ => ""
+  }
+
+fn attr-node(attrs: [Node], name: Text) -> Node? =
+  match first a in attrs if ascii-lower(a.name.text) == name: a.value {
+    some(Value(_, _, v)) => some(v)
+    _ => none
   }
 
 fn unquote-attr(v: Text) -> Text = match v {
@@ -78,9 +86,11 @@ fn written(p: Page, made: [Made], base: Text) -> Text = applied(p.text, sort e i
 fn load-edits(p: Page, l: Load, made: [Made], base: Text) -> [Edit] = match l.script {
   # A module script goes, with its line when it is all the line has; what it loads is at the head.
   true => [Edit(lo: line-start(p.text, l.lo), hi: line-end(p.text, l.hi), text: "")]
-  false => [Edit(lo: l.lo, hi: l.hi, text: "<link rel=\"stylesheet\" crossorigin href=\"" ++ base ++ style ++ "\">")
-            for m in made if m.source == l.source for style in m.styles]
+  false => [href-edit(l, base ++ style) for m in made if m.source == l.source for style in m.styles]
 }
+
+fn href-edit(l: Load, href: Text) -> Edit =
+  Edit(lo: l.href-lo, hi: l.href-hi, text: quote-text(replace-all(replace-all(href, "&", "&amp;"), "\"", "&quot;")))
 
 # Where an edit taking out a tag starts: the start of its line, when only space is before it there.
 fn line-start(text: Text, lo: Int) -> Int = match blank?(text[from..lo]) {
@@ -133,8 +143,9 @@ fn applied(text: Text, edits: [Edit]) -> Text =
 
 # The page as a development server serves it: its module scripts taken out, and at the end of its
 # head the development bundle of its script loaded (after the page is parsed, as a module script
-# would be), and the stylesheets it links as they are.
-fn dev-written(p: Page, bundle: Text) -> Text = applied(p.text, sort e in edits by e.lo)
+# would be), and its stylesheet links pointed at their compiled versions.
+fn dev-written(p: Page, bundle: Text, styles: {Text:Text}) -> Text = applied(p.text, sort e in edits by e.lo)
   where edits = [Edit(lo: line-start(p.text, l.lo), hi: line-end(p.text, l.hi), text: "") for l in p.loads if l.script]
+                ++ [href-edit(l, href) for l in p.loads if not l.script if let some(href) = styles[l.source]]
                 ++ [Edit(lo: at, hi: at, text: step ++ "<script defer src=\"/" ++ bundle ++ "\"></script>\n" ++ indent)
                     for at in [p.head] if at >= 0 for indent in [indent-of(p.text, at)] for step in [if indent == "" then "" else "  "]]

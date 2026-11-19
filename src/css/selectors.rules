@@ -1,0 +1,735 @@
+# Selectors as lightningcss reads and writes them (its parcel_selectors parser, and selector.rs):
+# the parse with its states (what may follow a pseudo-element, what nesting requires), the
+# pseudo-classes and pseudo-elements it knows and their vendor prefixes, and the writing (`::before` as `:before`, an attribute
+# value as an identifier when that is shorter, `&` as the parent's selector when nesting is
+# compiled).
+#
+# A selector is a `V` of kind `selector` whose items are compounds and combinators in source
+# order, as parcel_selectors builds them: a known pseudo-element starts a compound of its own after
+# a `pseudo-element` combinator. A compound (`compound`) holds components:
+#
+#   nesting, universal, root, empty, scope
+#   type, class, id                  text: the name
+#   attr-exists                      text: the name
+#   attr                             text: the name, items: [operator, value (string), case]
+#   pseudo-class, pseudo-element     text: the name lightningcss knows it by, num: its prefix bits
+#   custom-pseudo-class(-function), custom-pseudo-element(-function)   text: the name, items: arguments
+#   nth                              text: the type, num: 1 when written as a function, items: [a, b]
+#   nth-of                           items: [nth, selectors…]
+#   is, where, not, has, host        items: selectors
+#   lang, dir                        items/text: the arguments
+#   combinator                       text: descendant, child, next-sibling, later-sibling,
+#                                    deep-descendant, deep, pseudo-element, slot, part
+rules css.selectors
+use css.values as cv
+use css.tokens as tk
+use css.compat as compat
+
+# ---------------------------------------------------------------- parsing state
+
+# parcel_selectors' `SelectorParsingState` bits.
+const skip-default-namespace: Int = 1
+const after-slotted: Int = 2
+const after-part: Int = 4
+const after-pseudo-element: Int = 8
+const after-non-stateful-pseudo-element: Int = 16
+const after-pseudo: Int = 14
+const disallow-combinators: Int = 32
+const disallow-pseudos: Int = 64
+const after-nesting: Int = 128
+const after-webkit-scrollbar: Int = 256
+const after-view-transition: Int = 512
+const after-unknown-pseudo-element: Int = 1024
+
+fn has?(state: Int, bits: Int) -> Bool = bit-and(state, bits) != 0
+
+# What a parse made: a value (a selector, or a holder of selectors), the tokens after it, and the
+# state it left.
+record Parsed { value: cv.V, rest: [cv.V], state: Int }
+
+fn parsed(value: cv.V, rest: [cv.V], state: Int) -> Parsed? = some(Parsed(value: value, rest: rest, state: state))
+
+# ---------------------------------------------------------------- lists
+
+# How a nested rule's selectors are read: `implicit` when `&` is added in front of a selector that
+# has none (a rule in a style rule), `none` otherwise.
+#
+# `SelectorList::parse` with `DiscardList` recovery: any bad selector makes the list none.
+fn selector-list(ts: [cv.V], nesting: Text) -> [cv.V]? = match list-with-state(ts, 0, false, nesting, true) {
+  some(p) => some(p.value.items)
+  none => none
+}
+
+# A rule's prelude in a style rule: relative selectors, `&` added where there is none.
+fn relative-list(ts: [cv.V], nesting: Text) -> [cv.V]? = match list-with-state(ts, 0, true, nesting, true) {
+  some(p) => some(p.value.items)
+  none => none
+}
+
+# `parse_with_state` / `parse_relative_with_state`: the selectors between top-level commas. With
+# `discard`, a bad one makes the whole list none; without, it is left out.
+fn list-with-state(ts: [cv.V], state: Int, relative: Bool, nesting: Text, discard: Bool) -> Parsed? =
+  match fold acc = ListAcc(selectors: [], failed: false, state: state) for part in comma-parts(ts): list-step(acc, part, state, relative, nesting, discard) {
+    acc if acc.failed => none
+    acc => parsed(cv.holder("selectors", acc.selectors), [], acc.state)
+  }
+
+record ListAcc { selectors: [cv.V], failed: Bool, state: Int }
+
+fn list-step(acc: ListAcc, part: [cv.V], original: Int, relative: Bool, nesting: Text, discard: Bool) -> ListAcc = match acc.failed {
+  true => acc
+  false => match (if relative then relative-selector(part, original, nesting) else one-selector(part, original, nesting)) {
+    some(p) if len(cv.skip-space(p.rest)) == 0 => acc with { selectors: acc.selectors ++ [p.value], state: bit-or(acc.state, bit-and(p.state, after-nesting)) }
+    _ => if discard then acc with { failed: true } else acc
+  }
+}
+
+# The tokens between top-level commas.
+fn comma-parts(ts: [cv.V]) -> [[cv.V]] = [ts[bounds[i] + 1..bounds[i + 1]] for i in 0..len(bounds) - 1]
+  where bounds = [-1] ++ [i for i in 0..len(ts) if ts[i].kind == "comma"] ++ [len(ts)]
+
+# ---------------------------------------------------------------- selectors
+
+# `parse_relative_selector`: a leading `>`, `+` or `~` relates the selector to its scope (`&` in
+# a nested rule, `:scope` in `:has()`), which then needs no other `&`.
+fn relative-selector(ts: [cv.V], state: Int, nesting: Text) -> Parsed? = match cv.next-of(ts) {
+  some(g) if g.value.kind == "delim" and g.value.text in [">", "+", "~"] => match one-selector(g.rest, state, "none") {
+    some(p) => parsed(p.value with { items: [compound([cv.word(if nesting == "implicit" then "nesting" else "scope", "")]),
+                                             combinator(leading-combinator(g.value.text))] ++ p.value.items }, p.rest, p.state)
+    none => none
+  }
+  _ => one-selector(ts, state, nesting)
+}
+
+fn leading-combinator(d: Text) -> Text = match d { ">" => "child"  "+" => "next-sibling"  _ => "later-sibling" }
+
+fn compound(items: [cv.V]) -> cv.V = cv.holder("compound", items)
+fn combinator(name: Text) -> cv.V = cv.word("combinator", name)
+
+# `parse_selector`: compounds joined by combinators; nothing may follow a pseudo-element; under
+# implicit nesting, a selector with no `&` is `& selector`.
+fn one-selector(ts: [cv.V], state: Int, nesting: Text) -> Parsed? = match compounds(ts, state, []) {
+  none => none
+  some(p) if not has?(p.state, after-nesting) and nesting == "implicit" =>
+    parsed(cv.holder("selector", [compound([cv.word("nesting", "")]), combinator("descendant")] ++ p.value.items), p.rest, p.state)
+  some(p) => parsed(cv.holder("selector", p.value.items), p.rest, p.state)
+}
+
+fn compounds(ts: [cv.V], state: Int, made: [cv.V]) -> Parsed? = match compound-of(ts, state) {
+  none => none
+  some(c) if len(c.value.items) == 0 => none
+  some(c) if has?(c.state, after-pseudo) => match cv.next-of(c.rest) {
+    some(_) => none
+    none => parsed(cv.holder("parts", made ++ c.value.items), c.rest, c.state)
+  }
+  some(c) => match combinator-after(c.rest) {
+    none => parsed(cv.holder("parts", made ++ c.value.items), c.rest, c.state)
+    some(k) => compounds(k.rest, c.state, made ++ c.value.items ++ [k.value])
+  }
+}
+
+# The combinator after a compound: `>`, `+`, `~` (and `>>>`, `/deep/`) with any space around
+# them, or space alone before something else; none at the end or before anything else.
+fn combinator-after(ts: [cv.V]) -> cv.Got? = combinator-from(ts, false)
+
+fn combinator-from(ts: [cv.V], spaced: Bool) -> cv.Got? = match ts {
+  [] => none
+  [t, rest...] if t.kind == "ws" => combinator-from(rest, true)
+  [t, rest...] if t.kind == "comment" => combinator-from(rest, spaced)
+  [t, rest...] if t.kind == "delim" and t.text == ">" => match deep-tail(rest) {
+    some(after) => cv.got(combinator("deep-descendant"), after)
+    none => cv.got(combinator("child"), rest)
+  }
+  [t, rest...] if t.kind == "delim" and t.text == "+" => cv.got(combinator("next-sibling"), rest)
+  [t, rest...] if t.kind == "delim" and t.text == "~" => cv.got(combinator("later-sibling"), rest)
+  [t, rest...] if t.kind == "delim" and t.text == "/" => match cv.ident-matching(rest, "deep") {
+    some(after) => match cv.delim-matching(after, "/") {
+      some(after2) => cv.got(combinator("deep"), after2)
+      none => none
+    }
+    none => none
+  }
+  _ if spaced => cv.got(combinator("descendant"), ts)
+  _ => none
+}
+
+# `>>`, the rest of a `>>>` (the deep selector combinator, which Tailwind's optimize enables).
+fn deep-tail(ts: [cv.V]) -> [cv.V]? = match cv.delim-matching(ts, ">") {
+  some(after) => cv.delim-matching(after, ">")
+  none => none
+}
+
+# `parse_compound_selector`: `&`, a type selector, then simple selectors, read with no space
+# between them. Its value holds the compound, or the compound, a pseudo-element combinator and
+# the compound the pseudo-element starts.
+fn compound-of(ts0: [cv.V], state0: Int) -> Parsed? = match lead {
+  none => none
+  some(l) => match simple-run(l.rest, l.state, [l.value.items], l.value.num == 1.0) {
+    none => none
+    some(r) => parsed(cv.holder("parts", joined-compounds(r.value.items)), r.rest, r.state)
+  }
+} where ts = cv.skip-space(ts0), lead = leading(ts, state0)
+
+# `&` and a type selector at the start of a compound: num 1 when there was neither.
+fn leading(ts: [cv.V], state: Int) -> Parsed? = match ts {
+  [t, rest...] if t.kind == "delim" and t.text == "&" => match type-selector(rest, bit-or(state, after-nesting)) {
+    some(ty) => parsed(cv.holder("lead", [cv.word("nesting", "")] ++ ty.value.items), ty.rest, ty.state)
+    none => none
+  }
+  _ => match type-selector(ts, state) {
+    some(ty) => parsed(cv.v("lead", if len(ty.value.items) == 0 then 1.0 else 0.0, "", ty.value.items), ty.rest, ty.state)
+    none => none
+  }
+}
+
+# A type selector or `*`; namespaces are not ported.
+fn type-selector(ts: [cv.V], state: Int) -> Parsed? = match ts {
+  [t, more, ...] if (t.kind == "ident" or (t.kind == "delim" and t.text == "*")) and more.kind == "delim" and more.text == "|" =>
+    none
+  [t, ...] if t.kind == "delim" and t.text == "|" => none
+  [t, rest...] if t.kind == "ident" => if has?(state, after-pseudo) then none else parsed(cv.holder("type", [cv.word("type", t.text)]), rest, state)
+  [t, rest...] if t.kind == "delim" and t.text == "*" => if has?(state, after-pseudo) then none else parsed(cv.holder("type", [cv.word("universal", "")]), rest, state)
+  _ => parsed(cv.holder("type", []), ts, state)
+}
+
+# The simple selectors after the lead: a list of compounds (as `parts` of V lists), a known
+# pseudo-element starting a new one after a pseudo-element combinator.
+fn simple-run(ts: [cv.V], state: Int, groups: [[cv.V]], empty: Bool) -> Parsed? = match simple-selector(ts, state) {
+  none => none
+  some(s) if s.value.kind == "none" => match empty and len(last(groups)) == 0 {
+    true => parsed(cv.holder("groups", []), ts, state)
+    false => parsed(cv.holder("groups", [cv.holder("g", g) for g in groups]), ts, state)
+  }
+  some(s) if s.value.kind == "new-compound" =>
+    simple-run(s.rest, s.state, groups ++ [[combinator(s.value.text)], s.value.items], false)
+  some(s) => simple-run(s.rest, s.state, groups[0..len(groups) - 1] ++ [last(groups) ++ s.value.items], false)
+}
+
+# The groups as compounds and combinators.
+fn joined-compounds(groups: [cv.V]) -> [cv.V] = [x for g in groups for x in (match g.items {
+  [c] if c.kind == "combinator" => [c]
+  items => [compound(items)]
+})]
+
+# `parse_one_simple_selector`, reading tokens with no space skipped. Its value is `none` where no
+# simple selector starts, a holder of the components it adds, or `new-compound` (text: the
+# combinator) when a pseudo-element, `::slotted()` or `::part()` starts a compound.
+fn simple-selector(ts: [cv.V], state: Int) -> Parsed? = match ts {
+  [] => parsed(cv.word("none", ""), ts, state)
+  [t, rest...] if t.kind == "idhash" => if has?(state, after-pseudo) then none else parsed(adds(cv.word("id", t.text)), rest, state)
+  [t, c, rest...] if t.kind == "delim" and t.text == "." =>
+    if has?(state, after-pseudo) or c.kind != "ident" then none else parsed(adds(cv.word("class", c.text)), rest, state)
+  [t, ...] if t.kind == "delim" and t.text == "." => none
+  [t, rest...] if t.kind == "brackets" => if has?(state, after-pseudo) then none else match attribute(t.items) {
+    some(a) => parsed(adds(a), rest, state)
+    none => none
+  }
+  [t, c, n, rest...] if t.kind == "colon" and c.kind == "colon" => pseudo-element-of(n, rest, state)
+  [t, c, ...] if t.kind == "colon" and c.kind == "colon" => none
+  [t, n, rest...] if t.kind == "colon" and n.kind == "ident" and css2-pseudo-element?(n.text) => pseudo-element-of(n, rest, state)
+  [t, n, rest...] if t.kind == "colon" => pseudo-class-of(n, rest, state)
+  [t, ...] if t.kind == "colon" => none
+  [t, rest...] if t.kind == "delim" and t.text == "&" => parsed(adds(cv.word("nesting", "")), rest, bit-or(state, after-nesting))
+  _ => parsed(cv.word("none", ""), ts, state)
+}
+
+fn adds(c: cv.V) -> cv.V = cv.holder("adds", [c])
+
+fn css2-pseudo-element?(name: Text) -> Bool = cv.lower(name) in ["before", "after", "first-line", "first-letter"]
+
+# ---------------------------------------------------------------- attributes
+
+# `parse_attribute_selector`: a name, then nothing or an operator, a value (an identifier or a
+# string) and an `i` or `s` flag.
+fn attribute(ts: [cv.V]) -> cv.V? = match cv.next-of(ts) {
+  some(n) if n.value.kind == "ident" => match cv.next-of(n.rest) {
+    some(bar) if bar.value.kind == "delim" and bar.value.text == "|" => none
+    none => some(cv.word("attr-exists", n.value.text))
+    some(op) => match attr-operator(op.value) {
+      none => none
+      some(o) => match cv.next-of(op.rest) {
+        some(val) if val.value.kind == "ident" or val.value.kind == "string" => match attr-flags(val.rest) {
+          none => none
+          some(flag) => some(cv.named("attr", n.value.text, [cv.word("op", o), cv.word("string", val.value.text),
+                                                              cv.word("case", case-of(flag, n.value.text))]))
+        }
+        _ => none
+      }
+    }
+  }
+  some(n) if n.value.kind == "delim" and (n.value.text == "*" or n.value.text == "|") => none
+  _ => none
+}
+
+
+fn attr-operator(t: cv.V) -> Text? = match t.kind {
+  "delim" if t.text == "=" => some("=")
+  "match" => some(t.text)
+  _ => none
+}
+
+fn attr-flags(ts: [cv.V]) -> Text? = match cv.next-of(ts) {
+  none => some("")
+  some(f) if f.value.kind == "ident" and cv.exhausted?(f.rest) and cv.lower(f.value.text) == "i" => some("i")
+  some(f) if f.value.kind == "ident" and cv.exhausted?(f.rest) and cv.lower(f.value.text) == "s" => some("s")
+  _ => none
+}
+
+# `AttributeFlags::to_case_sensitivity`.
+fn case-of(flag: Text, name: Text) -> Text = match flag {
+  "i" => "ascii-case-insensitive"
+  "s" => "explicit-case-sensitive"
+  _ if name in html-case-insensitive => "if-in-html"
+  _ => "case-sensitive"
+}
+
+const html-case-insensitive: [Text] = ["accept", "accept-charset", "align", "alink", "axis", "bgcolor", "charset", "checked",
+  "clear", "codetype", "color", "compact", "declare", "defer", "dir", "direction", "disabled", "enctype", "face", "frame",
+  "hreflang", "http-equiv", "lang", "language", "link", "media", "method", "multiple", "nohref", "noresize", "noshade",
+  "nowrap", "readonly", "rel", "rev", "rules", "scope", "scrolling", "selected", "shape", "target", "text", "type",
+  "valign", "valuetype", "vlink"]
+
+# ---------------------------------------------------------------- pseudo-elements
+
+fn pseudo-element-of(n: cv.V, rest: [cv.V], state: Int) -> Parsed? = match n.kind {
+  _ if not allows-pseudos?(state) => none
+  "ident" => element-added(known-element(n.text), rest, state)
+  "function" => match cv.lower(n.text) {
+    "part" | "slotted" => none
+    "cue" | "cue-region" | "highlight" | "picker" | "view-transition-group" | "view-transition-image-pair"
+    | "view-transition-old" | "view-transition-new" => none
+    _ => element-added(cv.named("custom-pseudo-element-function", n.text, n.items), rest, state)
+  }
+  _ => none
+}
+
+fn allows-pseudos?(state: Int) -> Bool = not has?(state, bit-or(after-pseudo-element, disallow-pseudos))
+
+# A pseudo-element: a known one starts a compound after a pseudo-element combinator; an unknown
+# one stays in its compound.
+fn element-added(p: cv.V, rest: [cv.V], state: Int) -> Parsed? = match p.kind {
+  _ if has?(state, after-slotted) and not (p.text in ["before", "after", "marker", "placeholder", "file-selector-button"]) => none
+  "custom-pseudo-element" | "custom-pseudo-element-function" =>
+    parsed(adds(p), rest, bit-or(state, bit-or(after-unknown-pseudo-element, if p.text == "-webkit-scrollbar" then 0 else 0)))
+  _ => parsed(cv.named("new-compound", "pseudo-element", [p]), rest,
+              bit-or(bit-or(state, after-pseudo-element), if webkit-scrollbar-element?(p.text) then after-webkit-scrollbar else 0)
+              + (if p.text == "view-transition" then 0 else 0))
+}
+
+fn webkit-scrollbar-element?(name: Text) -> Bool = starts-with(name, "-webkit-scrollbar") or name == "-webkit-resizer"
+
+# lightningcss's `parse_pseudo_element`: its name for a known pseudo-element and the prefix.
+fn known-element(name: Text) -> cv.V = match cv.lower(name) {
+  "before" | "after" | "first-line" | "first-letter" | "details-content" | "target-text" | "search-text" | "cue"
+  | "cue-region" | "marker" | "picker-icon" | "checkmark" | "view-transition" | "grammar-error" | "spelling-error" =>
+    element(cv.lower(name), 0)
+  "selection" => element("selection", 1)
+  "-moz-selection" => element("selection", 4)
+  "placeholder" => element("placeholder", 1)
+  "-webkit-input-placeholder" => element("placeholder", 2)
+  "-moz-placeholder" => element("placeholder", 4)
+  "-ms-input-placeholder" => element("placeholder", 4)
+  "backdrop" => element("backdrop", 1)
+  "-webkit-backdrop" => element("backdrop", 2)
+  "file-selector-button" => element("file-selector-button", 1)
+  "-webkit-file-upload-button" => element("file-selector-button", 2)
+  "-ms-browse" => element("file-selector-button", 8)
+  "-webkit-scrollbar" | "-webkit-scrollbar-button" | "-webkit-scrollbar-track" | "-webkit-scrollbar-track-piece"
+  | "-webkit-scrollbar-thumb" | "-webkit-scrollbar-corner" | "-webkit-resizer" => element(cv.lower(name), 0)
+  _ => cv.word("custom-pseudo-element", name)
+}
+
+fn element(name: Text, prefix: Int) -> cv.V = cv.v("pseudo-element", f32-of(prefix), name, [])
+
+# ---------------------------------------------------------------- pseudo-classes
+
+fn pseudo-class-of(n: cv.V, rest: [cv.V], state: Int) -> Parsed? = match n.kind {
+  "ident" => match simple-pseudo-class(n.text, state) {
+    some(c) => parsed(adds(c), rest, state)
+    none => none
+  }
+  "function" => match functional-pseudo-class(n, state) {
+    some(c) => parsed(adds(c.value), rest, c.state)
+    none => none
+  }
+  _ => none
+}
+
+# `parse_simple_pseudo_class`.
+fn simple-pseudo-class(name: Text, state: Int) -> cv.V? = match cv.lower(name) {
+  _ if has?(state, bit-or(after-slotted, after-non-stateful-pseudo-element)) => none
+  "first-child" if structural?(state) => some(nth("child", 0.0, 0, 1))
+  "last-child" if structural?(state) => some(nth("last-child", 0.0, 0, 1))
+  "only-child" if structural?(state) => some(nth("only-child", 0.0, 0, 1))
+  "root" if structural?(state) => some(cv.word("root", ""))
+  "empty" if structural?(state) => some(cv.word("empty", ""))
+  "scope" if structural?(state) => some(cv.word("scope", ""))
+  "host" if structural?(state) => some(cv.holder("host", []))
+  "first-of-type" if structural?(state) => some(nth("of-type", 0.0, 0, 1))
+  "last-of-type" if structural?(state) => some(nth("last-of-type", 0.0, 0, 1))
+  "only-of-type" if structural?(state) => some(nth("only-of-type", 0.0, 0, 1))
+  "only-child" if has?(state, after-view-transition) => some(nth("only-child", 0.0, 0, 1))
+  _ => checked-pseudo-class(known-class(name), state)
+}
+
+fn structural?(state: Int) -> Bool = not has?(state, after-pseudo)
+
+# What may follow a pseudo-element: after a `::-webkit-scrollbar…`, its own states; after
+# another, user actions.
+fn checked-pseudo-class(c: cv.V, state: Int) -> cv.V? = match c {
+  _ if has?(state, after-webkit-scrollbar) => if c.kind == "pseudo-class" and (c.text in scrollbar-states or user-action?(c.text)) then some(c) else none
+  _ if has?(state, after-pseudo-element) => if c.kind == "pseudo-class" and user-action?(c.text) then some(c) else none
+  _ if c.kind == "pseudo-class" and c.text in scrollbar-states => none
+  _ => some(c)
+}
+
+fn user-action?(name: Text) -> Bool = name in ["hover", "active", "focus", "focus-visible", "focus-within"]
+
+const scrollbar-states: [Text] = ["horizontal", "vertical", "decrement", "increment", "start", "end", "double-button",
+                                  "single-button", "no-button", "corner-present", "window-inactive"]
+
+fn nth(ty: Text, function: F32, a: Int, b: Int) -> cv.V = cv.v("nth", function, ty, [cv.n(f32-of(a)), cv.n(f32-of(b))])
+
+fn pseudo-class(name: Text, prefix: Int) -> cv.V = cv.v("pseudo-class", f32-of(prefix), name, [])
+
+# lightningcss's `parse_non_ts_pseudo_class`.
+fn known-class(name: Text) -> cv.V = match cv.lower(name) {
+  "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "current" | "past" | "future" | "playing" | "paused"
+  | "seeking" | "buffering" | "stalled" | "muted" | "volume-locked" | "open" | "closed" | "modal" | "picture-in-picture"
+  | "popover-open" | "defined" | "link" | "local-link" | "target" | "target-within" | "visited" | "enabled" | "disabled"
+  | "default" | "checked" | "indeterminate" | "blank" | "valid" | "invalid" | "in-range" | "out-of-range" | "required"
+  | "optional" | "user-valid" | "user-invalid" | "active-view-transition" | "horizontal" | "vertical" | "decrement"
+  | "increment" | "start" | "end" | "double-button" | "single-button" | "no-button" | "corner-present"
+  | "window-inactive" => pseudo-class(cv.lower(name), 0)
+  "fullscreen" => pseudo-class("fullscreen", 1)
+  "-webkit-full-screen" => pseudo-class("fullscreen", 2)
+  "-moz-full-screen" => pseudo-class("fullscreen", 4)
+  "-ms-fullscreen" => pseudo-class("fullscreen", 8)
+  "any-link" => pseudo-class("any-link", 1)
+  "-webkit-any-link" => pseudo-class("any-link", 2)
+  "-moz-any-link" => pseudo-class("any-link", 4)
+  "read-only" => pseudo-class("read-only", 1)
+  "-moz-read-only" => pseudo-class("read-only", 4)
+  "read-write" => pseudo-class("read-write", 1)
+  "-moz-read-write" => pseudo-class("read-write", 4)
+  "placeholder-shown" => pseudo-class("placeholder-shown", 1)
+  "-moz-placeholder" => pseudo-class("placeholder-shown", 4)
+  "-ms-input-placeholder" => pseudo-class("placeholder-shown", 8)
+  "autofill" => pseudo-class("autofill", 1)
+  "-webkit-autofill" => pseudo-class("autofill", 2)
+  "-o-autofill" => pseudo-class("autofill", 16)
+  _ => cv.word("custom-pseudo-class", name)
+}
+
+# `parse_functional_pseudo_class`.
+fn functional-pseudo-class(f: cv.V, state: Int) -> Parsed? = match cv.lower(f.text) {
+  "nth-child" => nth-function("child", f.items, state)
+  "nth-of-type" => nth-function("of-type", f.items, state)
+  "nth-last-child" => nth-function("last-child", f.items, state)
+  "nth-last-of-type" => nth-function("last-of-type", f.items, state)
+  "nth-col" => nth-function("col", f.items, state)
+  "nth-last-col" => nth-function("last-col", f.items, state)
+  "is" => list-function("is", f.items, state, bit-or(skip-default-namespace, disallow-pseudos), false)
+  "where" => list-function("where", f.items, state, bit-or(skip-default-namespace, disallow-pseudos), false)
+  "not" => list-function("not", f.items, state, bit-or(skip-default-namespace, disallow-pseudos), true)
+  "has" => has-function(f.items, state)
+  "host" => none
+  "-webkit-any" | "-moz-any" => none
+  _ if has?(state, after-pseudo) => none
+  "lang" => none
+  "dir" => match cv.significant(f.items) {
+    [d] if d.kind == "ident" and cv.lower(d.text) in ["ltr", "rtl"] => parsed(cv.word("dir", cv.lower(d.text)), [], state)
+    _ => none
+  }
+  "state" | "active-view-transition-type" => none
+  _ => parsed(cv.named("custom-pseudo-class-function", f.text, f.items), [], state)
+}
+
+# `:is()`, `:where()`, `:not()`: a selector list, which may not hold pseudo-elements; `:not()`'s
+# is not forgiving.
+fn list-function(kind: Text, ts: [cv.V], state: Int, child: Int, discard: Bool) -> Parsed? =
+  match list-with-state(ts, bit-or(state, child), false, "none", discard) {
+    some(p) => parsed(cv.holder(kind, p.value.items), [], bit-or(state, bit-and(p.state, after-nesting)))
+    none => none
+  }
+
+fn has-function(ts: [cv.V], state: Int) -> Parsed? = match list-with-state(ts, state, true, "none", false) {
+  some(p) => parsed(cv.holder("has", p.value.items), [], bit-or(state, bit-and(p.state, after-nesting)))
+  none => none
+}
+
+# `parse_nth_pseudo_class`: An+B, then for the child types `of` and a selector list.
+fn nth-function(ty: Text, ts: [cv.V], state: Int) -> Parsed? = match nth-of(ts) {
+  _ if has?(state, after-pseudo) => none
+  none => none
+  some(ab) => match ty in ["child", "last-child"] {
+    true => match cv.ident-matching(ab.rest, "of") {
+      some(after) => match list-with-state(after, bit-or(state, bit-or(skip-default-namespace, disallow-pseudos)), false, "none", false) {
+        some(p) => parsed(cv.holder("nth-of", [nth(ty, 1.0, ab.a, ab.b)] ++ p.value.items), [], state)
+        none => none
+      }
+      none => if cv.exhausted?(ab.rest) then parsed(nth(ty, 1.0, ab.a, ab.b), [], state) else none
+    }
+    false => if cv.exhausted?(ab.rest) then parsed(nth(ty, 1.0, ab.a, ab.b), [], state) else none
+  }
+}
+
+record AB { a: Int, b: Int, rest: [cv.V] }
+
+fn ab(a: Int, b: Int, rest: [cv.V]) -> AB? = some(AB(a: a, b: b, rest: rest))
+
+# cssparser's `parse_nth`.
+fn nth-of(ts: [cv.V]) -> AB? = match cv.next-of(ts) {
+  none => none
+  some(g) => match g.value.kind {
+    "number" => match tk.int-value(g.value.text) {
+      some(b) => ab(0, b, g.rest)
+      none => none
+    }
+    "dimension" => match tk.int-value(g.value.items[0].text) {
+      none => none
+      some(a) => match cv.lower(g.value.text) {
+        "n" => b-part(g.rest, a)
+        "n-" => signless-b(g.rest, a, -1)
+        unit => match n-dash-digits(unit) {
+          some(b) => ab(a, b, g.rest)
+          none => none
+        }
+      }
+    }
+    "ident" => match cv.lower(g.value.text) {
+      "even" => ab(2, 0, g.rest)
+      "odd" => ab(2, 1, g.rest)
+      "n" => b-part(g.rest, 1)
+      "-n" => b-part(g.rest, -1)
+      "n-" => signless-b(g.rest, 1, -1)
+      "-n-" => signless-b(g.rest, -1, -1)
+      v => match v {
+        "-" ++ stripped => match n-dash-digits(stripped) { some(b) => ab(-1, b, g.rest)  none => none }
+        _ => match n-dash-digits(v) { some(b) => ab(1, b, g.rest)  none => none }
+      }
+    }
+    "delim" if g.value.text == "+" => match g.rest {
+      [t, rest...] if t.kind == "ident" => match cv.lower(t.text) {
+        "n" => b-part(rest, 1)
+        "n-" => signless-b(rest, 1, -1)
+        v => match n-dash-digits(v) { some(b) => ab(1, b, rest)  none => none }
+      }
+      _ => none
+    }
+    _ => none
+  }
+}
+
+# `parse_b`: nothing, `+ B`, `- B`, or a signed integer.
+fn b-part(ts: [cv.V], a: Int) -> AB? = match cv.next-of(ts) {
+  some(g) if g.value.kind == "delim" and g.value.text == "+" => signless-b(g.rest, a, 1)
+  some(g) if g.value.kind == "delim" and g.value.text == "-" => signless-b(g.rest, a, -1)
+  some(g) if g.value.kind == "number" and tk.has-sign?(g.value.text) and is-some(tk.int-value(g.value.text)) =>
+    ab(a, tk.int-value(g.value.text) ?? 0, g.rest)
+  _ => ab(a, 0, ts)
+}
+
+fn signless-b(ts: [cv.V], a: Int, sign: Int) -> AB? = match cv.next-of(ts) {
+  some(g) if g.value.kind == "number" and not tk.has-sign?(g.value.text) and is-some(tk.int-value(g.value.text)) =>
+    ab(a, sign * (tk.int-value(g.value.text) ?? 0), g.rest)
+  _ => none
+}
+
+# `n-123`: B is -123.
+fn n-dash-digits(s: Text) -> Int? = match s {
+  "n-" ++ digits if len(digits) > 0 and span-of(digits, 0, "0123456789") == len(digits) => some(0 - css-int-of(digits))
+  _ => none
+}
+
+# ---------------------------------------------------------------- what selectors are
+
+fn combinators-of(sel: cv.V) -> [cv.V] = [p for p in sel.items if p.kind == "combinator"]
+
+# parcel_selectors' `has_combinator` (a pseudo-element's combinator counts).
+fn simple?(sel: cv.V) -> Bool = len(combinators-of(sel)) == 0
+
+# Whether the selector's last compound starts with a type selector (`has_type_selector`, which
+# looks at the first component in match order).
+fn has-type-selector?(sel: cv.V) -> Bool = match [p for p in sel.items] {
+  [] => false
+  parts => match last(parts) {
+    p if p.kind == "compound" and len(p.items) > 0 => p.items[0].kind == "type" or p.items[0].kind == "universal"
+    _ => false
+  }
+}
+
+# Unwrapping :is() with a single simple selector keeps the same specificity.
+fn unwrap-is?(sels: [cv.V]) -> Bool = len(sels) == 1 and not has-type-selector?(sels[0]) and simple?(sels[0])
+
+# ---------------------------------------------------------------- writing
+
+# What writing a selector depends on: the vendor prefix a rule is being written with (0: none),
+# whether nesting is compiled, and the selectors of the style rules around it, innermost last.
+record Ctx { prefix: Int, compile-nesting: Bool, parents: [[cv.V]] }
+
+fn list-text(sels: [cv.V], ctx: Ctx) -> Text = join([selector-text(s, ctx, false) for s in sels], ",")
+
+# `serialize_selector`.
+fn selector-text(sel: cv.V, ctx: Ctx, relative: Bool) -> Text = parts-text(sel.items, ctx, relative, true)
+
+fn parts-text(parts: [cv.V], ctx: Ctx, relative: Bool, first: Bool) -> Text = match parts {
+  [] => ""
+  [c, rest...] if c.kind == "combinator" => combinator-text(c.text) ++ parts-text(rest, ctx, relative, first)
+  [c, rest...] if relative and len(c.items) > 0 and c.items[0].kind == "scope" => match rest {
+    [k, more...] if k.kind == "combinator" => combinator-text(k.text) ++ parts-text([compound(c.items[1..len(c.items)])] ++ more, ctx, false, first)
+    _ => parts-text([compound(c.items[1..len(c.items)])] ++ rest, ctx, false, first)
+  }
+  [c, rest...] if len(c.items) == 0 => parts-text(rest, ctx, relative, first)
+  [c, rest...] => compound-text(c.items, next-combinator(rest), ctx, first) ++ parts-text(rest, ctx, relative, false)
+}
+
+fn next-combinator(parts: [cv.V]) -> Text = match parts {
+  [k, ...] if k.kind == "combinator" => k.text
+  _ => ""
+}
+
+fn compound-text(items: [cv.V], next: Text, ctx: Ctx, first: Bool) -> Text = match items {
+  [n, u] if first and n.kind == "nesting" and u.kind == "universal" and next != "pseudo-element" and next != "slot" =>
+    if ctx.compile-nesting then "*" ++ nesting-text(ctx, false) else components-text(items, ctx)
+  [u] if u.kind == "universal" and next != "pseudo-element" and next != "slot" => "*"
+  [n, ty, rest...] if first and n.kind == "nesting" and ctx.compile-nesting and (ty.kind == "type" or ty.kind == "universal") =>
+    component-text(ty, ctx) ++ component-text(n, ctx) ++ elided-text(rest, ctx)
+  [n, rest...] if first and n.kind == "nesting" and ctx.compile-nesting => nesting-text(ctx, true) ++ elided-text(rest, ctx)
+  _ => elided-text(items, ctx)
+}
+
+# Step 2 of the serialization: each component, a universal selector left out.
+fn elided-text(items: [cv.V], ctx: Ctx) -> Text = join([component-text(c, ctx) for c in items if c.kind != "universal"], "")
+
+fn components-text(items: [cv.V], ctx: Ctx) -> Text = join([component-text(c, ctx) for c in items], "")
+
+fn combinator-text(name: Text) -> Text = match name {
+  "child" => ">"
+  "descendant" => " "
+  "next-sibling" => "+"
+  "later-sibling" => "~"
+  "deep" => " /deep/ "
+  "deep-descendant" => ">>>"
+  _ => ""
+}
+
+# `serialize_nesting`: the parent's one selector (when it can stand where `&` does), the
+# parent's list in `:is()`, `:scope` at the root when nesting is compiled, or `&`.
+fn nesting-text(ctx: Ctx, first: Bool) -> Text = match ctx.parents {
+  [] => if ctx.compile-nesting then ":scope" else "&"
+  _ => match last(ctx.parents) {
+    [one] if first or (not has-type-selector?(one) and simple?(one)) => selector-text(one, outer, false)
+    sels => ":is(" ++ list-text(sels, outer) ++ ")"
+  } where outer = ctx with { parents: ctx.parents[0..len(ctx.parents) - 1] }
+}
+
+fn component-text(c: cv.V, ctx: Ctx) -> Text = match c.kind {
+  "nesting" => nesting-text(ctx, false)
+  "universal" => "*"
+  "type" => cv.identifier-text(c.text)
+  "class" => "." ++ cv.identifier-text(c.text)
+  "id" => "#" ++ cv.identifier-text(c.text)
+  "attr-exists" => "[" ++ cv.identifier-text(c.text) ++ "]"
+  "attr" => "[" ++ cv.identifier-text(c.text) ++ c.items[0].text ++ attr-value-text(c.items[1].text) ++ case-text(c.items[2].text) ++ "]"
+  "root" => ":root"
+  "empty" => ":empty"
+  "scope" => ":scope"
+  "host" => ":host"
+  "nth" => nth-text(c)
+  "nth-of" => nth-start(c.items[0].text, true) ++ affine-text(c.items[0]) ++ " of " ++ join([selector-text(s, ctx, true) for s in c.items[1..len(c.items)]], ",") ++ ")"
+  "is" => match unwrap-is?(c.items) {
+    true => selector-text(c.items[0], ctx, false)
+    false => (if bit-and(ctx.prefix, 6) != 0 then ":" ++ compat.prefix-text(ctx.prefix) ++ "any(" else ":is(") ++ list-text(c.items, ctx) ++ ")"
+  }
+  "where" => ":where(" ++ list-text(c.items, ctx) ++ ")"
+  "not" => ":not(" ++ list-text(c.items, ctx) ++ ")"
+  "has" => ":has(" ++ join([selector-text(s, ctx, true) for s in c.items], ",") ++ ")"
+  "dir" => ":dir(" ++ c.text ++ ")"
+  "pseudo-class" => pseudo-class-text(c, ctx)
+  "pseudo-element" => pseudo-element-text(c, ctx)
+  "custom-pseudo-class" => ":" ++ c.text
+  "custom-pseudo-class-function" => ":" ++ c.text ++ "(" ++ raw-tokens-text(c.items) ++ ")"
+  "custom-pseudo-element" => "::" ++ c.text
+  "custom-pseudo-element-function" => "::" ++ c.text ++ "(" ++ raw-tokens-text(c.items) ++ ")"
+  k => fail-build("lightningcss: writing the selector part " ++ k ++ " is not implemented")
+}
+
+# A custom pseudo-class's arguments, as tokens are written raw (`to_css_raw`): space as written.
+fn raw-tokens-text(ts: [cv.V]) -> Text = join([raw-token-text(t) for t in ts], "")
+
+fn raw-token-text(t: cv.V) -> Text = match t.kind {
+  "ws" => t.text
+  "comment" => "/*" ++ t.text ++ "*/"
+  "number" => cv.numeric-text(t.num, tk.int-value(t.text), tk.has-sign?(t.text))
+  "dimension" => cv.numeric-text(t.num, tk.int-value(t.items[0].text), tk.has-sign?(t.items[0].text)) ++ cv.unit-text(t.text)
+  "function" => cv.identifier-text(t.text) ++ "(" ++ raw-tokens-text(t.items) ++ ")"
+  "parens" => "(" ++ raw-tokens-text(t.items) ++ ")"
+  "brackets" => "[" ++ raw-tokens-text(t.items) ++ "]"
+  "braces" => "{" ++ raw-tokens-text(t.items) ++ "}"
+  _ => tk.token-text(t)
+}
+
+# An attribute's value: as an identifier when that is shorter than as a string.
+fn attr-value-text(v: Text) -> Text = match cv.identifier-text(v) {
+  id if len(id) > 0 and len(id) < len(cv.string-text(v)) => id
+  _ => cv.string-text(v)
+}
+
+fn case-text(c: Text) -> Text = match c { "ascii-case-insensitive" => " i"  "explicit-case-sensitive" => " s"  _ => "" }
+
+fn nth-text(c: cv.V) -> Text = match c.num == 1.0 {
+  true => nth-start(c.text, true) ++ affine-text(c) ++ ")"
+  false => nth-start(c.text, false)
+}
+
+fn nth-start(ty: Text, function: Bool) -> Text = match ty, function {
+  "child", true => ":nth-child("
+  "child", false => ":first-child"
+  "last-child", true => ":nth-last-child("
+  "last-child", false => ":last-child"
+  "of-type", true => ":nth-of-type("
+  "of-type", false => ":first-of-type"
+  "last-of-type", true => ":nth-last-of-type("
+  "last-of-type", false => ":last-of-type"
+  "only-child", _ => ":only-child"
+  "only-of-type", _ => ":only-of-type"
+  "col", _ => ":nth-col("
+  _, _ => ":nth-last-col("
+}
+
+# `write_affine`.
+fn affine-text(c: cv.V) -> Text = match f32-to-i32(c.items[0].num), f32-to-i32(c.items[1].num) {
+  0, 0 => "0"
+  1, 0 => "n"
+  a, 0 if a == -1 => "-n"
+  a, 0 => int-text(a) ++ "n"
+  2, 1 => "odd"
+  0, b => int-text(b)
+  1, b => "n" ++ signed(b)
+  a, b if a == -1 => "-n" ++ signed(b)
+  a, b => int-text(a) ++ "n" ++ signed(b)
+}
+
+fn signed(b: Int) -> Text = if b >= 0 then "+" ++ int-text(b) else int-text(b)
+
+# The prefix a prefixed pseudo is written with: the rule's, where it is being written with one.
+fn written-prefix(c: cv.V, ctx: Ctx) -> Int = match ctx.prefix {
+  0 => f32-to-i32(c.num)
+  p => if bit-and(p, f32-to-i32(c.num)) == 0 then 1 else bit-and(p, f32-to-i32(c.num))
+}
+
+fn pseudo-class-text(c: cv.V, ctx: Ctx) -> Text = match c.text {
+  "fullscreen" => ":" ++ compat.prefix-text(p) ++ (if p == 2 or p == 4 then "full-screen" else "fullscreen") where p = written-prefix(c, ctx)
+  "any-link" | "read-only" | "read-write" | "placeholder-shown" | "autofill" => ":" ++ compat.prefix-text(written-prefix(c, ctx)) ++ c.text
+  _ => ":" ++ c.text
+}
+
+fn pseudo-element-text(c: cv.V, ctx: Ctx) -> Text = match c.text {
+  "after" | "before" | "first-line" | "first-letter" => ":" ++ c.text
+  "selection" | "backdrop" => "::" ++ compat.prefix-text(written-prefix(c, ctx)) ++ c.text
+  "placeholder" => "::" ++ compat.prefix-text(p) ++ (if p == 2 or p == 8 then "input-placeholder" else "placeholder") where p = written-prefix(c, ctx)
+  "file-selector-button" => "::" ++ compat.prefix-text(p) ++ (match p { 2 => "file-upload-button"  8 => "browse"  _ => "file-selector-button" })
+    where p = written-prefix(c, ctx)
+  _ => "::" ++ c.text
+}

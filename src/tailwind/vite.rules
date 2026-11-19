@@ -1,0 +1,83 @@
+# What `@tailwindcss/vite` does to a stylesheet in a build (packages/@tailwindcss-vite/src/index.ts,
+# v4.3.5), for a project that has it installed: a stylesheet Vite loads (one a module or the page
+# imports, not one another stylesheet `@import`s) that uses Tailwind (`@tailwind utilities` or
+# `@import "tailwindcss"`, `@apply`, `@variant`, a theme function) is what Tailwind's compiler makes
+# of it, with the candidates its scanner finds in the sources the stylesheet names: `source(…)`,
+# `@source`, or the project's root. Every file read is read through the bundler, so a watcher builds
+# again when one changes. The bundler lowers and minifies the combined CSS in production.
+rules tailwind.vite
+use tailwind.compile as tw
+use tailwind.scan as scan
+use bundle.resolve as res
+
+# The version of Tailwind this port is of.
+const version: Text = "4.3.5"
+
+# The bundler lowers production CSS after resolving assets and combining stylesheets.
+fn loaded(path: Text, production: Bool) -> Text? = transformed-in(path, production)
+
+fn transformed(path: Text) -> Text? = transformed-in(path, false)
+
+# A stylesheet as the plugin leaves it: Tailwind's output, or none when Tailwind is not installed
+# for it or it does not use Tailwind (the plugin leaves it alone).
+fn transformed-in(path: Text, production: Bool) -> Text? = match installed(dir-of(path)) {
+  none => none
+  some(project) => match compiler-in(path, production) {
+    c if not tw.root-features?(c.features) => none
+    c => some(tw.build(c, scanned(c, project), version))
+  }
+}
+
+fn compiler-in(path: Text, production: Bool) -> tw.Compiler =
+  with tw.production = production { tw.compiler(read-file(path), path) }
+
+# Whether the plugin takes the stylesheet as Tailwind's.
+fn root?(path: Text) -> Bool = match installed(dir-of(path)) {
+  none => false
+  some(_) => tw.root-features?(compiler-in(path, false).features)
+}
+
+# The candidates the plugin's scanner finds for the stylesheet.
+fn candidates-of(path: Text) -> [Text] = match installed(dir-of(path)) {
+  none => []
+  some(project) => scanned(compiler-in(path, false), project)
+}
+
+# The candidates, scanned only when the stylesheet has `@tailwind utilities` (as the plugin does).
+fn scanned(c: tw.Compiler, project: Text) -> [Text] = match c.found.utilities {
+  false => []
+  true => scan.candidates([scan.Source(base: s.base, pattern: s.pattern, negated: s.negated) for s in checked-sources(tw.scan-sources(c, project), c)])
+}
+
+# Tailwind's check that `source(…)` names a directory.
+fn checked-sources(sources: [tw.Source], c: tw.Compiler) -> [tw.Source] = match c.found.root {
+  "" | "none" => sources
+  pattern => match listed?(path-normalize(c.found.root-base ++ "/" ++ glob-free(pattern))) {
+    true => sources
+    false => fail-build("The `source(" ++ pattern ++ ")` does not exist or is not a directory.")
+  }
+}
+
+# The path up to the first segment with a glob in it.
+fn glob-free(pattern: Text) -> Text = join([s for s in split(pattern, "/") while not (has-byte?(s, '*') or has-byte?(s, '{'))], "/")
+
+fn listed?(dir: Text) -> Bool = match res.listing-of(dir-of(dir))[path-base(dir)] {
+  some(kind) => kind == 'd' or kind == 'l'
+  none => false
+}
+
+# The project whose Tailwind the stylesheet is built with: the nearest directory above it with a
+# package.json that has `@tailwindcss/vite` and `tailwindcss` installed where it can find them, as
+# Vite's root is the project's. Tailwind's own version must be the one ported.
+fn installed(dir: Text) -> Text? = first pj in res.package-json-for(dir) for project in [dir-of(pj)]
+  for tailwind in package-dir(project, "tailwindcss") if is-some(package-dir(project, "@tailwindcss/vite")):
+    checked-version(tailwind, project)
+
+fn package-dir(project: Text, name: Text) -> Text? = first d in path-ancestors(project)
+  for pdir in [res.in-dir(d, "node_modules/" ++ name)] if is-some(res.package-doc(pdir)): pdir
+
+fn checked-version(tailwind: Text, project: Text) -> Text = match first doc in res.package-doc(tailwind): res.text-member(doc, "version") ?? "" {
+  some(v) if v == version => project
+  some(v) => fail-build(project ++ ": Tailwind CSS " ++ v ++ " is installed; this build implements Tailwind CSS " ++ version)
+  none => fail-build(tailwind ++ ": no package.json")
+}
